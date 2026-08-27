@@ -722,10 +722,10 @@ impl PkceOAuthTokenSource {
             //     (see [`LeaderGuard::complete`]), so this is a fresh, bounded,
             //     leader-eligible attempt — not a re-join of the dead
             //     generation, and not a loop. Its cache re-read excludes our
-            //     `rejected`, and if the bounded refresh re-issues those exact
-            //     bytes `acquire_locked` fails it with a typed error (see the
-            //     refresh-success guard there) rather than escaping the
-            //     invariant — either way it never hands us back our `rejected`.
+            //     `rejected`, and `acquire_leader`'s choke-point guard rejects
+            //     any refresh- or browser-issued token equal to our `rejected`
+            //     with a typed error — so the rerun never hands us back our
+            //     `rejected` on any path.
             //
             //   * It may publish a terminal failure even though a sibling wrote
             //     a valid replacement into the cache while we waited. We
@@ -783,8 +783,33 @@ impl PkceOAuthTokenSource {
         // Threading the deadline lets every interactive timeout exit through
         // the common outcome writer while the lock is still held.
         let attempt_deadline = std::time::Instant::now() + AUTH_ATTEMPT_DEADLINE;
-        self.acquire_locked(intent, rejected, attempt_deadline)
-            .await
+        let token = self
+            .acquire_locked(intent, rejected, attempt_deadline)
+            .await?;
+
+        // The single choke point for the 401-recovery invariant: a recovering
+        // acquisition must never hand back the exact bytes the caller reported
+        // rejected. `cached_hit` already excludes `rejected`, so a cache result
+        // can't equal it — but a refresh (a provider re-issuing the identical
+        // access token) or a browser exchange (the same, after a dead refresh
+        // falls through to a sign-in) can. Every successful acquisition —
+        // cache, refresh, browser — returns through here, so validating once
+        // covers a plain leader and a joiner's bounded rerun alike; the earlier
+        // per-branch guards would each miss the others' paths.
+        //
+        // Ordering note: on a match, `acquire_locked`'s `finish()` has already
+        // cached the token and cleared cooldown. That is benign and does not
+        // loop — the next recovery passes the same `rejected`, so `cached_hit`
+        // excludes the just-saved token and forces a fresh refresh/browser
+        // rather than serving it back. We fail terminally here regardless.
+        if rejected == Some(token.as_str()) {
+            return Err(if intent.may_open_browser() {
+                AuthError::NetworkUnavailable
+            } else {
+                AuthError::RefreshRejected
+            });
+        }
+        Ok(token)
     }
 
     /// Slow-path body, run while holding the cross-process auth lock.
@@ -817,26 +842,7 @@ impl PkceOAuthTokenSource {
         if let Some(rt) = state.as_ref().and_then(|t| t.refresh_token.clone()) {
             let eps = self.discover(&mut endpoints).await?;
             match self.refresh(eps, &rt).await {
-                RefreshOutcome::Refreshed(fresh) => {
-                    // A 401-recovery acquisition must never hand back the exact
-                    // bytes the caller reported rejected. A well-behaved
-                    // provider rotates the access token on refresh, but a
-                    // misbehaving one can re-issue the identical token;
-                    // returning it would send the caller straight back into the
-                    // 401 it is recovering from. Fail with a typed error —
-                    // terminal, no browser, no loop. This is the single choke
-                    // point for the invariant: it covers a plain leader and the
-                    // joiner's bounded rerun alike, since the rerun routes
-                    // through here.
-                    if rejected == Some(fresh.access_token.as_str()) {
-                        return Err(if intent.may_open_browser() {
-                            AuthError::NetworkUnavailable
-                        } else {
-                            AuthError::RefreshRejected
-                        });
-                    }
-                    return self.finish(&mut state, fresh);
-                }
+                RefreshOutcome::Refreshed(fresh) => return self.finish(&mut state, fresh),
                 // A transient fault (transport/timeout/5xx/decode) is not a
                 // credential decision: never fall through to a browser or
                 // report RefreshRejected. A sibling may have written a fresh

@@ -181,6 +181,11 @@ enum ExchangeMode {
     /// Sleep `d` before answering, so the caller's per-request HTTP timeout
     /// elapses first (a transport timeout, not a verdict from the provider).
     Hang(Duration),
+    /// `200` returning the same fixed access token on every authorization-code
+    /// exchange. Models a provider that re-issues an identical access token, so
+    /// a browser sign-in (reached after a dead refresh) can hand back the exact
+    /// bytes the caller reported 401-rejected.
+    SucceedSticky(&'static str),
 }
 
 /// Boot a stub provider. `reject_refresh` makes the token endpoint 401 every
@@ -304,6 +309,14 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                         ExchangeMode::MalformedSuccess => (
                             axum::http::StatusCode::OK,
                             Json(json!({ "token_type": "bearer" })),
+                        ),
+                        ExchangeMode::SucceedSticky(tok) => (
+                            axum::http::StatusCode::OK,
+                            Json(json!({
+                                "access_token": tok,
+                                "refresh_token": "browser-refresh",
+                                "expires_in": 3600,
+                            })),
                         ),
                         // Reached only after the sleep above; answer as a
                         // success the caller has already abandoned.
@@ -1220,6 +1233,67 @@ async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
         opener.call_count(),
         0,
         "a headless collision never opens a browser"
+    );
+}
+
+// ---- a browser success that re-issues the rejected bytes must fail typed ---
+//
+// The 401-recovery invariant lives at `acquire_leader`'s single choke point, so
+// it must hold on the browser-success path too — not just refresh. An
+// interactive caller whose refresh is dead falls through to a browser sign-in;
+// if that exchange re-issues the exact token the caller reported 401-rejected
+// (a provider reusing an access token within its validity window), the guard
+// must terminate typed rather than hand back the dead bearer. A single
+// interactive leader exercises the path; the colliding-joiner rerun routes
+// through the same choke point.
+
+#[tokio::test]
+async fn test_interactive_browser_reissuing_rejected_token_fails_typed_not_loop() {
+    // Refresh 401s (dead), so an interactive intent falls through to the
+    // browser; the exchange stickily returns one fixed token on every grant.
+    let stub = spawn_stub_with_modes(
+        RefreshMode::Reject,
+        ExchangeMode::SucceedSticky("sticky-browser"),
+    )
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // Expired seed with a (dead) refresh token: the caller misses the cache,
+    // its refresh is rejected, and it browses.
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "dead-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+
+    // The caller reports the sticky browser token as its rejected bearer, so
+    // the browser exchange hands back exactly those bytes.
+    let result = src
+        .acquire_with_intent(AuthIntent::UserInitiated, Some("sticky-browser"))
+        .await;
+
+    assert_eq!(
+        result,
+        Err(AuthError::NetworkUnavailable),
+        "a browser success equal to the rejected bytes must fail typed, not return them"
+    );
+    assert_eq!(
+        opener.call_count(),
+        1,
+        "the interactive attempt browsed exactly once — no loop re-launching the browser"
+    );
+    assert_eq!(
+        stub.code_grants.load(Ordering::SeqCst),
+        1,
+        "exactly one code exchange — the guard fails terminally instead of retrying"
     );
 }
 
