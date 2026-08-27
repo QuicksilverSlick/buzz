@@ -624,6 +624,20 @@ impl PkceOAuthTokenSource {
         None
     }
 
+    /// Lock-free variant of [`cached_hit`]'s disk branch: read the on-disk
+    /// cache and return its bearer if a sibling wrote a usable replacement for
+    /// `rejected`. Used by the joiner's shared-failure recheck, where every
+    /// waiter wakes at once — taking `self.state` (even with `try_lock`) would
+    /// either drop the replacement for `try_lock` losers or serialize the read
+    /// behind a new leader holding `state` across its browser flow. The
+    /// in-memory memo is intentionally not updated; the next real acquisition
+    /// re-reads and adopts under the lock.
+    fn usable_from_disk(&self, rejected: Option<&str>) -> Option<String> {
+        let disk = read_cache(&self.cache_path)?;
+        (!is_expired(&disk) && rejected != Some(disk.access_token.as_str()))
+            .then(|| disk.access_token)
+    }
+
     /// Discover OIDC endpoints once per flow, memoizing into `slot` so the
     /// refresh and browser branches share a single discovery call. A discovery
     /// failure (unreachable URL or malformed document) maps to
@@ -707,22 +721,29 @@ impl PkceOAuthTokenSource {
             //     run our own acquisition: the slot is evicted before publish
             //     (see [`LeaderGuard::complete`]), so this is a fresh, bounded,
             //     leader-eligible attempt — not a re-join of the dead
-            //     generation, and not a loop. Its own cache re-read / refresh
-            //     yields a token that differs from our `rejected`.
+            //     generation, and not a loop. Its cache re-read excludes our
+            //     `rejected`, and if the bounded refresh re-issues those exact
+            //     bytes `acquire_locked` fails it with a typed error (see the
+            //     refresh-success guard there) rather than escaping the
+            //     invariant — either way it never hands us back our `rejected`.
             //
             //   * It may publish a terminal failure even though a sibling wrote
             //     a valid replacement into the cache while we waited. We
             //     re-check the cache cheaply before adopting the failure — a
-            //     lock + disk read, never a browser or refresh — so a shared
-            //     failure can never fan out into an N-way browser storm.
+            //     lock-free disk read, never a browser or refresh — so a shared
+            //     failure can never fan out into an N-way browser storm. The
+            //     read is lock-free (not `state.try_lock()`) because all
+            //     waiters wake together: `try_lock` losers would skip the read
+            //     and drop a valid replacement, and `state.lock().await` could
+            //     serialize behind a *new* leader holding `state` across its
+            //     ~60s browser flow. The in-memory memo isn't load-bearing
+            //     here — the next real acquisition re-reads under the lock.
             match slot.wait().await {
                 Ok(token) if Some(token.as_str()) != rejected => return Ok(token),
                 Ok(_) => return self.acquire_leader(intent, rejected).await,
                 Err(shared) => {
-                    if let Ok(mut state) = self.state.try_lock() {
-                        if let Some(hit) = self.cached_hit(&mut state, rejected) {
-                            return Ok(hit);
-                        }
+                    if let Some(hit) = self.usable_from_disk(rejected) {
+                        return Ok(hit);
                     }
                     return Err(shared);
                 }
@@ -796,7 +817,26 @@ impl PkceOAuthTokenSource {
         if let Some(rt) = state.as_ref().and_then(|t| t.refresh_token.clone()) {
             let eps = self.discover(&mut endpoints).await?;
             match self.refresh(eps, &rt).await {
-                RefreshOutcome::Refreshed(fresh) => return self.finish(&mut state, fresh),
+                RefreshOutcome::Refreshed(fresh) => {
+                    // A 401-recovery acquisition must never hand back the exact
+                    // bytes the caller reported rejected. A well-behaved
+                    // provider rotates the access token on refresh, but a
+                    // misbehaving one can re-issue the identical token;
+                    // returning it would send the caller straight back into the
+                    // 401 it is recovering from. Fail with a typed error —
+                    // terminal, no browser, no loop. This is the single choke
+                    // point for the invariant: it covers a plain leader and the
+                    // joiner's bounded rerun alike, since the rerun routes
+                    // through here.
+                    if rejected == Some(fresh.access_token.as_str()) {
+                        return Err(if intent.may_open_browser() {
+                            AuthError::NetworkUnavailable
+                        } else {
+                            AuthError::RefreshRejected
+                        });
+                    }
+                    return self.finish(&mut state, fresh);
+                }
                 // A transient fault (transport/timeout/5xx/decode) is not a
                 // credential decision: never fall through to a browser or
                 // report RefreshRejected. A sibling may have written a fresh
@@ -1752,6 +1792,68 @@ mod tests {
         // bearer() should pick up the disk token without any network call.
         let result = source.bearer().await.unwrap();
         assert_eq!(result, "fresh-from-disk");
+    }
+
+    /// A joiner that wakes to the leader's shared *failure* must still recover
+    /// a sibling's valid replacement from disk even when `self.state` is held
+    /// by another task — the `try_lock`-loser / new-leader-holds-state
+    /// condition. The old recheck used `self.state.try_lock()`, so a loser fell
+    /// straight through to the shared error and dropped the replacement; the
+    /// fix reads the cache lock-free. Deterministic: the slot is pre-installed
+    /// and pre-published, and `state` is held for the whole call, so the
+    /// contended branch is forced rather than raced.
+    #[tokio::test]
+    async fn test_joiner_shared_failure_recovers_disk_replacement_under_state_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PkceOAuthConfig {
+            discovery_url: "https://invalid.example.test/.well-known".into(),
+            client_id: "test-client".into(),
+            scopes: vec!["offline_access".into()],
+            cache_namespace: "test".into(),
+            cache_dir_override: Some(dir.path().to_path_buf()),
+        };
+        let source = PkceOAuthTokenSource::new(cfg).unwrap();
+
+        // A sibling wrote a valid, unexpired replacement for the rejected token.
+        let future_exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 7200;
+        let replacement = CachedToken {
+            access_token: "sibling-replacement".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: Some(future_exp),
+        };
+        fs::write(
+            &source.cache_path,
+            serde_json::to_vec(&replacement).unwrap(),
+        )
+        .unwrap();
+
+        // Pre-install a slot for this key and publish the leader's terminal
+        // failure, so the call below takes the joiner branch and wakes to Err.
+        let key: InflightKey = (source.lock_path(), AuthIntent::Headless);
+        let slot = Arc::new(InflightSlot::new());
+        inflight_registry().insert(key.clone(), slot.clone());
+        slot.publish(Err(AuthError::RefreshRejected));
+
+        // Hold `state` for the whole acquisition: the fast-path `try_lock` and
+        // the old recheck's `try_lock` both fail, forcing the contended branch.
+        let held = source.state.lock().await;
+
+        let result = source
+            .acquire(AuthIntent::Headless, Some("rejected-bytes"))
+            .await;
+
+        drop(held);
+        inflight_registry().remove(&key);
+
+        assert_eq!(
+            result,
+            Ok("sibling-replacement".to_string()),
+            "the joiner must read the disk replacement lock-free, not inherit the shared failure"
+        );
     }
 
     #[tokio::test]

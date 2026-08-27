@@ -155,6 +155,11 @@ enum RefreshMode {
     /// Sleep `d` before answering, so the caller's per-request HTTP timeout
     /// elapses first (a transport timeout, not a verdict from the provider).
     Hang(Duration),
+    /// `200` returning the same fixed access token on every grant, regardless
+    /// of how many are served. Models a provider that re-issues an identical
+    /// access token, so a bounded rerun can hand back the exact bytes the
+    /// caller already reported 401-rejected.
+    SucceedSticky(&'static str),
 }
 
 /// How the stub's token endpoint answers an `authorization_code` grant (the
@@ -263,6 +268,14 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                                 axum::http::StatusCode::OK,
                                 Json(json!({
                                     "access_token": format!("refreshed-token-{n}"),
+                                    "refresh_token": "rotated-refresh",
+                                    "expires_in": 3600,
+                                })),
+                            ),
+                            RefreshMode::SucceedSticky(tok) => (
+                                axum::http::StatusCode::OK,
+                                Json(json!({
+                                    "access_token": tok,
                                     "refresh_token": "rotated-refresh",
                                     "expires_in": 3600,
                                 })),
@@ -1142,6 +1155,71 @@ async fn test_joiner_never_receives_its_own_rejected_token() {
         opener.call_count(),
         0,
         "a live refresh recovers both callers without any browser"
+    );
+}
+
+// ---- a bounded rerun that re-issues the rejected bytes must fail typed -----
+//
+// The joiner-collision fix reruns its own bounded acquisition when the leader
+// publishes the joiner's own rejected token. That rerun is only safe if it,
+// too, refuses to hand back the rejected bytes: a provider that re-issues an
+// identical access token on refresh would otherwise let the exact 401'd
+// credential escape through the rerun. The coordinator guards the refresh
+// success at its single choke point, so both a plain leader and this rerun
+// terminate with a typed auth error rather than returning the rejected token.
+
+#[tokio::test]
+async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
+    // A sticky provider returns ONE fixed access token on every refresh. Leader
+    // A rejects a different value, so its refresh to the sticky token is a
+    // clean success it publishes and caches. Joiner B rejected exactly the
+    // sticky token: it collides with A's published result, reruns its own
+    // bounded acquisition, and that rerun's refresh hands back the sticky token
+    // again — B's own rejected bytes. The choke-point guard turns that into a
+    // terminal `RefreshRejected` (Headless, no browser) instead of returning
+    // the dead credential or looping.
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("sticky-token")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let a = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let b = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+
+    let (ra, rb) = tokio::join!(
+        a.acquire_with_intent(AuthIntent::Headless, Some("rejected-by-a")),
+        b.acquire_with_intent(AuthIntent::Headless, Some("sticky-token")),
+    );
+
+    assert_eq!(
+        ra,
+        Ok("sticky-token".to_string()),
+        "the leader's refresh yields the sticky token, which differs from its own rejected value"
+    );
+    assert_eq!(
+        rb,
+        Err(AuthError::RefreshRejected),
+        "the joiner's rerun re-issued its own rejected bytes and must fail typed, not return them"
+    );
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "exactly two refreshes: the leader's, then the joiner's single bounded rerun — no loop"
+    );
+    assert_eq!(
+        opener.call_count(),
+        0,
+        "a headless collision never opens a browser"
     );
 }
 
