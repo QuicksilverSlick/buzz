@@ -1063,6 +1063,88 @@ async fn test_userinitiated_joiner_does_not_inherit_auto_cooldown_result() {
     );
 }
 
+// ---- a joiner must never inherit its own rejected token -------------------
+//
+// The in-process slot is keyed by (lock path, intent) only, so a 401-recovery
+// joiner shares a leader that ran with a *different* `rejected` value. If the
+// leader publishes a token equal to THIS caller's rejected bytes — e.g. its
+// refresh produced exactly the generation the joiner just reported 401 — the
+// joiner would retry the provider with the credentials it already knows are
+// dead. The joiner must instead detect the collision and run its own bounded
+// acquisition, obtaining a token that differs from its `rejected`.
+
+#[tokio::test]
+async fn test_joiner_never_receives_its_own_rejected_token() {
+    // Two concurrent `Headless` 401-recovery callers on one key, each rejecting
+    // a DIFFERENT bearer. The seeded cache token is expired, so neither caller
+    // is satisfied by the fast path (or the under-lock re-read) — both must go
+    // to the live refresh grant, which is what makes the leader slow enough to
+    // join. `join!` polls A first: it registers the INFLIGHT slot as leader,
+    // takes the file lock, and yields on its refresh HTTP call while holding
+    // the slot. B is then polled *while A is in flight* and joins A's slot.
+    //
+    // A's refresh yields `refreshed-token-1` and saves it. That is exactly the
+    // bearer B passed as `rejected` (B held gen-1 and was 401'd on it). Before
+    // the fix, B — a joiner keyed only by intent — received A's published
+    // `refreshed-token-1`: the precise bytes it just reported rejected. The fix
+    // makes B detect `published == own rejected`, fall through to its own
+    // acquisition, and refresh again to `refreshed-token-2`. The rerun goes
+    // straight to the leader body (not back through the registry), and its
+    // under-lock re-read rejects A's freshly-saved gen-1 (it equals B's
+    // `rejected`), so B can neither re-join the dead generation's slot, adopt
+    // its own rejected bytes from disk, nor loop.
+    let stub = spawn_stub(false).await; // refresh always succeeds
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // Expired access token with a live refresh token: the expiry forces both
+    // callers past the cache into the refresh grant regardless of their
+    // distinct `rejected` values.
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let a = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let b = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+
+    let (ra, rb) = tokio::join!(
+        a.acquire_with_intent(AuthIntent::Headless, Some("rejected-by-a")),
+        b.acquire_with_intent(AuthIntent::Headless, Some("refreshed-token-1")),
+    );
+
+    assert_eq!(
+        ra,
+        Ok("refreshed-token-1".to_string()),
+        "the leader refreshes to gen-1, which differs from its own rejected value"
+    );
+    let b_token = rb.expect("the joiner runs its own acquisition instead of inheriting gen-1");
+    assert_ne!(
+        b_token, "refreshed-token-1",
+        "the joiner must never receive the exact bytes it reported 401-rejected"
+    );
+    assert_eq!(
+        b_token, "refreshed-token-2",
+        "the joiner refreshed once more to a token that differs from its rejected value"
+    );
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "exactly two refreshes: the leader's, then the joiner's single bounded rerun — no loop"
+    );
+    assert_eq!(
+        opener.call_count(),
+        0,
+        "a live refresh recovers both callers without any browser"
+    );
+}
+
 // ---- expired-sibling replacement must not satisfy a 401 recovery ----------
 //
 // After a 401, `rejected = Some(t)` makes the expiry clock untrustworthy, so a

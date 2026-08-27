@@ -694,8 +694,39 @@ impl PkceOAuthTokenSource {
             }
         };
         if !is_leader {
-            // Pre-existing joiner: observe the leader's outcome.
-            return slot.wait().await;
+            // Pre-existing joiner: observe the leader's outcome, but do not
+            // adopt a result that violates *this* caller's contract. The slot
+            // is keyed only by (lock path, intent), so a joiner shares a leader
+            // that ran with a *different* `rejected` value — and the leader's
+            // result can be wrong for us in two ways:
+            //
+            //   * It may publish a token equal to THIS caller's `rejected`
+            //     bytes — e.g. its cache re-read adopted a sibling write we
+            //     just reported 401-rejected. Returning it would retry the
+            //     provider with the exact credentials it refused. We instead
+            //     run our own acquisition: the slot is evicted before publish
+            //     (see [`LeaderGuard::complete`]), so this is a fresh, bounded,
+            //     leader-eligible attempt — not a re-join of the dead
+            //     generation, and not a loop. Its own cache re-read / refresh
+            //     yields a token that differs from our `rejected`.
+            //
+            //   * It may publish a terminal failure even though a sibling wrote
+            //     a valid replacement into the cache while we waited. We
+            //     re-check the cache cheaply before adopting the failure — a
+            //     lock + disk read, never a browser or refresh — so a shared
+            //     failure can never fan out into an N-way browser storm.
+            match slot.wait().await {
+                Ok(token) if Some(token.as_str()) != rejected => return Ok(token),
+                Ok(_) => return self.acquire_leader(intent, rejected).await,
+                Err(shared) => {
+                    if let Ok(mut state) = self.state.try_lock() {
+                        if let Some(hit) = self.cached_hit(&mut state, rejected) {
+                            return Ok(hit);
+                        }
+                    }
+                    return Err(shared);
+                }
+            }
         }
 
         // Leader: run the real flow, then evict + publish. The guard makes
