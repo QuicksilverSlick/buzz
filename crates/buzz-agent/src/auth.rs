@@ -635,7 +635,7 @@ impl PkceOAuthTokenSource {
     fn usable_from_disk(&self, rejected: Option<&str>) -> Option<String> {
         let disk = read_cache(&self.cache_path)?;
         (!is_expired(&disk) && rejected != Some(disk.access_token.as_str()))
-            .then(|| disk.access_token)
+            .then_some(disk.access_token)
     }
 
     /// Discover OIDC endpoints once per flow, memoizing into `slot` so the
