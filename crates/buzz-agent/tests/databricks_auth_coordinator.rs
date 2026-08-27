@@ -173,6 +173,9 @@ enum ExchangeMode {
     /// `200` whose body lacks an `access_token` — a malformed success the
     /// provider should never send, so it is a fault, not a rejected code.
     MalformedSuccess,
+    /// Sleep `d` before answering, so the caller's per-request HTTP timeout
+    /// elapses first (a transport timeout, not a verdict from the provider).
+    Hang(Duration),
 }
 
 /// Boot a stub provider. `reject_refresh` makes the token endpoint 401 every
@@ -267,6 +270,12 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                         };
                     }
                     let n = code_grants.fetch_add(1, Ordering::SeqCst) + 1;
+                    // A hang delays the answer so the caller's per-request HTTP
+                    // timeout can elapse first (transport timeout, not a code
+                    // decision), mirroring the refresh path above.
+                    if let ExchangeMode::Hang(d) = exchange {
+                        tokio::time::sleep(d).await;
+                    }
                     match exchange {
                         ExchangeMode::Succeed => (
                             axum::http::StatusCode::OK,
@@ -282,6 +291,16 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                         ExchangeMode::MalformedSuccess => (
                             axum::http::StatusCode::OK,
                             Json(json!({ "token_type": "bearer" })),
+                        ),
+                        // Reached only after the sleep above; answer as a
+                        // success the caller has already abandoned.
+                        ExchangeMode::Hang(_) => (
+                            axum::http::StatusCode::OK,
+                            Json(json!({
+                                "access_token": format!("browser-token-{n}"),
+                                "refresh_token": "browser-refresh",
+                                "expires_in": 3600,
+                            })),
                         ),
                     }
                 }
@@ -1177,6 +1196,51 @@ async fn test_exchange_transient_faults_are_network_unavailable_not_cooldown() {
             "no cooldown means the next Auto caller opens a fresh browser"
         );
     }
+}
+
+#[tokio::test]
+async fn test_exchange_timeout_is_network_unavailable_not_cooldown() {
+    // The code exchange hangs far longer than the injected per-request HTTP
+    // timeout, so the exchange POST times out at the transport layer with no
+    // verdict from the provider — the transport branch the classifier maps to
+    // NetworkUnavailable. Like the refresh-timeout test, a short real-time
+    // timeout is injected rather than pausing the clock: under `start_paused`
+    // tokio would auto-advance into the timer while the real loopback
+    // discovery/authorize round-trips are still in flight, tripping the timeout
+    // on the wrong request. Real time keeps the timeout attached to the
+    // exchange that actually hangs.
+    let stub = spawn_stub_with_exchange(ExchangeMode::Hang(Duration::from_secs(30))).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    let src = PkceOAuthTokenSource::new_with_http_timeout(
+        cfg,
+        Arc::new(opener.clone()),
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    let result = src.acquire_with_intent(AuthIntent::Auto, None).await;
+    assert_eq!(
+        result,
+        Err(AuthError::NetworkUnavailable),
+        "an exchange transport timeout is infrastructural, not a rejected code"
+    );
+    assert_eq!(opener.call_count(), 1);
+
+    // The timed-out exchange wrote no cooldown, so a second Auto caller launches
+    // its own browser rather than inheriting a suppressed outcome.
+    let retry = src.acquire_with_intent(AuthIntent::Auto, None).await;
+    assert_eq!(
+        retry,
+        Err(AuthError::NetworkUnavailable),
+        "an exchange transport timeout leaves no cooldown to suppress the retry"
+    );
+    assert_eq!(
+        opener.call_count(),
+        2,
+        "no cooldown means the next Auto caller opens a fresh browser"
+    );
 }
 
 // ---- genuine cross-process lock contention and crash release -------------
