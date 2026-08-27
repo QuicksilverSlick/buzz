@@ -82,7 +82,7 @@ const COOLDOWN_DURATION: Duration = Duration::from_secs(300);
 /// - [`Headless`](Self::Headless): managed-runtime inference and provider
 ///   preflight. Never opens a browser; may consume another attempt's cached
 ///   success but never becomes the initiator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthIntent {
     Auto,
     UserInitiated,
@@ -597,18 +597,18 @@ impl PkceOAuthTokenSource {
     /// `rejected = None` (normal): a not-yet-expired cached token is a hit.
     /// `rejected = Some(t)`: the expiry clock is untrustworthy — the rejected
     /// token looked locally fresh — so a hit requires the cached token to
-    /// *differ* from `t`, meaning a sibling already replaced it. Checks the
-    /// in-memory cell first, then re-reads disk (a sibling process may have
-    /// written a newer token) and adopts it into the cell on a hit.
+    /// *differ* from `t` (a sibling already replaced it) **and** still be
+    /// unexpired. Without the expiry check an expired sibling token B could be
+    /// returned as A's replacement, skipping the refresh the 401 demanded.
+    /// Checks the in-memory cell first, then re-reads disk (a sibling process
+    /// may have written a newer token) and adopts it into the cell on a hit.
     fn cached_hit(
         &self,
         state: &mut Option<CachedToken>,
         rejected: Option<&str>,
     ) -> Option<String> {
-        let usable = |tok: &CachedToken| match rejected {
-            Some(r) => tok.access_token != r,
-            None => !is_expired(tok),
-        };
+        let usable =
+            |tok: &CachedToken| !is_expired(tok) && rejected != Some(tok.access_token.as_str());
         if let Some(tok) = state.as_ref() {
             if usable(tok) {
                 return Some(tok.access_token.clone());
@@ -673,15 +673,15 @@ impl PkceOAuthTokenSource {
         }
 
         // In-process single-flight (see [`INFLIGHT`]). Keyed by (lock path,
-        // browser capability): browser-capable callers coalesce with each
-        // other, so a caller that was already waiting when the leader's attempt
-        // was in flight shares the leader's result instead of taking the lock
-        // after it and launching a second browser. A `Headless` caller never
-        // shares a browser-capable slot (and vice versa), so a racing inference
-        // call is neither handed an interactive failure nor able to deny an
-        // explicit sign-in its browser — those two intents still coordinate
-        // only through the cross-process file lock.
-        let key: InflightKey = (self.lock_path(), intent.may_open_browser());
+        // intent): callers with the same intent coalesce, so a caller already
+        // waiting when the leader's attempt is in flight shares the leader's
+        // result instead of taking the lock after it and launching a second
+        // browser. Distinct intents key separately: a `Headless` caller never
+        // shares a browser-capable slot, and — critically — a `UserInitiated`
+        // caller never inherits an `Auto` leader's cooldown-suppressed result,
+        // since the two disagree on cooldown and browser policy. Those cases
+        // still coordinate through the cross-process file lock.
+        let key: InflightKey = (self.lock_path(), intent);
         let (slot, is_leader) = {
             let mut reg = inflight_registry();
             match reg.get(&key) {
@@ -1059,12 +1059,15 @@ async fn acquire_auth_lock(
 }
 
 /// Key for the in-process single-flight registry: the cross-process lock path
-/// (one per cache key) paired with whether the caller may open a browser.
-/// Browser-capable callers (`Auto`/`UserInitiated`) coalesce with each other;
-/// a `Headless` caller keys separately so it neither inherits an interactive
-/// failure nor denies an explicit sign-in its browser — those two still
-/// coordinate through the cross-process file lock, not this registry.
-type InflightKey = (PathBuf, bool);
+/// (one per cache key) paired with the caller's [`AuthIntent`]. Keying by the
+/// full intent — not merely browser capability — keeps callers with *different*
+/// outcome policy from coalescing: an `Auto` leader honors a live cooldown and
+/// returns its recorded `Denied`/`TimedOut`, but a `UserInitiated` caller is
+/// promised a cooldown bypass and a fresh browser, so it must never inherit an
+/// `Auto` leader's suppressed result. Each intent still coalesces with itself
+/// (two concurrent `UserInitiated` sign-ins share one browser), and all intents
+/// on the same key still serialize through the cross-process file lock.
+type InflightKey = (PathBuf, AuthIntent);
 
 /// Process-global registry of in-flight auth attempts, the in-process
 /// counterpart to [`acquire_auth_lock`]'s cross-process file lock. The file
@@ -1444,8 +1447,9 @@ fn sanitize_callback_detail(raw: &str) -> String {
 /// listener. Every failure is a typed [`AuthError`] so the coordinator can
 /// record a cooldown (or not) by category: an open failure is
 /// [`BrowserOpenFailed`], a redirect that never arrives is [`TimedOut`], a
-/// provider-reported denial is [`Denied`], and a rejected code exchange is
-/// [`ExchangeFailed`]; infrastructure faults (bind/exchange transport) are
+/// provider-reported denial is [`Denied`], and a code exchange the provider
+/// rejects with `invalid_grant` is [`ExchangeFailed`]; infrastructure faults
+/// (bind/exchange transport, 429, 5xx, or a malformed success body) are
 /// [`NetworkUnavailable`].
 ///
 /// [`BrowserOpenFailed`]: AuthError::BrowserOpenFailed
@@ -1546,14 +1550,41 @@ async fn browser_pkce_flow(
         .form(&params)
         .send()
         .await
+        // Transport error or the per-request timeout elapsed: no verdict from
+        // the provider, so this is infrastructural, not a rejected grant.
         .map_err(|_| AuthError::NetworkUnavailable)?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        tracing::warn!(status = "error", body = %body, "oauth code exchange rejected");
-        return Err(AuthError::ExchangeFailed);
+        // Only a 4xx `invalid_grant` (RFC 6749 §6.4.1) establishes the
+        // authorization code itself was rejected — the terminal, cooldown-worthy
+        // `ExchangeFailed`. A 429, any 5xx, and any other/unparseable 4xx are a
+        // transient provider fault or misconfiguration a cooldown must not
+        // suppress, so they surface as `NetworkUnavailable` — mirroring the
+        // refresh classifier, which likewise keys on the body `error`, not the
+        // bare status class.
+        if status.is_client_error()
+            && serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("invalid_grant")
+        {
+            tracing::warn!(status = %status, body = %body, "oauth code exchange rejected");
+            return Err(AuthError::ExchangeFailed);
+        }
+        tracing::warn!(status = %status, body = %body, "oauth code exchange not a grant rejection");
+        return Err(AuthError::NetworkUnavailable);
     }
-    let v: Value = resp.json().await.map_err(|_| AuthError::ExchangeFailed)?;
-    token_from_response(&v, None).map_err(|_| AuthError::ExchangeFailed)
+    // A 2xx whose body is missing/malformed or lacks an access token is a
+    // provider fault, not a rejected grant: it never establishes that the code
+    // was refused, so it stays in the transient bucket rather than poisoning a
+    // 5-minute cooldown.
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|_| AuthError::NetworkUnavailable)?;
+    token_from_response(&v, None).map_err(|_| AuthError::NetworkUnavailable)
 }
 
 #[cfg(test)]

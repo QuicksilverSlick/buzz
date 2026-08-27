@@ -157,6 +157,24 @@ enum RefreshMode {
     Hang(Duration),
 }
 
+/// How the stub's token endpoint answers an `authorization_code` grant (the
+/// browser code exchange). Lets a test drive the exchange classifier: a
+/// `401 invalid_grant` is a genuine rejected code (`ExchangeFailed`), while a
+/// `429`, a `500`, and a malformed `200` are transient/provider faults that
+/// must classify as `NetworkUnavailable` rather than poisoning the cooldown.
+#[derive(Clone, Copy)]
+enum ExchangeMode {
+    /// `200` with a fresh access token — the browser flow completes.
+    Succeed,
+    /// A failing status carrying the given OAuth `error` body. Only a 4xx
+    /// `invalid_grant` is a true code rejection; every other status/error is
+    /// infrastructural.
+    Fail(axum::http::StatusCode, &'static str),
+    /// `200` whose body lacks an `access_token` — a malformed success the
+    /// provider should never send, so it is a fault, not a rejected code.
+    MalformedSuccess,
+}
+
 /// Boot a stub provider. `reject_refresh` makes the token endpoint 401 every
 /// refresh-token grant (a dead refresh token); authorization-code grants
 /// always succeed with a fresh token.
@@ -172,6 +190,18 @@ async fn spawn_stub(reject_refresh: bool) -> Stub {
 /// Boot a stub provider whose refresh-token grant follows `mode`. Discovery and
 /// authorization-code grants always succeed instantly regardless of `mode`.
 async fn spawn_stub_with(mode: RefreshMode) -> Stub {
+    spawn_stub_with_modes(mode, ExchangeMode::Succeed).await
+}
+
+/// Boot a stub whose authorization-code exchange follows `exchange`. Refresh
+/// grants succeed; used by the exchange-classifier tests.
+async fn spawn_stub_with_exchange(exchange: ExchangeMode) -> Stub {
+    spawn_stub_with_modes(RefreshMode::Succeed, exchange).await
+}
+
+/// Boot a stub provider whose refresh-token grant follows `refresh` and whose
+/// authorization-code grant follows `exchange`. Discovery always succeeds.
+async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> Stub {
     let code_grants = Arc::new(AtomicU64::new(0));
     let refresh_grants = Arc::new(AtomicU64::new(0));
 
@@ -203,17 +233,18 @@ async fn spawn_stub_with(mode: RefreshMode) -> Stub {
             post(move |Form(form): Form<TokenForm>| {
                 let code_grants = code_for_token.clone();
                 let refresh_grants = refresh_for_token.clone();
-                let mode = mode;
+                let refresh = refresh;
+                let exchange = exchange;
                 async move {
                     if form.grant_type == "refresh_token" {
                         let n = refresh_grants.fetch_add(1, Ordering::SeqCst) + 1;
                         // A hang delays the answer so the caller's per-request
                         // HTTP timeout can elapse first (transport timeout, not
                         // a credential decision).
-                        if let RefreshMode::Hang(d) = mode {
+                        if let RefreshMode::Hang(d) = refresh {
                             tokio::time::sleep(d).await;
                         }
-                        return match mode {
+                        return match refresh {
                             RefreshMode::Reject => (
                                 axum::http::StatusCode::UNAUTHORIZED,
                                 Json(json!({ "error": "invalid_grant" })),
@@ -236,14 +267,23 @@ async fn spawn_stub_with(mode: RefreshMode) -> Stub {
                         };
                     }
                     let n = code_grants.fetch_add(1, Ordering::SeqCst) + 1;
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(json!({
-                            "access_token": format!("browser-token-{n}"),
-                            "refresh_token": "browser-refresh",
-                            "expires_in": 3600,
-                        })),
-                    )
+                    match exchange {
+                        ExchangeMode::Succeed => (
+                            axum::http::StatusCode::OK,
+                            Json(json!({
+                                "access_token": format!("browser-token-{n}"),
+                                "refresh_token": "browser-refresh",
+                                "expires_in": 3600,
+                            })),
+                        ),
+                        ExchangeMode::Fail(status, error) => {
+                            (status, Json(json!({ "error": error })))
+                        }
+                        ExchangeMode::MalformedSuccess => (
+                            axum::http::StatusCode::OK,
+                            Json(json!({ "token_type": "bearer" })),
+                        ),
+                    }
                 }
             }),
         );
@@ -932,6 +972,211 @@ async fn test_two_concurrent_userinitiated_denials_share_one_browser() {
         1,
         "one browser launch shared across both concurrent UserInitiated callers"
     );
+}
+
+// ---- mixed-intent coalescing must not leak an Auto cooldown to a user -----
+//
+// `Auto` and `UserInitiated` disagree on cooldown policy: `Auto` honors a
+// recorded cooldown and returns its `Denied`/`TimedOut` without a browser,
+// while `UserInitiated` bypasses the cooldown and opens a fresh sign-in. If
+// both coalesced onto one in-process slot, a user's explicit action arriving
+// behind an `Auto` leader would inherit the leader's suppressed result and
+// silently get *nothing* — no browser, no bypass. Keying the single-flight
+// slot by the full intent keeps the two from sharing a slot.
+
+#[tokio::test]
+async fn test_userinitiated_joiner_does_not_inherit_auto_cooldown_result() {
+    // Race an Auto caller and a UserInitiated caller on one key. `join!` polls
+    // the Auto future first: it becomes the in-process leader, takes the file
+    // lock, and opens a browser that is DENIED — and it yields on the callback
+    // wait while still holding the lock and its INFLIGHT slot. The
+    // UserInitiated caller is then polled *while the Auto attempt is in flight*.
+    //
+    // Before the fix, both intents keyed the single-flight slot by browser
+    // capability alone, so the UserInitiated caller joined the Auto leader's
+    // slot and inherited its `Denied` — never opening its own browser, never
+    // getting the cooldown bypass it promises. Keying by the full intent keeps
+    // them apart: the UserInitiated caller runs its own flow, bypasses the
+    // cooldown the Auto denial recorded, and signs in on its own browser.
+    //
+    // Distinct openers make the coalescing visible: if the UserInitiated caller
+    // had inherited the Auto result, its `approve` opener would never fire.
+    let stub = spawn_stub(false).await;
+    let cache = TempDir::new().unwrap();
+    let deny = ScriptedOpener::new(Script::Deny);
+    let approve = ScriptedOpener::new(Script::Approve);
+
+    let auto = PkceOAuthTokenSource::new_with(
+        config(&stub, "/disco/a", cache.path()),
+        Arc::new(deny.clone()),
+    )
+    .unwrap();
+    let user = PkceOAuthTokenSource::new_with(
+        config(&stub, "/disco/a", cache.path()),
+        Arc::new(approve.clone()),
+    )
+    .unwrap();
+
+    let (auto_res, user_res) = tokio::join!(
+        auto.acquire_with_intent(AuthIntent::Auto, None),
+        user.acquire_with_intent(AuthIntent::UserInitiated, None),
+    );
+    assert_eq!(
+        auto_res,
+        Err(AuthError::Denied),
+        "the Auto leader observes its own browser denial"
+    );
+    let bearer =
+        user_res.expect("the UserInitiated caller runs its own sign-in, not the Auto slot");
+    assert!(
+        bearer.starts_with("browser-token-"),
+        "UserInitiated got a fresh browser token, not the Auto leader's Denied: {bearer}"
+    );
+    assert_eq!(
+        deny.call_count(),
+        1,
+        "the Auto leader opened exactly one (denied) browser"
+    );
+    assert_eq!(
+        approve.call_count(),
+        1,
+        "the UserInitiated caller opened its own browser instead of inheriting the Auto denial"
+    );
+}
+
+// ---- expired-sibling replacement must not satisfy a 401 recovery ----------
+//
+// After a 401, `rejected = Some(t)` makes the expiry clock untrustworthy, so a
+// cache hit requires a token that both DIFFERS from `t` and is still unexpired.
+// An expired sibling token — one that merely differs from the rejected bytes —
+// must NOT be served as the replacement: doing so would skip the refresh the
+// 401 demanded and hand back a token the provider will also reject.
+
+#[tokio::test]
+async fn test_rejected_recovery_skips_expired_sibling_and_refreshes() {
+    let stub = spawn_stub(false).await; // refresh succeeds
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // The cached token is a DIFFERENT string from the rejected bytes, but it is
+    // expired. Under the old "differs is enough" rule it would be returned as
+    // the sibling replacement; the fix requires it to be unexpired too, so the
+    // coordinator must fall through to the live refresh instead.
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-sibling",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let token = src
+        .acquire_with_intent(AuthIntent::Headless, Some("rejected-original"))
+        .await
+        .expect("an expired sibling forces a refresh rather than being reused");
+    assert_eq!(
+        token, "refreshed-token-1",
+        "the expired sibling was not accepted; a fresh token was obtained"
+    );
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        1,
+        "the 401 recovery refreshed instead of reusing the expired sibling"
+    );
+    assert_eq!(opener.call_count(), 0, "a live refresh needs no browser");
+}
+
+// ---- code-exchange classifier: rejection vs. infrastructure --------------
+//
+// The browser code exchange must mirror the refresh classifier: only a 4xx
+// `invalid_grant` establishes the authorization code was rejected (terminal,
+// cooldown-worthy `ExchangeFailed`). A 429, any 5xx, and a malformed 2xx are a
+// transient provider fault that must surface as `NetworkUnavailable` — never
+// poisoning the 5-minute cooldown against a provider outage after callback.
+
+#[tokio::test]
+async fn test_exchange_invalid_grant_is_exchange_failed_and_cools_down() {
+    let stub = spawn_stub_with_exchange(ExchangeMode::Fail(
+        axum::http::StatusCode::UNAUTHORIZED,
+        "invalid_grant",
+    ))
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // A genuinely rejected code is terminal ExchangeFailed and is
+    // cooldown-worthy: a following Auto caller reads the cooldown without a
+    // second browser.
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let first = src.acquire_with_intent(AuthIntent::Auto, None).await;
+    assert_eq!(
+        first,
+        Err(AuthError::ExchangeFailed),
+        "a 401 invalid_grant on the code exchange is a rejected grant"
+    );
+    assert_eq!(opener.call_count(), 1);
+
+    let second = src.acquire_with_intent(AuthIntent::Auto, None).await;
+    assert_eq!(
+        second,
+        Err(AuthError::ExchangeFailed),
+        "the rejected exchange wrote a cooldown the next Auto caller honors"
+    );
+    assert_eq!(
+        opener.call_count(),
+        1,
+        "the cooldown suppressed a second browser launch"
+    );
+}
+
+#[tokio::test]
+async fn test_exchange_transient_faults_are_network_unavailable_not_cooldown() {
+    // A 429, a 500, and a malformed 2xx are provider faults, not rejected
+    // codes: each must surface as NetworkUnavailable and leave no cooldown, so
+    // a subsequent Auto caller retries with a fresh browser rather than
+    // inheriting a suppressed outcome.
+    let cases = [
+        ExchangeMode::Fail(axum::http::StatusCode::TOO_MANY_REQUESTS, "slow_down"),
+        ExchangeMode::Fail(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "temporarily_unavailable",
+        ),
+        ExchangeMode::MalformedSuccess,
+    ];
+    for exchange in cases {
+        let stub = spawn_stub_with_exchange(exchange).await;
+        let cache = TempDir::new().unwrap();
+        let opener = ScriptedOpener::new(Script::Approve);
+        let cfg = config(&stub, "/disco/a", cache.path());
+
+        let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+        let result = src.acquire_with_intent(AuthIntent::Auto, None).await;
+        assert_eq!(
+            result,
+            Err(AuthError::NetworkUnavailable),
+            "a transient exchange fault is infrastructural, not a rejected code"
+        );
+        assert_eq!(opener.call_count(), 1);
+
+        // No cooldown was written, so a second Auto caller launches again
+        // rather than reading a suppressed outcome.
+        let retry = src.acquire_with_intent(AuthIntent::Auto, None).await;
+        assert_eq!(
+            retry,
+            Err(AuthError::NetworkUnavailable),
+            "a transient exchange fault leaves no cooldown to suppress the retry"
+        );
+        assert_eq!(
+            opener.call_count(),
+            2,
+            "no cooldown means the next Auto caller opens a fresh browser"
+        );
+    }
 }
 
 // ---- genuine cross-process lock contention and crash release -------------
