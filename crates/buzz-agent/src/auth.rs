@@ -722,10 +722,10 @@ impl PkceOAuthTokenSource {
             //     (see [`LeaderGuard::complete`]), so this is a fresh, bounded,
             //     leader-eligible attempt — not a re-join of the dead
             //     generation, and not a loop. Its cache re-read excludes our
-            //     `rejected`, and `acquire_leader`'s choke-point guard rejects
+            //     `rejected`, and `finish`'s persistence-boundary guard rejects
             //     any refresh- or browser-issued token equal to our `rejected`
-            //     with a typed error — so the rerun never hands us back our
-            //     `rejected` on any path.
+            //     with a typed error before caching it — so the rerun never
+            //     hands us back our `rejected` on any path.
             //
             //   * It may publish a terminal failure even though a sibling wrote
             //     a valid replacement into the cache while we waited. We
@@ -783,33 +783,8 @@ impl PkceOAuthTokenSource {
         // Threading the deadline lets every interactive timeout exit through
         // the common outcome writer while the lock is still held.
         let attempt_deadline = std::time::Instant::now() + AUTH_ATTEMPT_DEADLINE;
-        let token = self
-            .acquire_locked(intent, rejected, attempt_deadline)
-            .await?;
-
-        // The single choke point for the 401-recovery invariant: a recovering
-        // acquisition must never hand back the exact bytes the caller reported
-        // rejected. `cached_hit` already excludes `rejected`, so a cache result
-        // can't equal it — but a refresh (a provider re-issuing the identical
-        // access token) or a browser exchange (the same, after a dead refresh
-        // falls through to a sign-in) can. Every successful acquisition —
-        // cache, refresh, browser — returns through here, so validating once
-        // covers a plain leader and a joiner's bounded rerun alike; the earlier
-        // per-branch guards would each miss the others' paths.
-        //
-        // Ordering note: on a match, `acquire_locked`'s `finish()` has already
-        // cached the token and cleared cooldown. That is benign and does not
-        // loop — the next recovery passes the same `rejected`, so `cached_hit`
-        // excludes the just-saved token and forces a fresh refresh/browser
-        // rather than serving it back. We fail terminally here regardless.
-        if rejected == Some(token.as_str()) {
-            return Err(if intent.may_open_browser() {
-                AuthError::NetworkUnavailable
-            } else {
-                AuthError::RefreshRejected
-            });
-        }
-        Ok(token)
+        self.acquire_locked(intent, rejected, attempt_deadline)
+            .await
     }
 
     /// Slow-path body, run while holding the cross-process auth lock.
@@ -842,7 +817,9 @@ impl PkceOAuthTokenSource {
         if let Some(rt) = state.as_ref().and_then(|t| t.refresh_token.clone()) {
             let eps = self.discover(&mut endpoints).await?;
             match self.refresh(eps, &rt).await {
-                RefreshOutcome::Refreshed(fresh) => return self.finish(&mut state, fresh),
+                RefreshOutcome::Refreshed(fresh) => {
+                    return self.finish(&mut state, fresh, intent, rejected)
+                }
                 // A transient fault (transport/timeout/5xx/decode) is not a
                 // credential decision: never fall through to a browser or
                 // report RefreshRejected. A sibling may have written a fresh
@@ -902,8 +879,9 @@ impl PkceOAuthTokenSource {
             Err(_) => Err(AuthError::TimedOut),
         };
         match outcome {
-            // `finish` clears the cooldown on success.
-            Ok(fresh) => self.finish(&mut state, fresh),
+            // `finish` clears the cooldown on success and rejects a re-issued
+            // 401'd token before persisting it.
+            Ok(fresh) => self.finish(&mut state, fresh, intent, rejected),
             Err(e) => {
                 if e.is_cooldown_worthy() {
                     write_cooldown(&cooldown_path, &e);
@@ -918,11 +896,33 @@ impl PkceOAuthTokenSource {
     /// (the infrastructural bucket) — the token was valid but couldn't be
     /// persisted, which the caller should treat as transient, not as a
     /// credential rejection.
+    ///
+    /// The persistence boundary is the single choke point for the 401-recovery
+    /// invariant: a refresh or browser exchange that re-issues the exact bytes
+    /// the caller reported rejected (a provider reusing an access token within
+    /// its validity window) must never be committed. Persisting it would cache
+    /// the proven-dead token as fresh, so a later plain `bearer()`
+    /// (`rejected = None`) or a freshly constructed source reading the same
+    /// cache would serve it back. Validating *before* the write keeps the dead
+    /// token out of the cache and off disk entirely: we fail typed
+    /// (`NetworkUnavailable` interactive / `RefreshRejected` headless) without
+    /// caching it or clearing the cooldown. `cached_hit` and `usable_from_disk`
+    /// already exclude `rejected`, so guarding the two live-token sites here
+    /// covers every path that can produce the rejected bytes.
     fn finish(
         &self,
         state: &mut Option<CachedToken>,
         token: CachedToken,
+        intent: AuthIntent,
+        rejected: Option<&str>,
     ) -> Result<String, AuthError> {
+        if rejected == Some(token.access_token.as_str()) {
+            return Err(if intent.may_open_browser() {
+                AuthError::NetworkUnavailable
+            } else {
+                AuthError::RefreshRejected
+            });
+        }
         let bearer = token.access_token.clone();
         self.save(state, token)
             .map_err(|_| AuthError::NetworkUnavailable)?;

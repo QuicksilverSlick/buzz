@@ -1178,8 +1178,9 @@ async fn test_joiner_never_receives_its_own_rejected_token() {
 // too, refuses to hand back the rejected bytes: a provider that re-issues an
 // identical access token on refresh would otherwise let the exact 401'd
 // credential escape through the rerun. The coordinator guards the refresh
-// success at its single choke point, so both a plain leader and this rerun
-// terminate with a typed auth error rather than returning the rejected token.
+// success at the persistence boundary (`finish`), so both a plain leader and
+// this rerun terminate with a typed auth error before caching the rejected
+// token rather than returning it.
 
 #[tokio::test]
 async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
@@ -1188,9 +1189,9 @@ async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
     // clean success it publishes and caches. Joiner B rejected exactly the
     // sticky token: it collides with A's published result, reruns its own
     // bounded acquisition, and that rerun's refresh hands back the sticky token
-    // again — B's own rejected bytes. The choke-point guard turns that into a
-    // terminal `RefreshRejected` (Headless, no browser) instead of returning
-    // the dead credential or looping.
+    // again — B's own rejected bytes. The persistence-boundary guard turns that
+    // into a terminal `RefreshRejected` (Headless, no browser) instead of
+    // returning the dead credential or looping.
     let stub = spawn_stub_with(RefreshMode::SucceedSticky("sticky-token")).await;
     let cache = TempDir::new().unwrap();
     let opener = ScriptedOpener::new(Script::Approve);
@@ -1238,14 +1239,14 @@ async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
 
 // ---- a browser success that re-issues the rejected bytes must fail typed ---
 //
-// The 401-recovery invariant lives at `acquire_leader`'s single choke point, so
-// it must hold on the browser-success path too — not just refresh. An
+// The 401-recovery invariant lives at `finish`'s persistence boundary, so it
+// must hold on the browser-success path too — not just refresh. An
 // interactive caller whose refresh is dead falls through to a browser sign-in;
 // if that exchange re-issues the exact token the caller reported 401-rejected
 // (a provider reusing an access token within its validity window), the guard
-// must terminate typed rather than hand back the dead bearer. A single
-// interactive leader exercises the path; the colliding-joiner rerun routes
-// through the same choke point.
+// must terminate typed before caching it rather than hand back the dead
+// bearer. A single interactive leader exercises the path; the colliding-joiner
+// rerun routes through the same boundary.
 
 #[tokio::test]
 async fn test_interactive_browser_reissuing_rejected_token_fails_typed_not_loop() {
@@ -1294,6 +1295,137 @@ async fn test_interactive_browser_reissuing_rejected_token_fails_typed_not_loop(
         stub.code_grants.load(Ordering::SeqCst),
         1,
         "exactly one code exchange — the guard fails terminally instead of retrying"
+    );
+}
+
+// ---- a rejected re-issue must not poison the cache for later callers -------
+//
+// The persistence-boundary guard's whole purpose: a rejected-aware acquisition
+// that a provider answers with the exact 401'd bytes must not leave those bytes
+// cached as fresh. Before the fix, `finish()` persisted first and the guard
+// fired after, so the dead token survived on disk and in memory — the next
+// plain `bearer()` (`rejected = None`) and any freshly constructed source would
+// serve it straight from the cache with no re-validation. These two regressions
+// prove the cache is untouched after the typed failure, on both the refresh and
+// the browser re-issue paths.
+
+#[tokio::test]
+async fn test_sticky_refresh_rejection_does_not_poison_cache_for_later_callers() {
+    // A sticky provider re-issues `sticky-token` on every refresh. A caller that
+    // reports `sticky-token` as its rejected bearer gets a typed failure — and
+    // the rejected bytes must never reach the cache.
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("sticky-token")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let rejected = src
+        .acquire_with_intent(AuthIntent::Headless, Some("sticky-token"))
+        .await;
+    assert_eq!(
+        rejected,
+        Err(AuthError::RefreshRejected),
+        "a refresh that re-issues the rejected bytes fails typed"
+    );
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+
+    // The rejected bytes were never persisted: a fresh process reading the same
+    // cache path finds the original expired seed, not `sticky-token`.
+    let on_disk = std::fs::read_to_string(cache_file_path(&cfg, cache.path())).unwrap();
+    assert!(
+        on_disk.contains("expired-seed") && !on_disk.contains("sticky-token"),
+        "the failed acquisition poisoned the on-disk cache: {on_disk}"
+    );
+
+    // A freshly constructed source over the same cache must therefore refresh
+    // over the network to obtain the token — it cannot serve a cached poison.
+    // Under the bug this was a lock-free cache hit and `refresh_grants` stayed
+    // at 1; the fix forces a second refresh. `Headless, None` is the plain
+    // `bearer()` path (rejected = None) with the typed error surfaced directly.
+    let fresh = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let token = fresh
+        .acquire_with_intent(AuthIntent::Headless, None)
+        .await
+        .expect("a rejected=None caller legitimately obtains the current token");
+    assert_eq!(token, "sticky-token");
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "the fresh source re-validated over the network — it did not serve a cached poison"
+    );
+}
+
+#[tokio::test]
+async fn test_sticky_browser_rejection_does_not_poison_cache_for_later_callers() {
+    // Refresh is dead, so an interactive caller browses; the exchange stickily
+    // re-issues `sticky-browser`. A caller reporting those bytes as rejected
+    // gets a typed failure, and the dead token must never reach the cache.
+    let stub = spawn_stub_with_modes(
+        RefreshMode::Reject,
+        ExchangeMode::SucceedSticky("sticky-browser"),
+    )
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "dead-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let rejected = src
+        .acquire_with_intent(AuthIntent::UserInitiated, Some("sticky-browser"))
+        .await;
+    assert_eq!(
+        rejected,
+        Err(AuthError::NetworkUnavailable),
+        "a browser exchange that re-issues the rejected bytes fails typed"
+    );
+    assert_eq!(opener.call_count(), 1);
+    assert_eq!(stub.code_grants.load(Ordering::SeqCst), 1);
+
+    // The rejected bytes were never persisted: the on-disk cache still holds
+    // the expired seed, so no fresh process can restore `sticky-browser`.
+    let on_disk = std::fs::read_to_string(cache_file_path(&cfg, cache.path())).unwrap();
+    assert!(
+        on_disk.contains("expired-seed") && !on_disk.contains("sticky-browser"),
+        "the failed browser acquisition poisoned the on-disk cache: {on_disk}"
+    );
+
+    // A subsequent plain `bearer()` (Headless, `rejected = None`) reads that
+    // un-poisoned cache: the seed is expired and its refresh is dead, so it
+    // fails `RefreshRejected` — it never serves `sticky-browser` from cache.
+    // Under the bug the poisoned cache made this a hit returning the dead bytes.
+    let fresh_opener = ScriptedOpener::new(Script::Approve);
+    let fresh = PkceOAuthTokenSource::new_with(cfg, Arc::new(fresh_opener.clone())).unwrap();
+    let later = fresh.acquire_with_intent(AuthIntent::Headless, None).await;
+    assert_eq!(
+        later,
+        Err(AuthError::RefreshRejected),
+        "a fresh source must not serve the rejected browser token from cache"
+    );
+    assert_eq!(
+        fresh_opener.call_count(),
+        0,
+        "a headless caller never browses"
     );
 }
 
