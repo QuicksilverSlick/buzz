@@ -99,6 +99,20 @@ impl AuthIntent {
     fn honors_cooldown(self) -> bool {
         matches!(self, Self::Auto)
     }
+
+    /// Stable discriminant for the cross-process attempt sidecar. A queued
+    /// caller adopts a completed attempt's failure only when the recorded
+    /// intent matches its own — the durable mirror of the in-process
+    /// [`INFLIGHT`] registry's `(path, intent)` keying, so a `UserInitiated`
+    /// caller never inherits an `Auto` attempt's suppressed result across
+    /// processes any more than it does within one.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::UserInitiated => "user_initiated",
+            Self::Headless => "headless",
+        }
+    }
 }
 
 /// Typed result of an auth acquisition. `Ok` carries the bearer; the error
@@ -158,17 +172,20 @@ impl AuthError {
         )
     }
 
-    /// Reconstruct a recorded outcome from its [`code`](Self::code). Only the
-    /// cooldown-worthy variants round-trip; any other code (a forward-compat
-    /// sidecar written by a newer buzz-agent) yields `None`, so a stale or
-    /// unrecognized record is treated as "no cooldown" rather than a hard
-    /// failure.
+    /// Reconstruct a recorded outcome from its [`code`](Self::code). The
+    /// cooldown-worthy variants always round-trip; `RefreshRejected` and
+    /// `NoCredential` are also reconstructed for the cross-process attempt
+    /// adoption path. Any other code (a forward-compat sidecar written by a
+    /// newer buzz-agent) yields `None`, treated as "no active record" rather
+    /// than a hard failure.
     fn from_code(code: &str) -> Option<Self> {
         match code {
             "denied" => Some(Self::Denied),
             "timed_out" => Some(Self::TimedOut),
             "browser_open_failed" => Some(Self::BrowserOpenFailed),
             "exchange_failed" => Some(Self::ExchangeFailed),
+            "refresh_rejected" => Some(Self::RefreshRejected),
+            "no_credential" => Some(Self::NoCredential),
             _ => None,
         }
     }
@@ -433,6 +450,13 @@ impl PkceOAuthTokenSource {
         append_ext(&self.cache_path, "cooldown")
     }
 
+    /// Path of the attempt sidecar recording the generation and outcome of the
+    /// last completed slow-path acquisition for this cache key. Drives the
+    /// cross-process single-flight of *failures* (see [`AttemptRecord`]).
+    fn attempt_path(&self) -> PathBuf {
+        append_ext(&self.cache_path, "attempt")
+    }
+
     /// Discover authorization + token endpoints from the well-known URL.
     async fn endpoints(&self) -> Result<OidcEndpoints, AgentError> {
         let v: Value = self
@@ -469,14 +493,67 @@ impl PkceOAuthTokenSource {
     /// The cache holds both the access and refresh tokens, so the on-disk
     /// file is written owner-only (`0o600` on Unix) via an atomic
     /// inode-swapping rename — see [`write_private_cache`].
+    ///
+    /// On non-Unix platforms the token is stored in-memory only: the
+    /// `write_private_cache` path creates files with default ACLs, which do
+    /// not enforce owner-only access. Disk persistence is intentionally
+    /// disabled until a Windows-specific owner-only DACL is implemented (see
+    /// the `create_private_temp_file` non-Unix branch). The cost is re-auth
+    /// per process on Windows — correct and safe until the guarantee exists.
     fn save(&self, state: &mut Option<CachedToken>, token: CachedToken) -> Result<(), AgentError> {
-        let body = serde_json::to_vec_pretty(&token)
-            .map_err(|e| AgentError::Llm(format!("oauth cache serialize: {e}")))?;
-        write_private_cache(&self.cache_path, &body).map_err(|e| {
-            AgentError::Llm(format!("oauth cache write {:?}: {e}", self.cache_path))
-        })?;
+        self.persist(&token)?;
         *state = Some(token);
         Ok(())
+    }
+
+    /// Write `token` to the on-disk cache. Split out of [`save`](Self::save) so
+    /// the 401 neutralization path can rewrite the disk layer without clobbering
+    /// a distinct in-memory entry. No-op on non-Unix (see [`save`](Self::save)).
+    fn persist(&self, token: &CachedToken) -> Result<(), AgentError> {
+        #[cfg(unix)]
+        {
+            let body = serde_json::to_vec_pretty(token)
+                .map_err(|e| AgentError::Llm(format!("oauth cache serialize: {e}")))?;
+            write_private_cache(&self.cache_path, &body).map_err(|e| {
+                AgentError::Llm(format!("oauth cache write {:?}: {e}", self.cache_path))
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Disk persistence disabled on non-Unix: owner-only file
+            // permissions require a DACL that is not yet implemented.
+            let _ = token;
+        }
+        Ok(())
+    }
+
+    /// Neutralize a cached token the caller just reported 401-rejected.
+    ///
+    /// A 401 means the cached access token is dead even though its local expiry
+    /// clock still looks fresh. [`cached_hit`](Self::cached_hit) and
+    /// [`usable_from_disk`](Self::usable_from_disk) already exclude it for a
+    /// caller carrying `rejected`, but a *later* plain `bearer()`
+    /// (`rejected = None`) trusts the clock and would serve it, and a freshly
+    /// constructed source would restore it from disk. Force it expired in both
+    /// layers so [`is_expired`] excludes it for every future caller and every
+    /// fresh process, while the refresh token — which was *not* rejected and
+    /// drives this very recovery — stays intact. Each layer is neutralized only
+    /// when its access token byte-equals `rejected`, so a sibling's
+    /// concurrently-written distinct replacement is preserved. Best-effort on
+    /// disk: a write failure only means the next caller re-refreshes.
+    fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
+        let Some(rej) = rejected else { return };
+        if let Some(tok) = state.as_mut() {
+            if tok.access_token == rej {
+                tok.expires_at = Some(0);
+            }
+        }
+        if let Some(mut disk) = read_cache(&self.cache_path) {
+            if disk.access_token == rej {
+                disk.expires_at = Some(0);
+                let _ = self.persist(&disk);
+            }
+        }
     }
 
     /// Exchange a refresh token for a fresh access token.
@@ -768,6 +845,15 @@ impl PkceOAuthTokenSource {
         intent: AuthIntent,
         rejected: Option<&str>,
     ) -> Result<String, AuthError> {
+        // Snapshot the current attempt generation *before* queueing on the
+        // lock. When we acquire the lock, we compare: if the generation
+        // advanced, a predecessor completed while we were waiting and we can
+        // adopt its outcome instead of re-running the full flow.
+        let attempt_path = self.attempt_path();
+        let snapshot_gen = read_attempt(&attempt_path)
+            .map(|r| r.generation)
+            .unwrap_or(0);
+
         // Slow path: one flow at a time per cache key. The waiter's deadline
         // exceeds a healthy holder's attempt deadline, so it never gives up on
         // a live holder.
@@ -783,8 +869,14 @@ impl PkceOAuthTokenSource {
         // Threading the deadline lets every interactive timeout exit through
         // the common outcome writer while the lock is still held.
         let attempt_deadline = std::time::Instant::now() + AUTH_ATTEMPT_DEADLINE;
-        self.acquire_locked(intent, rejected, attempt_deadline)
-            .await
+        self.acquire_locked(
+            intent,
+            rejected,
+            attempt_deadline,
+            &attempt_path,
+            snapshot_gen,
+        )
+        .await
     }
 
     /// Slow-path body, run while holding the cross-process auth lock.
@@ -795,18 +887,60 @@ impl PkceOAuthTokenSource {
     /// during the interactive step surfaces as [`AuthError::TimedOut`] through
     /// the same arm that records the cooldown — never as a cancellation that
     /// drops the guard without writing it.
+    ///
+    /// `attempt_path` + `snapshot_gen` implement cross-process failure
+    /// single-flight: the caller snapshotted `snapshot_gen` before queueing on
+    /// the lock; if the generation has since advanced, a predecessor completed
+    /// while we waited. A non-`UserInitiated` caller that was already queued
+    /// when the predecessor ran adopts its terminal failure rather than
+    /// re-running, mirroring what [`INFLIGHT`] does within one process.
     async fn acquire_locked(
         &self,
         intent: AuthIntent,
         rejected: Option<&str>,
         attempt_deadline: std::time::Instant,
+        attempt_path: &Path,
+        snapshot_gen: u64,
     ) -> Result<String, AuthError> {
         let mut state = self.state.lock().await;
+
+        // A 401 (`rejected = Some`) proves the cached access token is dead even
+        // though its local expiry clock still looks fresh. Neutralize it now,
+        // under the lock, so it can never be served again: cache_hit already
+        // excludes it for callers carrying `rejected`, but a later plain
+        // `bearer()` (`rejected = None`) or a freshly constructed source would
+        // otherwise trust the clock and hand back the proven-dead bytes. The
+        // refresh token is untouched — it was not rejected and drives the
+        // recovery below.
+        self.expire_rejected(&mut state, rejected);
 
         // Re-check under the lock: a holder we queued behind may have already
         // produced a token (this process or a sibling wrote the cache).
         if let Some(hit) = self.cached_hit(&mut state, rejected) {
             return Ok(hit);
+        }
+
+        // Cross-process failure single-flight. A predecessor completed while
+        // this caller was waiting on the lock: check whether its outcome was a
+        // terminal failure we should adopt rather than re-run. The test is:
+        //   (a) the attempt generation advanced past our snapshot — we were
+        //       queued while the predecessor ran, not a fresh arrival after it;
+        //   (b) this caller is NOT `UserInitiated` — it never inherits a prior
+        //       failure (it promised a fresh browser and a cooldown bypass);
+        //   (c) the recorded intent matches ours — the in-process INFLIGHT
+        //       registry keys by (path, intent), so cross-process adoption
+        //       must respect the same boundary;
+        //   (d) the recorded result is a recognized terminal failure — `"ok"`
+        //       and unrecognized codes fall through to a normal attempt.
+        if intent != AuthIntent::UserInitiated {
+            if let Some(rec) = read_attempt(attempt_path) {
+                if rec.generation > snapshot_gen && rec.intent == intent.as_str() {
+                    if let Some(err) = AuthError::from_code(&rec.result) {
+                        write_attempt(attempt_path, rec.generation, intent, &rec.result);
+                        return Err(err);
+                    }
+                }
+            }
         }
 
         // Refresh-token grant, if we have one. Endpoints are discovered lazily
@@ -846,11 +980,13 @@ impl PkceOAuthTokenSource {
 
         // No token from cache or refresh. Browser or terminal failure.
         if !intent.may_open_browser() {
-            return Err(if refresh_failed {
+            let err = if refresh_failed {
                 AuthError::RefreshRejected
             } else {
                 AuthError::NoCredential
-            });
+            };
+            write_attempt(attempt_path, snapshot_gen, intent, err.code());
+            return Err(err);
         }
 
         let cooldown_path = self.cooldown_path();
@@ -881,11 +1017,20 @@ impl PkceOAuthTokenSource {
         match outcome {
             // `finish` clears the cooldown on success and rejects a re-issued
             // 401'd token before persisting it.
-            Ok(fresh) => self.finish(&mut state, fresh, intent, rejected),
+            Ok(fresh) => {
+                let result = self.finish(&mut state, fresh, intent, rejected);
+                let code = match &result {
+                    Ok(_) => "ok",
+                    Err(e) => e.code(),
+                };
+                write_attempt(attempt_path, snapshot_gen, intent, code);
+                result
+            }
             Err(e) => {
                 if e.is_cooldown_worthy() {
                     write_cooldown(&cooldown_path, &e);
                 }
+                write_attempt(attempt_path, snapshot_gen, intent, e.code());
                 Err(e)
             }
         }
@@ -1034,6 +1179,69 @@ struct CooldownRecord {
     /// Unix seconds after which the cooldown lapses and an `Auto` caller may
     /// launch a browser again.
     until: u64,
+}
+
+/// Durable record of the generation and outcome of the most recently completed
+/// slow-path acquisition attempt for a cache key.
+///
+/// Cross-process single-flight for *failures*: the in-process [`INFLIGHT`]
+/// registry coalesces same-key callers within one process, but two separate
+/// processes both waiting on the OS file lock do NOT share the registry. When
+/// process A holds the lock and fails (e.g. browser denial or dead refresh),
+/// process B's queued caller acquires the lock after A releases it and — under
+/// the old protocol — would re-run the full flow from scratch. This record lets
+/// B detect that it was already queued while A ran and adopt A's failure
+/// instead of hammering the provider again.
+///
+/// Protocol:
+/// - A caller **snapshots** the current generation from the sidecar *before*
+///   queueing on the file lock.
+/// - A caller that **acquires** the lock compares the current generation to its
+///   snapshot: if it advanced, an attempt completed while this caller was
+///   waiting. If the recorded intent matches this caller's intent and the
+///   outcome is a terminal failure, adopt it directly.
+/// - Every attempt **writes** a fresh record (generation + 1) with its outcome
+///   under the lock before releasing it.
+///
+/// Intent matching mirrors the in-process [`INFLIGHT`] keying: a
+/// `UserInitiated` caller must never inherit a non-`UserInitiated` failure
+/// (it promised the user a fresh browser and a cooldown bypass), but `Headless`
+/// and `Auto` callers adopt any same-intent failure without re-running.
+///
+/// `UserInitiated` waiters do NOT inherit *any* prior failure — they always run
+/// their own attempt (clearning any cooldown and opening a browser if needed).
+/// This mirrors the in-process guarantee.
+#[derive(Debug, Serialize, Deserialize)]
+struct AttemptRecord {
+    /// Monotonically increasing counter, incremented on each completed attempt.
+    generation: u64,
+    /// Intent of the attempt that completed, as [`AuthIntent::as_str`].
+    intent: String,
+    /// Error code of the terminal failure, or `"ok"` on success. Matches
+    /// [`AuthError::code`] / the `"ok"` sentinel.
+    result: String,
+}
+
+/// Read the attempt sidecar at `path`, if any. Returns `None` when absent,
+/// unparseable, or the generation is 0 (no attempt has completed yet).
+fn read_attempt(path: &Path) -> Option<AttemptRecord> {
+    let body = fs::read(path).ok()?;
+    let record: AttemptRecord = serde_json::from_slice(&body).ok()?;
+    Some(record)
+}
+
+/// Write a fresh attempt record at `path`. Called under the auth lock.
+/// Best-effort — a write failure only means the next cross-process waiter
+/// cannot adopt this attempt's outcome, so errors are swallowed.
+fn write_attempt(path: &Path, generation: u64, intent: AuthIntent, result: &str) {
+    let record = AttemptRecord {
+        generation: generation.wrapping_add(1),
+        intent: intent.as_str().to_owned(),
+        result: result.to_owned(),
+    };
+    if let Ok(body) = serde_json::to_vec(&record) {
+        let _ = write_private_cache(path, &body);
+    }
 }
 
 fn now_secs() -> u64 {

@@ -1429,6 +1429,183 @@ async fn test_sticky_browser_rejection_does_not_poison_cache_for_later_callers()
     );
 }
 
+// ---- a 401 on a locally-fresh token neutralizes the cached copy -----------
+//
+// P1: the persistence-boundary guard refuses to *save* a re-issued rejected
+// token, but the ORIGINAL cached copy — the exact bytes the provider just
+// 401'd — is untouched. Because `is_expired` trusts only the clock, a later
+// plain `bearer()` (`rejected = None`) or a freshly constructed source would
+// serve that dead token straight from cache. `expire_rejected` force-expires
+// the cached copy (memory and disk) under the lock the moment a caller reports
+// it rejected, so no future caller and no fresh process can serve it, while the
+// refresh token — not rejected, and the engine of recovery — stays intact.
+
+#[tokio::test]
+async fn test_rejected_fresh_token_is_neutralized_for_a_fresh_process() {
+    // The cached access token `A` is locally UNEXPIRED, and the provider
+    // stickily re-issues `A` on refresh. A caller reports `A` as rejected: the
+    // refresh hands back `A`, the guard fails typed without persisting it — and
+    // the original unexpired `A` must not survive on disk for a fresh process.
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("A")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "A",
+            "refresh_token": "live-refresh",
+            "expires_at": future_secs(),
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let rejected = src
+        .acquire_with_intent(AuthIntent::Headless, Some("A"))
+        .await;
+    assert_eq!(
+        rejected,
+        Err(AuthError::RefreshRejected),
+        "a refresh that re-issues the rejected bytes fails typed"
+    );
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+
+    // The on-disk copy of `A` was force-expired in place: the refresh token is
+    // preserved, but the access token's expiry is neutralized so no clock-based
+    // read can serve it. Under the bug it stayed at its future expiry.
+    let on_disk: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(cache_file_path(&cfg, cache.path())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        on_disk["access_token"], "A",
+        "the entry is kept, not deleted"
+    );
+    assert_eq!(
+        on_disk["refresh_token"], "live-refresh",
+        "the refresh token — not rejected — survives for recovery"
+    );
+    assert_eq!(
+        on_disk["expires_at"], 0,
+        "the rejected access token was force-expired on disk"
+    );
+
+    // A freshly constructed source reading that cache must NOT serve `A` from
+    // the clock: it sees the neutralized entry as expired and refreshes over
+    // the network. Under the bug this was a lock-free cache hit returning the
+    // dead `A` with `refresh_grants` frozen at 1.
+    let fresh = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let token = fresh
+        .acquire_with_intent(AuthIntent::Headless, None)
+        .await
+        .expect("a rejected=None caller obtains the provider's current token");
+    assert_eq!(token, "A");
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "the fresh source re-validated over the network — it did not serve the neutralized cache"
+    );
+}
+
+#[tokio::test]
+async fn test_rejected_fresh_token_is_neutralized_for_the_same_source() {
+    // The in-memory layer of the same neutralization: after the SAME source
+    // fails a 401-recovery on unexpired `A`, its next plain `bearer()`
+    // (`rejected = None`) must not serve `A` from the in-memory cell — it must
+    // re-validate. `A` is sticky, so recovery returns `A` again, but only after
+    // a real refresh grant (the discriminator: 1 cache hit vs. 2 grants).
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("A")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "A",
+            "refresh_token": "live-refresh",
+            "expires_at": future_secs(),
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    assert_eq!(
+        src.acquire_with_intent(AuthIntent::Headless, Some("A"))
+            .await,
+        Err(AuthError::RefreshRejected),
+    );
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+
+    // Same source, plain bearer: the in-memory `A` was neutralized, so this is
+    // a miss that refreshes rather than a cache hit. Under the bug the
+    // unexpired in-memory `A` was served directly and `refresh_grants` stayed 1.
+    let token = src
+        .acquire_with_intent(AuthIntent::Headless, None)
+        .await
+        .expect("a subsequent plain bearer re-validates rather than serving the dead token");
+    assert_eq!(token, "A");
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "the same source re-validated in memory — it did not serve the neutralized token"
+    );
+}
+
+#[tokio::test]
+async fn test_rejected_fresh_token_neutralized_when_recovery_browses() {
+    // The browser variant: `A` is unexpired but its refresh token is dead, so
+    // an interactive 401-recovery falls through to the browser, whose exchange
+    // stickily re-issues `A`. The guard fails typed without persisting it, and
+    // the neutralized `A` must not survive for a later headless caller.
+    let stub = spawn_stub_with_modes(RefreshMode::Reject, ExchangeMode::SucceedSticky("A")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "A",
+            "refresh_token": "dead-refresh",
+            "expires_at": future_secs(),
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let rejected = src
+        .acquire_with_intent(AuthIntent::UserInitiated, Some("A"))
+        .await;
+    assert_eq!(
+        rejected,
+        Err(AuthError::NetworkUnavailable),
+        "a browser exchange that re-issues the rejected bytes fails typed"
+    );
+    assert_eq!(opener.call_count(), 1);
+    assert_eq!(stub.code_grants.load(Ordering::SeqCst), 1);
+
+    // The unexpired `A` was force-expired on disk, so a fresh headless source
+    // finds it unusable and — its refresh being dead — fails `RefreshRejected`
+    // rather than serving `A`. Under the bug the still-fresh `A` was a cache
+    // hit that returned the dead token.
+    let fresh_opener = ScriptedOpener::new(Script::Approve);
+    let fresh = PkceOAuthTokenSource::new_with(cfg, Arc::new(fresh_opener.clone())).unwrap();
+    let later = fresh.acquire_with_intent(AuthIntent::Headless, None).await;
+    assert_eq!(
+        later,
+        Err(AuthError::RefreshRejected),
+        "a fresh source must not serve the neutralized rejected token from cache"
+    );
+    assert_eq!(
+        fresh_opener.call_count(),
+        0,
+        "a headless caller never browses"
+    );
+}
+
 // ---- expired-sibling replacement must not satisfy a 401 recovery ----------
 //
 // After a 401, `rejected = Some(t)` makes the expiry clock untrustworthy, so a
@@ -1913,5 +2090,163 @@ async fn test_crossprocess_two_coordinators_race_to_one_grant_and_cache() {
         cached.get("access_token").and_then(|v| v.as_str()),
         Some(bearer_a.as_str()),
         "the cached token is the shared bearer"
+    );
+}
+
+// ---- cross-process failure single-flight (attempt-record protocol) --------
+//
+// `INFLIGHT` coalesces same-key callers within one process before they reach
+// the file lock, so two separate processes both queued on the lock do NOT
+// share the in-process registry. Without the attempt-record protocol, a
+// process that acquires the lock AFTER the holder fails would re-run the
+// full flow from scratch — a second browser launch on `Denied`, or a second
+// dead-refresh call on `RefreshRejected`. The attempt sidecar lets the
+// second process detect that the predecessor completed while it was waiting
+// and adopt its failure directly.
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_crossprocess_waiting_headless_adopts_predecessor_refresh_rejected() {
+    // Two real headless processes on one key. The cache holds an expired
+    // token with a dead refresh. Both workers are released simultaneously
+    // into a lock race: one wins the lock, runs the dead refresh, gets
+    // `RefreshRejected`, writes the attempt sidecar, and releases the lock;
+    // the other was waiting, acquires the lock after the leader, sees that
+    // the attempt generation advanced past its snapshot, and adopts
+    // `RefreshRejected` without re-running the refresh — ONE refresh grant
+    // total across both processes.
+    let stub = spawn_stub(true).await; // reject_refresh = true
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // Seed the shared cache: expired token with a dead refresh, so both
+    // workers fall through to the refresh grant rather than a cache hit.
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "stale",
+            "refresh_token": "dead-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let ready_a = cache.path().join("a.ready");
+    let ready_b = cache.path().join("b.ready");
+    let start = cache.path().join("start");
+
+    let worker_a = spawn_worker(
+        &cfg,
+        cache.path(),
+        "headless",
+        "approve",
+        "a",
+        &[
+            ("AUTH_WORKER_READY_MARKER", ready_a.as_path()),
+            ("AUTH_WORKER_START_MARKER", start.as_path()),
+        ],
+    );
+    let worker_b = spawn_worker(
+        &cfg,
+        cache.path(),
+        "headless",
+        "approve",
+        "b",
+        &[
+            ("AUTH_WORKER_READY_MARKER", ready_b.as_path()),
+            ("AUTH_WORKER_START_MARKER", start.as_path()),
+        ],
+    );
+
+    // Both processes are ready; release them simultaneously into the lock race.
+    wait_for_marker(&ready_a, "worker A ready").await;
+    wait_for_marker(&ready_b, "worker B ready").await;
+    std::fs::write(&start, b"go").unwrap();
+
+    let (out_a, out_b) = tokio::join!(worker_a.join(), worker_b.join());
+
+    // Both workers must report RefreshRejected.
+    assert_eq!(
+        out_a.result, "refresh_rejected",
+        "worker A gets RefreshRejected on a dead refresh"
+    );
+    assert_eq!(
+        out_b.result, "refresh_rejected",
+        "worker B adopts RefreshRejected via the attempt sidecar"
+    );
+    assert_eq!(out_a.launches, 0, "headless never opens a browser");
+    assert_eq!(out_b.launches, 0, "headless never opens a browser");
+
+    // One refresh grant total: under the old protocol the second worker would
+    // re-run the dead refresh independently; the attempt record prevents that.
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        1,
+        "exactly one refresh grant across both headless processes"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_crossprocess_userinitiated_waiter_does_not_adopt_predecessor_denial() {
+    // A `UserInitiated` caller must NEVER inherit a prior failure — it
+    // promised the user a fresh browser and a cooldown bypass, so it always
+    // runs its own attempt. When process A (UserInitiated) gets `Denied` and
+    // process B (UserInitiated) was queued behind it, B must clear the
+    // cooldown and open a second browser rather than adopting A's denial.
+    //
+    // This is the cross-process mirror of the in-process guarantee: a
+    // `UserInitiated` joiner never inherits an `Auto` or another
+    // `UserInitiated` leader's result within one process (it re-runs its
+    // own acquisition), and the same must hold across processes.
+    let stub = spawn_stub(false).await;
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    let launched_a = cache.path().join("a.launched");
+    let proceed_a = cache.path().join("a.proceed");
+
+    // Worker A holds the lock and keeps its browser open until we signal it.
+    let worker_a = spawn_worker(
+        &cfg,
+        cache.path(),
+        "userinitiated",
+        "deny",
+        "a",
+        &[
+            ("AUTH_WORKER_LAUNCHED_MARKER", launched_a.as_path()),
+            ("AUTH_WORKER_PROCEED_MARKER", proceed_a.as_path()),
+        ],
+    );
+
+    // Wait until A holds the lock and the browser is open.
+    wait_for_marker(&launched_a, "worker A browser launch").await;
+
+    // Worker B (also UserInitiated) queues behind A on the file lock.
+    let worker_b = spawn_worker(&cfg, cache.path(), "userinitiated", "approve", "b", &[]);
+    // Give B time to queue on the file lock before releasing A.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Release A: it denies and writes the cooldown + attempt sidecars.
+    std::fs::write(&proceed_a, b"go").unwrap();
+    let out_a = worker_a.join().await;
+    assert_eq!(out_a.result, "denied", "worker A is denied");
+    assert_eq!(out_a.launches, 1, "worker A opens one browser");
+
+    // Worker B (UserInitiated) clears the cooldown and opens its own browser;
+    // it does NOT adopt A's denial even though the attempt record records it.
+    let out_b = worker_b.join().await;
+    assert_eq!(
+        out_b.result, "ok",
+        "UserInitiated worker B runs its own flow and succeeds (approve script)"
+    );
+    assert_eq!(
+        out_b.launches, 1,
+        "UserInitiated worker B opens a second browser — it never inherits a prior denial"
+    );
+    assert_eq!(
+        stub.code_grants.load(Ordering::SeqCst),
+        1,
+        "exactly one code exchange (worker B's approval)"
     );
 }
