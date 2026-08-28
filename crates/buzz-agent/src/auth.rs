@@ -543,15 +543,29 @@ impl PkceOAuthTokenSource {
     /// disk: a write failure only means the next caller re-refreshes.
     fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
         let Some(rej) = rejected else { return };
+        // Neutralize the in-memory entry: force-expire so `is_expired` excludes
+        // it for every subsequent in-process caller, while the refresh token
+        // (which was not rejected) stays intact for the recovery below.
         if let Some(tok) = state.as_mut() {
             if tok.access_token == rej {
                 tok.expires_at = Some(0);
             }
         }
+        // Neutralize the on-disk copy. If the rewrite fails, remove the cache
+        // file: a later plain `bearer()` (no `rejected`) or a freshly constructed
+        // source reads disk via `cached_hit`'s disk branch — leaving an
+        // unexpired-but-401'd file would cause them to serve the proven-dead
+        // token. Removing it is safe: the refresh token is already in memory for
+        // the current recovery, and a successful refresh writes a fresh token back
+        // so the next caller gets a valid entry. If removal also fails we are no
+        // worse than before (`cached_hit`'s `rejected`-aware filter still protects
+        // the calling 401-recovery path itself).
         if let Some(mut disk) = read_cache(&self.cache_path) {
             if disk.access_token == rej {
                 disk.expires_at = Some(0);
-                let _ = self.persist(&disk);
+                if self.persist(&disk).is_err() {
+                    let _ = fs::remove_file(&self.cache_path);
+                }
             }
         }
     }
@@ -891,9 +905,11 @@ impl PkceOAuthTokenSource {
     /// `attempt_path` + `snapshot_gen` implement cross-process failure
     /// single-flight: the caller snapshotted `snapshot_gen` before queueing on
     /// the lock; if the generation has since advanced, a predecessor completed
-    /// while we waited. A non-`UserInitiated` caller that was already queued
-    /// when the predecessor ran adopts its terminal failure rather than
-    /// re-running, mirroring what [`INFLIGHT`] does within one process.
+    /// while we waited. A caller already queued when the predecessor ran adopts
+    /// its same-intent terminal failure rather than re-running — including
+    /// `UserInitiated` callers, mirroring what [`INFLIGHT`] does within one
+    /// process. A `UserInitiated` caller arriving *after* the failure snapshots
+    /// the new generation and naturally does not adopt.
     async fn acquire_locked(
         &self,
         intent: AuthIntent,
@@ -922,23 +938,28 @@ impl PkceOAuthTokenSource {
 
         // Cross-process failure single-flight. A predecessor completed while
         // this caller was waiting on the lock: check whether its outcome was a
-        // terminal failure we should adopt rather than re-run. The test is:
+        // terminal failure we should adopt rather than re-run. The contract is
+        // *temporal*, not intent-based: a caller whose pre-queue snapshot is
+        // older than the current generation was already queued while the
+        // predecessor ran and may adopt its failure, mirroring how the
+        // in-process [`INFLIGHT`] registry coalesces same-intent callers
+        // (including `UserInitiated`) within a single process. A `UserInitiated`
+        // caller arriving *after* a failure naturally snapshots the new
+        // generation and does not adopt, so "later explicit user retry bypasses"
+        // falls out without a special case. The conditions are:
         //   (a) the attempt generation advanced past our snapshot — we were
         //       queued while the predecessor ran, not a fresh arrival after it;
-        //   (b) this caller is NOT `UserInitiated` — it never inherits a prior
-        //       failure (it promised a fresh browser and a cooldown bypass);
-        //   (c) the recorded intent matches ours — the in-process INFLIGHT
-        //       registry keys by (path, intent), so cross-process adoption
-        //       must respect the same boundary;
-        //   (d) the recorded result is a recognized terminal failure — `"ok"`
+        //   (b) the recorded intent matches ours — cross-process adoption
+        //       respects the same (path, intent) boundary as INFLIGHT, so a
+        //       `UserInitiated` waiter never inherits an `Auto`/`Headless`
+        //       failure (different intent, different promise to the user);
+        //   (c) the recorded result is a recognized terminal failure — `"ok"`
         //       and unrecognized codes fall through to a normal attempt.
-        if intent != AuthIntent::UserInitiated {
-            if let Some(rec) = read_attempt(attempt_path) {
-                if rec.generation > snapshot_gen && rec.intent == intent.as_str() {
-                    if let Some(err) = AuthError::from_code(&rec.result) {
-                        write_attempt(attempt_path, rec.generation, intent, &rec.result);
-                        return Err(err);
-                    }
+        if let Some(rec) = read_attempt(attempt_path) {
+            if rec.generation > snapshot_gen && rec.intent == intent.as_str() {
+                if let Some(err) = AuthError::from_code(&rec.result) {
+                    write_attempt(attempt_path, intent, &rec.result);
+                    return Err(err);
                 }
             }
         }
@@ -952,7 +973,16 @@ impl PkceOAuthTokenSource {
             let eps = self.discover(&mut endpoints).await?;
             match self.refresh(eps, &rt).await {
                 RefreshOutcome::Refreshed(fresh) => {
-                    return self.finish(&mut state, fresh, intent, rejected)
+                    let result = self.finish(&mut state, fresh, intent, rejected);
+                    // Record recognized terminal failures (rejected-equal reissuance)
+                    // so a cross-process headless waiter can adopt them rather than
+                    // re-running the same dead refresh. Successes are shared through
+                    // the token cache — a waiter that wins the lock after us finds
+                    // the token via `cached_hit` without reaching the adoption check.
+                    if let Err(ref e) = result {
+                        write_attempt(attempt_path, intent, e.code());
+                    }
+                    return result;
                 }
                 // A transient fault (transport/timeout/5xx/decode) is not a
                 // credential decision: never fall through to a browser or
@@ -985,7 +1015,7 @@ impl PkceOAuthTokenSource {
             } else {
                 AuthError::NoCredential
             };
-            write_attempt(attempt_path, snapshot_gen, intent, err.code());
+            write_attempt(attempt_path, intent, err.code());
             return Err(err);
         }
 
@@ -1023,14 +1053,14 @@ impl PkceOAuthTokenSource {
                     Ok(_) => "ok",
                     Err(e) => e.code(),
                 };
-                write_attempt(attempt_path, snapshot_gen, intent, code);
+                write_attempt(attempt_path, intent, code);
                 result
             }
             Err(e) => {
                 if e.is_cooldown_worthy() {
                     write_cooldown(&cooldown_path, &e);
                 }
-                write_attempt(attempt_path, snapshot_gen, intent, e.code());
+                write_attempt(attempt_path, intent, e.code());
                 Err(e)
             }
         }
@@ -1042,18 +1072,19 @@ impl PkceOAuthTokenSource {
     /// persisted, which the caller should treat as transient, not as a
     /// credential rejection.
     ///
-    /// The persistence boundary is the single choke point for the 401-recovery
-    /// invariant: a refresh or browser exchange that re-issues the exact bytes
-    /// the caller reported rejected (a provider reusing an access token within
-    /// its validity window) must never be committed. Persisting it would cache
-    /// the proven-dead token as fresh, so a later plain `bearer()`
-    /// (`rejected = None`) or a freshly constructed source reading the same
-    /// cache would serve it back. Validating *before* the write keeps the dead
-    /// token out of the cache and off disk entirely: we fail typed
-    /// (`NetworkUnavailable` interactive / `RefreshRejected` headless) without
-    /// caching it or clearing the cooldown. `cached_hit` and `usable_from_disk`
-    /// already exclude `rejected`, so guarding the two live-token sites here
-    /// covers every path that can produce the rejected bytes.
+    /// The candidate-token persistence boundary for refresh and browser results.
+    /// Cache-hit paths bypass this function, but every refresh- or browser-issued
+    /// token flows through here before being written to memory or disk. This is
+    /// where the 401-recovery invariant is enforced: a token equal to the
+    /// caller's `rejected` bytes must never be committed — doing so would cache
+    /// the proven-dead token as fresh, so a later plain `bearer()` (`rejected =
+    /// None`) or a freshly constructed source reading the same cache would serve
+    /// it back. Validating *before* the write keeps the dead token out of the
+    /// cache and off disk entirely: we fail typed (`NetworkUnavailable` interactive
+    /// / `RefreshRejected` headless) without caching it or clearing the cooldown.
+    /// `cached_hit` and `usable_from_disk` already exclude `rejected`, so guarding
+    /// the two live-token sites (refresh and browser exchange) here covers every
+    /// path that can produce the rejected bytes.
     fn finish(
         &self,
         state: &mut Option<CachedToken>,
@@ -1197,23 +1228,32 @@ struct CooldownRecord {
 /// - A caller **snapshots** the current generation from the sidecar *before*
 ///   queueing on the file lock.
 /// - A caller that **acquires** the lock compares the current generation to its
-///   snapshot: if it advanced, an attempt completed while this caller was
-///   waiting. If the recorded intent matches this caller's intent and the
-///   outcome is a terminal failure, adopt it directly.
-/// - Every attempt **writes** a fresh record (generation + 1) with its outcome
-///   under the lock before releasing it.
+///   snapshot: if it advanced, a predecessor completed while it was waiting.
+///   If the recorded intent matches this caller's intent and the outcome is a
+///   recognized terminal failure, adopt it rather than re-running.
+/// - Completing attempts **write** a fresh record under the lock. Write
+///   coverage: the headless no-browser arm (`RefreshRejected`/`NoCredential`),
+///   the refresh arm when `finish()` fails typed (rejected-equal reissuance),
+///   and the browser arm (all outcomes including `"ok"`). Omissions that are
+///   intentionally not adoption-worthy: transient `Network` errors, discovery
+///   failures (both non-terminal; next caller retries), and cache/refresh-
+///   success paths (a waiting caller finds the token via `cached_hit` without
+///   reaching the adoption check).
 ///
-/// Intent matching mirrors the in-process [`INFLIGHT`] keying: a
-/// `UserInitiated` caller must never inherit a non-`UserInitiated` failure
-/// (it promised the user a fresh browser and a cooldown bypass), but `Headless`
-/// and `Auto` callers adopt any same-intent failure without re-running.
+/// The generation counter is read fresh from disk at write time so each
+/// completed attempt strictly advances the value regardless of when the
+/// caller's pre-queue snapshot was taken.
 ///
-/// `UserInitiated` waiters do NOT inherit *any* prior failure — they always run
-/// their own attempt (clearning any cooldown and opening a browser if needed).
-/// This mirrors the in-process guarantee.
+/// Intent matching is same-intent only, mirroring the in-process `(path,
+/// intent)` key. The temporal condition handles "later explicit retry bypasses":
+/// a `UserInitiated` caller arriving after the failure snapshots the new
+/// generation and sees no advance, so it always runs its own attempt and never
+/// inherits a prior failure — regardless of intent.
 #[derive(Debug, Serialize, Deserialize)]
 struct AttemptRecord {
-    /// Monotonically increasing counter, incremented on each completed attempt.
+    /// Strictly increasing counter: read from disk at write time and incremented
+    /// by one so each attempt advances from the actual current value regardless
+    /// of when the writing caller's snapshot was taken.
     generation: u64,
     /// Intent of the attempt that completed, as [`AuthIntent::as_str`].
     intent: String,
@@ -1233,9 +1273,16 @@ fn read_attempt(path: &Path) -> Option<AttemptRecord> {
 /// Write a fresh attempt record at `path`. Called under the auth lock.
 /// Best-effort — a write failure only means the next cross-process waiter
 /// cannot adopt this attempt's outcome, so errors are swallowed.
-fn write_attempt(path: &Path, generation: u64, intent: AuthIntent, result: &str) {
+///
+/// Always reads the current on-disk generation before writing so the new
+/// record strictly advances from the actual last-recorded value, not from
+/// any caller's pre-queue snapshot. An intervening different-intent attempt
+/// that advanced the sidecar between snapshot and lock-acquire is reflected
+/// correctly: the next waiter's comparison still sees a real advance.
+fn write_attempt(path: &Path, intent: AuthIntent, result: &str) {
+    let current_gen = read_attempt(path).map_or(0, |r| r.generation);
     let record = AttemptRecord {
-        generation: generation.wrapping_add(1),
+        generation: current_gen.wrapping_add(1),
         intent: intent.as_str().to_owned(),
         result: result.to_owned(),
     };
@@ -1528,11 +1575,23 @@ fn read_private_cache(path: &Path) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
-/// Non-Unix fallback: read the cache as-is. Owner-only enforcement is the
-/// Windows DACL work deferred behind the [`create_private_temp_file`] seam.
+/// Non-Unix: token persistence and reading are both disabled until a
+/// Windows-specific owner-only DACL is implemented. Any legacy token file
+/// left by an older build (written with default ACLs) is deleted
+/// opportunistically so the exposed artifact cannot be served by new builds.
+/// Returns an error so [`read_cache`] yields `None`, giving a consistent
+/// memory-only cache on non-Unix.
 #[cfg(not(unix))]
 fn read_private_cache(path: &Path) -> io::Result<Vec<u8>> {
-    fs::read(path)
+    // Best-effort removal of any legacy file. Errors are ignored — either the
+    // file does not exist (normal case) or it cannot be removed (no worse
+    // than before — the DACL story is still broken, but that is the pre-fix
+    // state we are trying to retire).
+    let _ = fs::remove_file(path);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "token disk cache disabled on non-Unix (no owner-only DACL)",
+    ))
 }
 
 /// Removes a temp file on drop unless it was already renamed away. Keeps a
