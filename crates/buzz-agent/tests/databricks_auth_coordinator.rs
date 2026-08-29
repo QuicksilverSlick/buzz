@@ -159,7 +159,20 @@ enum RefreshMode {
     /// of how many are served. Models a provider that re-issues an identical
     /// access token, so a bounded rerun can hand back the exact bytes the
     /// caller already reported 401-rejected.
+    ///
+    /// Used only by Unix-only tests (rejected-token neutralization, sticky
+    /// reissuance). Gated to suppress dead-code warnings on Windows.
+    #[cfg(unix)]
     SucceedSticky(&'static str),
+    /// Hang for `d`, then behave like `SucceedSticky(tok)` for all grants.
+    /// Lets the test guarantee a second process can queue on the lock before
+    /// A completes its refresh — the hang duration exceeds process-spawn
+    /// latency, making the ordering deterministic.
+    ///
+    /// Used only by the cross-process digest test. Gated the same as
+    /// `SucceedSticky` to suppress dead-code warnings on Windows.
+    #[cfg(unix)]
+    HangThenSucceedSticky(Duration, &'static str),
 }
 
 /// How the stub's token endpoint answers an `authorization_code` grant (the
@@ -185,6 +198,10 @@ enum ExchangeMode {
     /// exchange. Models a provider that re-issues an identical access token, so
     /// a browser sign-in (reached after a dead refresh) can hand back the exact
     /// bytes the caller reported 401-rejected.
+    ///
+    /// Used only by Unix-only tests (sticky browser exchange after dead refresh).
+    /// Gated to suppress dead-code warnings on Windows.
+    #[cfg(unix)]
     SucceedSticky(&'static str),
 }
 
@@ -277,6 +294,7 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                                     "expires_in": 3600,
                                 })),
                             ),
+                            #[cfg(unix)]
                             RefreshMode::SucceedSticky(tok) => (
                                 axum::http::StatusCode::OK,
                                 Json(json!({
@@ -285,6 +303,18 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                                     "expires_in": 3600,
                                 })),
                             ),
+                            #[cfg(unix)]
+                            RefreshMode::HangThenSucceedSticky(d, tok) => {
+                                tokio::time::sleep(d).await;
+                                (
+                                    axum::http::StatusCode::OK,
+                                    Json(json!({
+                                        "access_token": tok,
+                                        "refresh_token": "rotated-refresh",
+                                        "expires_in": 3600,
+                                    })),
+                                )
+                            }
                         };
                     }
                     let n = code_grants.fetch_add(1, Ordering::SeqCst) + 1;
@@ -310,6 +340,7 @@ async fn spawn_stub_with_modes(refresh: RefreshMode, exchange: ExchangeMode) -> 
                             axum::http::StatusCode::OK,
                             Json(json!({ "token_type": "bearer" })),
                         ),
+                        #[cfg(unix)]
                         ExchangeMode::SucceedSticky(tok) => (
                             axum::http::StatusCode::OK,
                             Json(json!({
@@ -376,10 +407,21 @@ fn cache_file_path(cfg: &PkceOAuthConfig, cache_dir: &std::path::Path) -> std::p
         .join(format!("{hash}.json"))
 }
 
+/// The cross-process attempt sidecar path for a config, matching the
+/// coordinator's `append_ext(cache_path, "attempt")`. Used by tests that
+/// inspect the generation counter directly after a cross-process adoption to
+/// verify the adopter did not re-write a new generation.
+fn attempt_sidecar_path(cfg: &PkceOAuthConfig, cache_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut p = cache_file_path(cfg, cache_dir).into_os_string();
+    p.push(".attempt");
+    p.into()
+}
+
 /// The cross-process advisory lock path for a config, matching the
 /// coordinator's `append_ext(cache_path, "lock")`. Used to point the
 /// out-of-process lock-holder helper at the exact file the coordinator
 /// contends on.
+#[cfg(unix)]
 fn lock_file_path(cfg: &PkceOAuthConfig, cache_dir: &std::path::Path) -> std::path::PathBuf {
     let mut p = cache_file_path(cfg, cache_dir).into_os_string();
     p.push(".lock");
@@ -728,6 +770,7 @@ async fn test_interactive_login_reuses_valid_cache_without_browser() {
 
 /// Seed a not-yet-expired access token with a (dead) refresh token and return
 /// the access token so the caller can pass it as `rejected`.
+#[cfg(unix)]
 fn seed_fresh_rejectable(cfg: &PkceOAuthConfig, cache_dir: &std::path::Path) -> String {
     let access = "fresh-but-rejected";
     seed_cache(
@@ -1695,7 +1738,7 @@ async fn test_rejected_fresh_token_neutralized_when_recovery_browses() {
     );
 }
 
-// ---- P1-1 fail-closed: disk neutralization with in-place fallback ---------
+// ---- P1-1 bounded three-stage neutralization: disk fallback paths -----------
 //
 // `expire_rejected()` neutralizes the on-disk token with three-stage fallback:
 // 1. Atomic rewrite via `persist()` (temp-file + rename, owner-only perms).
@@ -1713,7 +1756,7 @@ async fn test_rejected_fresh_token_neutralized_when_recovery_browses() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_rejected_token_disk_neutralization_removes_file_when_rewrite_fails() {
+async fn test_rejected_token_disk_neutralization_neutralizes_in_place_when_parent_blocks_rewrite() {
     use std::os::unix::fs::PermissionsExt as _;
 
     // Seed unexpired `A` with a live refresh. The provider stickily re-issues `A`.
@@ -1747,11 +1790,38 @@ async fn test_rejected_token_disk_neutralization_removes_file_when_rewrite_fails
     // Build the source: it reads `A` from disk into its in-memory cell.
     let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
 
-    // Make the parent directory non-writable (0500): temp-file creation in
-    // `write_private_cache` requires creating a new file in the directory, which
-    // EACCES. The file itself remains 0600 owner-writable, so the in-place
-    // fallback path in `expire_rejected` can still open and truncate it.
-    std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // The token file lives at `token_dir/databricks/<hash>.json`. Its direct
+    // parent is `token_dir/databricks/`, not `token_dir` itself — the
+    // coordinator's `cache_path_for()` appends the namespace subdir. Assert
+    // the relationship explicitly so a future path-resolution change breaks
+    // loudly here instead of silently letting the atomic write succeed (which
+    // would make the test vacuously pass even without the in-place fallback).
+    let protected_dir = cache_file
+        .parent()
+        .expect("cache file must have a parent directory");
+    assert_eq!(
+        protected_dir,
+        token_dir.join("databricks"),
+        "cache file's direct parent is token_dir/databricks, not token_dir"
+    );
+
+    // Pre-create the advisory lock file so `acquire_auth_lock` can open it
+    // even after the directory is made non-writable. The lock file must exist
+    // before the chmod, because `OpenOptions::create(true)` on an existing
+    // file succeeds regardless of parent-dir permissions, while creating a new
+    // file in a 0500 directory would EACCES.
+    let lock_file = {
+        let mut p = cache_file.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    std::fs::File::create(&lock_file).expect("pre-create lock file before chmod");
+
+    // Make the direct parent non-writable (0500): temp-file creation for the
+    // atomic persist requires creating a new file in this directory → EACCES.
+    // The file itself remains 0600 owner-writable, so the in-place fallback
+    // path in `expire_rejected` can still open and truncate it.
+    std::fs::set_permissions(protected_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
     // Trigger 401-recovery: refresh stickily re-issues `A`, `finish()` rejects
     // it typed. `expire_rejected` runs: atomic persist fails (EACCES on parent),
@@ -1767,7 +1837,7 @@ async fn test_rejected_token_disk_neutralization_removes_file_when_rewrite_fails
     assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
 
     // Restore write permission so the test harness can clean up.
-    std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(protected_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     // The cache file still exists (in-place write, not removal), but its
     // `expires_at` should now be 0 — it was overwritten in-place.
@@ -2157,6 +2227,7 @@ struct Worker {
 #[derive(Deserialize)]
 struct WorkerOutcome {
     result: String,
+    #[cfg(unix)]
     bearer: Option<String>,
     launches: u64,
 }
@@ -2456,7 +2527,6 @@ async fn test_crossprocess_waiting_headless_adopts_predecessor_refresh_rejected(
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_crossprocess_userinitiated_waiter_adopts_predecessor_denial() {
     // The adoption contract is *temporal*, not intent-based. A `UserInitiated`
@@ -2531,7 +2601,6 @@ async fn test_crossprocess_userinitiated_waiter_adopts_predecessor_denial() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_crossprocess_post_failure_userinitiated_runs_own_attempt() {
     // A `UserInitiated` caller that arrives *after* a failure — not queued
@@ -2571,6 +2640,116 @@ async fn test_crossprocess_post_failure_userinitiated_runs_own_attempt() {
     );
 }
 
+// ---- cross-process: adopter must NOT re-write the attempt generation -------
+//
+// Proves that an adopting process B does not advance the attempt-sidecar
+// generation, so a third process C — which arrives AFTER A's failure but sees
+// no generation advance (B didn't re-write) — correctly runs its own attempt.
+//
+// Protocol ordering:
+//   1. A (UserInitiated, deny-scripted) holds the lock mid-browser via
+//      LAUNCHED_MARKER + PROCEED_MARKER.
+//   2. B (UserInitiated, deny-scripted) starts while A holds the lock.
+//      B queues with snapshot gen=0. After 300 ms we signal A's proceed.
+//   3. A: denial recorded, writes gen=1 to the attempt sidecar, releases lock.
+//   4. B: acquires lock, sees gen=1 > snap=0, intent matches → adopts A's
+//      denial. With the fix B does NOT re-write the sidecar. With the mutation
+//      (restoring the deleted write_attempt at the adoption site) B writes
+//      gen=2.
+//   5. After A and B finish: assert sidecar generation == 1. This is the
+//      discriminating assertion — it FAILS when the adoption-site re-write is
+//      restored (gen becomes 2 instead of 1).
+//   6. C (UserInitiated, approve-scripted) starts fresh. C's snapshot == gen
+//      on disk (1 with fix, 2 with mutation). In both cases C sees no advance
+//      and runs its own browser flow. code_grants increments by 1 for C.
+//
+// This test is cache-free (no seed_cache / disk-token assertions) so it runs
+// on Windows as well as Unix.
+
+#[tokio::test]
+async fn test_crossprocess_adopter_does_not_relay_failure_to_third_process() {
+    let stub = spawn_stub(false).await; // deny does not hit any endpoint
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // ---- Phase 1: A holds the lock mid-browser ----------------------------
+    let launched_a = cache.path().join("a.launched");
+    let proceed_a = cache.path().join("a.proceed");
+
+    let worker_a = spawn_worker(
+        &cfg,
+        cache.path(),
+        "userinitiated",
+        "deny",
+        "a",
+        &[
+            ("AUTH_WORKER_LAUNCHED_MARKER", launched_a.as_path()),
+            ("AUTH_WORKER_PROCEED_MARKER", proceed_a.as_path()),
+        ],
+    );
+
+    // Wait until A holds the lock and its browser is open.
+    wait_for_marker(&launched_a, "worker A browser launch").await;
+
+    // ---- Phase 2: B queues behind A ---------------------------------------
+    // B is UserInitiated + deny-scripted, but B will adopt A's denial rather
+    // than opening its own browser (B was queued while A held the lock).
+    let worker_b = spawn_worker(&cfg, cache.path(), "userinitiated", "deny", "b", &[]);
+    // Give B time to acquire the lock position before releasing A.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // ---- Phase 3: release A, let A fail and write gen=1 -------------------
+    std::fs::write(&proceed_a, b"go").unwrap();
+    let out_a = worker_a.join().await;
+    assert_eq!(out_a.result, "denied", "worker A is denied");
+    assert_eq!(out_a.launches, 1, "worker A opens exactly one browser");
+
+    // ---- Phase 4: B adopts (does NOT re-write the sidecar) ----------------
+    let out_b = worker_b.join().await;
+    assert_eq!(
+        out_b.result, "denied",
+        "worker B adopts A's denial — it does not open a second browser"
+    );
+    assert_eq!(
+        out_b.launches, 0,
+        "worker B adopts without opening a browser"
+    );
+
+    // ---- Phase 5: discriminating generation check -------------------------
+    // With the fix: sidecar gen == 1 (B did not re-write).
+    // Mutation check: restore the deleted `write_attempt` at the adoption site
+    // → B writes gen=2 → this assertion FAILS.
+    let sidecar = attempt_sidecar_path(&cfg, cache.path());
+    let raw = std::fs::read(&sidecar).expect("attempt sidecar written by A");
+    let record: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar parses as JSON");
+    assert_eq!(
+        record.get("generation").and_then(|v| v.as_u64()),
+        Some(1),
+        "adopter B must not advance the sidecar generation (gen must stay at 1, not 2)"
+    );
+
+    // ---- Phase 6: C runs its own attempt ----------------------------------
+    // C arrives after A's failure. C's snapshot equals the on-disk generation
+    // (1 with fix, 2 with mutation). Either way C sees no advance and runs its
+    // own browser flow. But the sidecar check above already catches the
+    // mutation; C proves the end-to-end behaviour.
+    let worker_c = spawn_worker(&cfg, cache.path(), "userinitiated", "approve", "c", &[]);
+    let out_c = worker_c.join().await;
+    assert_eq!(
+        out_c.result, "ok",
+        "worker C (fresh arrival after A's failure) runs its own flow and succeeds"
+    );
+    assert_eq!(
+        out_c.launches, 1,
+        "worker C opens its own browser — not inherited from A or B"
+    );
+    assert_eq!(
+        stub.code_grants.load(Ordering::SeqCst),
+        1,
+        "exactly one code exchange — C's own approval (A was denied; B adopted without exchange)"
+    );
+}
+
 // ---- cross-process: a waiter with a different rejected must not inherit ----
 //
 // Cross-process mirror of the in-process test above: process A carries
@@ -2580,12 +2759,29 @@ async fn test_crossprocess_post_failure_userinitiated_runs_own_attempt() {
 // lock and reads the attempt record, the digest mismatch causes B to run its
 // own attempt rather than adopt A's failure — B's refresh gets "X", which is
 // valid for B, so B succeeds.
+//
+// Ordering: the stub hangs each refresh grant by 300 ms before returning "X".
+// A is spawned first; B is spawned after A's READY_MARKER fires (A has built
+// its source and is about to acquire the lock). Because A starts acquiring
+// immediately on its READY marker and the hang guarantees A holds the lock for
+// ≥300 ms, B is certain to be queued before A releases. This makes the
+// ordering deterministic: B always arrives with snapshot gen=0, sees A's
+// advance to gen=1, and the digest check is exercised.
+//
+// Mutation check: on the r8 shape (no digest gating) B adopts A's failure →
+// refresh_grants stays at 1 (B never hits the refresh endpoint). The assertion
+// `refresh_grants == 2` then FAILS. With the fix the assertion passes.
 
 #[cfg(unix)]
 #[tokio::test]
 async fn test_crossprocess_waiter_with_different_rejected_does_not_adopt_leaders_failure() {
-    // Sticky provider always issues "X" on every refresh grant.
-    let stub = spawn_stub_with(RefreshMode::SucceedSticky("X")).await;
+    // Hang 300 ms per refresh, then stickily return "X". A holds the lock
+    // for ≥300 ms, giving B time to queue with snap=0.
+    let stub = spawn_stub_with(RefreshMode::HangThenSucceedSticky(
+        Duration::from_millis(300),
+        "X",
+    ))
+    .await;
     let cache = TempDir::new().unwrap();
     let cfg = config(&stub, "/disco/a", cache.path());
 
@@ -2600,17 +2796,12 @@ async fn test_crossprocess_waiter_with_different_rejected_does_not_adopt_leaders
         }),
     );
 
-    // Worker A: headless, rejected = "X". It will acquire the lock first
-    // (no synchronization needed — just let them race). Its refresh yields X,
-    // finish(rejected="X", token="X") → RefreshRejected. Records the attempt
-    // with rejected_digest = sha256("X").
-    let ready_a = cache.path().join("a.ready");
-    let ready_b = cache.path().join("b.ready");
-    let start = cache.path().join("start");
-
     let result_a = cache.path().join("a.result.json");
     let result_b = cache.path().join("b.result.json");
+    let ready_a = cache.path().join("a.ready");
 
+    // Worker A (rejected="X"): headless, no start barrier. A fires READY_MARKER
+    // (source built) and immediately begins acquiring the lock.
     let mut cmd_a = tokio::process::Command::new(env!("CARGO_BIN_EXE_auth-worker"));
     cmd_a
         .env("AUTH_WORKER_DISCOVERY_URL", &cfg.discovery_url)
@@ -2623,9 +2814,21 @@ async fn test_crossprocess_waiter_with_different_rejected_does_not_adopt_leaders
         .env("AUTH_WORKER_REJECTED", "X")
         .env("AUTH_WORKER_RESULT", &result_a)
         .env("AUTH_WORKER_READY_MARKER", &ready_a)
-        .env("AUTH_WORKER_START_MARKER", &start)
         .kill_on_drop(true);
 
+    let child_a = cmd_a.spawn().expect("spawn worker A");
+
+    // Wait for A's ready marker (A has built its source and is about to
+    // acquire the lock). Spawn B immediately after; since A is already
+    // entering the lock and the stub will hang A for 300 ms, B is guaranteed
+    // to queue behind A before A finishes.
+    wait_for_marker(&ready_a, "worker A ready").await;
+
+    // Worker B (rejected="Y"): headless, no barriers. B starts, acquires lock
+    // after A releases, sees gen=1>snap=0 (B's snapshot was taken before A
+    // wrote the sidecar), and checks digests:
+    //   sha256("Y") ≠ sha256("X") → digest mismatch → B runs its own refresh.
+    // On r8 (no digest check): B adopts A's RefreshRejected → no refresh hit.
     let mut cmd_b = tokio::process::Command::new(env!("CARGO_BIN_EXE_auth-worker"));
     cmd_b
         .env("AUTH_WORKER_DISCOVERY_URL", &cfg.discovery_url)
@@ -2637,57 +2840,38 @@ async fn test_crossprocess_waiter_with_different_rejected_does_not_adopt_leaders
         .env("AUTH_WORKER_SCRIPT", "failopen")
         .env("AUTH_WORKER_REJECTED", "Y")
         .env("AUTH_WORKER_RESULT", &result_b)
-        .env("AUTH_WORKER_READY_MARKER", &ready_b)
-        .env("AUTH_WORKER_START_MARKER", &start)
         .kill_on_drop(true);
 
-    let child_a = cmd_a.spawn().expect("spawn worker A");
     let child_b = cmd_b.spawn().expect("spawn worker B");
 
-    // Wait for both to be ready (both have built their source and are about
-    // to queue on the lock), then release them together.
-    wait_for_marker(&ready_a, "worker A ready").await;
-    wait_for_marker(&ready_b, "worker B ready").await;
-    std::fs::write(&start, b"go").unwrap();
-
-    let mut worker_a = Worker {
+    let worker_a = Worker {
         child: child_a,
         result_path: result_a,
     };
-    let mut worker_b = Worker {
+    let worker_b = Worker {
         child: child_b,
         result_path: result_b,
     };
     let (out_a, out_b) = tokio::join!(worker_a.join(), worker_b.join());
 
-    // One of {A, B} wins the lock first. Possible orderings:
-    //   A wins: A → RefreshRejected (X re-issued). B acquires lock, reads
-    //   record with digest(X) ≠ digest(Y) → mismatch → B runs own attempt
-    //   → gets X → finish(rejected=Y) → Ok("X").
-    //
-    //   B wins: B → Ok("X") (X ≠ Y → persists). A acquires lock, cached_hit
-    //   finds X in cache but A's rejected=X so it's excluded → A goes to
-    //   refresh → gets X → finish(rejected=X) → RefreshRejected.
-    //
-    // In both orderings: exactly one RefreshRejected and one Ok("X").
-    let results: std::collections::HashSet<String> = [out_a.result.clone(), out_b.result.clone()]
-        .into_iter()
-        .collect();
-    assert!(
-        results.contains("ok"),
-        "one of the two workers must succeed: {:?}",
-        (out_a.result, out_b.result)
+    // A (rejected=X): refresh returns "X" stickily, finish(rejected=X) → RefreshRejected.
+    // Writes sidecar: gen=1, result=refresh_rejected, rejected_digest=sha256("X").
+    assert_eq!(
+        out_a.result, "refresh_rejected",
+        "worker A (rejected=X) must get RefreshRejected"
     );
-    assert!(
-        results.contains("refresh_rejected"),
-        "the worker carrying rejected=X must fail typed: {:?}",
-        (out_a.result, out_b.result)
+    // B (rejected=Y): digest(Y) ≠ digest(X) → B runs its own refresh.
+    // B's refresh also returns "X", finish(rejected=Y, token=X) → Ok(X).
+    assert_eq!(
+        out_b.result, "ok",
+        "worker B (rejected=Y) must succeed after rerunning — not adopt A's RefreshRejected"
     );
-    // Exactly two refresh grants total.
+    // Mutation check (r8 shape): B adopts → refresh_grants stays 1.
+    // With the digest fix: B reruns → refresh_grants = 2.
     assert_eq!(
         stub.refresh_grants.load(Ordering::SeqCst),
         2,
-        "both workers run their own refresh — no adoption"
+        "both workers run their own refresh — digest mismatch prevented adoption"
     );
 }
 
@@ -2763,6 +2947,11 @@ async fn test_non_unix_does_not_serve_legacy_on_disk_token() {
             stub.code_grants.load(Ordering::SeqCst),
             1,
             "non-Unix: browser flow ran — disk token was not served"
+        );
+        assert_eq!(
+            stub.refresh_grants.load(Ordering::SeqCst),
+            0,
+            "non-Unix: no refresh grant — the source went straight to the browser flow"
         );
         // The legacy file should have been removed by read_private_cache.
         assert!(

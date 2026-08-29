@@ -15,28 +15,39 @@
 //! reported back so a test can assert "exactly one browser across processes".
 //!
 //! Env contract (all required unless noted):
-//!   AUTH_WORKER_DISCOVERY_URL — OIDC discovery URL (the parent stub).
-//!   AUTH_WORKER_CACHE_DIR     — shared cache dir (`cache_dir_override`).
-//!   AUTH_WORKER_NAMESPACE     — cache namespace.
-//!   AUTH_WORKER_CLIENT_ID     — OAuth client id.
-//!   AUTH_WORKER_SCOPES        — comma-separated scopes.
-//!   AUTH_WORKER_INTENT        — auto | userinitiated | headless.
-//!   AUTH_WORKER_SCRIPT        — approve | deny | failopen.
-//!   AUTH_WORKER_RESULT        — path to write the JSON outcome to.
-//!   AUTH_WORKER_REJECTED      — (optional) rejected token bytes passed to
-//!                               `acquire_with_intent`; absent means no rejection.
-//!   AUTH_WORKER_READY_MARKER  — (optional) written once the source is built,
-//!                               before acquisition, so the parent can release
-//!                               several workers into a genuine lock race.
-//!   AUTH_WORKER_START_MARKER  — (optional) acquisition blocks until this file
-//!                               exists, so multiple workers begin together.
+//!   AUTH_WORKER_DISCOVERY_URL   — OIDC discovery URL (the parent stub).
+//!   AUTH_WORKER_CACHE_DIR       — shared cache dir (`cache_dir_override`).
+//!   AUTH_WORKER_NAMESPACE       — cache namespace.
+//!   AUTH_WORKER_CLIENT_ID       — OAuth client id.
+//!   AUTH_WORKER_SCOPES          — comma-separated scopes.
+//!   AUTH_WORKER_INTENT          — auto | userinitiated | headless.
+//!   AUTH_WORKER_SCRIPT          — approve | deny | failopen.
+//!   AUTH_WORKER_RESULT          — path to write the JSON outcome to.
+//!   AUTH_WORKER_REJECTED        — (optional) rejected token bytes passed to
+//!                                 `acquire_with_intent`; absent means no rejection.
+//!   AUTH_WORKER_READY_MARKER    — (optional) written once the source is built,
+//!                                 before acquisition, so the parent can release
+//!                                 several workers into a genuine lock race.
+//!   AUTH_WORKER_START_MARKER    — (optional) acquisition blocks until this file
+//!                                 exists, so multiple workers begin together.
 //!   AUTH_WORKER_LAUNCHED_MARKER — (optional) written when the browser opener
-//!                               fires (i.e. this process holds the lock and is
-//!                               mid-flow), so the parent can queue behind it.
-//!   AUTH_WORKER_PROCEED_MARKER — (optional) the scripted callback is withheld
-//!                               until this file exists, so the parent can
-//!                               confirm another process is already waiting on
-//!                               the lock before this one resolves.
+//!                                 fires (i.e. this process holds the lock and is
+//!                                 mid-flow), so the parent can queue behind it.
+//!   AUTH_WORKER_PROCEED_MARKER  — (optional) the scripted callback is withheld
+//!                                 until this file exists, so the parent can
+//!                                 confirm another process is already waiting on
+//!                                 the lock before this one resolves.
+//!   AUTH_WORKER_ACQUIRED_MARKER — (optional) written immediately after the
+//!                                 cross-process lock is acquired, before any
+//!                                 attempt logic runs. Lets the test observe that
+//!                                 this process now holds the lock.
+//!   AUTH_WORKER_PROCEED_ACQUIRE — (optional) when set together with
+//!                                 AUTH_WORKER_ACQUIRED_MARKER, the worker
+//!                                 blocks after writing the acquired marker until
+//!                                 this file exists. This lets the test inject
+//!                                 other processes (e.g. a third worker that must
+//!                                 snapshot the attempt sidecar while THIS worker
+//!                                 holds the lock) before the attempt logic runs.
 //!
 //! Result JSON: `{ "result": "ok"|"<error_code>", "bearer": <string|null>,
 //! "launches": <u64> }`.

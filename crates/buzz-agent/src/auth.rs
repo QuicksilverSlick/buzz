@@ -546,14 +546,15 @@ impl PkceOAuthTokenSource {
     /// when its access token byte-equals `rejected`, so a sibling's
     /// concurrently-written distinct replacement is preserved.
     ///
-    /// Disk neutralization is fail-closed: on atomic-rewrite failure (e.g.
-    /// non-writable parent directory), the implementation falls back to an
-    /// in-place truncating overwrite of the existing file (no parent-dir perms
-    /// required), and finally to `remove_file`. If all three fail the file
-    /// survives; `cached_hit`'s `rejected`-aware filter protects this caller's
-    /// path, but a later plain `bearer()` could re-read the unexpired file.
-    /// That residual corner is outside the normal threat model (owner actively
-    /// hardening their own cache file to 0400 against their own process).
+    /// Disk neutralization is a bounded three-stage process: on atomic-rewrite
+    /// failure (e.g. non-writable parent directory), the implementation falls
+    /// back to an in-place truncating overwrite of the existing file (no
+    /// parent-dir perms required), and finally to `remove_file`. If all three
+    /// fail the file survives; `cached_hit`'s `rejected`-aware filter protects
+    /// this caller's path, but a later plain `bearer()` could re-read the
+    /// unexpired file. That residual corner is outside the normal threat model
+    /// (owner actively hardening their own cache file to 0400 against their own
+    /// process).
     fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
         let Some(rej) = rejected else { return };
         // Neutralize the in-memory entry: force-expire so `is_expired` excludes
