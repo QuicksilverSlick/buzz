@@ -89,6 +89,12 @@ jobs:
           scripts/test-mobile-release-candidate-publisher.sh
       - name: Mobile worktree identity contract
         run: scripts/test-mobile-worktree-overrides.sh
+      - name: Install actionlint
+        run: |
+          curl -fsSL --output /tmp/actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c
+          tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
       - name: Codex security review contract
         run: just security-review-check
       - name: Rust cache contract

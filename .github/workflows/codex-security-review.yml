@@ -227,8 +227,6 @@ jobs:
       REVIEW_CONTEXT: review-context
       REVIEW_REPOSITORY: review-target
       REVIEW_DIFF_FILE: .git/codex-review.diff
-      # Written by the action before the hang; lives outside the PR checkout.
-      CODEX_OUTPUT_FILE: ${{ runner.temp }}/codex-review.json
     outputs:
       review_json: ${{ steps.salvage.outputs.review_json }}
     steps:
@@ -315,7 +313,7 @@ jobs:
           permission-profile: ':read-only'
           working-directory: ${{ github.workspace }}/${{ env.REVIEW_CONTEXT }}
           # Written before the hang; salvaged below if the step times out.
-          output-file: ${{ env.CODEX_OUTPUT_FILE }}
+          output-file: ${{ runner.temp }}/codex-review.json
           output-schema: |
             {
               "type": "object",
@@ -462,6 +460,7 @@ jobs:
         if: always()
         env:
           FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          CODEX_OUTPUT_FILE: ${{ runner.temp }}/codex-review.json
         run: |
           json=""
 
@@ -490,9 +489,11 @@ jobs:
 
           # Write as a multiline output (GitHub-safe delimiter).
           EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
-          echo "review_json<<${EOF}" >> "$GITHUB_OUTPUT"
-          echo "$json"             >> "$GITHUB_OUTPUT"
-          echo "${EOF}"            >> "$GITHUB_OUTPUT"
+          {
+            echo "review_json<<${EOF}"
+            echo "$json"
+            echo "${EOF}"
+          } >> "$GITHUB_OUTPUT"
 
   post-review:
     name: Post Codex Security Review

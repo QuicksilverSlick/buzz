@@ -99,6 +99,7 @@ check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clip
 security-review-check:
     node --check .github/scripts/codex-security-review.js
     node --test .github/scripts/codex-security-review.test.js
+    actionlint .github/workflows/codex-security-review.yml
 
 # Run the repository-wide differential file-size ratchet and its policy tests.
 # The ratchet inspects only files changed from the merge base, so this stays
