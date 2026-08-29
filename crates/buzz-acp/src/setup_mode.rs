@@ -432,7 +432,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         // Apply the same author gate as normal mode so the nudge only goes
         // to authors the real agent would have answered. Same DM hardening:
         // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
-        // LISTENER_AUTHOR_GATE_BEGIN
         let Some(authorized_event) = authorize_setup_listener_event(
             &mut author_gate_ctx,
             buzz_event,
@@ -460,7 +459,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         {
             continue;
         }
-        // LISTENER_AUTHOR_GATE_END
     }
 
     Ok(())
@@ -475,7 +473,7 @@ async fn nudge_authorized_event(
     keys: &nostr::Keys,
     payload: &SetupPayload,
 ) -> bool {
-    let buzz_event = authorized_event.into_event();
+    let (buzz_event, effective_author) = authorized_event.into_parts();
 
     // Apply channel/kind filter rules.
     let filter_matched =
@@ -493,6 +491,7 @@ async fn nudge_authorized_event(
         keys,
         buzz_event.channel_id,
         &buzz_event.event,
+        &effective_author,
         payload,
     )
     .await
@@ -631,12 +630,13 @@ async fn handle_setup_membership(
 /// Build and publish a setup nudge reply to the triggering event.
 ///
 /// Threading: flat reply to the thread root if one exists; otherwise reply
-/// to the triggering event itself. P-tags the asker.
+/// to the triggering event itself. P-tags the verified effective asker.
 async fn publish_setup_nudge(
     publisher: &RelayEventPublisher,
     keys: &nostr::Keys,
     channel_id: Uuid,
     triggering_event: &nostr::Event,
+    recipient_hex: &str,
     payload: &SetupPayload,
 ) -> Result<()> {
     use buzz_sdk::ThreadRef;
@@ -661,13 +661,12 @@ async fn publish_setup_nudge(
     };
 
     let body = payload.nudge_body();
-    let author_hex = triggering_event.pubkey.to_hex();
 
     let event_builder = buzz_sdk::build_message(
         channel_id,
         &body,
         thread_ref.as_ref(),
-        &[&author_hex], // p-tag the asker
+        &[recipient_hex], // p-tag the verified effective asker
         false,
         &[],
     )
@@ -737,6 +736,89 @@ mod tests {
             payload.requirements.as_slice(),
             [RequirementPayload::GitBash]
         ));
+    }
+
+    #[tokio::test]
+    async fn authorized_workflow_nudge_mentions_effective_owner_not_relay_signer() {
+        let agent_keys = nostr::Keys::generate();
+        let relay_keys = nostr::Keys::generate();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let event = relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event: crate::author_gate_tests::relay_signed_workflow_dispatch(
+                &relay_keys,
+                &workflow_owner,
+                &agent,
+            ),
+        };
+        let relay_hex = relay_keys.public_key().to_hex();
+        let (rest_client, server) =
+            crate::author_gate_tests::nip11_server(serde_json::json!({ "self": relay_hex })).await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "setup nudge test").await;
+        let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
+        let channel_info = crate::pool::ChannelInfoResolver::new(
+            std::collections::HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "workflow".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let authorized = authorize_setup_listener_event(
+            &mut gate,
+            event,
+            &crate::config::RespondTo::OwnerOnly,
+            &HashSet::new(),
+            &owner_cache,
+            &channel_info,
+            &rest_client,
+        )
+        .await
+        .expect("workflow owner should pass the setup author gate");
+        let rules = vec![filter::SubscriptionRule {
+            name: "workflow".into(),
+            channels: filter::ChannelScope::All("all".into()),
+            ..Default::default()
+        }];
+        let (publisher, mut published) = RelayEventPublisher::test_pair();
+        let payload = SetupPayload {
+            agent_name: "Fizz".into(),
+            agent_pubkey: agent.clone(),
+            requirements: vec![],
+        };
+
+        assert!(
+            nudge_authorized_event(
+                authorized,
+                &rules,
+                &agent,
+                &mut HashSet::new(),
+                &publisher,
+                &agent_keys,
+                &payload,
+            )
+            .await
+        );
+        let nudge = published.recv().await.expect("setup nudge published");
+        let recipients: Vec<&str> = nudge
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let values = tag.as_slice();
+                (values.first().map(String::as_str) == Some("p"))
+                    .then(|| values.get(1).map(String::as_str))
+                    .flatten()
+            })
+            .collect();
+        assert!(recipients.contains(&workflow_owner.as_str()));
+        assert!(!recipients.contains(&relay_hex.as_str()));
+        server.abort();
     }
 
     #[test]

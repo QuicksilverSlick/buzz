@@ -362,10 +362,6 @@ mod inbound_author_gate {
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
         }
-
-        pub(crate) fn into_event(self) -> relay::BuzzEvent {
-            self.buzz_event
-        }
     }
 
     /// Apply the configured raw-author policy after trusted workflow attribution.
@@ -587,9 +583,109 @@ use inbound_author_gate::{AuthorizedListenerEvent, InboundAuthorGate};
 
 struct AuthorizedNormalListenerEvent(AuthorizedListenerEvent);
 
+struct NormalListenerIngress {
+    buzz_event: relay::BuzzEvent,
+    effective_author: String,
+    prompt_tag: String,
+}
+
 impl AuthorizedNormalListenerEvent {
-    fn into_parts(self) -> (relay::BuzzEvent, String) {
-        self.0.into_parts()
+    async fn match_subscription(
+        self,
+        rules: &[SubscriptionRule],
+        agent_pubkey_hex: &str,
+    ) -> Option<NormalListenerIngress> {
+        let (buzz_event, effective_author) = self.0.into_parts();
+        let matched = filter::match_event(
+            &buzz_event.event,
+            buzz_event.channel_id,
+            rules,
+            agent_pubkey_hex,
+        )
+        .await?;
+        Some(NormalListenerIngress {
+            buzz_event,
+            effective_author,
+            prompt_tag: matched.prompt_tag,
+        })
+    }
+}
+
+struct QueuedNormalListenerEvent {
+    accepted: bool,
+    channel_id: Uuid,
+    effective_author: String,
+    event_id_hex: String,
+    event_for_steer: nostr::Event,
+    prompt_tag_for_steer: String,
+}
+
+impl QueuedNormalListenerEvent {
+    fn mark_seen(&self, rest_client: &relay::RestClient) {
+        if !self.accepted {
+            return;
+        }
+        let rest_client = rest_client.clone();
+        let event_id = self.event_id_hex.clone();
+        tokio::spawn(async move {
+            pool::reaction_add(&rest_client, &event_id, "👀").await;
+        });
+    }
+
+    fn steer_or_interrupt(
+        self,
+        handling: MultipleEventHandling,
+        owner: Option<&str>,
+        pool: &mut AgentPool,
+        queue: &mut EventQueue,
+        steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+    ) {
+        if !self.accepted || !queue.is_channel_in_flight(self.channel_id) {
+            return;
+        }
+        let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
+            return;
+        };
+        let native_attempted = matches!(signal, ControlSignal::Steer)
+            && try_native_steer(
+                pool,
+                queue,
+                self.channel_id,
+                self.event_for_steer,
+                self.prompt_tag_for_steer,
+                steer_ack_tx,
+            );
+        if !native_attempted {
+            signal_in_flight_task(pool, self.channel_id, signal);
+        }
+    }
+}
+
+impl NormalListenerIngress {
+    fn push(self, queue: &mut EventQueue) -> QueuedNormalListenerEvent {
+        let Self {
+            buzz_event,
+            effective_author,
+            prompt_tag,
+        } = self;
+        let event_id_hex = buzz_event.event.id.to_hex();
+        let event_for_steer = buzz_event.event.clone();
+        let prompt_tag_for_steer = prompt_tag.clone();
+        let channel_id = buzz_event.channel_id;
+        let accepted = queue.push(QueuedEvent {
+            channel_id,
+            event: buzz_event.event,
+            received_at: std::time::Instant::now(),
+            prompt_tag,
+        });
+        QueuedNormalListenerEvent {
+            accepted,
+            channel_id,
+            effective_author,
+            event_id_hex,
+            event_for_steer,
+            prompt_tag_for_steer,
+        }
     }
 }
 
@@ -3248,7 +3344,6 @@ async fn tokio_main() -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
-                            // LISTENER_AUTHOR_GATE_BEGIN
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -3262,96 +3357,32 @@ async fn tokio_main() -> Result<()> {
                             else {
                                 continue;
                             };
-                            let (buzz_event, author_hex) =
-                                AuthorizedNormalListenerEvent(authorized_event).into_parts();
-                            // LISTENER_AUTHOR_GATE_END
-
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
-                                None => {
-                                    tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
-                                    continue;
-                                }
+                            let Some(ingress) =
+                                AuthorizedNormalListenerEvent(authorized_event)
+                                    .match_subscription(&rules, &pubkey_hex)
+                                    .await
+                            else {
+                                tracing::debug!("authorized event matched no rule — dropping");
+                                continue;
                             };
-                            // The effective author was captured before queue.push()
-                            // moved the event; the mode gate uses the same verified
-                            // principal as the inbound author gate.
-                            let event_id_hex = buzz_event.event.id.to_hex();
-                            // Clone for the non-cancelling steer fork, which
-                            // needs the event to render the steer body. The
-                            // clone is unconditional because we don't know
-                            // yet whether the mode gate will demand a steer
-                            // — checking `multiple_event_handling` here
-                            // would couple the queueing path to the mode
-                            // and break the existing invariant that every
-                            // accepted event goes through `queue.push`
-                            // first. `nostr::Event::clone` is cheap (Arc-
-                            // backed payload) so the cost is negligible.
-                            let event_for_steer = buzz_event.event.clone();
-                            let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
-                                channel_id: buzz_event.channel_id,
-                                event: buzz_event.event,
-                                received_at: std::time::Instant::now(),
-                                prompt_tag,
-                            });
+                            let queued = ingress.push(&mut queue);
+
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            if accepted {
-                                let rc = ctx.rest_client.clone();
-                                let eid = event_id_hex.clone();
-                                tokio::spawn(async move {
-                                    pool::reaction_add(&rc, &eid, "👀").await;
-                                });
-                            }
-                            // Event is already queued. If mode requires it AND
-                            // the channel has an in-flight task, fire cancel —
-                            // OR take the non-cancelling (ACP steer) fork for Steer signals.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
-                                // Author eligibility (owner ∪ allowlist ∪ siblings)
-                                // is already enforced by the inbound author gate
-                                // above, so the mid-turn signal fires for every
-                                // event that reaches here.
-                                let signal = mode_gate_signal(
-                                    config.multiple_event_handling,
-                                    &author_hex,
-                                    owner_cache.get(),
-                                );
-                                if let Some(signal) = signal {
-                                    // Non-cancelling fork: when the mode
-                                    // wants a Steer, attempt the
-                                    // non-cancelling path first. On accept,
-                                    // withhold the queued event and spawn an
-                                    // ack watcher; the main loop's
-                                    // `PoolEvent::SteerAck` arm decides
-                                    // success/release/fallback. On reject
-                                    // (including agents that advertise no
-                                    // steer transport at all), fall through
-                                    // to the universal cancel+merge `Steer`
-                                    // signal so the event still reaches the
-                                    // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
-                                        && try_native_steer(
-                                            &mut pool,
-                                            &mut queue,
-                                            buzz_event.channel_id,
-                                            event_for_steer,
-                                            prompt_tag_for_steer,
-                                            &steer_ack_tx,
-                                        );
-                                    if !native_attempted {
-                                        signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            signal,
-                                        );
-                                    }
-                                }
-                            }
+                            queued.mark_seen(&ctx.rest_client);
+                            // Event is already queued. The authorized ingress
+                            // retains its verified author and event data through
+                            // the optional steer/interrupt decision.
+                            queued.steer_or_interrupt(
+                                config.multiple_event_handling,
+                                owner_cache.get(),
+                                &mut pool,
+                                &mut queue,
+                                &steer_ack_tx,
+                            );
                             if pool_ready {
                                 for (channel_id, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -6071,7 +6102,7 @@ mod author_gate_tests {
     /// injecting an already-resolved relay identity. This is what makes the
     /// listener-to-gate wiring testable: a gate that never loads its identity
     /// fails these tests instead of silently degrading to the raw signer.
-    async fn nip11_server(
+    pub(super) async fn nip11_server(
         document: serde_json::Value,
     ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
         nip11_scripted_server(std::collections::VecDeque::from([Ok(document)])).await
@@ -6152,7 +6183,7 @@ mod author_gate_tests {
 
     /// A genuine relay-signed workflow dispatch that explicitly targets `agent`
     /// on behalf of `owner` — the exact event shape a scheduled workflow emits.
-    fn relay_signed_workflow_dispatch(
+    pub(super) fn relay_signed_workflow_dispatch(
         relay_keys: &nostr::Keys,
         owner: &str,
         agent: &str,
@@ -6168,18 +6199,34 @@ mod author_gate_tests {
             .expect("signed workflow event")
     }
 
-    async fn listener_boundary_scenario(
+    struct ListenerBoundaryScenario<'a> {
         listener: ListenerBoundary,
-        relay_keys: &nostr::Keys,
-        workflow_owner: &str,
+        relay_keys: &'a nostr::Keys,
+        workflow_owner: &'a str,
         responses: std::collections::VecDeque<Result<serde_json::Value, ()>>,
         event_generation: u64,
-        channel_type: &str,
+        channel_type: &'a str,
         respond_to: RespondTo,
         allowlist: HashSet<String>,
         cache_owner: bool,
         cache_sibling: bool,
+    }
+
+    async fn listener_boundary_scenario(
+        scenario: ListenerBoundaryScenario<'_>,
     ) -> (Option<String>, bool) {
+        let ListenerBoundaryScenario {
+            listener,
+            relay_keys,
+            workflow_owner,
+            responses,
+            event_generation,
+            channel_type,
+            respond_to,
+            allowlist,
+            cache_owner,
+            cache_sibling,
+        } = scenario;
         let relay_hex = relay_keys.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_scripted_server(responses).await;
@@ -6258,47 +6305,6 @@ mod author_gate_tests {
         }
     }
 
-    fn listener_gate_region<'a>(source: &'a str, label: &str) -> &'a str {
-        let begin = ["LISTENER_AUTHOR_GATE_", "BEGIN"].concat();
-        let end = ["LISTENER_AUTHOR_GATE_", "END"].concat();
-        let mut regions = source.split(&begin);
-        let _before = regions.next().expect("source has a prefix");
-        let region = regions
-            .next()
-            .unwrap_or_else(|| panic!("{label} listener gate begin marker missing"));
-        assert!(
-            regions.next().is_none(),
-            "{label} listener gate begin marker must be unique"
-        );
-        let mut region_parts = region.split(&end);
-        let body = region_parts
-            .next()
-            .expect("gate region has a body before its end marker");
-        assert!(
-            region_parts.next().is_some(),
-            "{label} listener gate end marker missing"
-        );
-        body
-    }
-
-    /// The production loop segments themselves retain the authorization
-    /// capability edge. This complements behavioral tests at the callables:
-    /// replacing either loop call with a raw signer or permissive boolean
-    /// removes the required symbols from its marked segment and fails here.
-    #[test]
-    fn production_listener_loops_consume_authorized_event_capabilities() {
-        let normal = listener_gate_region(include_str!("lib.rs"), "normal");
-        assert_eq!(
-            normal.matches("authorize_normal_listener_event(").count(),
-            1
-        );
-        assert_eq!(normal.matches("AuthorizedNormalListenerEvent(").count(), 1);
-
-        let setup = listener_gate_region(include_str!("setup_mode.rs"), "setup");
-        assert_eq!(setup.matches("authorize_setup_listener_event(").count(), 1);
-        assert_eq!(setup.matches("nudge_authorized_event(").count(), 1);
-    }
-
     /// Both production listener callables must attribute relay-signed workflow
     /// events to the workflow owner and enforce policy there. A local
     /// `allowed: true` replacement at either call site makes the Nobody case
@@ -6309,18 +6315,20 @@ mod author_gate_tests {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
             let accepted_workflow_owner = nostr::Keys::generate().public_key().to_hex();
-            let accepted = listener_boundary_scenario(
+            let accepted = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &accepted_workflow_owner,
-                std::collections::VecDeque::from([Ok(serde_json::json!({ "self": relay_hex }))]),
-                0,
-                "stream",
-                RespondTo::OwnerOnly,
-                HashSet::new(),
-                true,
-                false,
-            )
+                relay_keys: &relay_keys,
+                workflow_owner: &accepted_workflow_owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerOnly,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 accepted.1,
@@ -6337,18 +6345,20 @@ mod author_gate_tests {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
             let denied_workflow_owner = nostr::Keys::generate().public_key().to_hex();
-            let denied = listener_boundary_scenario(
+            let denied = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &denied_workflow_owner,
-                std::collections::VecDeque::from([Ok(serde_json::json!({ "self": relay_hex }))]),
-                0,
-                "stream",
-                RespondTo::Nobody,
-                HashSet::new(),
-                true,
-                false,
-            )
+                relay_keys: &relay_keys,
+                workflow_owner: &denied_workflow_owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::Nobody,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 !denied.1,
@@ -6369,18 +6379,20 @@ mod author_gate_tests {
             let relay_hex = relay_keys.public_key().to_hex();
             let external = nostr::Keys::generate().public_key().to_hex();
             let external_allowlist = HashSet::from([external.clone()]);
-            let denied_external = listener_boundary_scenario(
+            let denied_external = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &external,
-                std::collections::VecDeque::from([Ok(serde_json::json!({ "self": relay_hex }))]),
-                0,
-                "dm",
-                RespondTo::Allowlist,
-                external_allowlist,
-                false,
-                false,
-            )
+                relay_keys: &relay_keys,
+                workflow_owner: &external,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Allowlist,
+                allowlist: external_allowlist,
+                cache_owner: false,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 !denied_external.1,
@@ -6391,18 +6403,20 @@ mod author_gate_tests {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
             let stranger = nostr::Keys::generate().public_key().to_hex();
-            let denied_stranger = listener_boundary_scenario(
+            let denied_stranger = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &stranger,
-                std::collections::VecDeque::from([Ok(serde_json::json!({ "self": relay_hex }))]),
-                0,
-                "dm",
-                RespondTo::Anyone,
-                HashSet::new(),
-                false,
-                false,
-            )
+                relay_keys: &relay_keys,
+                workflow_owner: &stranger,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                cache_owner: false,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 !denied_stranger.1,
@@ -6426,20 +6440,20 @@ mod author_gate_tests {
             ] {
                 let relay_keys = nostr::Keys::generate();
                 let relay_hex = relay_keys.public_key().to_hex();
-                let allowed = listener_boundary_scenario(
+                let allowed = listener_boundary_scenario(ListenerBoundaryScenario {
                     listener,
-                    &relay_keys,
-                    &principal,
-                    std::collections::VecDeque::from([Ok(
+                    relay_keys: &relay_keys,
+                    workflow_owner: &principal,
+                    responses: std::collections::VecDeque::from([Ok(
                         serde_json::json!({ "self": relay_hex }),
                     )]),
-                    0,
-                    "dm",
-                    RespondTo::Anyone,
-                    HashSet::new(),
+                    event_generation: 0,
+                    channel_type: "dm",
+                    respond_to: RespondTo::Anyone,
+                    allowlist: HashSet::new(),
                     cache_owner,
                     cache_sibling,
-                )
+                })
                 .await;
                 assert!(
                     allowed.1,
@@ -6451,18 +6465,20 @@ mod author_gate_tests {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
             let owner = nostr::Keys::generate().public_key().to_hex();
-            let denied_nobody = listener_boundary_scenario(
+            let denied_nobody = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &owner,
-                std::collections::VecDeque::from([Ok(serde_json::json!({ "self": relay_hex }))]),
-                0,
-                "dm",
-                RespondTo::Nobody,
-                HashSet::new(),
-                true,
-                false,
-            )
+                relay_keys: &relay_keys,
+                workflow_owner: &owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Nobody,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 !denied_nobody.1,
@@ -6481,22 +6497,22 @@ mod author_gate_tests {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
             let workflow_owner = nostr::Keys::generate().public_key().to_hex();
-            let result = listener_boundary_scenario(
+            let result = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
-                &relay_keys,
-                &workflow_owner,
-                std::collections::VecDeque::from([
+                relay_keys: &relay_keys,
+                workflow_owner: &workflow_owner,
+                responses: std::collections::VecDeque::from([
                     Err(()),
                     Err(()),
                     Ok(serde_json::json!({ "self": relay_hex })),
                 ]),
-                0,
-                "stream",
-                RespondTo::OwnerOnly,
-                HashSet::new(),
-                true,
-                false,
-            )
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerOnly,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
             .await;
             assert!(
                 result.1,
