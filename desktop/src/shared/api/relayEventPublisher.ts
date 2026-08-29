@@ -5,7 +5,7 @@ import { PUBLISH_TIMEOUT_MS } from "@/shared/api/relayClientTimings";
 
 type PublishSession = {
   generation: () => number;
-  connected: () => boolean;
+  ownership: () => number;
   pendingEvents: Map<string, PendingEvent>;
   send: (payload: unknown[], generation: number) => Promise<void>;
   reconnect: () => Promise<number>;
@@ -20,11 +20,12 @@ export async function publishSessionEvent(
   timeoutMessage: string,
   sendErrorMessage: string,
 ): Promise<RelayEvent> {
-  const publishGeneration = session.generation();
+  const publishOwnership = session.ownership();
   await waitForRateLimit();
-  if (publishGeneration !== session.generation() || !session.connected()) {
+  if (publishOwnership !== session.ownership()) {
     throw new Error("Relay disconnected for community switch.");
   }
+  const publishGeneration = session.generation();
 
   return new Promise<RelayEvent>((resolve, reject) => {
     const timeout = window.setTimeout(() => {
@@ -40,6 +41,7 @@ export async function publishSessionEvent(
         // A disconnect may already have rejected this operation while the send
         // was in flight. Its late failure must not reset the replacement session.
         if (
+          publishOwnership !== session.ownership() ||
           publishGeneration !== session.generation() ||
           session.pendingEvents.get(event.id) !== pendingEvent
         ) {
@@ -55,6 +57,7 @@ export async function publishSessionEvent(
         try {
           retryGeneration = await session.reconnect();
           if (
+            publishOwnership !== session.ownership() ||
             session.generation() !== retryGeneration ||
             session.pendingEvents.get(event.id) !== pendingEvent
           ) {
@@ -69,7 +72,9 @@ export async function publishSessionEvent(
           window.clearTimeout(timeout);
           session.pendingEvents.delete(event.id);
           reject(
-            retryGeneration !== null && session.generation() === retryGeneration
+            publishOwnership === session.ownership() &&
+              retryGeneration !== null &&
+              session.generation() === retryGeneration
               ? session.recoverSocketFailure(retryError, sendError.message)
               : session.normalizeError(retryError, sendError.message),
           );

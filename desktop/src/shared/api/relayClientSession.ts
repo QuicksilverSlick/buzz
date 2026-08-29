@@ -93,6 +93,7 @@ export class RelayClient {
   private notifyReconnectListeners = false;
   private onMessageChannel: Channel<unknown> | null = null;
   private connectionGeneration = 0;
+  private sessionEpoch = 0;
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
@@ -122,6 +123,7 @@ export class RelayClient {
       this.stabilityTimer = null;
     }
     this.stallWatchdog.stop();
+    this.sessionEpoch++;
     this.connectionGeneration++;
     this.keepAliveRequested = false;
     this.relayUrl = null;
@@ -723,7 +725,7 @@ export class RelayClient {
     return publishSessionEvent(
       {
         generation: () => this.connectionGeneration,
-        connected: () => this.wsId !== null,
+        ownership: () => this.sessionEpoch,
         pendingEvents: this.pendingEvents,
         send: (payload, generation) =>
           this.sendRawForGeneration(payload, generation),

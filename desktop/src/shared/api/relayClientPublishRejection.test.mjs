@@ -197,6 +197,30 @@ test("an accepted OK still resolves the pending publish", async () => {
   assert.equal(outcome.value.id, eventId);
 });
 
+test("a publish started during an ordinary outage reconnects once and settles", async () => {
+  reset();
+  const client = new RelayClient();
+  const event = { id: "0".repeat(64), kind: 1 };
+  let reconnects = 0;
+  client.ensureConnected = async () => {
+    reconnects++;
+    client.connectionGeneration++;
+    client.wsId = 8;
+    return client.connectionGeneration;
+  };
+
+  const published = client.publishEvent(event, "timed out", "send failed");
+  await flushUntil(() => eventFrames().length === 1);
+
+  assert.equal(reconnects, 1);
+  assert.equal(sendAttempts.length, 1);
+  assert.equal(client.pendingEvents.has(event.id), true);
+
+  await deliver(client, ["OK", event.id, true, ""]);
+  assert.equal(await published, event);
+  assert.equal(client.pendingEvents.size, 0);
+});
+
 test("a community switch while gated cannot publish through its replacement socket", async () => {
   reset();
   activateRateLimit(4);
