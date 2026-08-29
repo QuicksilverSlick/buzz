@@ -23,6 +23,8 @@
 //!   AUTH_WORKER_INTENT        — auto | userinitiated | headless.
 //!   AUTH_WORKER_SCRIPT        — approve | deny | failopen.
 //!   AUTH_WORKER_RESULT        — path to write the JSON outcome to.
+//!   AUTH_WORKER_REJECTED      — (optional) rejected token bytes passed to
+//!                               `acquire_with_intent`; absent means no rejection.
 //!   AUTH_WORKER_READY_MARKER  — (optional) written once the source is built,
 //!                               before acquisition, so the parent can release
 //!                               several workers into a genuine lock race.
@@ -185,7 +187,13 @@ async fn main() {
         }
     }
 
-    let (result, bearer) = match src.acquire_with_intent(intent, None).await {
+    let (result, bearer) = match src
+        .acquire_with_intent(
+            intent,
+            std::env::var("AUTH_WORKER_REJECTED").ok().as_deref(),
+        )
+        .await
+    {
         Ok(token) => ("ok".to_owned(), Some(token)),
         Err(e) => (e.code().to_owned(), None),
     };

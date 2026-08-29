@@ -498,8 +498,13 @@ impl PkceOAuthTokenSource {
     /// `write_private_cache` path creates files with default ACLs, which do
     /// not enforce owner-only access. Disk persistence is intentionally
     /// disabled until a Windows-specific owner-only DACL is implemented (see
-    /// the `create_private_temp_file` non-Unix branch). The cost is re-auth
-    /// per process on Windows — correct and safe until the guarantee exists.
+    /// the `create_private_temp_file` non-Unix branch). The cost is that each
+    /// process performs its own acquisition on non-Unix — cross-process
+    /// *success* handoff requires the shared on-disk cache, so processes
+    /// serialize through the lock but the loser repeats the flow rather than
+    /// reading the winner's token. Cross-process *failure* adoption still works
+    /// because it uses the attempt sidecar (no token bytes). Correct and
+    /// safe until owner-only DACL persistence exists.
     fn save(&self, state: &mut Option<CachedToken>, token: CachedToken) -> Result<(), AgentError> {
         self.persist(&token)?;
         *state = Some(token);
@@ -539,8 +544,16 @@ impl PkceOAuthTokenSource {
     /// fresh process, while the refresh token — which was *not* rejected and
     /// drives this very recovery — stays intact. Each layer is neutralized only
     /// when its access token byte-equals `rejected`, so a sibling's
-    /// concurrently-written distinct replacement is preserved. Best-effort on
-    /// disk: a write failure only means the next caller re-refreshes.
+    /// concurrently-written distinct replacement is preserved.
+    ///
+    /// Disk neutralization is fail-closed: on atomic-rewrite failure (e.g.
+    /// non-writable parent directory), the implementation falls back to an
+    /// in-place truncating overwrite of the existing file (no parent-dir perms
+    /// required), and finally to `remove_file`. If all three fail the file
+    /// survives; `cached_hit`'s `rejected`-aware filter protects this caller's
+    /// path, but a later plain `bearer()` could re-read the unexpired file.
+    /// That residual corner is outside the normal threat model (owner actively
+    /// hardening their own cache file to 0400 against their own process).
     fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
         let Some(rej) = rejected else { return };
         // Neutralize the in-memory entry: force-expire so `is_expired` excludes
@@ -551,20 +564,43 @@ impl PkceOAuthTokenSource {
                 tok.expires_at = Some(0);
             }
         }
-        // Neutralize the on-disk copy. If the rewrite fails, remove the cache
-        // file: a later plain `bearer()` (no `rejected`) or a freshly constructed
-        // source reads disk via `cached_hit`'s disk branch — leaving an
-        // unexpired-but-401'd file would cause them to serve the proven-dead
-        // token. Removing it is safe: the refresh token is already in memory for
-        // the current recovery, and a successful refresh writes a fresh token back
-        // so the next caller gets a valid entry. If removal also fails we are no
-        // worse than before (`cached_hit`'s `rejected`-aware filter still protects
-        // the calling 401-recovery path itself).
+        // Neutralize the on-disk copy. Prefer atomic rewrite via `persist()`
+        // (temp-file + rename, owner-only permissions). If the atomic rewrite
+        // fails (e.g. the parent directory denies temp-file creation), fall back
+        // to in-place truncating overwrite: `OpenOptions::write().truncate(true)`
+        // on the existing file does not require parent-directory write permission,
+        // only that the file itself is owner-writable (0600, which our cache files
+        // always are). As a last resort, attempt `remove_file`. The two-stage
+        // fallback covers the proven hostile case: a 0600 token file under a
+        // 0500 parent — the atomic path cannot create the temp file (EACCES), but
+        // the in-place write succeeds because the file's own mode permits it.
+        // Residual out of threat model: if the owner explicitly chmodded their own
+        // cache file to 0400 before this runs, the in-place write also fails and
+        // we fall through to `remove_file`; if that too fails, the file survives
+        // with `expires_at = 0` still NOT written — `cached_hit`'s
+        // `rejected`-aware filter still protects the calling 401-recovery path,
+        // but a later plain `bearer()` could re-adopt the file. That corner is
+        // not in the normal threat model (a user actively hardening their own
+        // cache file against their own process).
         if let Some(mut disk) = read_cache(&self.cache_path) {
             if disk.access_token == rej {
                 disk.expires_at = Some(0);
                 if self.persist(&disk).is_err() {
-                    let _ = fs::remove_file(&self.cache_path);
+                    // Atomic rewrite failed. Try in-place truncating overwrite —
+                    // does not need parent-dir write permission, only the file's
+                    // own mode.
+                    let inplace_ok = serde_json::to_vec_pretty(&disk).ok().is_some_and(|body| {
+                        use std::io::Write as _;
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(&self.cache_path)
+                            .and_then(|mut f| f.write_all(&body))
+                            .is_ok()
+                    });
+                    if !inplace_ok {
+                        let _ = fs::remove_file(&self.cache_path);
+                    }
                 }
             }
         }
@@ -818,6 +854,18 @@ impl PkceOAuthTokenSource {
             //     with a typed error before caching it — so the rerun never
             //     hands us back our `rejected` on any path.
             //
+            //   * It may publish a terminal failure from a *rejection-relative*
+            //     cause — e.g. refresh reissued the leader's own `rejected` bytes
+            //     and `finish()` returned `RefreshRejected`. That failure is valid
+            //     only for the leader's specific rejected token; a joiner with a
+            //     *different* `rejected` (or none) should rerun: its refresh may
+            //     yield a valid token. The leader publishes its rejected-token
+            //     SHA-256 digest so joiners can compare without inspecting the
+            //     token bytes directly. A digest mismatch triggers an `acquire_leader`
+            //     rerun (the slot is already evicted). A false rerun (non-rejection
+            //     failure with digest mismatch) costs one network round-trip and
+            //     stays headless — far better than silently adopting a wrong denial.
+            //
             //   * It may publish a terminal failure even though a sibling wrote
             //     a valid replacement into the cache while we waited. We
             //     re-check the cache cheaply before adopting the failure — a
@@ -829,10 +877,17 @@ impl PkceOAuthTokenSource {
             //     serialize behind a *new* leader holding `state` across its
             //     ~60s browser flow. The in-memory memo isn't load-bearing
             //     here — the next real acquisition re-reads under the lock.
-            match slot.wait().await {
+            let (leader_rejected_digest, outcome) = slot.wait().await;
+            match outcome {
                 Ok(token) if Some(token.as_str()) != rejected => return Ok(token),
                 Ok(_) => return self.acquire_leader(intent, rejected).await,
                 Err(shared) => {
+                    // Reject-digest mismatch: the leader's failure was
+                    // rejection-relative to ITS OWN `rejected` token, not ours.
+                    // Rerun so we can pursue our own refresh/browser path.
+                    if leader_rejected_digest != digest_of(rejected) {
+                        return self.acquire_leader(intent, rejected).await;
+                    }
                     if let Some(hit) = self.usable_from_disk(rejected) {
                         return Ok(hit);
                     }
@@ -847,7 +902,7 @@ impl PkceOAuthTokenSource {
         // dead slot that turns later callers into joiners of nothing.
         let guard = LeaderGuard::new(key, slot);
         let result = self.acquire_leader(intent, rejected).await;
-        guard.complete(result)
+        guard.complete(result, digest_of(rejected))
     }
 
     /// The leader's slow-path body: take the cross-process lock, then run the
@@ -954,11 +1009,28 @@ impl PkceOAuthTokenSource {
         //       `UserInitiated` waiter never inherits an `Auto`/`Headless`
         //       failure (different intent, different promise to the user);
         //   (c) the recorded result is a recognized terminal failure — `"ok"`
-        //       and unrecognized codes fall through to a normal attempt.
+        //       and unrecognized codes fall through to a normal attempt;
+        //   (d) the recorded rejected_digest matches ours — a failure caused by
+        //       the predecessor's specific rejected token is not valid for a
+        //       caller with a *different* rejected token (both-`None` matches).
+        //       A digest mismatch triggers a normal attempt; a false rerun on a
+        //       non-rejection-relative failure costs one network round-trip and
+        //       stays headless — preferable to silently serving a wrong denial.
+        //
+        // Adoptors do NOT write a new attempt record: adopting does not
+        // represent new work. Writing one would advance the generation so a
+        // third caller that arrives after the adoption (snapshot = new gen) sees
+        // no advance and tries its own attempt — but a fourth arriving while the
+        // third runs would inherit the adopter's re-written record, relaying the
+        // original failure indefinitely. The original record already has the
+        // correct generation; subsequent waiters with snapshot < original gen
+        // still adopt from it directly.
         if let Some(rec) = read_attempt(attempt_path) {
-            if rec.generation > snapshot_gen && rec.intent == intent.as_str() {
+            if rec.generation > snapshot_gen
+                && rec.intent == intent.as_str()
+                && rec.rejected_digest == digest_of(rejected)
+            {
                 if let Some(err) = AuthError::from_code(&rec.result) {
-                    write_attempt(attempt_path, intent, &rec.result);
                     return Err(err);
                 }
             }
@@ -980,7 +1052,7 @@ impl PkceOAuthTokenSource {
                     // the token cache — a waiter that wins the lock after us finds
                     // the token via `cached_hit` without reaching the adoption check.
                     if let Err(ref e) = result {
-                        write_attempt(attempt_path, intent, e.code());
+                        write_attempt(attempt_path, intent, e.code(), rejected);
                     }
                     return result;
                 }
@@ -1015,7 +1087,7 @@ impl PkceOAuthTokenSource {
             } else {
                 AuthError::NoCredential
             };
-            write_attempt(attempt_path, intent, err.code());
+            write_attempt(attempt_path, intent, err.code(), rejected);
             return Err(err);
         }
 
@@ -1053,14 +1125,14 @@ impl PkceOAuthTokenSource {
                     Ok(_) => "ok",
                     Err(e) => e.code(),
                 };
-                write_attempt(attempt_path, intent, code);
+                write_attempt(attempt_path, intent, code, rejected);
                 result
             }
             Err(e) => {
                 if e.is_cooldown_worthy() {
                     write_cooldown(&cooldown_path, &e);
                 }
-                write_attempt(attempt_path, intent, e.code());
+                write_attempt(attempt_path, intent, e.code(), rejected);
                 Err(e)
             }
         }
@@ -1150,6 +1222,14 @@ impl TokenSource for PkceOAuthTokenSource {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/// SHA-256 hex digest of `rejected` token bytes, or `None` when there is no
+/// rejected token. Used to scope in-process and cross-process failure adoption
+/// to the specific token that was rejected — a joiner carrying a *different*
+/// rejected token (or none) must not inherit a rejection-relative failure.
+fn digest_of(rejected: Option<&str>) -> Option<String> {
+    rejected.map(|r| hex::encode(sha2::Sha256::digest(r.as_bytes())))
+}
 
 /// Aborts a spawned task when dropped. Used to guarantee the localhost
 /// callback server doesn't outlive a failed/abandoned PKCE attempt.
@@ -1260,6 +1340,16 @@ struct AttemptRecord {
     /// Error code of the terminal failure, or `"ok"` on success. Matches
     /// [`AuthError::code`] / the `"ok"` sentinel.
     result: String,
+    /// SHA-256 hex digest of the token bytes that the completing caller had
+    /// marked as `rejected`, or `None` when the caller carried no rejected
+    /// token. A waiter adopts only when its own digest matches: a failure caused
+    /// by the leader's specific rejected token is not valid for a waiter with a
+    /// *different* rejected token (or none) — its refresh may yield a live
+    /// token. Both-`None` is a match. A mismatched digest triggers a normal
+    /// attempt; a false rerun on a non-rejection failure costs one network round-
+    /// trip and stays headless — preferable to silently adopting a wrong denial.
+    #[serde(default)]
+    rejected_digest: Option<String>,
 }
 
 /// Read the attempt sidecar at `path`, if any. Returns `None` when absent,
@@ -1279,12 +1369,13 @@ fn read_attempt(path: &Path) -> Option<AttemptRecord> {
 /// any caller's pre-queue snapshot. An intervening different-intent attempt
 /// that advanced the sidecar between snapshot and lock-acquire is reflected
 /// correctly: the next waiter's comparison still sees a real advance.
-fn write_attempt(path: &Path, intent: AuthIntent, result: &str) {
+fn write_attempt(path: &Path, intent: AuthIntent, result: &str, rejected: Option<&str>) {
     let current_gen = read_attempt(path).map_or(0, |r| r.generation);
     let record = AttemptRecord {
         generation: current_gen.wrapping_add(1),
         intent: intent.as_str().to_owned(),
         result: result.to_owned(),
+        rejected_digest: digest_of(rejected),
     };
     if let Ok(body) = serde_json::to_vec(&record) {
         let _ = write_private_cache(path, &body);
@@ -1422,13 +1513,20 @@ fn inflight_registry() -> std::sync::MutexGuard<'static, HashMap<InflightKey, Ar
     INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The value published by a leader to its joiners: the leader's rejected-token
+/// SHA-256 digest (non-secret identity, `None` when the leader carried no
+/// `rejected`) paired with the attempt result. Joiners use the digest to detect
+/// a mismatch — the leader's rejection-relative failure is not valid for a
+/// joiner that carried a *different* rejected token.
+type SlotPublish = (Option<String>, Result<String, AuthError>);
+
 /// The shared result of one leader's auth attempt, awaited by any joiner that
 /// arrived while the leader was in flight. A `watch` channel gives us
 /// publish-once plus wait-for-publish in one primitive: the leader publishes
 /// exactly once through [`LeaderGuard`]; joiners clone the published result.
 struct InflightSlot {
-    tx: watch::Sender<Option<Result<String, AuthError>>>,
-    rx: watch::Receiver<Option<Result<String, AuthError>>>,
+    tx: watch::Sender<Option<SlotPublish>>,
+    rx: watch::Receiver<Option<SlotPublish>>,
 }
 
 impl InflightSlot {
@@ -1437,7 +1535,7 @@ impl InflightSlot {
         Self { tx, rx }
     }
 
-    /// Block until the leader publishes, then clone out its result.
+    /// Block until the leader publishes, then clone out `(rejected_digest, result)`.
     ///
     /// `borrow_and_update` marks the current value seen before awaiting, so a
     /// publish that lands between the read and the `changed()` await is not a
@@ -1445,22 +1543,22 @@ impl InflightSlot {
     /// A closed channel (leader dropped without publishing — which
     /// [`LeaderGuard`]'s `Drop` prevents) surfaces as a transient so the caller
     /// retries rather than hangs.
-    async fn wait(&self) -> Result<String, AuthError> {
+    async fn wait(&self) -> SlotPublish {
         let mut rx = self.rx.clone();
         loop {
-            if let Some(result) = rx.borrow_and_update().clone() {
-                return result;
+            if let Some(publish) = rx.borrow_and_update().clone() {
+                return publish;
             }
             if rx.changed().await.is_err() {
-                return Err(AuthError::NetworkUnavailable);
+                return (None, Err(AuthError::NetworkUnavailable));
             }
         }
     }
 
-    /// Publish `result` to every waiting joiner. A send error means no joiners
-    /// remain, which is fine.
-    fn publish(&self, result: Result<String, AuthError>) {
-        let _ = self.tx.send(Some(result));
+    /// Publish `(rejected_digest, result)` to every waiting joiner. A send
+    /// error means no joiners remain, which is fine.
+    fn publish(&self, rejected_digest: Option<String>, result: Result<String, AuthError>) {
+        let _ = self.tx.send(Some((rejected_digest, result)));
     }
 }
 
@@ -1484,15 +1582,20 @@ impl LeaderGuard {
         }
     }
 
-    /// Normal completion: evict the slot, publish `result` to joiners, and
-    /// return it to the leader. Evicting *before* publishing means a caller
-    /// arriving after this point starts a fresh attempt (a later explicit
-    /// retry may launch), while joiners already holding the slot still receive
-    /// the result. `Drop` covers the cancel/panic path.
-    fn complete(mut self, result: Result<String, AuthError>) -> Result<String, AuthError> {
+    /// Normal completion: evict the slot, publish `(rejected_digest, result)`
+    /// to joiners, and return `result` to the leader. Evicting *before*
+    /// publishing means a caller arriving after this point starts a fresh
+    /// attempt (a later explicit retry may launch), while joiners already
+    /// holding the slot still receive the result. `Drop` covers the cancel/panic
+    /// path.
+    fn complete(
+        mut self,
+        result: Result<String, AuthError>,
+        rejected_digest: Option<String>,
+    ) -> Result<String, AuthError> {
         self.done = true;
         Self::evict(&self.key, &self.slot);
-        self.slot.publish(result.clone());
+        self.slot.publish(rejected_digest, result.clone());
         result
     }
 
@@ -1519,7 +1622,7 @@ impl Drop for LeaderGuard {
         // fresh, and wake joiners with a transient error so they retry rather
         // than hang on a leader that will never publish.
         Self::evict(&self.key, &self.slot);
-        self.slot.publish(Err(AuthError::NetworkUnavailable));
+        self.slot.publish(None, Err(AuthError::NetworkUnavailable));
     }
 }
 
@@ -2109,7 +2212,7 @@ mod tests {
         let key: InflightKey = (source.lock_path(), AuthIntent::Headless);
         let slot = Arc::new(InflightSlot::new());
         inflight_registry().insert(key.clone(), slot.clone());
-        slot.publish(Err(AuthError::RefreshRejected));
+        slot.publish(None, Err(AuthError::RefreshRejected));
 
         // Hold `state` for the whole acquisition: the fast-path `try_lock` and
         // the old recheck's `try_lock` both fail, forcing the contended branch.

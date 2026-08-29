@@ -590,6 +590,7 @@ async fn test_browser_open_failure_is_typed_and_retryable_by_user() {
     assert_eq!(approve_opener.call_count(), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_headless_dead_refresh_returns_refresh_rejected_without_browser() {
     let stub = spawn_stub(true).await; // refresh grants 401
@@ -625,6 +626,7 @@ async fn test_headless_dead_refresh_returns_refresh_rejected_without_browser() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_interactive_dead_refresh_converts_to_browser() {
     let stub = spawn_stub(true).await; // refresh grants 401
@@ -655,6 +657,7 @@ async fn test_interactive_dead_refresh_converts_to_browser() {
     assert_eq!(stub.code_grants.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_headless_expired_token_live_refresh_recovers_silently() {
     let stub = spawn_stub(false).await; // refresh succeeds
@@ -682,6 +685,7 @@ async fn test_headless_expired_token_live_refresh_recovers_silently() {
     assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_interactive_login_reuses_valid_cache_without_browser() {
     let stub = spawn_stub(false).await;
@@ -738,6 +742,7 @@ fn seed_fresh_rejectable(cfg: &PkceOAuthConfig, cache_dir: &std::path::Path) -> 
     access.to_string()
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_auto_rejected_fresh_bearer_with_dead_refresh_launches_browser() {
     let stub = spawn_stub(true).await; // refresh grants 401
@@ -761,6 +766,7 @@ async fn test_auto_rejected_fresh_bearer_with_dead_refresh_launches_browser() {
     assert_eq!(stub.code_grants.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_headless_rejected_fresh_bearer_with_dead_refresh_returns_refresh_rejected() {
     let stub = spawn_stub(true).await; // refresh grants 401
@@ -792,6 +798,7 @@ async fn test_headless_rejected_fresh_bearer_with_dead_refresh_returns_refresh_r
 // `RefreshRejected`, which would misreport a transient fault as a rotated
 // token and (for interactive intents) prompt a needless sign-in.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_refresh_timeout_is_network_unavailable_not_rejected() {
     // The token endpoint hangs far longer than the injected per-request HTTP
@@ -845,6 +852,7 @@ async fn test_refresh_timeout_is_network_unavailable_not_rejected() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_refresh_server_error_is_network_unavailable_not_rejected() {
     let stub = spawn_stub_with(RefreshMode::ServerError).await; // refresh 500s
@@ -892,6 +900,7 @@ async fn test_refresh_server_error_is_network_unavailable_not_rejected() {
 // and never pop a browser. The classifier keys on the OAuth error body, not
 // the bare status class.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_refresh_400_invalid_grant_is_dead_grant_not_network() {
     // A 400 (not just 401) carrying `invalid_grant` is still a dead refresh
@@ -927,6 +936,7 @@ async fn test_refresh_400_invalid_grant_is_dead_grant_not_network() {
     assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_refresh_non_invalid_grant_4xx_is_network_unavailable_not_rejected() {
     // Every 4xx whose OAuth body is NOT `invalid_grant` is a request/config or
@@ -1099,6 +1109,7 @@ async fn test_userinitiated_joiner_does_not_inherit_auto_cooldown_result() {
 // dead. The joiner must instead detect the collision and run its own bounded
 // acquisition, obtaining a token that differs from its `rejected`.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_joiner_never_receives_its_own_rejected_token() {
     // Two concurrent `Headless` 401-recovery callers on one key, each rejecting
@@ -1182,6 +1193,7 @@ async fn test_joiner_never_receives_its_own_rejected_token() {
 // this rerun terminate with a typed auth error before caching the rejected
 // token rather than returning it.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
     // A sticky provider returns ONE fixed access token on every refresh. Leader
@@ -1237,6 +1249,77 @@ async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
     );
 }
 
+// ---- a joiner with a DIFFERENT rejected must not inherit a rejection-relative failure ---
+//
+// When a leader A rejects token X (its own `rejected`) and the refresh yields
+// X again — causing `finish()` to return `RefreshRejected` — that failure is
+// scoped to A's specific rejected token. A joiner B waiting on the same slot
+// with a *different* rejected token Y must NOT adopt that failure: the refresh
+// grant of X is a perfectly valid token for B (B only rejected Y). The slot
+// publishes A's rejected-token digest; B detects the mismatch and reruns its
+// own `acquire_leader` — which finds X already in the cache from A's successful
+// write (X was issued but not cached because A had it as `rejected`, but in
+// Carl's scenario there was NO prior good token — the refresh just minted X
+// which IS good for B), and returns it.
+//
+// Concrete scenario: A rejected X, refresh re-issues X → A gets RefreshRejected.
+// B rejected Y (different), refresh would yield X for B → B succeeds.
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_joiner_with_different_rejected_does_not_inherit_leaders_rejection_failure() {
+    // Sticky provider always returns "X" on every refresh grant.
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("X")).await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    // A rejected "X" (same as what the provider always issues). The refresh
+    // re-issues "X", `finish()` returns RefreshRejected — the failure is
+    // rejection-relative to A's own rejected bytes.
+    //
+    // B rejected "Y" (different). It should NOT inherit A's RefreshRejected:
+    // the provider can give B "X", which is valid for B.
+    let a = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    let b = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+
+    let (ra, rb) = tokio::join!(
+        a.acquire_with_intent(AuthIntent::Headless, Some("X")),
+        b.acquire_with_intent(AuthIntent::Headless, Some("Y")),
+    );
+
+    assert_eq!(
+        ra,
+        Err(AuthError::RefreshRejected),
+        "A's refresh re-issued its own rejected token X — typed failure for A"
+    );
+    assert_eq!(
+        rb,
+        Ok("X".to_string()),
+        "B's rejected was Y (not X), so B reruns and its refresh yields X — a valid token for B"
+    );
+    assert_eq!(
+        opener.call_count(),
+        0,
+        "headless callers never open a browser"
+    );
+    // At least two refresh grants: A's, then B's rerun.
+    assert!(
+        stub.refresh_grants.load(Ordering::SeqCst) >= 2,
+        "B must have run its own refresh (rerun, not adoption)"
+    );
+}
+
 // ---- a browser success that re-issues the rejected bytes must fail typed ---
 //
 // The 401-recovery invariant lives at `finish`'s persistence boundary, so it
@@ -1248,6 +1331,7 @@ async fn test_joiner_rerun_reissuing_rejected_token_fails_typed_not_loop() {
 // bearer. A single interactive leader exercises the path; the colliding-joiner
 // rerun routes through the same boundary.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_interactive_browser_reissuing_rejected_token_fails_typed_not_loop() {
     // Refresh 401s (dead), so an interactive intent falls through to the
@@ -1309,6 +1393,7 @@ async fn test_interactive_browser_reissuing_rejected_token_fails_typed_not_loop(
 // prove the cache is untouched after the typed failure, on both the refresh and
 // the browser re-issue paths.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_sticky_refresh_rejection_does_not_poison_cache_for_later_callers() {
     // A sticky provider re-issues `sticky-token` on every refresh. A caller that
@@ -1366,6 +1451,7 @@ async fn test_sticky_refresh_rejection_does_not_poison_cache_for_later_callers()
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_sticky_browser_rejection_does_not_poison_cache_for_later_callers() {
     // Refresh is dead, so an interactive caller browses; the exchange stickily
@@ -1440,6 +1526,7 @@ async fn test_sticky_browser_rejection_does_not_poison_cache_for_later_callers()
 // it rejected, so no future caller and no fresh process can serve it, while the
 // refresh token — not rejected, and the engine of recovery — stays intact.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_rejected_fresh_token_is_neutralized_for_a_fresh_process() {
     // The cached access token `A` is locally UNEXPIRED, and the provider
@@ -1509,6 +1596,7 @@ async fn test_rejected_fresh_token_is_neutralized_for_a_fresh_process() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_rejected_fresh_token_is_neutralized_for_the_same_source() {
     // The in-memory layer of the same neutralization: after the SAME source
@@ -1554,6 +1642,7 @@ async fn test_rejected_fresh_token_is_neutralized_for_the_same_source() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_rejected_fresh_token_neutralized_when_recovery_browses() {
     // The browser variant: `A` is unexpired but its refresh token is dead, so
@@ -1606,37 +1695,48 @@ async fn test_rejected_fresh_token_neutralized_when_recovery_browses() {
     );
 }
 
-// ---- P1-1 fail-closed: disk neutralization and removal fallback -----------
+// ---- P1-1 fail-closed: disk neutralization with in-place fallback ---------
 //
-// `expire_rejected()` rewrites the on-disk token with `expires_at = 0`. If
-// the rewrite fails, it falls back to removing the cache file so a later plain
-// `bearer()` or a fresh source cannot serve the proven-dead token.
+// `expire_rejected()` neutralizes the on-disk token with three-stage fallback:
+// 1. Atomic rewrite via `persist()` (temp-file + rename, owner-only perms).
+// 2. In-place truncating overwrite via `OpenOptions::write().truncate(true)` —
+//    succeeds even when the parent directory is non-writable, because only the
+//    file's own mode matters for writing an existing file.
+// 3. `remove_file` as a last resort.
 //
-// The removal path fires when `write_private_cache` cannot rename the temp
-// file over the target (e.g. the target is a directory). After removal, a
-// fresh source finds no readable regular-file cache and must re-validate over
-// the network rather than serving the stale token.
-//
-// Note: if BOTH persist() and remove_file() fail (e.g. the directory is
-// read-only), the disk copy survives but read_private_cache's O_NOFOLLOW +
-// type-check rejects non-regular-file entries, so a replacement with a
-// directory still prevents serving the token. The in-memory layer is always
-// neutralized regardless of disk I/O, as proved by the tests below.
+// The primary case this tests: a 0600 token file under a 0500 parent directory.
+// Temp-file creation (for the atomic path) fails with EACCES; the in-place
+// write succeeds because the file itself is owner-writable. After the in-place
+// overwrite the file still exists but carries `expires_at = 0`, so a later
+// plain `bearer(None)` or a freshly constructed source reads the now-expired
+// entry and re-validates over the network instead of serving the dead token.
 
 #[cfg(unix)]
 #[tokio::test]
 async fn test_rejected_token_disk_neutralization_removes_file_when_rewrite_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     // Seed unexpired `A` with a live refresh. The provider stickily re-issues `A`.
     let stub = spawn_stub_with(RefreshMode::SucceedSticky("A")).await;
     let cache = TempDir::new().unwrap();
     let opener = ScriptedOpener::new(Script::Approve);
     let cfg = config(&stub, "/disco/a", cache.path());
-    let cache_file = cache_file_path(&cfg, cache.path());
 
-    // Seed the token file so it can be read at source-construction time.
+    // Create the token file inside a dedicated subdirectory so we can chmod
+    // just that subdirectory non-writable without affecting the test harness.
+    let token_dir = cache.path().join("protected");
+    std::fs::create_dir_all(&token_dir).unwrap();
+
+    // Override the config to use the protected subdir.
+    let cfg = PkceOAuthConfig {
+        cache_dir_override: Some(token_dir.clone()),
+        ..cfg
+    };
+    let cache_file = cache_file_path(&cfg, &token_dir);
+
     seed_cache(
         &cfg,
-        cache.path(),
+        &token_dir,
         json!({
             "access_token": "A",
             "refresh_token": "live-refresh",
@@ -1647,56 +1747,62 @@ async fn test_rejected_token_disk_neutralization_removes_file_when_rewrite_fails
     // Build the source: it reads `A` from disk into its in-memory cell.
     let src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
 
-    // Replace the on-disk cache file with a same-named DIRECTORY so that
-    // `write_private_cache`'s `rename(temp_regular_file, directory)` fails with
-    // EISDIR. The parent directory remains writable, so `remove_file` on the
-    // directory entry succeeds, clearing the cache path entirely.
-    // Note: `read_cache` inside `expire_rejected` runs before `persist()` and
-    // opens with O_NOFOLLOW; opening a directory returns EISDIR → None, so the
-    // disk neutralization branch is skipped and only the persist arm fires when
-    // the read_cache at the start of acquire_locked (via cached_hit's disk
-    // branch) would re-read it. In practice, `expire_rejected` is called FIRST
-    // under the state lock — the in-memory layer is always neutralized.
-    //
-    // For this test the important assertion is: after `remove_file` removes the
-    // directory entry, a fresh source finds no cache and re-validates.
-    std::fs::remove_file(&cache_file).unwrap();
-    std::fs::create_dir_all(&cache_file).unwrap(); // same path, now a dir
+    // Make the parent directory non-writable (0500): temp-file creation in
+    // `write_private_cache` requires creating a new file in the directory, which
+    // EACCES. The file itself remains 0600 owner-writable, so the in-place
+    // fallback path in `expire_rejected` can still open and truncate it.
+    std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    // Trigger 401-recovery: `A` is in memory (read at construction), refresh
-    // re-issues `A` (sticky), `finish()` rejects it → typed failure.
+    // Trigger 401-recovery: refresh stickily re-issues `A`, `finish()` rejects
+    // it typed. `expire_rejected` runs: atomic persist fails (EACCES on parent),
+    // in-place write succeeds (file mode 0600).
     let result = src
         .acquire_with_intent(AuthIntent::Headless, Some("A"))
         .await;
     assert_eq!(
         result,
         Err(AuthError::RefreshRejected),
-        "typed failure returned; the guard is not disrupted by disk I/O issues"
+        "typed failure returned; neutralization does not disrupt the recovery path"
     );
     assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
 
-    // After `expire_rejected` ran: the cache_file path should no longer be a
-    // regular file. Either the directory was removed by remove_file (success
-    // path), or it remains as a directory. In both cases `read_private_cache`
-    // (O_NOFOLLOW, type-checks for regular file) refuses it, so a fresh source
-    // cannot serve `A`.
-    // The removal path is what we want to exercise: the directory was removed.
-    // The cache path must no longer be a regular file: either the directory was
-    // removed by remove_file (the target case), or it remains as a directory
-    // that read_private_cache (O_NOFOLLOW + type check) refuses to read. In
-    // either case a fresh source cannot serve `A` as a plain cache hit.
+    // Restore write permission so the test harness can clean up.
+    std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The cache file still exists (in-place write, not removal), but its
+    // `expires_at` should now be 0 — it was overwritten in-place.
     assert!(
-        !cache_file.is_file(),
-        "the cache path is not a readable regular file — a fresh source cannot         serve the dead token from disk"
+        cache_file.is_file(),
+        "in-place fallback: file still exists (not removed)"
     );
-    // Prove fresh sources can't get a stale cache hit: seed a new valid token
-    // file with a different access token so a fresh source goes to disk (not
-    // A), confirming the A path is blocked. Instead of constructing a fresh
-    // source (which has no refresh token), verify the same-source in-memory
-    // neutralization proved by the companion test below.
-    // (Cross-source disk safety for the removal path is covered structurally:
-    // if the file is gone, there is nothing to serve; if it is a directory,
-    // read_private_cache refuses it via the EISDIR check on O_NOFOLLOW open.)
+    let raw = std::fs::read(&cache_file).expect("cache file readable after in-place write");
+    let cached: serde_json::Value =
+        serde_json::from_slice(&raw).expect("cache file parseable after in-place write");
+    assert_eq!(
+        cached.get("expires_at").and_then(|v| v.as_u64()),
+        Some(0),
+        "in-place write set expires_at = 0: token is now expired on disk"
+    );
+
+    // A fresh source constructed after the neutralization must not serve `A`.
+    let fresh_src = PkceOAuthTokenSource::new_with(cfg.clone(), Arc::new(opener.clone())).unwrap();
+    // The disk token is expired; bearer() falls through to refresh, which
+    // stickily re-issues `A`, which `finish()` rejects again (no rejected
+    // identity on this plain call — the disk is now expired, so the source
+    // enters the refresh path, gets `A` back from the provider, and `finish()`
+    // sees no rejection guard and would persist it). But with no `rejected`
+    // passed here, a plain `bearer()` with the now-expired disk entry must
+    // re-validate. If the in-place write succeeded, the disk token has
+    // expires_at = 0 and `cached_hit` skips it, so the source goes to refresh.
+    // We confirm `A` is not served as a cache hit: the stub records a second
+    // refresh grant.
+    let _ = fresh_src
+        .acquire_with_intent(AuthIntent::Headless, None)
+        .await;
+    assert!(
+        stub.refresh_grants.load(Ordering::SeqCst) >= 2,
+        "fresh source did not serve `A` as a plain cache hit — it re-validated over the network"
+    );
 }
 
 #[cfg(unix)]
@@ -1775,6 +1881,7 @@ async fn test_rejected_token_in_memory_neutralized_when_disk_neutralization_skip
 // must NOT be served as the replacement: doing so would skip the refresh the
 // 401 demanded and hand back a token the provider will also reject.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_rejected_recovery_skips_expired_sibling_and_refreshes() {
     let stub = spawn_stub(false).await; // refresh succeeds
@@ -1956,6 +2063,7 @@ async fn test_exchange_timeout_is_network_unavailable_not_cooldown() {
 // crash mid-flow, and the kernel's release of the advisory lock is what lets
 // the coordinator's successor proceed with no PID files and no lock breaking.
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_crossprocess_lock_holder_blocks_then_crash_release_lets_successor_proceed() {
     let stub = spawn_stub(false).await; // refresh succeeds once the lock is free
@@ -2175,6 +2283,7 @@ async fn test_crossprocess_userinitiated_denial_shared_with_waiting_auto() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_crossprocess_two_coordinators_race_to_one_grant_and_cache() {
     // Two real coordinator processes race on one key from a cold cache. They
@@ -2459,6 +2568,126 @@ async fn test_crossprocess_post_failure_userinitiated_runs_own_attempt() {
         stub.code_grants.load(Ordering::SeqCst),
         1,
         "exactly one code exchange (worker B's own approval)"
+    );
+}
+
+// ---- cross-process: a waiter with a different rejected must not inherit ----
+//
+// Cross-process mirror of the in-process test above: process A carries
+// `rejected = "X"` and the refresh stickily re-issues "X" → A's attempt
+// records RefreshRejected with `rejected_digest = sha256("X")`. Process B
+// waits on the lock with `rejected = "Y"` (different). When B acquires the
+// lock and reads the attempt record, the digest mismatch causes B to run its
+// own attempt rather than adopt A's failure — B's refresh gets "X", which is
+// valid for B, so B succeeds.
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_crossprocess_waiter_with_different_rejected_does_not_adopt_leaders_failure() {
+    // Sticky provider always issues "X" on every refresh grant.
+    let stub = spawn_stub_with(RefreshMode::SucceedSticky("X")).await;
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    // Seed a token entry so both workers have a refresh token to exercise.
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "expired-seed",
+            "refresh_token": "live-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    // Worker A: headless, rejected = "X". It will acquire the lock first
+    // (no synchronization needed — just let them race). Its refresh yields X,
+    // finish(rejected="X", token="X") → RefreshRejected. Records the attempt
+    // with rejected_digest = sha256("X").
+    let ready_a = cache.path().join("a.ready");
+    let ready_b = cache.path().join("b.ready");
+    let start = cache.path().join("start");
+
+    let result_a = cache.path().join("a.result.json");
+    let result_b = cache.path().join("b.result.json");
+
+    let mut cmd_a = tokio::process::Command::new(env!("CARGO_BIN_EXE_auth-worker"));
+    cmd_a
+        .env("AUTH_WORKER_DISCOVERY_URL", &cfg.discovery_url)
+        .env("AUTH_WORKER_CACHE_DIR", cache.path())
+        .env("AUTH_WORKER_NAMESPACE", &cfg.cache_namespace)
+        .env("AUTH_WORKER_CLIENT_ID", &cfg.client_id)
+        .env("AUTH_WORKER_SCOPES", cfg.scopes.join(","))
+        .env("AUTH_WORKER_INTENT", "headless")
+        .env("AUTH_WORKER_SCRIPT", "failopen") // headless never browses
+        .env("AUTH_WORKER_REJECTED", "X")
+        .env("AUTH_WORKER_RESULT", &result_a)
+        .env("AUTH_WORKER_READY_MARKER", &ready_a)
+        .env("AUTH_WORKER_START_MARKER", &start)
+        .kill_on_drop(true);
+
+    let mut cmd_b = tokio::process::Command::new(env!("CARGO_BIN_EXE_auth-worker"));
+    cmd_b
+        .env("AUTH_WORKER_DISCOVERY_URL", &cfg.discovery_url)
+        .env("AUTH_WORKER_CACHE_DIR", cache.path())
+        .env("AUTH_WORKER_NAMESPACE", &cfg.cache_namespace)
+        .env("AUTH_WORKER_CLIENT_ID", &cfg.client_id)
+        .env("AUTH_WORKER_SCOPES", cfg.scopes.join(","))
+        .env("AUTH_WORKER_INTENT", "headless")
+        .env("AUTH_WORKER_SCRIPT", "failopen")
+        .env("AUTH_WORKER_REJECTED", "Y")
+        .env("AUTH_WORKER_RESULT", &result_b)
+        .env("AUTH_WORKER_READY_MARKER", &ready_b)
+        .env("AUTH_WORKER_START_MARKER", &start)
+        .kill_on_drop(true);
+
+    let child_a = cmd_a.spawn().expect("spawn worker A");
+    let child_b = cmd_b.spawn().expect("spawn worker B");
+
+    // Wait for both to be ready (both have built their source and are about
+    // to queue on the lock), then release them together.
+    wait_for_marker(&ready_a, "worker A ready").await;
+    wait_for_marker(&ready_b, "worker B ready").await;
+    std::fs::write(&start, b"go").unwrap();
+
+    let mut worker_a = Worker {
+        child: child_a,
+        result_path: result_a,
+    };
+    let mut worker_b = Worker {
+        child: child_b,
+        result_path: result_b,
+    };
+    let (out_a, out_b) = tokio::join!(worker_a.join(), worker_b.join());
+
+    // One of {A, B} wins the lock first. Possible orderings:
+    //   A wins: A → RefreshRejected (X re-issued). B acquires lock, reads
+    //   record with digest(X) ≠ digest(Y) → mismatch → B runs own attempt
+    //   → gets X → finish(rejected=Y) → Ok("X").
+    //
+    //   B wins: B → Ok("X") (X ≠ Y → persists). A acquires lock, cached_hit
+    //   finds X in cache but A's rejected=X so it's excluded → A goes to
+    //   refresh → gets X → finish(rejected=X) → RefreshRejected.
+    //
+    // In both orderings: exactly one RefreshRejected and one Ok("X").
+    let results: std::collections::HashSet<String> = [out_a.result.clone(), out_b.result.clone()]
+        .into_iter()
+        .collect();
+    assert!(
+        results.contains("ok"),
+        "one of the two workers must succeed: {:?}",
+        (out_a.result, out_b.result)
+    );
+    assert!(
+        results.contains("refresh_rejected"),
+        "the worker carrying rejected=X must fail typed: {:?}",
+        (out_a.result, out_b.result)
+    );
+    // Exactly two refresh grants total.
+    assert_eq!(
+        stub.refresh_grants.load(Ordering::SeqCst),
+        2,
+        "both workers run their own refresh — no adoption"
     );
 }
 
