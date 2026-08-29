@@ -14,6 +14,11 @@ import test from "node:test";
 const fakeNow = 0;
 const pendingTimers = new Map();
 let nextTimerId = 1;
+const sendAttempts = [];
+const deliveredFrames = [];
+let sendTransport = async (args) => {
+  deliveredFrames.push(args);
+};
 
 globalThis.window = {
   setTimeout: (fn, ms) => {
@@ -22,13 +27,62 @@ globalThis.window = {
     return id;
   },
   clearTimeout: (id) => pendingTimers.delete(id),
+  __TAURI_INTERNALS__: {
+    invoke: async (command, args) => {
+      if (command === "plugin:websocket|send") {
+        sendAttempts.push(args);
+        return sendTransport(args);
+      }
+    },
+  },
 };
 Date.now = () => fakeNow;
 
 const { RelayClient } = await import("./relayClientSession.ts");
-const { isRateLimited, resetRateLimitGate } = await import(
+const { activateRateLimit, isRateLimited, resetRateLimitGate } = await import(
   "./relayRateLimitGate.ts"
 );
+
+function reset() {
+  resetRateLimitGate();
+  pendingTimers.clear();
+  nextTimerId = 1;
+  sendAttempts.length = 0;
+  deliveredFrames.length = 0;
+  sendTransport = async (args) => {
+    deliveredFrames.push(args);
+  };
+}
+
+function connectedClient() {
+  const client = new RelayClient();
+  client.wsId = 7;
+  return client;
+}
+
+function eventFrames() {
+  return deliveredFrames.filter(
+    ({ message }) => JSON.parse(message.data)[0] === "EVENT",
+  );
+}
+
+async function flushUntil(predicate, attempts = 20) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  assert.fail("condition did not become true before the microtask limit");
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
 
 /**
  * Registers a pending publish the way `publishEvent` does, without needing a
@@ -131,8 +185,7 @@ test("an ordinary OK rejection does not arm the gate", async () => {
 });
 
 test("an accepted OK still resolves the pending publish", async () => {
-  resetRateLimitGate();
-  pendingTimers.clear();
+  reset();
   const client = new RelayClient();
   const eventId = "d".repeat(64);
   const settled = armPendingPublish(client, eventId);
@@ -142,4 +195,77 @@ test("an accepted OK still resolves the pending publish", async () => {
 
   assert.equal(outcome.status, "resolved");
   assert.equal(outcome.value.id, eventId);
+});
+
+test("a community switch while gated cannot publish through its replacement socket", async () => {
+  reset();
+  activateRateLimit(4);
+  const client = connectedClient();
+  const event = { id: "e".repeat(64), kind: 1 };
+
+  const published = client.publishEvent(event, "timed out", "send failed");
+  await Promise.resolve();
+  assert.equal(client.pendingEvents.size, 0);
+
+  client.disconnect();
+  resetRateLimitGate();
+  client.wsId = 8;
+
+  await assert.rejects(published, /community switch/);
+  assert.equal(client.pendingEvents.size, 0);
+  assert.equal(eventFrames().length, 0);
+});
+
+test("a community switch after send failure cannot retry through its replacement socket", async () => {
+  reset();
+  const client = connectedClient();
+  const event = { id: "f".repeat(64), kind: 1 };
+  const reconnect = deferred();
+  client.ensureConnected = async () => {
+    await reconnect.promise;
+    return client.connectionGeneration;
+  };
+  sendTransport = async () => {
+    throw new Error("old socket failed");
+  };
+
+  const published = client.publishEvent(event, "timed out", "send failed");
+  const outcome = published.then(
+    () => ({ status: "resolved" }),
+    (error) => ({ status: "rejected", error }),
+  );
+  await flushUntil(() => client.connectionGeneration === 1);
+  assert.equal(sendAttempts.length, 1);
+  assert.equal(eventFrames().length, 0);
+  assert.equal(
+    client.connectionGeneration,
+    1,
+    "the failed send reset its socket",
+  );
+  assert.equal(
+    client.pendingEvents.has(event.id),
+    true,
+    "the original publish remains owned while reconnect is pending",
+  );
+
+  client.disconnect();
+  client.wsId = 8;
+  const settledBeforeReconnect = await outcome;
+  assert.equal(
+    settledBeforeReconnect.status,
+    "rejected",
+    "community switch must settle the publish without waiting for reconnect",
+  );
+  assert.match(settledBeforeReconnect.error.message, /community switch/);
+
+  reconnect.resolve();
+  await published.catch(() => {});
+  await Promise.resolve();
+  assert.equal(client.pendingEvents.size, 0);
+  assert.equal(
+    sendAttempts.length,
+    1,
+    "the replacement socket must not be used",
+  );
+  assert.equal(eventFrames().length, 0);
 });
