@@ -4796,6 +4796,64 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+/// Post an in-channel notice that an inbound event was refused by the author gate.
+///
+/// Mirrors [`post_failure_notice`] but carries `mentions`, so the owner can be
+/// p-tagged and learn through the normal mention path that someone tried to
+/// reach the agent. Notices stay in the channel the request arrived in: keeping
+/// the exchange with the project preserves its context instead of stranding it
+/// in a private inbox, and the agent never opens a DM of its own.
+///
+/// Best-effort by design. A refused author is not owed delivery guarantees, and
+/// the caller must not be blocked waiting on the relay.
+pub(crate) async fn post_gate_notice(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    mentions: &[String],
+) {
+    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
+        let root_id = nostr::EventId::from_hex(root).ok()?;
+        let parent_id = thread_tags
+            .parent_event_id
+            .as_deref()
+            .and_then(|p| nostr::EventId::from_hex(p).ok())
+            .unwrap_or(root_id);
+        Some(buzz_sdk::ThreadRef {
+            root_event_id: root_id,
+            parent_event_id: parent_id,
+        })
+    });
+    let mention_refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
+    let builder = match buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        &mention_refs,
+        false,
+        &[],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "author gate notice: build failed: {e}");
+            return;
+        }
+    };
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "author gate notice: sign failed: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "author gate notice failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "author gate notice timed out"),
+    }
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
