@@ -2265,6 +2265,14 @@ async fn tokio_main() -> Result<()> {
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // (channel, author) pairs already told they are outside the author gate.
+    // One notice per person per channel: silence strands the sender, but a
+    // reply per refused event lets a noisy author turn the agent into a
+    // flooder. Bounded because this process is long-lived and the key space is
+    // attacker-controlled — on overflow we clear and allow one more notice per
+    // pair rather than growing without limit.
+    let mut gate_notified: HashSet<(Uuid, String)> = HashSet::new();
+
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
     // remain reasonably precise without waking long-lived agents frequently.
@@ -2884,13 +2892,53 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
+                                    // warn, not debug: a refused request is a
+                                    // person who got no answer. At debug level
+                                    // this is invisible in practice, so the
+                                    // sender is stranded and the owner never
+                                    // learns anyone tried.
+                                    tracing::warn!(
                                         channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
+                                        author = %author,
                                         mode = %config.respond_to,
                                         is_dm,
-                                        "inbound author gate — dropping event"
+                                        "inbound author gate — refusing event"
                                     );
+
+                                    if remember_gate_notice(
+                                        &mut gate_notified,
+                                        (buzz_event.channel_id, author.clone()),
+                                    ) {
+                                        // Mention the owner in channels so they
+                                        // learn through the normal mention
+                                        // path, in the project where the
+                                        // request arrived. Never in a DM: that
+                                        // would disclose the owner's pubkey to
+                                        // a stranger.
+                                        let mentions: Vec<String> = if is_dm {
+                                            Vec::new()
+                                        } else {
+                                            owner_cache
+                                                .get()
+                                                .map(|o| vec![o.to_string()])
+                                                .unwrap_or_default()
+                                        };
+                                        let content = author_gate_notice_text(is_dm);
+                                        let thread_tags =
+                                            queue::parse_thread_tags(&buzz_event.event);
+                                        let rest = ctx.rest_client.clone();
+                                        let channel_id = buzz_event.channel_id;
+                                        tokio::spawn(async move {
+                                            pool::post_gate_notice(
+                                                &rest,
+                                                channel_id,
+                                                &thread_tags,
+                                                &content,
+                                                &mentions,
+                                            )
+                                            .await;
+                                        });
+                                    }
                                     continue;
                                 }
                             }
@@ -3854,6 +3902,61 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
 /// dead-letter path so neither duplicates the tokio::spawn block.
+/// Upper bound on remembered (channel, author) gate refusals.
+///
+/// The key space is attacker-controlled — anyone can mint a pubkey and post —
+/// so this cannot grow unbounded in a long-lived process. At the cap the memo
+/// is cleared rather than evicted per-entry: the cost of forgetting is one
+/// extra notice to a person who has already been told, which is far cheaper
+/// than the bookkeeping to avoid it.
+const MAX_GATE_NOTIFIED: usize = 4_096;
+
+/// Record that `key` has been told it sits outside the author gate, and report
+/// whether this is the first time (so the caller should post a notice).
+///
+/// Clearing at the cap, rather than evicting one entry, is deliberate: the cost
+/// of forgetting is one repeat notice to someone already told, which is far
+/// cheaper than the bookkeeping an LRU would need on a path that exists only to
+/// suppress duplicates.
+fn remember_gate_notice(seen: &mut HashSet<(Uuid, String)>, key: (Uuid, String)) -> bool {
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() >= MAX_GATE_NOTIFIED {
+        tracing::warn!(
+            tracked = seen.len(),
+            "author gate notice memo full — clearing"
+        );
+        seen.clear();
+    }
+    seen.insert(key);
+    true
+}
+
+/// What someone outside the author gate is told.
+///
+/// Says what happened, what it means for them, and what happens next — without
+/// naming the mechanism. "I'm not set up to take requests from you" is
+/// actionable; "inbound author gate rejected event" is not. It never asks them
+/// to resend: the message is already in the channel, and re-typing it will not
+/// change the outcome.
+fn author_gate_notice_text(is_dm: bool) -> String {
+    if is_dm {
+        // No project channel to point at, and no owner mention — naming the
+        // owner here would hand a stranger their pubkey.
+        "I'm not currently set up to take requests from you, so I can't act on this. \
+         Your message hasn't gone anywhere and you don't need to send it again. \
+         If you're expecting access, ask whoever runs this workspace to add you."
+            .to_string()
+    } else {
+        "I saw your message but I'm not currently set up to take requests from you, \
+         so I can't start on it. Your message is safe in this channel and nothing \
+         needs re-typing. I've flagged this for the owner of this project — once \
+         they add you, send it again and I'll pick it up."
+            .to_string()
+    }
+}
+
 fn spawn_failure_notice(
     rest_client: Option<&relay::RestClient>,
     batch: &FlushBatch,
@@ -5504,6 +5607,106 @@ mod author_gate_tests {
                 )
                 .await,
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
+            );
+        }
+    }
+
+    // ── Author gate notice ────────────────────────────────────────────────
+    //
+    // A refused author used to be dropped at debug level with no reply, so the
+    // sender was stranded and the owner never learned anyone had tried. These
+    // lock down the properties that make the refusal visible instead.
+
+    #[test]
+    fn test_gate_notice_says_what_happened_and_what_next() {
+        for is_dm in [false, true] {
+            let text = author_gate_notice_text(is_dm);
+            assert!(
+                text.contains("can't"),
+                "notice must state that the request will not be acted on (is_dm={is_dm})"
+            );
+            assert!(
+                text.contains("send it again") || text.contains("add you"),
+                "notice must tell the sender what happens next (is_dm={is_dm})"
+            );
+            assert!(
+                !text.contains("author gate")
+                    && !text.contains("respond_to")
+                    && !text.contains("pubkey"),
+                "notice must name the state, not the mechanism (is_dm={is_dm})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gate_notice_never_asks_for_a_resend_of_the_same_message() {
+        // Re-sending cannot change the outcome — asking for it is the pattern
+        // that trains people to repeat themselves into silence.
+        let channel = author_gate_notice_text(false);
+        assert!(
+            channel.contains("nothing") && channel.contains("re-typing"),
+            "channel notice must reassure that the message is not lost: {channel}"
+        );
+        let dm = author_gate_notice_text(true);
+        assert!(
+            dm.contains("don't need to send it again"),
+            "DM notice must reassure that the message is not lost: {dm}"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_does_not_leak_owner_in_dm() {
+        // In a channel the owner is p-tagged so they learn someone tried. In a
+        // DM there is no such mention, and the text must not compensate by
+        // naming them — the sender is an unknown party.
+        let dm = author_gate_notice_text(true);
+        assert!(
+            !dm.contains("owner of this project"),
+            "DM notice must not point an unknown sender at the owner: {dm}"
+        );
+        let channel = author_gate_notice_text(false);
+        assert!(
+            channel.contains("owner"),
+            "channel notice should say the owner was flagged: {channel}"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_fires_once_per_person_per_channel() {
+        let mut seen = HashSet::new();
+        let chan_a = Uuid::from_u128(1);
+        let chan_b = Uuid::from_u128(2);
+
+        assert!(
+            remember_gate_notice(&mut seen, (chan_a, "alice".into())),
+            "first refusal must notify"
+        );
+        assert!(
+            !remember_gate_notice(&mut seen, (chan_a, "alice".into())),
+            "a repeat refusal must stay quiet — otherwise a noisy author turns the agent into a flooder"
+        );
+        assert!(
+            remember_gate_notice(&mut seen, (chan_b, "alice".into())),
+            "the same person in a different channel has not been told there"
+        );
+        assert!(
+            remember_gate_notice(&mut seen, (chan_a, "bob".into())),
+            "a different person in the same channel has not been told"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_memo_stays_bounded_under_attacker_supplied_keys() {
+        // Anyone can mint a pubkey and post, so the key space is not ours to
+        // trust. The memo must not grow without limit in a long-lived process.
+        let mut seen = HashSet::new();
+        let chan = Uuid::from_u128(7);
+        for i in 0..(MAX_GATE_NOTIFIED * 2 + 5) {
+            remember_gate_notice(&mut seen, (chan, format!("author-{i}")));
+            assert!(
+                seen.len() <= MAX_GATE_NOTIFIED,
+                "memo exceeded its bound at iteration {i}: {}",
+                seen.len()
             );
         }
     }
