@@ -2929,7 +2929,7 @@ async fn tokio_main() -> Result<()> {
                                         let rest = ctx.rest_client.clone();
                                         let channel_id = buzz_event.channel_id;
                                         tokio::spawn(async move {
-                                            pool::post_gate_notice(
+                                            pool::post_notice(
                                                 &rest,
                                                 channel_id,
                                                 &thread_tags,
@@ -3957,10 +3957,48 @@ fn author_gate_notice_text(is_dm: bool) -> String {
     }
 }
 
+/// Mention list for a notice that someone other than the sender must act on.
+///
+/// A failure the requester cannot fix has to reach the person who can — a
+/// notice nobody is pinged about is only marginally better than no notice.
+/// Empty when no owner is known, which degrades to the previous behaviour
+/// rather than failing.
+fn owner_mentions(owner: Option<&str>) -> Vec<String> {
+    owner
+        .filter(|o| !o.is_empty())
+        .map(|o| vec![o.to_string()])
+        .unwrap_or_default()
+}
+
+/// Plain-language account of why a batch could not be completed.
+///
+/// Names the state rather than the mechanism, and never surfaces a raw error
+/// string. Internals belong in the log — the person waiting cannot act on a
+/// `Display` impl, and a raw error can carry paths or tokens that should not be
+/// posted into a channel.
+fn failure_reason_text(outcome: &PromptOutcome) -> String {
+    match outcome {
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "it stopped making progress".to_string(),
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+            "it ran for a long time without getting closer".to_string()
+        }
+        PromptOutcome::AgentExited => "the tool I use to do the work stopped unexpectedly".to_string(),
+        // Deliberately vague to the channel; the detail is in the log. This is
+        // the one branch that used to interpolate the raw error.
+        PromptOutcome::Error(_) => "something went wrong on my side".to_string(),
+        PromptOutcome::ProjectContextIndeterminate(_) => {
+            "I couldn't tell which project this belongs to, and I'd rather ask than change the wrong one"
+                .to_string()
+        }
+        _ => "it kept failing".to_string(),
+    }
+}
+
 fn spawn_failure_notice(
     rest_client: Option<&relay::RestClient>,
     batch: &FlushBatch,
     content: String,
+    mentions: Vec<String>,
 ) {
     if let Some(rest) = rest_client {
         let thread_tags = batch
@@ -3971,7 +4009,7 @@ fn spawn_failure_notice(
         let rest = rest.clone();
         let channel_id = batch.channel_id;
         tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+            pool::post_notice(&rest, channel_id, &thread_tags, &content, &mentions).await;
         });
     }
 }
@@ -4067,11 +4105,16 @@ fn handle_prompt_result(
                     "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
-                let content = format!(
-                    "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                    config.max_turn_duration_secs
+                let content = "⚠️ I couldn't finish this one. I worked on it for a long \
+                    stretch without getting closer, so I stopped rather than keep going — \
+                    nothing was changed. Send it again if you'd like me to try once more."
+                    .to_string();
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
                 );
-                spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -4085,11 +4128,17 @@ fn handle_prompt_result(
                     "hard-cap timeout with recent activity — requeueing for retry"
                 );
                 if let Some(dead) = queue.requeue(batch) {
-                    let content = format!(
-                        "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                        config.max_turn_duration_secs
+                    let content = "⚠️ I tried this several times and couldn't get through it, \
+                        so I've stopped rather than keep failing quietly. Nothing was changed. \
+                        Sending it again is unlikely to help on its own — this one needs a person \
+                        to look at it."
+                        .to_string();
+                    spawn_failure_notice(
+                        rest_client,
+                        &dead,
+                        content,
+                        owner_mentions(config.agent_owner.as_deref()),
                     );
-                    spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
@@ -4104,26 +4153,32 @@ fn handle_prompt_result(
                     events = batch.events.len(),
                     "dead-lettering batch immediately — non-retryable auth error"
                 );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
+                let content = "⚠️ I've lost my ability to sign in to the tool I use to do this \
+                    work, so I can't act on this — or anything else — until that's restored. \
+                    Nothing was changed. This isn't something you can fix from here: it needs \
+                    whoever runs this workspace, and I've flagged them on this message."
                     .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
-            } else if let Some(dead) = queue.requeue(batch) {
-                let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "the turn exceeded the maximum duration".to_string()
-                    }
-                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
-                    PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
-                    _ => "repeated failures".to_string(),
-                };
-                let content = format!(
-                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
                 );
-                spawn_failure_notice(rest_client, &dead, content);
+            } else if let Some(dead) = queue.requeue(batch) {
+                // The raw error stays in the log above; what reaches the
+                // channel names the state, not the mechanism.
+                let reason = failure_reason_text(&result.outcome);
+                let content = format!(
+                    "⚠️ I tried this several times and couldn't get through it — {reason}. \
+                     I've stopped rather than keep failing quietly, and nothing was changed. \
+                     This one needs a person to look at it."
+                );
+                spawn_failure_notice(
+                    rest_client,
+                    &dead,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
+                );
             }
         } else {
             tracing::debug!(
@@ -5709,6 +5764,66 @@ mod author_gate_tests {
                 seen.len()
             );
         }
+    }
+
+    // ── Failure notice wording ────────────────────────────────────────────
+    //
+    // These notices used to name the mechanism ("the turn exceeded the maximum
+    // duration (7200s)"), interpolate a raw error, and tell whoever was waiting
+    // to run `claude /login` — an instruction a collaborator cannot act on.
+
+    #[test]
+    fn test_failure_reason_never_surfaces_a_raw_error() {
+        // A Display impl can carry paths, tokens, or stack detail. It belongs
+        // in the log, not in a channel anyone with access can read.
+        let leaky = PromptOutcome::Error(acp::AcpError::Protocol(
+            "connect ECONNREFUSED 10.0.0.4:8080 /home/x/.ssh".to_string(),
+        ));
+        let text = failure_reason_text(&leaky);
+        assert!(
+            !text.contains("ECONNREFUSED") && !text.contains(".ssh") && !text.contains("10.0.0.4"),
+            "raw error leaked into a user-facing notice: {text}"
+        );
+    }
+
+    #[test]
+    fn test_failure_reasons_name_the_state_not_the_mechanism() {
+        let cases = [
+            PromptOutcome::Timeout(TimeoutKind::Idle),
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            PromptOutcome::AgentExited,
+            PromptOutcome::Error(acp::AcpError::Protocol("boom".to_string())),
+        ];
+        for outcome in cases {
+            let text = failure_reason_text(&outcome);
+            assert!(
+                !text.is_empty(),
+                "every outcome needs a plain-language reason"
+            );
+            for jargon in ["turn", "batch", "dead-letter", "PromptOutcome", "requeue"] {
+                assert!(
+                    !text.to_lowercase().contains(jargon),
+                    "reason leaks internal vocabulary {jargon:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_owner_is_mentioned_so_a_failure_reaches_someone_who_can_act() {
+        assert_eq!(
+            owner_mentions(Some("npub_owner")),
+            vec!["npub_owner".to_string()],
+            "a failure the requester cannot fix must ping whoever can"
+        );
+        // Degrade to previous behaviour rather than failing when unknown.
+        assert!(owner_mentions(None).is_empty());
+        assert!(
+            owner_mentions(Some("")).is_empty(),
+            "an empty owner must not produce an empty p-tag"
+        );
     }
 
     // ── DM hardening ──────────────────────────────────────────────────────
