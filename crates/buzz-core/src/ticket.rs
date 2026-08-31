@@ -214,10 +214,16 @@ pub fn fold(rows: &[StatusRow], open_deadline: Option<i64>) -> TicketView {
             .or_insert(r);
     }
 
+    // Latest terminal row wins; on a same-instant tie, COMPLETION beats
+    // failure. If work finished in the very second the watchdog declared it
+    // timed out, the work actually happened — and telling someone their
+    // request failed, with a reason that is not true, is worse than a
+    // slightly late "done". `Reverse` picks the lower-ranked state on a tie,
+    // and Done ranks below Failed.
     let terminal = latest
         .values()
         .filter(|r| r.state.is_terminal())
-        .max_by_key(|r| (r.created_at, r.state));
+        .max_by_key(|r| (r.created_at, std::cmp::Reverse(r.state)));
 
     if let Some(t) = terminal {
         return TicketView {
@@ -486,6 +492,26 @@ mod tests {
         let a = row("agent", TicketState::Done, 100, None);
         let b = row("agent", TicketState::Acknowledged, 100, Some(130));
         assert_eq!(fold(&[a.clone(), b.clone()], None), fold(&[b, a], None));
+    }
+
+    #[test]
+    fn completion_beats_a_timeout_declared_in_the_same_instant() {
+        // The watchdog's clock and the worker's completion can land in the
+        // same second. Telling someone their request failed — with a timeout
+        // reason that did not actually happen — is worse than a late "done".
+        let done = row("agent", TicketState::Done, 100, None);
+        let mut timed_out = row("watchdog", TicketState::Failed, 100, None);
+        timed_out.reason = Some("acknowledgement deadline passed".to_string());
+
+        for rows in [vec![done.clone(), timed_out.clone()], vec![timed_out, done]] {
+            let v = fold(&rows, None);
+            assert_eq!(
+                v.state,
+                TicketState::Done,
+                "completion must win a same-instant tie, in either arrival order"
+            );
+            assert_eq!(v.reason, None, "no false failure reason should survive");
+        }
     }
 
     #[test]
