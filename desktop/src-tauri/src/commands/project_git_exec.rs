@@ -49,6 +49,10 @@ pub(crate) struct GitAuthConfig {
     credential_helper: Option<std::path::PathBuf>,
     nsec: String,
     allow_file_transport: bool,
+    /// Token for github.com, when one has been configured. Absent means the
+    /// previous behaviour: public GitHub repositories clone, private ones fail
+    /// with an authentication error.
+    github_token: Option<String>,
 }
 
 fn read_pipe_lossy(pipe: Option<impl Read>) -> String {
@@ -128,6 +132,30 @@ pub(crate) fn run_git(
     Ok(stdout)
 }
 
+/// Environment variable carrying the GitHub token into git's credential helper.
+///
+/// Passed through the environment rather than written into a config value:
+/// `GIT_CONFIG_VALUE_*` entries are readable by anything that can run
+/// `git config --list` in the same process tree, and a credential with write
+/// access to every repository should not be sitting in a listable config.
+const GITHUB_TOKEN_ENV: &str = "DREAMFORGE_GITHUB_TOKEN";
+
+/// Credential helper for github.com, reading the token from the environment.
+///
+/// Applied as `credential.https://github.com.helper`, never the global
+/// `credential.helper`. Git asks whichever helper matches the URL, so an
+/// unscoped helper would offer this token to any remote a repository happens
+/// to name. `x-access-token` is GitHub's documented username for token auth
+/// and works for both personal access tokens and App installation tokens, so
+/// this does not change when the GitHub App replaces the token.
+const GITHUB_CREDENTIAL_HELPER: &str = concat!(
+    "!f() { test \"$1\" = get && ",
+    // `\\n` so the shell's printf receives a literal backslash-n and emits the
+    // newline itself. A real newline here would end the helper line instead.
+    "printf 'username=x-access-token\\npassword=%s\\n' ",
+    "\"$DREAMFORGE_GITHUB_TOKEN\"; }; f"
+);
+
 fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credentials: bool) {
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -169,6 +197,18 @@ fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credent
         ),
     ];
     if needs_credentials {
+        // github.com is configured independently of the nostr helper: a
+        // project can point at a private GitHub repository whether or not a
+        // Buzz-hosted remote is involved, and the two credentials must not be
+        // able to reach each other's hosts.
+        if let Some(token) = &auth.github_token {
+            command.env(GITHUB_TOKEN_ENV, token);
+            entries.push((
+                "credential.https://github.com.helper",
+                GITHUB_CREDENTIAL_HELPER.to_string(),
+            ));
+        }
+
         let Some(cred_helper) = &auth.credential_helper else {
             return apply_git_config(command, &entries);
         };
@@ -208,16 +248,47 @@ pub(crate) fn build_git_clone_auth_config(
     state: &AppState,
 ) -> Result<GitAuthConfig, String> {
     if validate_github_clone_url(clone_url).is_ok() {
+        // A GitHub clone gets the GitHub credential and nothing else. The
+        // empty nsec and absent nostr helper are deliberate and predate this:
+        // the identity key must never travel to a third-party host, and
+        // `NOSTR_PRIVATE_KEY` is only exported when that helper is present.
         return Ok(GitAuthConfig {
             git_path: resolve_command("git")
                 .ok_or_else(|| "git was not found on PATH".to_string())?,
             credential_helper: None,
             nsec: String::new(),
             allow_file_transport: false,
+            github_token: load_github_token(),
         });
     }
     build_git_auth_config(state)
 }
+
+/// Read the configured GitHub token, if there is one.
+///
+/// Absent is the normal case and is not an error: without a token, public
+/// GitHub repositories clone exactly as before and private ones fail with
+/// GitHub's own authentication error, which the projects UI already explains.
+///
+/// The environment is checked first so a session can be given a token without
+/// touching the keyring, which is what CI and one-off clones want.
+fn load_github_token() -> Option<String> {
+    if let Ok(token) = std::env::var(GITHUB_TOKEN_ENV) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    crate::secret_store::SecretStore::shared(crate::app_state::keyring_service())
+        .load(GITHUB_TOKEN_SECRET_KEY)
+        .ok()
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Key under which the GitHub token is stored in the OS keyring.
+const GITHUB_TOKEN_SECRET_KEY: &str = "github_token";
 
 pub(crate) fn build_git_auth_config_for_keys(keys: &Keys) -> Result<GitAuthConfig, String> {
     let git_path = resolve_command("git").ok_or_else(|| "git was not found on PATH".to_string())?;
@@ -231,6 +302,7 @@ pub(crate) fn build_git_auth_config_for_keys(keys: &Keys) -> Result<GitAuthConfi
         credential_helper,
         nsec,
         allow_file_transport: false,
+        github_token: load_github_token(),
     })
 }
 
@@ -393,10 +465,145 @@ fn validate_clone_url_against_relay(clone_url: &str, relay_base: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_branch, clean_target_ref, credential_helper_config_value, git_needs_credentials,
-        git_subcommand, validate_clone_url, validate_clone_url_against_relay,
-        validate_local_clone_url,
+        clean_branch, clean_target_ref, configure_git_auth, credential_helper_config_value,
+        git_needs_credentials, git_subcommand, validate_clone_url,
+        validate_clone_url_against_relay, validate_local_clone_url, GitAuthConfig,
+        GITHUB_CREDENTIAL_HELPER, GITHUB_TOKEN_ENV,
     };
+    use std::process::Command;
+
+    /// Collect the `GIT_CONFIG_KEY_n`/`VALUE_n` pairs a configured command
+    /// carries, so a test can assert what git would actually see.
+    fn git_config_entries(auth: &GitAuthConfig, needs_credentials: bool) -> Vec<(String, String)> {
+        let mut command = Command::new("git");
+        configure_git_auth(&mut command, auth, needs_credentials);
+        let env: std::collections::HashMap<String, String> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        let count: usize = env
+            .get("GIT_CONFIG_COUNT")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (0..count)
+            .filter_map(|i| {
+                Some((
+                    env.get(&format!("GIT_CONFIG_KEY_{i}"))?.clone(),
+                    env.get(&format!("GIT_CONFIG_VALUE_{i}"))?.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    fn auth_with_token(token: Option<&str>) -> GitAuthConfig {
+        GitAuthConfig {
+            git_path: std::path::PathBuf::from("git"),
+            credential_helper: None,
+            nsec: String::new(),
+            allow_file_transport: false,
+            github_token: token.map(str::to_string),
+        }
+    }
+
+    fn env_of(
+        auth: &GitAuthConfig,
+        needs_credentials: bool,
+    ) -> std::collections::HashMap<String, String> {
+        let mut command = Command::new("git");
+        configure_git_auth(&mut command, auth, needs_credentials);
+        command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    // ── GitHub token handling ─────────────────────────────────────────────
+    //
+    // This credential can push to every repository the account can reach, so
+    // the tests are about where it must NOT go.
+
+    #[test]
+    fn the_github_token_is_never_written_into_a_config_value() {
+        // GIT_CONFIG_VALUE_* is readable by anything that can run
+        // `git config --list` in the same process tree. The token travels in
+        // its own environment variable instead.
+        let entries = git_config_entries(&auth_with_token(Some("ghp_supersecret")), true);
+        for (key, value) in &entries {
+            assert!(
+                !value.contains("ghp_supersecret"),
+                "token leaked into config {key}={value}"
+            );
+        }
+        let env = env_of(&auth_with_token(Some("ghp_supersecret")), true);
+        assert_eq!(
+            env.get(GITHUB_TOKEN_ENV).map(String::as_str),
+            Some("ghp_supersecret"),
+            "the token must reach git through the environment"
+        );
+    }
+
+    #[test]
+    fn the_github_helper_is_scoped_to_github_only() {
+        // Git asks whichever helper matches the URL. An unscoped
+        // `credential.helper` would offer this token to any remote a
+        // repository happens to name.
+        let entries = git_config_entries(&auth_with_token(Some("t")), true);
+        let github: Vec<_> = entries
+            .iter()
+            .filter(|(_, v)| v == GITHUB_CREDENTIAL_HELPER)
+            .collect();
+        assert_eq!(github.len(), 1, "expected exactly one github helper entry");
+        assert_eq!(
+            github[0].0, "credential.https://github.com.helper",
+            "the helper must be host-scoped, never global"
+        );
+    }
+
+    #[test]
+    fn no_token_configured_leaves_the_previous_behaviour_untouched() {
+        let entries = git_config_entries(&auth_with_token(None), true);
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| k.starts_with("credential.https://github.com")),
+            "without a token there must be no github credential config"
+        );
+        let env = env_of(&auth_with_token(None), true);
+        assert!(!env.contains_key(GITHUB_TOKEN_ENV));
+    }
+
+    #[test]
+    fn local_git_operations_never_see_the_token() {
+        // needs_credentials is false for local subcommands. A token exported
+        // for `git status` would be inherited by anything it spawns for no
+        // reason at all.
+        let env = env_of(&auth_with_token(Some("ghp_supersecret")), false);
+        assert!(
+            !env.contains_key(GITHUB_TOKEN_ENV),
+            "the token must only be exported for operations that talk to a remote"
+        );
+    }
+
+    #[test]
+    fn a_github_clone_never_carries_the_nostr_identity_key() {
+        // The pre-existing boundary this change had to preserve: a
+        // third-party host must never receive the identity key.
+        let env = env_of(&auth_with_token(Some("t")), true);
+        assert!(
+            !env.contains_key("NOSTR_PRIVATE_KEY"),
+            "identity key must not be exported for a github-only auth config"
+        );
+    }
 
     #[test]
     fn credential_helper_config_value_uses_forward_slashes() {
