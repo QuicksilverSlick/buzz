@@ -121,9 +121,60 @@ impl TicketView {
         }
     }
 
-    /// Whether `now` is past the deadline and the ticket still expects action.
+    /// Whether the ticket still expects action and that action is now due.
+    ///
+    /// A live ticket with **no** deadline counts as overdue. "Nobody said when
+    /// to check this" is not the same as "never check this", and reading an
+    /// absent deadline as never-due is how a single malformed row silences the
+    /// sweeper permanently. Sweeping it immediately is noisy; not sweeping it
+    /// is the failure this whole system exists to prevent.
     pub fn is_overdue(&self, now: i64) -> bool {
-        !self.state.is_terminal() && self.deadline.is_some_and(|d| now >= d)
+        if self.state.is_terminal() {
+            return false;
+        }
+        match self.deadline {
+            Some(d) => now >= d,
+            None => true,
+        }
+    }
+}
+
+/// Stand-in when a `failed` row carries no reason.
+pub const MISSING_REASON: &str = "no reason was recorded";
+
+/// Whether `candidate` should replace `current` as an actor's latest word.
+///
+/// Recency decides it. The interesting case is a tie, which is ordinary rather
+/// than exotic: Nostr timestamps are whole seconds, so two rows from one actor
+/// in the same second is a normal occurrence and `StatusRow` carries nothing
+/// finer to order them by.
+///
+/// On a tie the rule is "stay watched", applied in two steps:
+///
+/// 1. **Prefer the non-terminal row.** An extra escalation on a finished
+///    ticket is noise; a dropped request is not recoverable.
+/// 2. **Then prefer the tighter deadline**, treating "no deadline" as the
+///    loosest. Sweeping early is survivable; sweeping never is the failure.
+///
+/// Deliberately NOT ordered by [`TicketState`] rank. Rank and deadline
+/// tightness are independent: an `Acknowledged` row can carry a looser
+/// deadline than a `Progress` row from the same second, so preferring the
+/// lower rank would discard the tighter deadline and produce exactly the
+/// silent ticket this is meant to prevent.
+fn supersedes(candidate: &StatusRow, current: &StatusRow) -> bool {
+    if candidate.created_at != current.created_at {
+        return candidate.created_at > current.created_at;
+    }
+    match (candidate.state.is_terminal(), current.state.is_terminal()) {
+        (false, true) => return true,
+        (true, false) => return false,
+        _ => {}
+    }
+    // Tighter deadline wins; a row that names one beats a row that does not.
+    match (candidate.not_before, current.not_before) {
+        (Some(c), Some(k)) => c < k,
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 
@@ -156,7 +207,7 @@ pub fn fold(rows: &[StatusRow], open_deadline: Option<i64>) -> TicketView {
         latest
             .entry(r.actor.as_str())
             .and_modify(|cur| {
-                if (r.created_at, r.state) > (cur.created_at, cur.state) {
+                if supersedes(r, cur) {
                     *cur = r;
                 }
             })
@@ -173,7 +224,13 @@ pub fn fold(rows: &[StatusRow], open_deadline: Option<i64>) -> TicketView {
             state: t.state,
             deadline: None,
             decided_by: Some(t.actor.clone()),
-            reason: t.reason.clone(),
+            // A failure a person cannot read is a silent failure wearing a
+            // loud label. If the reason is missing, say so rather than
+            // rendering an empty field the reader has to interpret.
+            reason: match (t.state, &t.reason) {
+                (TicketState::Failed, None) => Some(MISSING_REASON.to_string()),
+                _ => t.reason.clone(),
+            },
         };
     }
 
@@ -182,12 +239,20 @@ pub fn fold(rows: &[StatusRow], open_deadline: Option<i64>) -> TicketView {
         .max_by_key(|r| (r.state, r.created_at))
         .expect("non-empty");
 
-    // Earliest live deadline: fire on the first thing that should have happened.
-    let deadline = latest
-        .values()
-        .filter(|r| !r.state.is_terminal())
-        .filter_map(|r| r.not_before)
-        .min();
+    // Earliest live deadline: fire on the first thing that should have
+    // happened. A live row that named no deadline falls back to
+    // `open_deadline` rather than contributing nothing — otherwise an actor
+    // who acknowledges without a deadline makes the ticket LESS watched than
+    // if they had said nothing at all.
+    let live = latest.values().filter(|r| !r.state.is_terminal());
+    let mut deadline: Option<i64> = None;
+    for r in live {
+        let d = r.not_before.or(open_deadline);
+        deadline = match (deadline, d) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
 
     TicketView {
         state: decided.state,
@@ -316,6 +381,111 @@ mod tests {
         );
         assert_eq!(TicketState::from_tag("finished"), None);
         assert_eq!(TicketState::from_tag(""), None);
+    }
+
+    // ── Regressions from the adversarial review ───────────────────────
+    //
+    // Each of these reproduced a real hole found by independently compiling
+    // and running this module. They are the cases where the fold used to go
+    // quiet, which is the one thing a watchdog must never do.
+
+    #[test]
+    fn a_live_row_with_no_deadline_is_swept_not_ignored() {
+        // Was: an Acknowledged row with no deadline gave deadline=None, and
+        // is_overdue returned false at EVERY representable timestamp — so one
+        // lazy row silenced the sweeper forever. Worse than posting nothing,
+        // since a ticket with no rows at least keeps its ack deadline.
+        let v = fold(&[row("agent", TicketState::Acknowledged, 10, None)], None);
+        assert!(
+            v.is_overdue(i64::MAX / 2),
+            "a live ticket nobody gave a deadline must be checked, not ignored"
+        );
+        assert!(
+            v.is_overdue(0),
+            "unknown deadline means check now, not never"
+        );
+    }
+
+    #[test]
+    fn a_live_row_with_no_deadline_falls_back_to_the_ack_deadline() {
+        // Acknowledging must never make a ticket LESS watched than silence.
+        let with_row = fold(
+            &[row("agent", TicketState::Acknowledged, 10, None)],
+            Some(100),
+        );
+        let without_row = fold(&[], Some(100));
+        assert_eq!(
+            with_row.deadline, without_row.deadline,
+            "an ack that names no deadline must not discard the ack deadline"
+        );
+        assert!(with_row.is_overdue(100));
+    }
+
+    #[test]
+    fn a_terminal_ticket_with_no_deadline_is_still_not_overdue() {
+        // The fix above must not make finished tickets sweep forever.
+        for st in [TicketState::Done, TicketState::Failed] {
+            let v = fold(&[row("agent", st, 10, None)], Some(1));
+            assert!(!v.is_overdue(i64::MAX / 2), "{st:?} is finished");
+        }
+    }
+
+    #[test]
+    fn a_failure_without_a_reason_still_says_something() {
+        // A failure a person cannot read is a silent failure wearing a loud
+        // label. Nothing enforced the reason, so an empty field reached the
+        // reader.
+        let v = fold(&[row("agent", TicketState::Failed, 10, None)], None);
+        assert_eq!(v.state, TicketState::Failed);
+        assert_eq!(v.reason.as_deref(), Some(MISSING_REASON));
+    }
+
+    #[test]
+    fn same_second_ties_keep_the_ticket_watched_not_terminal() {
+        // Was: a same-second Done swallowed the actor's own newer live row
+        // via state-rank ordering, terminalising the ticket permanently.
+        // Nostr timestamps are whole seconds, so this is ordinary.
+        let v = fold(
+            &[
+                row("agent", TicketState::Done, 100, None),
+                row("agent", TicketState::Acknowledged, 100, Some(130)),
+            ],
+            None,
+        );
+        assert_eq!(
+            v.state,
+            TicketState::Acknowledged,
+            "on a tie, prefer the row that keeps the ticket watched"
+        );
+        assert!(v.is_overdue(200));
+    }
+
+    #[test]
+    fn same_second_ties_keep_the_tighter_deadline() {
+        // The counterexample that disproved the reviewer's proposed fix:
+        // ordering by state RANK would pick Acknowledged (loose, 1000) over
+        // Progress (tight, 130) and go silent at now=200. Rank and deadline
+        // tightness are independent, so tightness is what must decide.
+        let v = fold(
+            &[
+                row("agent", TicketState::Acknowledged, 100, Some(1000)),
+                row("agent", TicketState::Progress, 100, Some(130)),
+            ],
+            None,
+        );
+        assert_eq!(v.deadline, Some(130), "the tighter deadline must survive");
+        assert!(
+            v.is_overdue(200),
+            "must still fire — this is the silent-ticket case"
+        );
+    }
+
+    #[test]
+    fn same_second_tie_break_is_order_independent() {
+        // Whichever order the relay hands them to us, the answer must match.
+        let a = row("agent", TicketState::Done, 100, None);
+        let b = row("agent", TicketState::Acknowledged, 100, Some(130));
+        assert_eq!(fold(&[a.clone(), b.clone()], None), fold(&[b, a], None));
     }
 
     #[test]
