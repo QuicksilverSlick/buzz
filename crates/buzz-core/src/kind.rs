@@ -448,6 +448,29 @@ pub const KIND_WORKFLOW_DEF: u32 = 30620;
 /// `hidden_at` per viewer; this is the only Nostr-visible projection of it.
 pub const KIND_DM_VISIBILITY: u32 = 30622;
 
+/// A durable request that must reach a terminal state (parameterized
+/// replaceable, d=ticket_id). Authored by whoever made the request; the
+/// content is theirs and nobody else can rewrite it, because the NIP-33
+/// replacement key includes the author pubkey.
+///
+/// State does NOT live here — see [`KIND_TICKET_STATUS`]. A ticket exists so
+/// that a request cannot be silently dropped: it is written down when it
+/// arrives, and something outside the agent sweeps for ones that stopped
+/// moving.
+pub const KIND_TICKET: u32 = 30623;
+
+/// One live status row per (ticket, actor) (parameterized replaceable,
+/// d=`{ticket_id}:{actor_pubkey}`, `e`=ticket root id).
+///
+/// Split from [`KIND_TICKET`] because the NIP-33 replacement key is
+/// `(community, kind, pubkey, d_tag)` — the author is part of the identity. A
+/// single addressable ticket could therefore only ever be advanced by its
+/// original signer, so an assignee, a reviewer, or the watchdog could never
+/// move it. Splitting root from status turns that pubkey binding from an
+/// obstacle into the authorization mechanism: each actor owns their own row
+/// and no actor can forge another's.
+pub const KIND_TICKET_STATUS: u32 = 30624;
+
 /// Lower bound of the NIP-33 parameterized replaceable range (30000–39999).
 pub const PARAM_REPLACEABLE_KIND_MIN: u32 = 30000;
 /// Upper bound of the NIP-33 parameterized replaceable range (30000–39999).
@@ -712,6 +735,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
     KIND_DM_VISIBILITY,
+    KIND_TICKET,
+    KIND_TICKET_STATUS,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
     KIND_DM_HIDE,
@@ -862,6 +887,8 @@ const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_TICKET)); // 30623 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_TICKET_STATUS)); // 30624 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
 
