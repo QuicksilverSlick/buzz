@@ -2265,6 +2265,14 @@ async fn tokio_main() -> Result<()> {
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // (channel, author) pairs already told they are outside the author gate.
+    // One notice per person per channel: silence strands the sender, but a
+    // reply per refused event lets a noisy author turn the agent into a
+    // flooder. Bounded because this process is long-lived and the key space is
+    // attacker-controlled — on overflow we clear and allow one more notice per
+    // pair rather than growing without limit.
+    let mut gate_notified: HashSet<(Uuid, String)> = HashSet::new();
+
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
     // remain reasonably precise without waking long-lived agents frequently.
@@ -2884,13 +2892,53 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
+                                    // warn, not debug: a refused request is a
+                                    // person who got no answer. At debug level
+                                    // this is invisible in practice, so the
+                                    // sender is stranded and the owner never
+                                    // learns anyone tried.
+                                    tracing::warn!(
                                         channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
+                                        author = %author,
                                         mode = %config.respond_to,
                                         is_dm,
-                                        "inbound author gate — dropping event"
+                                        "inbound author gate — refusing event"
                                     );
+
+                                    if remember_gate_notice(
+                                        &mut gate_notified,
+                                        (buzz_event.channel_id, author.clone()),
+                                    ) {
+                                        // Mention the owner in channels so they
+                                        // learn through the normal mention
+                                        // path, in the project where the
+                                        // request arrived. Never in a DM: that
+                                        // would disclose the owner's pubkey to
+                                        // a stranger.
+                                        let mentions: Vec<String> = if is_dm {
+                                            Vec::new()
+                                        } else {
+                                            owner_cache
+                                                .get()
+                                                .map(|o| vec![o.to_string()])
+                                                .unwrap_or_default()
+                                        };
+                                        let content = author_gate_notice_text(is_dm);
+                                        let thread_tags =
+                                            queue::parse_thread_tags(&buzz_event.event);
+                                        let rest = ctx.rest_client.clone();
+                                        let channel_id = buzz_event.channel_id;
+                                        tokio::spawn(async move {
+                                            pool::post_notice(
+                                                &rest,
+                                                channel_id,
+                                                &thread_tags,
+                                                &content,
+                                                &mentions,
+                                            )
+                                            .await;
+                                        });
+                                    }
                                     continue;
                                 }
                             }
@@ -3138,6 +3186,19 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = shutdown_rx.changed() => {
+                    // A run that discarded work must say so before it exits.
+                    // Otherwise the only trace is scattered mid-run lines that
+                    // nobody was watching, and the loss becomes unanswerable
+                    // after the fact.
+                    let drops = queue.drop_counts();
+                    if drops.total() > 0 {
+                        tracing::warn!(
+                            in_flight_dedup = drops.in_flight_dedup,
+                            queue_depth_cap = drops.queue_depth_cap,
+                            total = drops.total(),
+                            "shutting down — events were discarded before delivery during this run"
+                        );
+                    }
                     tracing::info!("shutting down");
                     break;
                 }
@@ -3854,10 +3915,103 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
 /// dead-letter path so neither duplicates the tokio::spawn block.
+/// Upper bound on remembered (channel, author) gate refusals.
+///
+/// The key space is attacker-controlled — anyone can mint a pubkey and post —
+/// so this cannot grow unbounded in a long-lived process. At the cap the memo
+/// is cleared rather than evicted per-entry: the cost of forgetting is one
+/// extra notice to a person who has already been told, which is far cheaper
+/// than the bookkeeping to avoid it.
+const MAX_GATE_NOTIFIED: usize = 4_096;
+
+/// Record that `key` has been told it sits outside the author gate, and report
+/// whether this is the first time (so the caller should post a notice).
+///
+/// Clearing at the cap, rather than evicting one entry, is deliberate: the cost
+/// of forgetting is one repeat notice to someone already told, which is far
+/// cheaper than the bookkeeping an LRU would need on a path that exists only to
+/// suppress duplicates.
+fn remember_gate_notice(seen: &mut HashSet<(Uuid, String)>, key: (Uuid, String)) -> bool {
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() >= MAX_GATE_NOTIFIED {
+        tracing::warn!(
+            tracked = seen.len(),
+            "author gate notice memo full — clearing"
+        );
+        seen.clear();
+    }
+    seen.insert(key);
+    true
+}
+
+/// What someone outside the author gate is told.
+///
+/// Says what happened, what it means for them, and what happens next — without
+/// naming the mechanism. "I'm not set up to take requests from you" is
+/// actionable; "inbound author gate rejected event" is not. It never asks them
+/// to resend: the message is already in the channel, and re-typing it will not
+/// change the outcome.
+fn author_gate_notice_text(is_dm: bool) -> String {
+    if is_dm {
+        // No project channel to point at, and no owner mention — naming the
+        // owner here would hand a stranger their pubkey.
+        "I'm not currently set up to take requests from you, so I can't act on this. \
+         Your message hasn't gone anywhere and you don't need to send it again. \
+         If you're expecting access, ask whoever runs this workspace to add you."
+            .to_string()
+    } else {
+        "I saw your message but I'm not currently set up to take requests from you, \
+         so I can't start on it. Your message is safe in this channel and nothing \
+         needs re-typing. I've flagged this for the owner of this project — once \
+         they add you, send it again and I'll pick it up."
+            .to_string()
+    }
+}
+
+/// Mention list for a notice that someone other than the sender must act on.
+///
+/// A failure the requester cannot fix has to reach the person who can — a
+/// notice nobody is pinged about is only marginally better than no notice.
+/// Empty when no owner is known, which degrades to the previous behaviour
+/// rather than failing.
+fn owner_mentions(owner: Option<&str>) -> Vec<String> {
+    owner
+        .filter(|o| !o.is_empty())
+        .map(|o| vec![o.to_string()])
+        .unwrap_or_default()
+}
+
+/// Plain-language account of why a batch could not be completed.
+///
+/// Names the state rather than the mechanism, and never surfaces a raw error
+/// string. Internals belong in the log — the person waiting cannot act on a
+/// `Display` impl, and a raw error can carry paths or tokens that should not be
+/// posted into a channel.
+fn failure_reason_text(outcome: &PromptOutcome) -> String {
+    match outcome {
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "it stopped making progress".to_string(),
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+            "it ran for a long time without getting closer".to_string()
+        }
+        PromptOutcome::AgentExited => "the tool I use to do the work stopped unexpectedly".to_string(),
+        // Deliberately vague to the channel; the detail is in the log. This is
+        // the one branch that used to interpolate the raw error.
+        PromptOutcome::Error(_) => "something went wrong on my side".to_string(),
+        PromptOutcome::ProjectContextIndeterminate(_) => {
+            "I couldn't tell which project this belongs to, and I'd rather ask than change the wrong one"
+                .to_string()
+        }
+        _ => "it kept failing".to_string(),
+    }
+}
+
 fn spawn_failure_notice(
     rest_client: Option<&relay::RestClient>,
     batch: &FlushBatch,
     content: String,
+    mentions: Vec<String>,
 ) {
     if let Some(rest) = rest_client {
         let thread_tags = batch
@@ -3868,7 +4022,7 @@ fn spawn_failure_notice(
         let rest = rest.clone();
         let channel_id = batch.channel_id;
         tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+            pool::post_notice(&rest, channel_id, &thread_tags, &content, &mentions).await;
         });
     }
 }
@@ -3964,11 +4118,16 @@ fn handle_prompt_result(
                     "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
-                let content = format!(
-                    "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                    config.max_turn_duration_secs
+                let content = "⚠️ I couldn't finish this one. I worked on it for a long \
+                    stretch without getting closer, so I stopped rather than keep going — \
+                    nothing was changed. Send it again if you'd like me to try once more."
+                    .to_string();
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
                 );
-                spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -3982,11 +4141,17 @@ fn handle_prompt_result(
                     "hard-cap timeout with recent activity — requeueing for retry"
                 );
                 if let Some(dead) = queue.requeue(batch) {
-                    let content = format!(
-                        "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                        config.max_turn_duration_secs
+                    let content = "⚠️ I tried this several times and couldn't get through it, \
+                        so I've stopped rather than keep failing quietly. Nothing was changed. \
+                        Sending it again is unlikely to help on its own — this one needs a person \
+                        to look at it."
+                        .to_string();
+                    spawn_failure_notice(
+                        rest_client,
+                        &dead,
+                        content,
+                        owner_mentions(config.agent_owner.as_deref()),
                     );
-                    spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
@@ -4001,26 +4166,32 @@ fn handle_prompt_result(
                     events = batch.events.len(),
                     "dead-lettering batch immediately — non-retryable auth error"
                 );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
+                let content = "⚠️ I've lost my ability to sign in to the tool I use to do this \
+                    work, so I can't act on this — or anything else — until that's restored. \
+                    Nothing was changed. This isn't something you can fix from here: it needs \
+                    whoever runs this workspace, and I've flagged them on this message."
                     .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
-            } else if let Some(dead) = queue.requeue(batch) {
-                let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "the turn exceeded the maximum duration".to_string()
-                    }
-                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
-                    PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
-                    _ => "repeated failures".to_string(),
-                };
-                let content = format!(
-                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
                 );
-                spawn_failure_notice(rest_client, &dead, content);
+            } else if let Some(dead) = queue.requeue(batch) {
+                // The raw error stays in the log above; what reaches the
+                // channel names the state, not the mechanism.
+                let reason = failure_reason_text(&result.outcome);
+                let content = format!(
+                    "⚠️ I tried this several times and couldn't get through it — {reason}. \
+                     I've stopped rather than keep failing quietly, and nothing was changed. \
+                     This one needs a person to look at it."
+                );
+                spawn_failure_notice(
+                    rest_client,
+                    &dead,
+                    content,
+                    owner_mentions(config.agent_owner.as_deref()),
+                );
             }
         } else {
             tracing::debug!(
@@ -5506,6 +5677,166 @@ mod author_gate_tests {
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
             );
         }
+    }
+
+    // ── Author gate notice ────────────────────────────────────────────────
+    //
+    // A refused author used to be dropped at debug level with no reply, so the
+    // sender was stranded and the owner never learned anyone had tried. These
+    // lock down the properties that make the refusal visible instead.
+
+    #[test]
+    fn test_gate_notice_says_what_happened_and_what_next() {
+        for is_dm in [false, true] {
+            let text = author_gate_notice_text(is_dm);
+            assert!(
+                text.contains("can't"),
+                "notice must state that the request will not be acted on (is_dm={is_dm})"
+            );
+            assert!(
+                text.contains("send it again") || text.contains("add you"),
+                "notice must tell the sender what happens next (is_dm={is_dm})"
+            );
+            assert!(
+                !text.contains("author gate")
+                    && !text.contains("respond_to")
+                    && !text.contains("pubkey"),
+                "notice must name the state, not the mechanism (is_dm={is_dm})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gate_notice_never_asks_for_a_resend_of_the_same_message() {
+        // Re-sending cannot change the outcome — asking for it is the pattern
+        // that trains people to repeat themselves into silence.
+        let channel = author_gate_notice_text(false);
+        assert!(
+            channel.contains("nothing") && channel.contains("re-typing"),
+            "channel notice must reassure that the message is not lost: {channel}"
+        );
+        let dm = author_gate_notice_text(true);
+        assert!(
+            dm.contains("don't need to send it again"),
+            "DM notice must reassure that the message is not lost: {dm}"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_does_not_leak_owner_in_dm() {
+        // In a channel the owner is p-tagged so they learn someone tried. In a
+        // DM there is no such mention, and the text must not compensate by
+        // naming them — the sender is an unknown party.
+        let dm = author_gate_notice_text(true);
+        assert!(
+            !dm.contains("owner of this project"),
+            "DM notice must not point an unknown sender at the owner: {dm}"
+        );
+        let channel = author_gate_notice_text(false);
+        assert!(
+            channel.contains("owner"),
+            "channel notice should say the owner was flagged: {channel}"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_fires_once_per_person_per_channel() {
+        let mut seen = HashSet::new();
+        let chan_a = Uuid::from_u128(1);
+        let chan_b = Uuid::from_u128(2);
+
+        assert!(
+            remember_gate_notice(&mut seen, (chan_a, "alice".into())),
+            "first refusal must notify"
+        );
+        assert!(
+            !remember_gate_notice(&mut seen, (chan_a, "alice".into())),
+            "a repeat refusal must stay quiet — otherwise a noisy author turns the agent into a flooder"
+        );
+        assert!(
+            remember_gate_notice(&mut seen, (chan_b, "alice".into())),
+            "the same person in a different channel has not been told there"
+        );
+        assert!(
+            remember_gate_notice(&mut seen, (chan_a, "bob".into())),
+            "a different person in the same channel has not been told"
+        );
+    }
+
+    #[test]
+    fn test_gate_notice_memo_stays_bounded_under_attacker_supplied_keys() {
+        // Anyone can mint a pubkey and post, so the key space is not ours to
+        // trust. The memo must not grow without limit in a long-lived process.
+        let mut seen = HashSet::new();
+        let chan = Uuid::from_u128(7);
+        for i in 0..(MAX_GATE_NOTIFIED * 2 + 5) {
+            remember_gate_notice(&mut seen, (chan, format!("author-{i}")));
+            assert!(
+                seen.len() <= MAX_GATE_NOTIFIED,
+                "memo exceeded its bound at iteration {i}: {}",
+                seen.len()
+            );
+        }
+    }
+
+    // ── Failure notice wording ────────────────────────────────────────────
+    //
+    // These notices used to name the mechanism ("the turn exceeded the maximum
+    // duration (7200s)"), interpolate a raw error, and tell whoever was waiting
+    // to run `claude /login` — an instruction a collaborator cannot act on.
+
+    #[test]
+    fn test_failure_reason_never_surfaces_a_raw_error() {
+        // A Display impl can carry paths, tokens, or stack detail. It belongs
+        // in the log, not in a channel anyone with access can read.
+        let leaky = PromptOutcome::Error(acp::AcpError::Protocol(
+            "connect ECONNREFUSED 10.0.0.4:8080 /home/x/.ssh".to_string(),
+        ));
+        let text = failure_reason_text(&leaky);
+        assert!(
+            !text.contains("ECONNREFUSED") && !text.contains(".ssh") && !text.contains("10.0.0.4"),
+            "raw error leaked into a user-facing notice: {text}"
+        );
+    }
+
+    #[test]
+    fn test_failure_reasons_name_the_state_not_the_mechanism() {
+        let cases = [
+            PromptOutcome::Timeout(TimeoutKind::Idle),
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            PromptOutcome::AgentExited,
+            PromptOutcome::Error(acp::AcpError::Protocol("boom".to_string())),
+        ];
+        for outcome in cases {
+            let text = failure_reason_text(&outcome);
+            assert!(
+                !text.is_empty(),
+                "every outcome needs a plain-language reason"
+            );
+            for jargon in ["turn", "batch", "dead-letter", "PromptOutcome", "requeue"] {
+                assert!(
+                    !text.to_lowercase().contains(jargon),
+                    "reason leaks internal vocabulary {jargon:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_owner_is_mentioned_so_a_failure_reaches_someone_who_can_act() {
+        assert_eq!(
+            owner_mentions(Some("npub_owner")),
+            vec!["npub_owner".to_string()],
+            "a failure the requester cannot fix must ping whoever can"
+        );
+        // Degrade to previous behaviour rather than failing when unknown.
+        assert!(owner_mentions(None).is_empty());
+        assert!(
+            owner_mentions(Some("")).is_empty(),
+            "an empty owner must not produce an empty p-tag"
+        );
     }
 
     // ── DM hardening ──────────────────────────────────────────────────────
