@@ -12087,7 +12087,7 @@ export function maybeInstallE2eTauriMocks() {
               name: "Gemma-4-E4B-it-Q4_K_M",
               size: "3.5GB",
               sizeGb: 3.5,
-              description: "Buzz-curated local agent model",
+              description: "Dreamforge-curated local agent model",
               fit: "comfortable",
               installed: true,
               recommended: true,
