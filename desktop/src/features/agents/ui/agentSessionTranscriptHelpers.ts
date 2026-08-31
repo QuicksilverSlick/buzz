@@ -88,7 +88,7 @@ export function parsePromptText(text: string): {
   return {
     sections,
     userText: eventContent,
-    userTitle: eventKind ? titleCase(eventKind) : "Buzz event",
+    userTitle: eventKind ? titleCase(eventKind) : "Dreamforge event",
     userPubkey: eventAuthorPubkey,
     userEventId: eventId,
   };
@@ -469,9 +469,11 @@ function semanticTurnTitle(
       return `${label} (${attributes.included} of ${attributes.total} messages${truncated})`;
     }
     case "buzz-event":
-      return attributes.type ? `Buzz event: ${attributes.type}` : "Buzz event";
+      return attributes.type
+        ? `Dreamforge event: ${attributes.type}`
+        : "Dreamforge event";
     case "buzz-events":
-      return `Buzz events — ${attributes.count} events`;
+      return `Dreamforge events — ${attributes.count} events`;
     case "what-you-were-working-on":
       return "What you were working on";
     case "new-message-arrived-while-you-were-working":
