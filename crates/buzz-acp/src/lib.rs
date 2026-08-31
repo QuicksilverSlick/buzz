@@ -3186,6 +3186,19 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = shutdown_rx.changed() => {
+                    // A run that discarded work must say so before it exits.
+                    // Otherwise the only trace is scattered mid-run lines that
+                    // nobody was watching, and the loss becomes unanswerable
+                    // after the fact.
+                    let drops = queue.drop_counts();
+                    if drops.total() > 0 {
+                        tracing::warn!(
+                            in_flight_dedup = drops.in_flight_dedup,
+                            queue_depth_cap = drops.queue_depth_cap,
+                            total = drops.total(),
+                            "shutting down — events were discarded before delivery during this run"
+                        );
+                    }
                     tracing::info!("shutting down");
                     break;
                 }

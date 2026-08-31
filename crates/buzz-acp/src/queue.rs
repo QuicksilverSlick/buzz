@@ -136,9 +136,35 @@ pub struct FlushBatch {
 ///     if retry_counts[channel] > MAX_RETRIES: dead-letter (log ERROR, return batch to caller)
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
 /// ```
+/// Events discarded before ever reaching an agent, by cause.
+///
+/// Both paths lose work somebody is waiting on, so they are counted and not
+/// merely logged. A running total is what makes the loss detectable: a
+/// watchdog can alert on any non-zero delta without a metrics pipeline, and
+/// "this counter moved" is a question anyone can answer from the logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropCounts {
+    /// Discarded because that channel already had a turn in flight, under
+    /// [`DedupMode::Drop`].
+    pub in_flight_dedup: u64,
+    /// Discarded because the channel queue was at its depth cap. The *oldest*
+    /// event is evicted, so the request that has waited longest is the one
+    /// lost — the reverse of what someone waiting would expect.
+    pub queue_depth_cap: u64,
+}
+
+impl DropCounts {
+    /// Total events lost across every cause.
+    pub fn total(&self) -> u64 {
+        self.in_flight_dedup + self.queue_depth_cap
+    }
+}
+
 pub struct EventQueue {
     queues: HashMap<Uuid, VecDeque<QueuedEvent>>,
     in_flight_channels: HashSet<Uuid>,
+    /// Running totals of work discarded before delivery. See [`DropCounts`].
+    drops: DropCounts,
     /// Per-channel deadline for auto-expiring stuck in-flight entries.
     in_flight_deadlines: HashMap<Uuid, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
@@ -182,6 +208,7 @@ impl EventQueue {
         Self {
             queues: HashMap::new(),
             in_flight_channels: HashSet::new(),
+            drops: DropCounts::default(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
             retry_after: HashMap::new(),
@@ -233,19 +260,27 @@ impl EventQueue {
         if matches!(self.dedup_mode, DedupMode::Drop)
             && self.in_flight_channels.contains(&event.channel_id)
         {
-            tracing::debug!(
+            self.drops.in_flight_dedup += 1;
+            // warn, not debug: this discards a request someone sent. At debug
+            // level the loss is invisible in practice, which is how work goes
+            // missing without anyone being able to say so afterwards.
+            tracing::warn!(
                 channel_id = %event.channel_id,
+                dropped_total = self.drops.in_flight_dedup,
                 "dropping event for in-flight channel (drop mode)"
             );
             return false;
         }
+        let drops = &mut self.drops;
         let queue = self.queues.entry(event.channel_id).or_default();
         // Enforce per-channel depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
             queue.pop_front();
+            drops.queue_depth_cap += 1;
             tracing::warn!(
                 channel_id = %event.channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
+                dropped_total = drops.queue_depth_cap,
                 "queue depth cap reached — dropped oldest event"
             );
         }
@@ -626,6 +661,15 @@ impl EventQueue {
     }
 
     /// Number of channels with pending events.
+    /// Running totals of work discarded before delivery.
+    ///
+    /// Exposed so a supervisor outside this queue can observe the loss. A
+    /// counter only the queue can see is not observability — the process that
+    /// drops the work is the least reliable place to report it from.
+    pub fn drop_counts(&self) -> DropCounts {
+        self.drops
+    }
+
     pub fn pending_channels(&self) -> usize {
         self.queues.len()
     }
@@ -2005,6 +2049,78 @@ mod tests {
     use std::time::Duration;
 
     /// Build a test event with the given content and kind.
+    // ── Discarded-work accounting ─────────────────────────────────────
+    //
+    // Both drop paths lose a request someone sent. They were previously
+    // observable only as scattered log lines — one of them at debug level —
+    // so work could go missing with no way to establish afterwards that it
+    // had. These lock the counting down.
+
+    #[test]
+    fn test_dedup_drop_is_counted_not_just_logged() {
+        let mut q = EventQueue::new(DedupMode::Drop);
+        let chan = Uuid::new_v4();
+        // flush_next() is what puts a channel in flight.
+        assert!(q.push(make_queued(chan, "first")));
+        let _in_flight = q.flush_next().expect("first push is flushable");
+
+        assert_eq!(q.drop_counts().total(), 0, "nothing lost yet");
+        assert!(
+            !q.push(make_queued(chan, "dropped one")),
+            "drop mode discards"
+        );
+        assert!(
+            !q.push(make_queued(chan, "dropped two")),
+            "drop mode discards"
+        );
+
+        let drops = q.drop_counts();
+        assert_eq!(
+            drops.in_flight_dedup, 2,
+            "every discarded event must be counted"
+        );
+        assert_eq!(drops.queue_depth_cap, 0, "wrong cause attributed");
+        assert_eq!(drops.total(), 2);
+    }
+
+    #[test]
+    fn test_queue_mode_does_not_count_drops_because_it_does_not_drop() {
+        // Queue mode is the CLI default. It must not inflate the loss counter,
+        // or a real drop becomes indistinguishable from normal operation.
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let chan = Uuid::new_v4();
+        assert!(q.push(make_queued(chan, "first")));
+        let _in_flight = q.flush_next().expect("first push is flushable");
+
+        assert!(q.push(make_queued(chan, "queued behind in-flight")));
+        assert_eq!(q.drop_counts().total(), 0, "queue mode loses nothing");
+    }
+
+    #[test]
+    fn test_depth_cap_drop_is_counted_and_evicts_the_oldest() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let chan = Uuid::new_v4();
+        for i in 0..MAX_PENDING_PER_CHANNEL {
+            assert!(q.push(make_queued(chan, &format!("event {i}"))));
+        }
+        assert_eq!(q.drop_counts().total(), 0, "at the cap, nothing lost yet");
+
+        // One past the cap evicts the OLDEST — the request that has waited
+        // longest is the one lost, which is worth asserting because it is the
+        // opposite of what someone waiting would expect.
+        assert!(q.push(make_queued(chan, "one too many")));
+        let drops = q.drop_counts();
+        assert_eq!(drops.queue_depth_cap, 1);
+        assert_eq!(drops.in_flight_dedup, 0, "wrong cause attributed");
+
+        let batch = q.flush_next().expect("a batch is pending");
+        let first = batch.events.first().expect("batch is non-empty");
+        assert!(
+            !first.event.content.contains("event 0"),
+            "the oldest event should have been evicted, but it is still at the front"
+        );
+    }
+
     fn make_event(content: &str) -> Event {
         let keys = Keys::generate();
         EventBuilder::new(Kind::Custom(9), content)
