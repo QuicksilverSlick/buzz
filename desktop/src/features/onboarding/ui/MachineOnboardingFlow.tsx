@@ -312,7 +312,7 @@ export function MachineOnboardingFlow({
               transitionKey={`machine-identity-${transitionDirection}`}
             >
               <img
-                alt="Buzz"
+                alt="Dreamforge"
                 className="w-full max-w-[600px]"
                 src="/landing/buzz-wordmark.png"
               />
@@ -381,8 +381,8 @@ export function MachineOnboardingFlow({
                     "Enter your backup password to restore your identity."
                   ) : (
                     <p>
-                      Paste your private key to sign in to Buzz. You can also
-                      use a{" "}
+                      Paste your private key to sign in to Dreamforge. You can
+                      also use a{" "}
                       <button
                         className="rounded-sm font-medium underline decoration-foreground/40 underline-offset-4 transition-colors hover:decoration-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-60"
                         data-testid="nostr-import-file-button"
@@ -450,7 +450,8 @@ export function MachineOnboardingFlow({
                       Restore from a backup file
                     </DialogTitle>
                     <DialogDescription className="mx-auto mt-4 max-w-[28rem] text-sm leading-6 text-foreground/80">
-                      Choose the encrypted backup file you saved from Buzz.
+                      Choose the encrypted backup file you saved from
+                      Dreamforge.
                     </DialogDescription>
                     <NostrKeyImportForm
                       footerMode="inline"
@@ -480,12 +481,12 @@ export function MachineOnboardingFlow({
                     <DialogTitle className="text-balance px-8 text-3xl font-normal text-foreground">
                       {identityLost
                         ? "Recover from your phone"
-                        : "Use your Buzz identity"}
+                        : "Use your Dreamforge identity"}
                     </DialogTitle>
                     <DialogDescription className="mt-4 text-sm leading-6 text-foreground/80">
                       {phoneRecoveryStep === "loading" ||
                       phoneRecoveryStep === "qr"
-                        ? "Scan this code with a signed-in Buzz phone."
+                        ? "Scan this code with a signed-in Dreamforge phone."
                         : "Confirm the code before sharing your identity."}
                     </DialogDescription>
                     <div className="mt-5">

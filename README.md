@@ -1,3 +1,19 @@
+> **This is Dreamforge**, a fork of [`block/buzz`](https://github.com/block/buzz).
+>
+> The product ships as Dreamforge and every screen says so. Everything below the
+> surface deliberately keeps upstream's names — crates stay `buzz-*`, environment
+> variables stay `BUZZ_*`, and on-the-wire tags (`buzz-channel`, `buzz-protect`,
+> `buzz-visibility`) and event kinds are untouched.
+>
+> That split is intentional. Renaming an environment variable would make upstream
+> code read one nobody sets — it compiles, runs, and silently takes a default.
+> Renaming a wire tag would diverge the protocol with no error at all. Both fail
+> quietly, and quiet failure is the thing this fork exists to remove. Renaming
+> what people read costs nothing, because no code depends on it.
+>
+> The product name lives in `desktop/src/shared/constants/brand.ts`.
+> Upstream documentation below is unchanged and still refers to Buzz.
+
 <h1 align="center">Buzz 🐝</h1>
 
 <p align="center">

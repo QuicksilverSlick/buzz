@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Buzz",
+  "productName": "Dreamforge",
   "version": "0.5.20",
   "identifier": "xyz.block.buzz.app",
   "build": {

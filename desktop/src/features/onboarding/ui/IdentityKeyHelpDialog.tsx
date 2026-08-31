@@ -82,18 +82,19 @@ export function IdentityKeyHelpDialog() {
           >
             <div>
               <p>
-                Buzz uses an identity key instead of a traditional account. It’s
-                created on your device and represents you whenever you use Buzz.
+                Dreamforge uses an identity key instead of a traditional
+                account. It’s created on your device and represents you whenever
+                you use Dreamforge.
               </p>
               <p>
-                Your identity belongs to you, not Buzz. There’s no password to
-                reset, and Buzz can’t recover your key if you lose it. Keep a
-                backup somewhere safe and never share it. Anyone with your key
-                can act as you.
+                Your identity belongs to you, not Dreamforge. There’s no
+                password to reset, and Dreamforge can’t recover your key if you
+                lose it. Keep a backup somewhere safe and never share it. Anyone
+                with your key can act as you.
               </p>
               <p>
-                If you’re new to Buzz, create a new identity key. If you already
-                have a Nostr identity, use your existing key.
+                If you’re new to Dreamforge, create a new identity key. If you
+                already have a Nostr identity, use your existing key.
               </p>
             </div>
           </DialogDescription>
