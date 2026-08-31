@@ -4752,15 +4752,27 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
-pub(crate) async fn post_failure_notice(
+/// Post a notice from the agent into a channel, optionally p-tagging people who
+/// need to know.
+///
+/// Replies into the thread of `thread_tags` when the triggering event was
+/// threaded, so the notice lands beside the request it concerns. Errors are
+/// logged and swallowed — a notice must never take down the main loop.
+///
+/// `mentions` is how a notice reaches the person who can act on it: the owner
+/// learns through the normal mention path rather than by watching a channel.
+/// Notices stay in the channel the work arrived in — keeping the exchange with
+/// its project preserves the context instead of stranding it in a private
+/// inbox, and the agent never opens a DM of its own.
+///
+/// Best-effort by design: the caller must not be blocked waiting on the relay,
+/// and a notice that cannot be delivered must not take the turn down with it.
+pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
+    mentions: &[String],
 ) {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
@@ -4774,25 +4786,32 @@ pub(crate) async fn post_failure_notice(
             parent_event_id: parent_id,
         })
     });
-    let builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-                return;
-            }
-        };
+    let mention_refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
+    let builder = match buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        &mention_refs,
+        false,
+        &[],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
+            return;
+        }
+    };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
+            tracing::warn!(channel = %channel_id, "notice: sign failed: {e}");
             return;
         }
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "notice failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "notice timed out"),
     }
 }
 

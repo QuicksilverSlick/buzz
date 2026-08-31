@@ -40,6 +40,9 @@ pub mod private_managed_agent;
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
+
+/// Ticket state: the fold from status events to what is true now.
+pub mod ticket;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 
