@@ -150,6 +150,27 @@
     color-scheme: dark;
   }
 
+  /* Native <select> popups are drawn by the OS, not the page, so they do not
+   * inherit the dialog's surface. Two things then go wrong together on a
+   * dark theme:
+   *
+   *   1. the popup surface falls back to the control's own background, and
+   *      our field controls are `bg-transparent`, which renders white;
+   *   2. each <option> inherits `color` from the select, and our fields use
+   *      `text-muted-foreground/55` — faint grey, chosen to be readable on a
+   *      dark surface.
+   *
+   * Faint grey on white is close to invisible, which is what the access
+   * channel picker in the Add-repository dialog looked like. Pinning both the
+   * surface and the text on the option itself fixes it wherever a native
+   * select is used — 25 of them across 19 files — rather than one dialog at
+   * a time.
+   */
+  select option {
+    background-color: hsl(var(--popover));
+    color: hsl(var(--popover-foreground));
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
     font-family: "Inter Variable", Inter, "Avenir Next", "Segoe UI", sans-serif;
