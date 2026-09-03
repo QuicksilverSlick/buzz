@@ -7,6 +7,7 @@ import {
   ContextMenuTrigger,
 } from "@/shared/ui/context-menu";
 
+import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { ChannelContextMenuItems } from "@/features/sidebar/ui/ChannelContextMenu";
 import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
@@ -31,6 +32,7 @@ import {
 } from "@/shared/ui/sidebar";
 import { ChannelActivityPopover } from "@/features/sidebar/ui/ChannelActivityPopover";
 import { useAppShell } from "@/app/AppShellContext";
+import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
 
 const SECTION_LABEL_BUTTON_CLASS =
   "group/section-label flex w-fit max-w-[calc(100%-3rem)] cursor-pointer appearance-none items-center gap-1 text-left transition-colors hover:text-sidebar-foreground focus-visible:text-sidebar-foreground";
@@ -153,6 +155,7 @@ function ChannelWorkingBadge({
 export type SidebarDmParticipant = {
   avatarUrl: string | null;
   label: string;
+  isAgent?: boolean;
   pubkey: string;
 };
 
@@ -197,6 +200,7 @@ function DmChannelIcon({
           geometry={DM_AVATAR_STATUS_GEOMETRY}
           iconClassName="h-3.5 w-3.5"
           label={primaryParticipant.label}
+          shape={primaryParticipant.isAgent ? "squircle" : "circle"}
           size={DM_AVATAR_SIZE}
           status={presenceStatus}
           statusTestId={`channel-presence-${channelName}`}
@@ -322,16 +326,34 @@ export function ChannelMenuButton({
         presenceStatus={presenceStatus}
       />
       <span
-        className={cn("min-w-0 flex-1 truncate", inactiveContentOpacity)}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1",
+          inactiveContentOpacity,
+        )}
         data-sidebar-row-label
       >
-        {resolvedLabel}
+        <span className="min-w-0 truncate">{resolvedLabel}</span>
+        {channel.channelType === "dm" &&
+        (channel.participantPubkeys.length === 2 ||
+          dmParticipants?.length === 1) ? (
+          <UserNameIndicators
+            className="ml-1"
+            pubkey={dmParticipants?.[0]?.pubkey}
+            size="dm"
+          />
+        ) : null}
       </span>
       {showsEphemeralBadge && ephemeralDisplay ? (
         <EphemeralChannelBadge
           display={ephemeralDisplay}
           testId={`channel-ephemeral-${channel.name}`}
           variant="sidebar"
+        />
+      ) : null}
+      {channel.channelType === "dm" && dmParticipants?.length === 1 ? (
+        <AgentManagementMarker
+          pubkey={dmParticipants[0].pubkey}
+          testId={`channel-agent-provenance-${channel.id}`}
         />
       ) : null}
       {activeWorking ? (
