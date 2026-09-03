@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import type { ObserverEvent, PromptSection } from "./agentSessionTypes";
 import {
   findBuzzToolName,
@@ -74,7 +75,18 @@ export function parsePromptText(text: string): {
 
   const eventSection = sections.find((section) => {
     const title = section.title.toLowerCase();
-    return title.startsWith("buzz event");
+    // Two different producers reach this matcher, and they do not agree on the
+    // product name. The wire tag is `buzz-event` and buzz-acp emits
+    // `[Buzz event: …]`; both are protocol surfaces this fork deliberately
+    // leaves unrenamed. `semanticTurnTitle` below renders the same section
+    // under the product name for display. Matching only one spelling silently
+    // yields no event section, which empties `userText` and drops the user's
+    // message from the transcript entirely -- the failure this accepts both to
+    // prevent.
+    return (
+      title.startsWith("buzz event") ||
+      title.startsWith(`${PRODUCT_NAME.toLowerCase()} event`)
+    );
   });
   const eventContent = eventSection
     ? extractEventContent(eventSection.body)
@@ -88,7 +100,7 @@ export function parsePromptText(text: string): {
   return {
     sections,
     userText: eventContent,
-    userTitle: eventKind ? titleCase(eventKind) : "Dreamforge event",
+    userTitle: eventKind ? titleCase(eventKind) : `${PRODUCT_NAME} event`,
     userPubkey: eventAuthorPubkey,
     userEventId: eventId,
   };
@@ -470,10 +482,10 @@ function semanticTurnTitle(
     }
     case "buzz-event":
       return attributes.type
-        ? `Dreamforge event: ${attributes.type}`
-        : "Dreamforge event";
+        ? `${PRODUCT_NAME} event: ${attributes.type}`
+        : `${PRODUCT_NAME} event`;
     case "buzz-events":
-      return `Dreamforge events — ${attributes.count} events`;
+      return `${PRODUCT_NAME} events — ${attributes.count} events`;
     case "what-you-were-working-on":
       return "What you were working on";
     case "new-message-arrived-while-you-were-working":
