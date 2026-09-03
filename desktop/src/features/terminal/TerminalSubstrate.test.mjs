@@ -1,3 +1,4 @@
+import { TERMINAL_LABEL } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 
@@ -219,7 +220,7 @@ test("tab actions restore terminal input focus", async () => {
   const actions = [
     ["select", view.getByRole("tab")],
     ["close", view.getByLabelText("Close SHELL")],
-    ["new", view.getByLabelText("New Buzz Term tab")],
+    ["new", view.getByLabelText(`New ${TERMINAL_LABEL} tab`)],
   ];
   for (const [label, target] of actions) {
     target.focus();
@@ -237,7 +238,7 @@ test("drag resize batches visual updates and commits state only on release", asy
   const { view } = fixture({ mode: "docked" });
   await ready(view);
   const substrate = view.container.querySelector(".buzz-terminal-substrate");
-  const handle = view.getByLabelText("Resize Buzz Term");
+  const handle = view.getByLabelText(`Resize ${TERMINAL_LABEL}`);
 
   fireEvent.pointerDown(handle, { clientY: 500, pointerId: 1 });
   fireEvent.pointerMove(handle, { clientY: 400, pointerId: 2 });
@@ -278,7 +279,7 @@ test("drag resize repaints the canvas without reporting PTY geometry until relea
   const canvas = view.container.querySelector(
     ".buzz-terminal-viewport > canvas:not(.buzz-terminal-welcome)",
   );
-  const handle = view.getByLabelText("Resize Buzz Term");
+  const handle = view.getByLabelText(`Resize ${TERMINAL_LABEL}`);
   await waitFor(() => assert.equal(canvas.height, 280));
   const reportsBeforeDrag = viewportSizes.length;
 
@@ -300,7 +301,7 @@ test("drag resize repaints the canvas without reporting PTY geometry until relea
 test("unmount cancels a queued drag update", async () => {
   const { view } = fixture({ mode: "docked" });
   await ready(view);
-  const handle = view.getByLabelText("Resize Buzz Term");
+  const handle = view.getByLabelText(`Resize ${TERMINAL_LABEL}`);
   const previousHeight = handle.closest(".buzz-terminal-substrate").style
     .height;
 

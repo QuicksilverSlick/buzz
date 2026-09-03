@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -125,7 +126,7 @@ test("approval and needs-action titles match the home-feed conventions", () => {
     }),
     {
       title: "Needs Action",
-      body: "Something in Buzz needs your attention.",
+      body: `Something in ${PRODUCT_NAME} needs your attention.`,
     },
   );
 });

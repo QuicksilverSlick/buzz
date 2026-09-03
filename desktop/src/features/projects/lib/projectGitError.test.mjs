@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -13,8 +14,7 @@ test("explains unsupported authenticated GitHub clones without exposing git outp
     ),
     {
       title: "Repository access required",
-      description:
-        "This repository requires GitHub authentication. Buzz currently clones public GitHub repositories without credentials.",
+      description: `This repository requires GitHub authentication. ${PRODUCT_NAME} currently clones public GitHub repositories without credentials.`,
     },
   );
 });

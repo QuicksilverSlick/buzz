@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -84,7 +85,7 @@ test("prompt footer contains current page details", () => {
   const footer = projectDetailAgentContextBlock(
     buildProjectDetailAgentContext(base),
   );
-  assert.match(footer, /Current Buzz project page:/);
+  assert.match(footer, new RegExp(`Current ${PRODUCT_NAME} project page:`));
   assert.match(footer, /Repository: "Buzz" \(address: "owner:buzz"\)/);
   assert.match(footer, /View: Files/);
   assert.match(footer, /File: "src\/app\.tsx"/);
