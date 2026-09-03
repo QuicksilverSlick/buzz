@@ -935,6 +935,13 @@ test("routes a managed relay-agent mention from an existing DM to the expanded c
   expect(sendCommands.map((entry) => entry.command)).not.toContain(
     "add_channel_members",
   );
+  // The awaited DM expansion is a relay round-trip between the
+  // pre-side-effect authorization pass and the publish, so the publish
+  // boundary re-validates instead of reusing the earlier pass.
+  expect(
+    sendCommands.filter((entry) => entry.command === "revalidate_relay_agents")
+      .length,
+  ).toBe(2);
 });
 
 test("does not reroute an expanded DM after the user navigates away", async ({
@@ -1032,7 +1039,13 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
   await page.keyboard.type(" for a hand");
   await page.getByTestId("send-message").click();
 
-  await expect(page.getByText(sendError)).toBeVisible();
+  await expect(
+    page.getByTestId("new-message-page").getByText(sendError, { exact: true }),
+  ).toBeVisible();
+  const sendErrorToast = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: `Message failed to send: ${sendError}` });
+  await expect(sendErrorToast).toBeVisible();
   await expect(input).toContainText("Fizz");
 
   const commandsAfterFailure = await readCommandPayloadLog(page);
@@ -1054,6 +1067,11 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
     "open_dm",
   );
 
+  // fill() does not move the pointer off Send, where the error toast appears.
+  // Sonner pauses dismissal on hover; move back to the editor and observe the
+  // toast's normal expiry before retrying the covered button.
+  await input.hover();
+  await expect(sendErrorToast).toHaveCount(0, { timeout: 10_000 });
   await input.fill(retryMessage);
   const retryBaseline = commandsAfterFailure.length;
   await page.getByTestId("send-message").click();
@@ -1087,8 +1105,13 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
   ).toHaveAttribute("data-channel-id", retryChannelId ?? "");
 });
 
-test("drops an expanded DM after agent startup fails", async ({ page }) => {
-  const retryMessage = "Retry after agent startup failed";
+test("publishes into an expanded DM even when agent startup fails", async ({
+  page,
+}) => {
+  // Agent starts are detached from the send: the message publishes into the
+  // expanded DM and the start failure surfaces as a post-send toast. Failures
+  // that still block the publish (and drop the expanded DM) are covered by
+  // the preceding "drops an expanded DM after the first message fails" spec.
   const startError = "Mock agent startup failed.";
   await installMockBridge(page, {
     activePersonaIds: ["builtin:fizz"],
@@ -1114,53 +1137,32 @@ test("drops an expanded DM after agent startup fails", async ({ page }) => {
   await page.keyboard.type(" before startup fails");
   await page.getByTestId("send-message").click();
 
+  // The message lands in the expanded DM despite the failed start.
+  await expect(page.getByTestId("chat-title")).toContainText("Fizz");
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "before startup fails",
+  );
+
+  // The start failure surfaces as a toast, and the sent text is not restored
+  // into the composer — the send succeeded, so there is nothing to retry.
+  // (The persistent agent audience may legitimately re-seed a "@Fizz"
+  // auto-mention, so only the message body proves there was no restore.)
   await expect(
     page.getByText(startError, { exact: false }).first(),
   ).toBeVisible();
-  await expect(input).toContainText("Fizz");
+  await expect(input).not.toContainText("before startup fails");
 
-  const commandsAfterFailure = await readCommandPayloadLog(page);
-  const openDmCallsAfterFailure = commandsAfterFailure.filter(
-    (entry) => entry.command === "open_dm",
+  const commands = await readCommandPayloadLog(page);
+  const lastOpenDm = commands
+    .filter((entry) => entry.command === "open_dm")
+    .at(-1);
+  const openDmPubkeys = (
+    lastOpenDm?.payload as { pubkeys?: string[] } | undefined
+  )?.pubkeys;
+  expect(openDmPubkeys).toEqual(
+    expect.arrayContaining([TEST_IDENTITIES.charlie.pubkey]),
   );
-  expect(openDmCallsAfterFailure).toHaveLength(2);
-  expect(
-    (openDmCallsAfterFailure.at(-1)?.payload as { pubkeys?: string[] })
-      ?.pubkeys,
-  ).toEqual(expect.arrayContaining([TEST_IDENTITIES.charlie.pubkey]));
-  expect(
-    (openDmCallsAfterFailure.at(-1)?.payload as { pubkeys?: string[] })
-      ?.pubkeys,
-  ).toHaveLength(2);
-
-  await input.fill(retryMessage);
-  const retryBaseline = commandsAfterFailure.length;
-  // The first send left the cursor parked over the bottom-right error toast,
-  // which overlaps the send button. Sonner pauses its dismiss timer while the
-  // toaster is hovered, so move the cursor away and let the transient toast
-  // clear before retrying — otherwise the retry click is intercepted for the
-  // full timeout.
-  await page.mouse.move(0, 0);
-  await expect(page.locator("[data-sonner-toast]")).toHaveCount(0, {
-    timeout: 10_000,
-  });
-  await page.getByTestId("send-message").click();
-
-  await expect(page.getByTestId("chat-title")).toHaveText("charlie");
-  await expect(page.getByTestId("message-timeline")).toContainText(
-    retryMessage,
-  );
-
-  const retryCommands = (await readCommandPayloadLog(page)).slice(
-    retryBaseline,
-  );
-  const retryOpenDm = retryCommands.find(
-    (entry) => entry.command === "open_dm",
-  );
-  expect(
-    (retryOpenDm?.payload as { pubkeys?: string[] } | undefined)?.pubkeys,
-  ).toEqual([TEST_IDENTITIES.charlie.pubkey]);
-  await expect(page.getByTestId("chat-title")).not.toContainText("Fizz");
+  expect(openDmPubkeys).toHaveLength(2);
 });
 
 test("closes direct message results while opening", async ({ page }) => {
@@ -1472,10 +1474,9 @@ test("create channel template selector matches the lifecycle controls", async ({
   await expect(page.getByTestId("create-channel-description")).toHaveValue(
     "Coordinate a new project from planning through launch.",
   );
-  await expect(page.getByTestId("create-channel-permissions")).toContainText(
-    "Private",
-  );
-  await page.getByTestId("create-channel-permissions").click();
+  await expect(
+    page.getByTestId("create-channel-permissions-option-private"),
+  ).toHaveAttribute("aria-pressed", "true");
   await page.getByTestId("create-channel-permissions-option-open").click();
   await expect(page.getByTestId("create-channel-template-summary")).toHaveText(
     "Open · Canvas included · 1 agent · 1 team",
@@ -1498,6 +1499,12 @@ test("create channel exposes templates when the library is empty", async ({
   const templateContainer = page.getByTestId(
     "create-channel-template-container",
   );
+  await expect(
+    page.getByTestId("create-channel-channel-type").getByRole("button"),
+  ).toHaveText(["Temporary", "Ongoing"]);
+  await expect(
+    page.getByTestId("create-channel-permissions").getByRole("button"),
+  ).toHaveText(["Private", "Public"]);
   await expect(templateContainer).toContainText("TemplateOptional");
   const typeBox = await typeContainer.boundingBox();
   const visibilityBox = await visibilityContainer.boundingBox();
@@ -1539,8 +1546,9 @@ test("create ephemeral stream shows sidebar and header affordances", async ({
   await page
     .getByTestId("create-channel-description")
     .fill("Auto-cleaned test stream");
-  await page.getByTestId("create-channel-channel-type").click();
-  await page.getByLabel("Temporary channel").click();
+  await page
+    .getByTestId("create-channel-channel-type-option-temporary")
+    .click();
   const channelTypeContainer = page.getByTestId(
     "create-channel-channel-type-container",
   );
@@ -1550,22 +1558,20 @@ test("create ephemeral stream shows sidebar and header affordances", async ({
   await expect(
     page.getByTestId("create-channel-permissions-container"),
   ).toBeVisible();
-  await expect(page.getByTestId("create-channel-permissions")).toContainText(
-    "Public",
-  );
-  await page.getByTestId("create-channel-permissions").click();
-  await page.getByTestId("create-channel-permissions-option-private").click();
-  await expect(page.getByTestId("create-channel-permissions")).toContainText(
-    "Private",
-  );
-  await expect(
-    page.getByTestId("create-channel-permissions-option-private"),
-  ).toHaveCount(0);
-  await page.getByTestId("create-channel-permissions").click();
   await expect(
     page.getByTestId("create-channel-permissions-option-open"),
-  ).toBeVisible();
+  ).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("create-channel-permissions-option-private").click();
+  await expect(
+    page.getByTestId("create-channel-permissions-option-private"),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByTestId("create-channel-permissions-option-open"),
+  ).toHaveAttribute("aria-pressed", "false");
   await page.getByTestId("create-channel-permissions-option-open").click();
+  await expect(
+    page.getByTestId("create-channel-permissions-option-open"),
+  ).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("create-channel-ttl")).toContainText("7 days");
   await page.getByTestId("create-channel-ttl").click();
   await page.getByTestId("create-channel-ttl-option-1209600").click();
@@ -1674,8 +1680,9 @@ test("ephemeral countdown refreshes when switching channels after a clock jump",
     await page
       .getByTestId("create-channel-description")
       .fill("Auto-cleaned test stream");
-    await page.getByTestId("create-channel-channel-type").click();
-    await page.getByLabel("Temporary channel").click();
+    await page
+      .getByTestId("create-channel-channel-type-option-temporary")
+      .click();
     await page.getByTestId("create-channel-submit").click();
     await expect(page.getByTestId("chat-title")).toContainText(channelName);
   }

@@ -14,6 +14,7 @@ import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
+import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAuthorWithIndicators";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
@@ -60,17 +61,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { getAgentAddressMentionPubkeys } from "@/features/messages/lib/agentAddressMention.mjs";
 import { getVisibleAgentAddressPubkeys } from "@/features/messages/lib/getVisibleAgentAddressPubkeys";
 import { MessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
-
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
-
 export type ThreadDepthGuideAction = {
   active?: boolean;
   depth: number;
   label: string;
   message: TimelineMessage;
 };
-
 export const MessageRow = React.memo(
   function MessageRow({
     channelId = null,
@@ -265,18 +263,18 @@ export const MessageRow = React.memo(
       (message.pubkey && isKnownAgentPubkey(message.pubkey))
         ? "bot"
         : message.role;
+    const isAuthorAgent =
+      message.isAgent === true || profilePopoverRole === "bot";
     const agentMentionPubkeysByName = React.useMemo(() => {
       if (!mentionPubkeysByName) {
         return undefined;
       }
-
       const values: Record<string, string> = {};
       for (const [name, pubkey] of Object.entries(mentionPubkeysByName)) {
         if (isKnownAgentPubkey(pubkey)) {
           values[name] = pubkey;
         }
       }
-
       return Object.keys(values).length > 0 ? values : undefined;
     }, [isKnownAgentPubkey, mentionPubkeysByName]);
     const addressedAgentPubkeys = React.useMemo(() => {
@@ -293,7 +291,6 @@ export const MessageRow = React.memo(
           pubkeys={addressedAgentPubkeys}
         />
       ) : undefined;
-
     const imetaByUrl = React.useMemo(
       () => (message.tags ? parseImetaTags(message.tags) : undefined),
       [message.tags],
@@ -464,7 +461,9 @@ export const MessageRow = React.memo(
 
     const isThreadReplyLayout = layoutVariant === "thread-reply";
     const guideBleedRem = isThreadReplyLayout ? 0.25 : 0;
-    const avatarButtonRadiusClass = "rounded-full";
+    const avatarButtonRadiusClass = isAuthorAgent
+      ? "rounded-[30%]"
+      : "rounded-full";
 
     const showRespondToIndicator =
       message.respondTo === "anyone" || message.respondTo === "allowlist";
@@ -476,6 +475,7 @@ export const MessageRow = React.memo(
           avatarUrl={message.avatarUrl ?? null}
           className="shrink-0"
           displayName={message.author}
+          shape={isAuthorAgent ? "squircle" : "circle"}
           testId="message-avatar"
         />
         {showRespondToIndicator &&
@@ -648,18 +648,14 @@ export const MessageRow = React.memo(
     const headerNode = isDisplayedAsContinuation ? null : (
       <MessageHeaderRow>
         {message.pubkey ? (
-          <UserProfilePopover
+          <MessageAuthorWithIndicators
+            authorName={message.author}
+            ownerPubkey={message.ownerPubkey}
             pubkey={message.pubkey}
             role={profilePopoverRole}
-            botIdenticonValue={message.author}
           >
-            <button
-              className="truncate rounded leading-message-author focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-              type="button"
-            >
-              {authorNode}
-            </button>
-          </UserProfilePopover>
+            {authorNode}
+          </MessageAuthorWithIndicators>
         ) : (
           authorNode
         )}
