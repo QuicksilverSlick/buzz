@@ -287,9 +287,16 @@ describe("visibility-gated hooks", () => {
     focused = true;
     await act(async () => window.dispatchEvent(new window.Event("focus")));
     assert.deepEqual(observed, [1_000, false]);
-    await act(
-      async () => new Promise((resolve) => window.setTimeout(resolve, 10)),
-    );
+    // The resume is scheduled, not synchronous, so wait for it to land rather
+    // than for a fixed delay. A hardcoded sleep here is a race: it passes on a
+    // warm run and fails whenever the machine is busy or this file runs alone,
+    // which is a flake that costs more attention than the test is worth.
+    await act(async () => {
+      const deadline = Date.now() + 2_000;
+      while (observed.length < 3 && Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 5));
+      }
+    });
     assert.deepEqual(observed, [1_000, false, 1_000]);
 
     await act(async () => root.unmount());
