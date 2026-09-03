@@ -541,7 +541,10 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
+                // warn, not debug: a refused request is a person who got no
+                // answer. At debug level this is invisible in practice, so the
+                // sender is stranded and the owner never learns anyone tried.
+                tracing::warn!(
                     channel_id = %buzz_event.channel_id,
                     raw_author = %buzz_event.event.pubkey.to_hex(),
                     effective_author = %decision.effective_author,
@@ -3483,11 +3486,12 @@ async fn tokio_main() -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
-                            // A refusal consumes the event, so capture what the
-                            // notice needs before the gate takes it.
-                            let refused_channel_id = buzz_event.channel_id;
-                            let refused_author = buzz_event.event.pubkey.to_hex();
-                            let refused_thread_tags = queue::parse_thread_tags(&buzz_event.event);
+                            // The gate consumes the event, so capture what the
+                            // drop logs and the notice need before it does.
+                            let inbound_channel_id = buzz_event.channel_id;
+                            let inbound_kind = buzz_event.event.kind.as_u16();
+                            let inbound_author = buzz_event.event.pubkey.to_hex();
+                            let inbound_thread_tags = queue::parse_thread_tags(&buzz_event.event);
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -3507,10 +3511,10 @@ async fn tokio_main() -> Result<()> {
                                 // into a flooder.
                                 if remember_gate_notice(
                                     &mut gate_notified,
-                                    (refused_channel_id, refused_author),
+                                    (inbound_channel_id, inbound_author),
                                 ) {
                                     let is_dm =
-                                        is_dm_channel(refused_channel_id, &ctx.channel_info).await;
+                                        is_dm_channel(inbound_channel_id, &ctx.channel_info).await;
                                     // Never mention the owner in a DM: that would
                                     // disclose their pubkey to a stranger.
                                     let mentions = if is_dm {
@@ -3523,8 +3527,8 @@ async fn tokio_main() -> Result<()> {
                                     tokio::spawn(async move {
                                         pool::post_notice(
                                             &rest,
-                                            refused_channel_id,
-                                            &refused_thread_tags,
+                                            inbound_channel_id,
+                                            &inbound_thread_tags,
                                             &content,
                                             &mentions,
                                         )
@@ -3538,7 +3542,11 @@ async fn tokio_main() -> Result<()> {
                                     .match_subscription(&rules, &pubkey_hex)
                                     .await
                             else {
-                                tracing::debug!("authorized event matched no rule — dropping");
+                                tracing::debug!(
+                                    channel_id = %inbound_channel_id,
+                                    kind = inbound_kind,
+                                    "authorized event matched no rule — dropping"
+                                );
                                 continue;
                             };
                             // Derive the session scope once, at admission, from
