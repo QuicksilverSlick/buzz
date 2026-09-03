@@ -1,3 +1,4 @@
+import { SHARED_COMPUTE_LABEL } from "@/shared/constants/brand";
 /**
  * Unit tests for the agent-dialog local-mode readiness gate.
  *
@@ -860,7 +861,7 @@ test("providerDefaultLabel_globalSetWithWhitespace_trimsAndReturnsInherit", () =
 test("providerDefaultLabel_sharedCompute_neverLeaksInternalId", () => {
   assert.equal(
     getDefaultLlmProviderLabel("buzz-agent", "relay-mesh"),
-    "Use agent defaults (Buzz shared compute)",
+    `Use agent defaults (${SHARED_COMPUTE_LABEL})`,
   );
 });
 

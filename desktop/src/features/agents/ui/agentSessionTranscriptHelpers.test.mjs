@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -35,7 +36,7 @@ test("parsePromptText wraps header-less free text in a single Prompt section", (
   );
   assert.equal(result.sections[0].body, "just some free text");
   assert.equal(result.userText, "");
-  assert.equal(result.userTitle, "Buzz event");
+  assert.equal(result.userTitle, `${PRODUCT_NAME} event`);
   assert.equal(result.userPubkey, null);
   assert.equal(result.userEventId, null);
 });
@@ -124,7 +125,7 @@ test("parsePromptText yields a null pubkey when From has no hex", () => {
 test("parsePromptText defaults the title to 'Buzz event' when no kind is present", () => {
   const text = ["[Buzz event]", "Content: x"].join("\n");
   const result = parsePromptText(text);
-  assert.equal(result.userTitle, "Buzz event");
+  assert.equal(result.userTitle, `${PRODUCT_NAME} event`);
 });
 
 test("parsePromptText leading text before a header becomes a Prompt section", () => {
@@ -191,7 +192,10 @@ test("parsePromptText splits paired top-level turn sections and preserves inner 
       body: "[1] Alice (2026-08-25T12:00:00Z): prior message",
     },
     {
-      title: "Buzz event: @mention",
+      // `<buzz-event>` sections are titled by `semanticTurnTitle`, which
+      // renders under the product name; the bracket form above is parsed
+      // from buzz-acp's wire text and keeps the protocol spelling.
+      title: `${PRODUCT_NAME} event: @mention`,
       body: "Event ID: abc123\nFrom: Alice (hex: AABBCC)\nContent: ship it",
     },
   ]);

@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -96,6 +97,10 @@ test("buildTranscript renders Prompt context + user message for a multi-block se
   const promptContext = items.find((i) => i.title === "Prompt context");
   assert.deepEqual(
     promptContext.sections.map((s) => s.title),
+    // This frame carries the bracket form `[Buzz event: …]` that buzz-acp
+    // writes on the wire, so the section title is parsed from the text and
+    // keeps the protocol spelling. The XML form `<buzz-event>` is titled by
+    // `semanticTurnTitle` instead and renders under the product name.
     ["Agent Memory — core", "Context", "Buzz event: @mention"],
     "every section header is counted",
   );
@@ -146,7 +151,7 @@ test("buildTranscript preserves a slash-command preamble before semantic prompt 
   );
   assert.deepEqual(
     promptContext?.sections.map((section) => section.title),
-    ["Prompt", "Context", "Buzz event: @mention"],
+    ["Prompt", "Context", `${PRODUCT_NAME} event: @mention`],
   );
   assert.equal(promptContext?.sections[0]?.body, "/goal ship it");
 });

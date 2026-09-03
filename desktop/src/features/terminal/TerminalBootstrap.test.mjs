@@ -1,3 +1,4 @@
+import { TERMINAL_LABEL } from "@/shared/constants/brand";
 import assert from "node:assert/strict";
 import { after, afterEach, before, beforeEach, test } from "node:test";
 
@@ -378,7 +379,7 @@ test("opening a tab keeps terminal ownership while its attachment is pending", a
   );
 
   attachResolver = () => {};
-  fireEvent.click(view.getByLabelText("New Buzz Term tab"));
+  fireEvent.click(view.getByLabelText(`New ${TERMINAL_LABEL} tab`));
   await waitFor(() => assert.equal(typeof attachResolver, "function"));
   assert.equal(
     substrate.dataset.terminalOwner,
