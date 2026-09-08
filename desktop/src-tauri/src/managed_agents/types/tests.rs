@@ -487,6 +487,7 @@ fn sample_agent_record() -> ManagedAgentRecord {
 
 fn sample_persona() -> AgentDefinition {
     AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: "custom:helper".to_string(),
         display_name: "Helper".to_string(),
@@ -533,6 +534,55 @@ fn persona_record_without_catalog_source_deserializes_and_omits_it() {
     assert!(
         !json.contains("catalog_source"),
         "absent provenance must stay absent on disk: {json}"
+    );
+}
+
+#[test]
+fn persona_capabilities_survive_the_agent_store_fold() {
+    // `AgentDefinition` is a view, not the store. A field wired into the view
+    // but missed in either mapping arm still compiles, still saves, and then
+    // comes back empty on the next launch — the owner ticks a capability, sees
+    // it accepted, and it is silently gone after a restart. Nothing but a
+    // round-trip catches that, so this test is the reason the field is safe to
+    // add.
+    let mut persona = sample_persona();
+    persona.capabilities = vec![
+        "cross-session-note".to_string(),
+        "computer-control".to_string(),
+    ];
+
+    let record = persona.clone().into_agent_record();
+    assert_eq!(
+        record.definition_capabilities, persona.capabilities,
+        "the store must absorb the grants, not drop them"
+    );
+
+    let view = record
+        .to_definition_view()
+        .expect("slugged record must present a persona view");
+
+    assert_eq!(
+        view.capabilities, persona.capabilities,
+        "grants must survive the trip back out of the store"
+    );
+}
+
+#[test]
+fn a_persona_with_no_capabilities_stays_empty_through_the_fold() {
+    // Deny-by-default has to survive the same round trip. An empty grant list
+    // is what every record written before this field existed deserializes to,
+    // and it must not acquire anything on the way through.
+    let persona = sample_persona();
+    assert!(persona.capabilities.is_empty(), "fixture starts ungranted");
+
+    let view = persona
+        .into_agent_record()
+        .to_definition_view()
+        .expect("slugged record must present a persona view");
+
+    assert!(
+        view.capabilities.is_empty(),
+        "an ungranted persona must come back ungranted"
     );
 }
 

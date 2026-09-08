@@ -43,6 +43,7 @@ fn snap(record: &ManagedAgentRecord) -> serde_json::Value {
 
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        definition_capabilities: Vec::new(),
         description: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),
@@ -105,6 +106,7 @@ fn record() -> ManagedAgentRecord {
 
 fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
     AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: id.into(),
         display_name: id.into(),

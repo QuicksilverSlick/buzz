@@ -310,6 +310,7 @@ mod tests {
 
     fn persona() -> AgentDefinition {
         AgentDefinition {
+            capabilities: Vec::new(),
             description: None,
             id: "catalog-reviewer".to_string(),
             display_name: "Catalog Reviewer".to_string(),

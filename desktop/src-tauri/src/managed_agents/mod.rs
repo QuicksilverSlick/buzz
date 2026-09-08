@@ -10,6 +10,7 @@ pub(crate) use agent_env::{
 };
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
+pub mod capabilities;
 mod backend;
 pub(crate) mod bestie_assignment;
 pub(crate) mod claude_config;

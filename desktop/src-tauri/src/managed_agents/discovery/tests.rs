@@ -170,6 +170,7 @@ fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
 }
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
     crate::managed_agents::AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: id.to_string(),
         display_name: id.to_string(),
@@ -212,6 +213,7 @@ fn record_with(
     override_cmd: Option<&str>,
 ) -> crate::managed_agents::types::ManagedAgentRecord {
     crate::managed_agents::types::ManagedAgentRecord {
+        definition_capabilities: Vec::new(),
         description: None,
         pubkey: String::new(),
         name: "r".to_string(),

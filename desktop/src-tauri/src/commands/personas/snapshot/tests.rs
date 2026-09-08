@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 /// persona_id.
 fn make_definition(slug: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
+        definition_capabilities: Vec::new(),
         description: None,
         pubkey: String::new(),
         slug: Some(slug.to_string()),
