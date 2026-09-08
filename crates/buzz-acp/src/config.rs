@@ -3,7 +3,7 @@
 //! CLI-first: every option is a CLI flag with env var fallback.
 //! Config file (TOML) for complex subscription rules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -485,6 +485,21 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
+    /// Comma-separated capabilities the owner has granted this agent.
+    ///
+    /// Empty and unset mean the same thing — nothing granted — so a harness
+    /// launched by a Desktop that predates the feature behaves identically to
+    /// one launched with an explicit empty value.
+    ///
+    /// Recorded policy, not an enforcement boundary. The agent holds an
+    /// unrestricted shell, so no tool name distinguishes a granted reach from
+    /// an ungranted one; treating this list as a guarantee would be wrong. It
+    /// exists so the harness can say what the owner authorised when it refuses
+    /// something, and so enforcement has something to consult once the turn's
+    /// authority reaches this layer.
+    #[arg(long, env = "BUZZ_ACP_CAPABILITIES", value_delimiter = ',')]
+    pub capabilities: Option<Vec<String>>,
+
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
     /// Modes: owner-only, allowlist, anyone, nobody.
@@ -593,6 +608,9 @@ pub struct Config {
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
+    /// Capabilities the owner granted, normalized and deduped. Empty means
+    /// nothing was granted, which is the default.
+    pub capabilities: BTreeSet<String>,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
     pub allowed_respond_to: Vec<String>,
     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
@@ -1150,7 +1168,22 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        // Normalized and deduped here so the running config carries the same
+        // canonical set the Desktop recorded, whatever order the env listed.
+        // Unknown values are dropped rather than fatal: the Desktop validates
+        // and refuses the spawn on a bad grant, so anything unrecognized here
+        // means the harness is older than the Desktop that launched it, and an
+        // older harness that cannot honour a capability must not claim to.
+        let capabilities: BTreeSet<String> = args
+            .capabilities
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+
         let config = Config {
+            capabilities,
             keys,
             relay_url: args.relay_url,
             agent_command,
@@ -1225,7 +1258,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} capabilities=[{}] {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1247,6 +1280,9 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            // Logged so an operator can see, from the agent's own log, exactly
+            // what the owner authorised — the same list the Desktop recorded.
+            self.capabilities.iter().cloned().collect::<Vec<_>>().join(","),
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1535,6 +1571,7 @@ mod tests {
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
+            capabilities: Default::default(),
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
