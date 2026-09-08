@@ -234,6 +234,7 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
     let created_at = event.created_at.to_human_datetime();
 
     Ok(AgentDefinition {
+        capabilities: Vec::new(),
         id: d_tag.clone(),
         display_name: content.display_name,
         avatar_url: content.avatar_url,

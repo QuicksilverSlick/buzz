@@ -600,6 +600,7 @@ pub async fn create_managed_agent(
             linked_persona.as_ref(),
         )?;
         let record = ManagedAgentRecord {
+            definition_capabilities: Vec::new(),
             pubkey: pubkey.clone(),
             name: name.clone(),
             description: None,

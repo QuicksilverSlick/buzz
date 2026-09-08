@@ -99,6 +99,14 @@ pub struct AgentDefinition {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<u32>,
+    /// Capabilities this definition grants, in WIRE shape for the same reason
+    /// the behavioral defaults above are: an unknown future capability string
+    /// must round-trip through the store byte-identically rather than being
+    /// silently dropped by an older build. Parsed and validated at the mint
+    /// boundary. Empty is the default and means no grants — see
+    /// [`crate::managed_agents::capabilities`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -166,6 +174,7 @@ impl AgentDefinition {
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
+            definition_capabilities: self.capabilities,
             relay_mesh: None,
             effort_level: None,
         }
@@ -204,6 +213,7 @@ impl ManagedAgentRecord {
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
             parallelism: self.definition_parallelism,
+            capabilities: self.definition_capabilities.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         })
@@ -451,6 +461,13 @@ pub struct ManagedAgentRecord {
     pub definition_respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_parallelism: Option<u32>,
+    /// Capabilities the *definition* grants, absorbed from
+    /// `AgentDefinition.capabilities`. Empty for every record written before
+    /// this field existed, which is also the deny-by-default value — the safe
+    /// value and the backward-compatible one coincide, so an old store loads
+    /// and re-serializes byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub definition_capabilities: Vec<String>,
     /// Typed marker for relay-mesh agents. `Some(_)` means this agent runs its
     /// inference through Buzz's relay-mesh local endpoint; the `model_ref` is
     /// the served model id to route to. `None` is a normal agent.

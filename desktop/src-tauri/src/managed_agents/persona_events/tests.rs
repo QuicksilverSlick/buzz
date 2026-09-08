@@ -5,6 +5,7 @@ use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
 /// state right after creation, before any snapshot apply.
 pub(super) fn sample_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        definition_capabilities: Vec::new(),
         description: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),
@@ -145,6 +146,7 @@ fn preview_passes_through_unchanged_when_persona_missing() {
 
 pub(super) fn sample_persona() -> AgentDefinition {
     AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: "test-persona".to_string(),
         display_name: "Test Persona".to_string(),
@@ -375,6 +377,7 @@ fn content_matches_nip_ap_vector() {
     // signed content, so a second implementer following the spec computes
     // the same NIP-01 id.
     let record = AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: "test-agent".to_string(),
         display_name: "Test Agent".to_string(),
@@ -408,6 +411,7 @@ fn content_matches_nip_ap_vector() {
 #[test]
 fn round_trip_minimal_persona() {
     let record = AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: "minimal".to_string(),
         display_name: "Minimal".to_string(),
@@ -507,6 +511,7 @@ fn behavioral_defaults_survive_record_round_trip() {
 #[test]
 fn quad_absent_definition_hash_stable_across_activation() {
     let record = AgentDefinition {
+        capabilities: Vec::new(),
         description: None,
         id: "quad-absent".to_string(),
         display_name: "Test".to_string(),
@@ -553,6 +558,7 @@ fn quad_absent_definition_hash_stable_across_activation() {
 /// way `persona_from_event` maps fields, without needing a signed event.
 fn persona_from_event_content_for_test(content: PersonaEventContent) -> AgentDefinition {
     AgentDefinition {
+        capabilities: Vec::new(),
         description: content.description,
         id: "staged".to_string(),
         display_name: content.display_name,

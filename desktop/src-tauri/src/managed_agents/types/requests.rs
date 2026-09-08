@@ -286,6 +286,7 @@ mod tests {
 
     fn record_without_quad() -> AgentDefinition {
         AgentDefinition {
+            capabilities: Vec::new(),
             description: None,
             id: "p-1".to_string(),
             display_name: "Test".to_string(),
