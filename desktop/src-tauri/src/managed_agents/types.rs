@@ -118,6 +118,7 @@ impl AgentDefinition {
     /// event coordinate (`d_tag = slug`) across the fold.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
+            capabilities: Vec::new(),
             pubkey: String::new(),
             name: self.display_name.clone(),
             persona_id: None,
@@ -371,6 +372,14 @@ pub struct ManagedAgentRecord {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_code: Option<i64>,
+    /// Capabilities granted to this running agent, in wire shape. Copied from
+    /// the definition at mint time, exactly as `respond_to` is. Translates to
+    /// `BUZZ_ACP_CAPABILITIES`.
+    ///
+    /// Empty means no grants, which is both the default and what every record
+    /// written before this field existed deserializes to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// Inbound author gate mode. Translates to `BUZZ_ACP_RESPOND_TO`.
     #[serde(default)]
     pub respond_to: RespondTo,
@@ -913,6 +922,9 @@ pub struct MintBehavioralDefaults {
     pub respond_to_allowlist: Vec<String>,
     /// Validated (1..=32) when present; caller applies its own default.
     pub parallelism: Option<u32>,
+    /// Capability grants copied from the definition, in wire shape, already
+    /// parsed and normalized. Empty means no grants.
+    pub capabilities: Vec<String>,
 }
 
 /// Resolve the NIP-AP behavioral quad for a new instance: explicit input
@@ -982,10 +994,32 @@ pub fn resolve_mint_behavioral_defaults(
         },
     };
 
+    // Capability grants ride the same rule as the behavioral strings above:
+    // this is the one place a definition's wire values are parsed, so an
+    // unrecognized capability fails the mint here rather than being dropped on
+    // the way to a running agent. Dropping it would mint an agent holding less
+    // than its author described while reporting success — the same silent
+    // substitution the respond-to parse exists to prevent.
+    //
+    // There is no instance-level override yet: grants come from the definition
+    // or not at all, so an agent never acquires a capability its definition
+    // does not carry.
+    let capabilities = {
+        let raw = definition
+            .map(|d| d.capabilities.as_slice())
+            .unwrap_or(&[]);
+        crate::managed_agents::capabilities::parse_capabilities(raw)
+            .map_err(|e| format!("definition capabilities are invalid: {e}"))?
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+
     Ok(MintBehavioralDefaults {
         respond_to,
         respond_to_allowlist,
         parallelism,
+        capabilities,
     })
 }
 

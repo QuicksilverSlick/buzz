@@ -598,6 +598,7 @@ pub async fn confirm_agent_snapshot_import(
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.
         let record = ManagedAgentRecord {
+            capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
             pubkey: pubkey.clone(),
             name: display_name.clone(),

@@ -366,6 +366,7 @@ mod tests {
     /// pubkey/nsec pair matters here.
     fn record_with_keys(pubkey: String, private_key_nsec: String) -> ManagedAgentRecord {
         ManagedAgentRecord {
+            capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
             description: None,
             pubkey,

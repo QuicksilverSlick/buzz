@@ -164,6 +164,7 @@ mod tests {
 
     fn sample_agent() -> ManagedAgentRecord {
         ManagedAgentRecord {
+            capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
             description: None,
             pubkey: "agentpubkeyhex".to_string(),
