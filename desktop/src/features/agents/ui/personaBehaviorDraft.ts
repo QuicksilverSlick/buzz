@@ -1,4 +1,8 @@
-import type { PersonaBehaviorInput, RespondToMode } from "@/shared/api/types";
+import type {
+  AgentCapability,
+  PersonaBehaviorInput,
+  RespondToMode,
+} from "@/shared/api/types";
 
 /**
  * Dialog-side draft of a definition's NIP-AP behavioral group.
@@ -15,12 +19,18 @@ export type PersonaBehaviorDraft = {
   respondToAllowlist: string[];
   /** Raw text; only `parseInt > 0` submits (legacy dialog parity). */
   parallelism: string;
+  /**
+   * Capabilities the owner has granted. Empty is the default and means the
+   * agent is granted nothing — the deny-by-default value.
+   */
+  capabilities: AgentCapability[];
 };
 
 export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
   respondTo: null,
   respondToAllowlist: [],
   parallelism: "",
+  capabilities: [],
 };
 
 /** Seed the draft from a dialog-state behavior group (edit/duplicate). */
@@ -32,6 +42,7 @@ export function draftFromBehavior(
     respondToAllowlist: [...(behavior?.respondToAllowlist ?? [])],
     parallelism:
       behavior?.parallelism != null ? String(behavior.parallelism) : "",
+    capabilities: [...(behavior?.capabilities ?? [])],
   };
 }
 
@@ -56,9 +67,17 @@ function behaviorFromDraft(
     respondToAllowlist:
       draft.respondTo === "allowlist" ? draft.respondToAllowlist : undefined,
     parallelism: parallelism > 0 ? parallelism : undefined,
+    // Sorted so two owners ticking the same boxes in a different order produce
+    // identical published bytes and the definition's content hash holds still.
+    capabilities:
+      draft.capabilities.length > 0
+        ? [...draft.capabilities].sort()
+        : undefined,
   };
   const isEmpty =
-    group.respondTo === undefined && group.parallelism === undefined;
+    group.respondTo === undefined &&
+    group.parallelism === undefined &&
+    group.capabilities === undefined;
   return isEmpty ? undefined : group;
 }
 

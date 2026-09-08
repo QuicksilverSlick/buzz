@@ -92,6 +92,9 @@ test("edit with a changed quad submits the full group", () => {
     respondTo: "allowlist",
     respondToAllowlist: [HEX, "b".repeat(64)],
     parallelism: undefined,
+    // Absent rather than an empty array: an ungranted draft must not publish a
+    // capabilities key at all, or every existing definition's bytes would move.
+    capabilities: undefined,
   });
 });
 
@@ -115,6 +118,7 @@ test("draftFromBehavior round-trips a full quad and copies the list", () => {
     respondTo: "allowlist",
     respondToAllowlist: [HEX],
     parallelism: "3",
+    capabilities: [],
   });
   draft.respondToAllowlist.push("mutated");
   assert.deepEqual(behavior.respondToAllowlist, [HEX], "list must be copied");
