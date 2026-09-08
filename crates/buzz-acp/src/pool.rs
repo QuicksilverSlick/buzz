@@ -2044,6 +2044,38 @@ pub async fn run_prompt_task(
         Some(b) => PromptSource::Channel(b.scope.clone()),
         None => PromptSource::Heartbeat,
     };
+
+    // Who this turn answers to, decided from the batch that triggered it.
+    //
+    // A batch can mix authors, so any non-owner event makes the whole turn a
+    // guest turn: the events are merged into one prompt and the model acts on
+    // all of them together, so there is no per-event authority to hand a tool
+    // call afterwards. Taking the lowest authority present is the only reading
+    // that cannot over-trust.
+    //
+    // Heartbeats carry no author at all. They are the harness prompting itself
+    // on a timer, with no inbound request behind them, so they run as the
+    // owner — treating them as guest turns would make an idle agent ask for
+    // approval nobody requested.
+    let turn_authority = match (&batch, ctx.agent_owner_pubkey.as_ref()) {
+        (None, _) => crate::acp::TurnAuthority::Owner,
+        (Some(_), None) => {
+            // No owner known: nothing can be verified as the owner, so nothing
+            // is. Fails toward asking.
+            crate::acp::TurnAuthority::Guest
+        }
+        (Some(b), Some(owner)) => {
+            let owner_hex = owner.to_hex();
+            if b.events
+                .iter()
+                .all(|be| be.event.pubkey.to_hex().eq_ignore_ascii_case(&owner_hex))
+            {
+                crate::acp::TurnAuthority::Owner
+            } else {
+                crate::acp::TurnAuthority::Guest
+            }
+        }
+    };
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
@@ -2467,6 +2499,10 @@ pub async fn run_prompt_task(
                     &init_msg,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    // Session bootstrap: the harness prompting the agent with
+                    // its own standing context, with no inbound request behind
+                    // it. Nobody is being answered here, so there is no guest.
+                    crate::acp::TurnAuthority::Owner,
                 )
                 .await;
 
@@ -2795,6 +2831,7 @@ pub async fn run_prompt_task(
                     &prompt_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    turn_authority,
                 ) => result,
             }
         }
@@ -2806,6 +2843,7 @@ pub async fn run_prompt_task(
                     &prompt_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    turn_authority,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
