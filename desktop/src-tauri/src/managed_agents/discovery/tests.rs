@@ -1106,11 +1106,7 @@ fn test_command_basenames_includes_cmd_bat_on_windows() {
     let candidates = super::command_basenames("codex-acp");
     assert_eq!(
         candidates,
-        vec![
-            "codex-acp.exe".to_string(),
-            "codex-acp.cmd".to_string(),
-            "codex-acp.bat".to_string(),
-        ],
+        ["codex-acp.exe", "codex-acp.cmd", "codex-acp.bat"],
         "Windows must produce .exe, .cmd, and .bat candidates"
     );
 }

@@ -1486,11 +1486,8 @@ mod tests {
         // User env_vars must win over baked defaults; in OSS builds baked map is empty,
         // so this validates the user-env layer is present in the output.
         let mut env_vars = BTreeMap::new();
-        env_vars.insert("BUZZ_AGENT_PROVIDER".to_string(), "anthropic".to_string());
-        env_vars.insert(
-            "BUZZ_AGENT_MODEL".to_string(),
-            "claude-opus-4-5".to_string(),
-        );
+        env_vars.insert("BUZZ_AGENT_PROVIDER".into(), "anthropic".into());
+        env_vars.insert("BUZZ_AGENT_MODEL".into(), "claude-opus-4-5".into());
         // Minimal record: only the fields resolve_effective_agent_env reads.
         let record = crate::managed_agents::types::ManagedAgentRecord {
             capabilities: Vec::new(),
