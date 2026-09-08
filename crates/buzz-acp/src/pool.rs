@@ -2686,9 +2686,15 @@ pub async fn run_prompt_task(
             );
         }
 
+        // Stamped onto every event block so the model can tell the owner from an
+        // allowlisted collaborator. `None` here means the harness never learned
+        // an owner, and every author is then reported as `guest`.
+        let owner_hex = ctx.agent_owner_pubkey.as_ref().map(|pk| pk.to_hex());
+
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
+                owner_pubkey_hex: owner_hex.as_deref(),
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
                 channel_info: channel_info.as_ref(),
