@@ -88,7 +88,16 @@ export function duplicatePersonaDialogState(
 function behaviorEntry(
   persona: AgentPersona,
 ): { behavior: PersonaBehaviorInput } | Record<string, never> {
-  if (persona.respondTo == null && persona.parallelism == null) {
+  // Capabilities count toward "has a behavior group". Without them in this
+  // guard, a persona whose ONLY setting is a grant returns no behavior key,
+  // the dialog seeds an empty draft, and the checkbox reads back unticked
+  // however correctly it was stored.
+  const capabilities = persona.capabilities ?? [];
+  if (
+    persona.respondTo == null &&
+    persona.parallelism == null &&
+    capabilities.length === 0
+  ) {
     return {};
   }
   return {
@@ -99,6 +108,9 @@ function behaviorEntry(
           ? persona.respondToAllowlist
           : undefined,
       parallelism: persona.parallelism ?? undefined,
+      // Absent rather than an empty array when nothing is granted, so a
+      // persona that never had a grant still submits byte-identically.
+      capabilities: capabilities.length > 0 ? [...capabilities] : undefined,
     },
   };
 }

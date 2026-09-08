@@ -158,6 +158,57 @@ test("editPersonaDialogState preserves the persona id for updates", () => {
   });
 });
 
+test("editPersonaDialogState seeds capability grants back into the dialog", () => {
+  // The write path stored the grant correctly and the checkbox still read back
+  // unticked, because the value evaporated between the store and the dialog:
+  // RawPersona did not declare it, fromRawPersona did not map it, AgentPersona
+  // did not carry it, and behaviorEntry did not seed it. Each link compiled and
+  // saved fine on its own.
+  const state = editPersonaDialogState({
+    id: "persona-caps",
+    displayName: "Reset Worker",
+    avatarUrl: null,
+    systemPrompt: "Maintain the project.",
+    runtime: null,
+    model: null,
+    isBuiltIn: false,
+    isActive: true,
+    namePool: [],
+    envVars: {},
+    capabilities: ["cross-session-note"],
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-02T00:00:00Z",
+  });
+
+  assert.deepEqual(
+    state.initialValues.behavior?.capabilities,
+    ["cross-session-note"],
+    "a stored grant must reach the dialog, or the checkbox reads back unticked",
+  );
+});
+
+test("editPersonaDialogState omits the behavior group when nothing is set", () => {
+  // The guard has to stay narrow: a persona with no grant, no respond-to and
+  // no parallelism must still submit byte-identically to the pre-feature shape.
+  const state = editPersonaDialogState({
+    id: "persona-bare",
+    displayName: "Bare",
+    avatarUrl: null,
+    systemPrompt: "Nothing set.",
+    runtime: null,
+    model: null,
+    isBuiltIn: false,
+    isActive: true,
+    namePool: [],
+    envVars: {},
+    capabilities: [],
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-02T00:00:00Z",
+  });
+
+  assert.equal(state.initialValues.behavior, undefined);
+});
+
 test("editPersonaDialogState seeds envVars and namePool from the persona", () => {
   const state = editPersonaDialogState({
     id: "persona-3",
@@ -262,6 +313,9 @@ test("edit and duplicate seed the behavior group from a quad-bearing persona", (
     respondTo: "allowlist",
     respondToAllowlist: ["a".repeat(64)],
     parallelism: 4,
+    // Absent when nothing is granted, so a persona that never had a
+    // grant still submits byte-identically.
+    capabilities: undefined,
   };
   assert.deepEqual(
     editPersonaDialogState(persona).initialValues.behavior,
@@ -300,6 +354,9 @@ test("a linked instance overrides stale definition access in the edit dialog", (
     respondTo: "allowlist",
     respondToAllowlist: ["c".repeat(64)],
     parallelism: 2,
+    // Absent when nothing is granted, so a persona that never had a
+    // grant still submits byte-identically.
+    capabilities: undefined,
   });
 });
 

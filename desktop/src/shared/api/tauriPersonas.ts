@@ -31,6 +31,8 @@ export type RawPersona = {
   respond_to?: string | null;
   respond_to_allowlist?: string[];
   parallelism?: number | null;
+  /** Owner-granted capabilities, wire shape. Absent on pre-feature records. */
+  capabilities?: string[];
   created_at: string;
   updated_at: string;
   /** Non-null when the pack `.persona.md` write-back failed (non-fatal). */
@@ -49,6 +51,9 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     provider: persona.provider ?? null,
     namePool: persona.name_pool ?? [],
     isBuiltIn: persona.is_builtin,
+    // Absent on any record written before the field existed, which reads back
+    // as no grants -- the deny-by-default value.
+    capabilities: (persona.capabilities ?? []) as AgentPersona["capabilities"],
     isActive: persona.is_active ?? true,
     shared: persona.shared ?? false,
     sourceTeam: persona.source_team ?? null,
