@@ -299,6 +299,7 @@ fn default_global_config_serializes_all_fields() {
 
 fn bare_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: "agent".to_string(),

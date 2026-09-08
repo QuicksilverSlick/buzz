@@ -100,6 +100,22 @@ pub(crate) fn build_respond_to_env_with_policy(
         remove.push("BUZZ_ACP_RESPOND_TO_ALLOWLIST");
     }
 
+    // Capability grants ride alongside the access gate because they answer the
+    // same question from the other side: the gate decides who may address this
+    // agent, the grants decide how far a turn may reach once admitted. Written
+    // here so both are set on one code path and cannot drift.
+    //
+    // Always set, never merely omitted-when-empty: an explicit empty value and
+    // a missing variable must mean the same thing to the harness, and pinning
+    // it on every start means a stale value from a previous configuration can
+    // never survive into a restart.
+    let granted = crate::managed_agents::capabilities::parse_capabilities(&record.capabilities)
+        .map_err(|e| format!("agent {} has invalid capabilities: {e}", record.pubkey))?;
+    set.push((
+        "BUZZ_ACP_CAPABILITIES",
+        crate::managed_agents::capabilities::capabilities_env_value(&granted),
+    ));
+
     if record.auth_tag.is_none() {
         if let Some(owner) = owner_hex {
             set.push(("BUZZ_ACP_AGENT_OWNER", owner.to_string()));
@@ -114,6 +130,57 @@ pub(crate) fn build_respond_to_env_with_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capability_grants_reach_the_spawn_env() {
+        let mut record = record(BackendKind::Local);
+        record.capabilities = vec![
+            "computer-control".to_string(),
+            "cross-session-note".to_string(),
+        ];
+
+        let (set, _remove) = build_respond_to_env_with_policy(&record, Some("owner"), false)
+            .expect("valid record must build");
+
+        let value = set
+            .iter()
+            .find(|(k, _)| *k == "BUZZ_ACP_CAPABILITIES")
+            .map(|(_, v)| v.as_str())
+            .expect("grants must be written on every start");
+        // Sorted, because the set is a BTreeSet — two owners ticking the same
+        // boxes in a different order must produce the same environment.
+        assert_eq!(value, "cross-session-note,computer-control");
+    }
+
+    #[test]
+    fn an_ungranted_agent_gets_an_explicit_empty_value() {
+        // Not merely omitted: an explicit empty string and an unset variable
+        // must mean the same thing, and pinning it every start stops a stale
+        // grant from a previous configuration surviving a restart.
+        let record = record(BackendKind::Local);
+        let (set, _remove) = build_respond_to_env_with_policy(&record, Some("owner"), false)
+            .expect("valid record must build");
+
+        let value = set
+            .iter()
+            .find(|(k, _)| *k == "BUZZ_ACP_CAPABILITIES")
+            .map(|(_, v)| v.as_str())
+            .expect("the variable is written even with nothing granted");
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn an_unknown_grant_refuses_the_spawn_rather_than_starting_unbounded() {
+        let mut record = record(BackendKind::Local);
+        record.capabilities = vec!["cross-session-everything".to_string()];
+
+        let error = build_respond_to_env_with_policy(&record, Some("owner"), false)
+            .expect_err("an unparseable grant must not reach a running agent");
+        assert!(
+            error.contains("cross-session-everything"),
+            "the error must name the offending grant; got: {error}"
+        );
+    }
+
     use super::*;
     use crate::managed_agents::BackendKind;
 

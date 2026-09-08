@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 /// relevant to snapshot export are filled; the rest use defaults.
 fn minimal_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: "deadbeef".to_string(),

@@ -64,6 +64,7 @@ mod tests {
 
     fn record_with(runtime: Option<&str>, parallelism: u32) -> ManagedAgentRecord {
         ManagedAgentRecord {
+            capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
             description: None,
             pubkey: String::new(),

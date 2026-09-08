@@ -41,6 +41,20 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_AGENT_COMMAND",
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
+    // Capability grants and the permission mode that bounds them.
+    //
+    // These are written from the owner's recorded grants, and user env is
+    // applied LAST at spawn — so leaving them overridable would make the
+    // Advanced "Environment variables" field a silent bypass for the capability
+    // checkboxes. Someone pastes a .env blob and the agent quietly holds grants
+    // the owner never gave it, with the UI still showing the boxes unticked.
+    // A control that can be turned off from a text field it does not mention is
+    // worse than no control, because it reads as a guarantee.
+    //
+    // BUZZ_ACP_PERMISSION_MODE was a behaviour knob until capabilities existed;
+    // it became security-relevant the moment a grant depended on it.
+    "BUZZ_ACP_CAPABILITIES",
+    "BUZZ_ACP_PERMISSION_MODE",
     // Control-plane parallelism: the Desktop resolves the effective
     // worker-pool size (applying any per-harness cap) and writes it into
     // launch.policy_env. A user-supplied BUZZ_ACP_AGENTS would bypass the

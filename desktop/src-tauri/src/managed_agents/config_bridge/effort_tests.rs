@@ -28,6 +28,7 @@ fn buzz_agent() -> &'static KnownAcpRuntime {
 
 pub(super) fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),

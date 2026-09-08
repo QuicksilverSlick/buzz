@@ -43,6 +43,7 @@ fn snap(record: &ManagedAgentRecord) -> serde_json::Value {
 
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: "p".repeat(64),

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 fn make_definition(slug: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: String::new(),

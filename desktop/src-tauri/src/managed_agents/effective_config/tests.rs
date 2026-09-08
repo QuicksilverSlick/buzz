@@ -42,6 +42,7 @@ fn record(
 ) -> ManagedAgentRecord {
     use crate::managed_agents::{BackendKind, RespondTo};
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: "agent-pk".to_string(),

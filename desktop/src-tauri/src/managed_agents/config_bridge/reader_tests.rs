@@ -68,6 +68,7 @@ fn test_runtime() -> &'static KnownAcpRuntime {
 
 fn test_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: "test".to_string(),

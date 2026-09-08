@@ -39,6 +39,7 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
 
 fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
     ManagedAgentRecord {
+        capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
         description: None,
         pubkey: String::new(),
