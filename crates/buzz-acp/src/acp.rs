@@ -164,6 +164,13 @@ pub struct AcpClient {
     /// on the allowlist. Defaults to `Guest`, so a path that forgets to set it
     /// is treated as untrusted rather than trusted.
     current_turn_authority: TurnAuthority,
+    /// Permission requests refused during the turn in flight.
+    ///
+    /// Buffered rather than sent through a channel because the pool is already
+    /// awaiting this turn: it can drain them the moment the prompt returns,
+    /// with no extra task, no ordering question, and no way for a refusal to
+    /// arrive after the notice that was supposed to mention it.
+    permission_refusals: Vec<PermissionRefusal>,
     /// Whether we have already sent a response to the pending permission request.
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
@@ -438,6 +445,21 @@ pub enum TurnAuthority {
     Guest,
 }
 
+/// A permission request this harness refused, kept so the layer above can
+/// tell the person who asked.
+///
+/// The ACP transport has no relay access — it cannot post to a channel — so a
+/// refusal recorded here would otherwise exist only as a log line in a file
+/// nobody reads. That is the same silent-drop shape the inbound author gate
+/// notices were added to remove, one layer down: from the channel it looks
+/// like the agent tried something, gave up, and said nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRefusal {
+    /// Tool title or kind as the agent reported it, for the person reading the
+    /// notice. `(untitled)` when the agent sent neither.
+    pub tool: String,
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -577,6 +599,7 @@ impl AcpClient {
             next_id: 0,
             pending_permission_id: None,
             current_turn_authority: TurnAuthority::Guest,
+            permission_refusals: Vec::new(),
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
@@ -816,6 +839,9 @@ impl AcpClient {
         // agent means one collaborator's turn running under the authority of
         // whoever prompted last.
         self.current_turn_authority = authority;
+        // Cleared per turn: a refusal from a previous turn reported against
+        // this one would name the wrong request to the wrong person.
+        self.permission_refusals.clear();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1966,6 +1992,15 @@ impl AcpClient {
     ///
     /// The request `id` is stored as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
+    /// Take the refusals recorded during the turn that just finished.
+    ///
+    /// Draining rather than borrowing, so the caller cannot post the same
+    /// refusal twice and a caller that forgets to post leaves nothing behind to
+    /// be reported against a later turn.
+    pub fn take_permission_refusals(&mut self) -> Vec<PermissionRefusal> {
+        std::mem::take(&mut self.permission_refusals)
+    }
+
     async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
         // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
         let id = msg
@@ -2014,6 +2049,9 @@ impl AcpClient {
                     authority = ?self.current_turn_authority,
                     "refusing permission request"
                 );
+                self.permission_refusals.push(PermissionRefusal {
+                    tool: tool.to_string(),
+                });
                 permission_response_selected(&id, option_id)
             }
             PermissionDecision::NoUsableOption => {
