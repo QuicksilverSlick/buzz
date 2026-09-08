@@ -39,6 +39,12 @@ export type AgentPersona = {
   respondTo: RespondToMode | null;
   respondToAllowlist: string[];
   parallelism: number | null;
+  /**
+   * Capabilities the owner granted this definition. Empty = nothing granted,
+   * which is both the default and what every persona stored before the field
+   * existed reads back as.
+   */
+  capabilities: AgentCapability[];
   createdAt: string;
   updatedAt: string;
 };

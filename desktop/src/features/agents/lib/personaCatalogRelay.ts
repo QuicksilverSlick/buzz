@@ -66,6 +66,9 @@ function publicationToPersona(
   // whole copy would leak local edits (notably its avatar) into the publisher's
   // catalog entry.
   const basePersona: AgentPersona = {
+    // A relay catalog entry advertises no grants: capabilities are the local
+    // owner's decision, never something a publisher can hand you.
+    capabilities: [],
     id:
       localPersona?.id ??
       `catalog:${publication.ownerPubkey}:${publication.sourcePersonaId}`,
