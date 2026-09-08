@@ -4761,6 +4761,8 @@ mod tests {
                 "hello",
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(5),
+                // A harness-driven wire test, not a channel turn: no inbound author.
+                TurnAuthority::Owner,
             )
             .await
             .expect("wire prompt");
