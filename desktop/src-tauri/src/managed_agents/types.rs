@@ -1005,9 +1005,7 @@ pub fn resolve_mint_behavioral_defaults(
     // or not at all, so an agent never acquires a capability its definition
     // does not carry.
     let capabilities = {
-        let raw = definition
-            .map(|d| d.capabilities.as_slice())
-            .unwrap_or(&[]);
+        let raw = definition.map(|d| d.capabilities.as_slice()).unwrap_or(&[]);
         crate::managed_agents::capabilities::parse_capabilities(raw)
             .map_err(|e| format!("definition capabilities are invalid: {e}"))?
             .iter()

@@ -39,8 +39,9 @@ use std::fmt;
 ///
 /// Serialized in wire shape (kebab-case) so the stored value is readable in
 /// `managed-agents.json` and stable across renames of the Rust variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentCapability {
     /// Append a labelled note to another Claude Code session's transcript.
@@ -210,24 +211,17 @@ mod tests {
     fn env_value_is_deterministic_regardless_of_input_order() {
         // Two owners ticking the same boxes in a different order must produce
         // byte-identical records, or every save churns the store.
-        let a = parse_capabilities(&[
-            "computer-control".into(),
-            "cross-session-note".into(),
-        ])
-        .expect("valid");
-        let b = parse_capabilities(&[
-            "cross-session-note".into(),
-            "computer-control".into(),
-        ])
-        .expect("valid");
+        let a = parse_capabilities(&["computer-control".into(), "cross-session-note".into()])
+            .expect("valid");
+        let b = parse_capabilities(&["cross-session-note".into(), "computer-control".into()])
+            .expect("valid");
         assert_eq!(capabilities_env_value(&a), capabilities_env_value(&b));
     }
 
     #[test]
     fn a_duplicate_grant_collapses() {
-        let caps =
-            parse_capabilities(&["desktop-control".into(), "desktop-control".into()])
-                .expect("valid");
+        let caps = parse_capabilities(&["desktop-control".into(), "desktop-control".into()])
+            .expect("valid");
         assert_eq!(caps.len(), 1);
     }
 }
