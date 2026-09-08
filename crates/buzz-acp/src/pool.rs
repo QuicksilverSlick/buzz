@@ -3002,6 +3002,50 @@ pub async fn run_prompt_task(
         }
     };
 
+    // Tell the channel what was refused, before anything else reports on the
+    // turn.
+    //
+    // The refusal itself happens in the ACP transport, which has no relay
+    // access, so without this it exists only as a log line: from the channel
+    // the agent simply tried something, gave up, and said nothing. That is the
+    // same silent drop the inbound author gate notices exist to remove, and it
+    // lands on someone who did nothing wrong — they asked a reasonable question
+    // of an agent they are allowed to use.
+    //
+    // One notice per turn, not per refusal: a single turn can trip the gate
+    // many times, and a message per tool call would bury the channel it is
+    // trying to inform.
+    let refusals = agent.acp.take_permission_refusals();
+    if !refusals.is_empty() {
+        if let (Some(channel_id), Some(b)) = (source.channel_id(), batch.as_ref()) {
+            let mut tools: Vec<String> =
+                refusals.into_iter().map(|refusal| refusal.tool).collect();
+            tools.sort();
+            tools.dedup();
+            let content = permission_refusal_notice_text(&tools);
+            // Thread onto the message that triggered the turn so the answer
+            // sits with the question rather than at the bottom of the channel.
+            let thread_tags = b
+                .events
+                .first()
+                .map(|be| crate::queue::parse_thread_tags(&be.event))
+                .unwrap_or_default();
+            let mentions = ctx
+                .agent_owner_pubkey
+                .as_ref()
+                .map(|pk| vec![pk.to_hex()])
+                .unwrap_or_default();
+            post_notice(
+                &ctx.rest_client,
+                channel_id,
+                &thread_tags,
+                &content,
+                &mentions,
+            )
+            .await;
+        }
+    }
+
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
@@ -5026,6 +5070,27 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
 ///
 /// Best-effort by design: the caller must not be blocked waiting on the relay,
 /// and a notice that cannot be delivered must not take the turn down with it.
+/// The message a person sees when this agent refused to act on their request.
+///
+/// Written for the person who asked, who is usually not the owner and has done
+/// nothing wrong. It says what stopped, that nothing changed, and what to do
+/// next — a refusal with no route forward reads as the agent being broken, and
+/// the reader has no way to tell the difference.
+///
+/// It never names the permission mode, the authority, or the gate. Those are
+/// the owner's concepts; the reader needs an outcome and a next step.
+pub(crate) fn permission_refusal_notice_text(tools: &[String]) -> String {
+    let tool_list = tools.join(", ");
+    let subject = if tools.len() == 1 { "it" } else { "they" };
+    format!(
+        "I stopped before doing this — {subject} needs approval from this \
+         agent's owner, and I can only act unattended on their own requests.\n\n\
+         Blocked: {tool_list}\n\n\
+         Nothing was changed. Ask them to run it, or to grant this agent the \
+         access it needs."
+    )
+}
+
 pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
@@ -5192,6 +5257,48 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refusal_notice_names_what_stopped_and_what_to_do() {
+        let text = super::permission_refusal_notice_text(&["Bash".to_string()]);
+        assert!(text.contains("Bash"), "the reader must learn what was blocked: {text}");
+        assert!(
+            text.contains("Nothing was changed"),
+            "a refusal that does not say the system is unchanged reads as a \
+             half-completed action: {text}"
+        );
+        assert!(
+            text.contains("Ask them"),
+            "a refusal with no route forward reads as the agent being broken: {text}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_notice_keeps_owner_side_vocabulary_out_of_it() {
+        // The reader is usually not the owner and has done nothing wrong.
+        // Permission modes, authorities and gates are the owner's concepts and
+        // tell that reader nothing they can act on.
+        let text = super::permission_refusal_notice_text(&["Read".to_string()]);
+        for jargon in ["permission mode", "authority", "guest", "allowlist", "gate"] {
+            assert!(
+                !text.to_lowercase().contains(jargon),
+                "notice leaks internal vocabulary ({jargon}): {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_notice_agrees_in_number() {
+        let one = super::permission_refusal_notice_text(&["Bash".to_string()]);
+        assert!(one.contains("it needs approval"), "singular: {one}");
+
+        let many = super::permission_refusal_notice_text(&[
+            "Bash".to_string(),
+            "Read".to_string(),
+        ]);
+        assert!(many.contains("they need"), "plural: {many}");
+        assert!(many.contains("Bash, Read"), "both tools listed: {many}");
+    }
+
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
