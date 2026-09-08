@@ -26,6 +26,9 @@ pub struct PersonaBehaviorRequest {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default)]
     pub parallelism: Option<u32>,
+    /// Capability grants, in wire shape. Absent and empty both mean no grants.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Validate a behavior group and apply it onto a persona record.
@@ -68,6 +71,15 @@ pub fn apply_persona_behavior(
         Vec::new()
     };
     record.parallelism = behavior.parallelism;
+    // Validated here, not just at mint, so a bad grant is refused while the
+    // author is still looking at the dialog rather than surfacing later as a
+    // failed spawn. Normalized through the parser so the stored order is
+    // deterministic and duplicates collapse.
+    record.capabilities =
+        crate::managed_agents::capabilities::parse_capabilities(&behavior.capabilities)?
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect();
     Ok(())
 }
 
@@ -330,6 +342,7 @@ mod tests {
         apply_persona_behavior(
             &mut record,
             Some(PersonaBehaviorRequest {
+                capabilities: Vec::new(),
                 respond_to: Some(RespondTo::Anyone),
                 respond_to_allowlist: Vec::new(),
                 parallelism: None,
@@ -417,6 +430,7 @@ mod tests {
         apply_persona_behavior(
             &mut record,
             Some(PersonaBehaviorRequest {
+                capabilities: Vec::new(),
                 respond_to: Some(RespondTo::Allowlist),
                 respond_to_allowlist: vec!["c".repeat(64)],
                 parallelism: Some(3),
