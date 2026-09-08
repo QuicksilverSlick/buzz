@@ -57,10 +57,20 @@ export type CatalogSourceCoordinate = {
  * NIP-AP behavioral group for a definition: absent preserves the stored group
  * for legacy callers; present replaces it as a unit. Mirrors `PersonaBehaviorRequest`.
  */
+/** Capability an owner can grant an agent. Wire strings match the Rust enum. */
+export type AgentCapability =
+  | "cross-session-note"
+  | "cross-session-activate"
+  | "cross-session-read"
+  | "desktop-control"
+  | "computer-control";
+
 export type PersonaBehaviorInput = {
   respondTo?: RespondToMode;
   respondToAllowlist?: string[];
   parallelism?: number;
+  /** Absent and empty both mean no grants. */
+  capabilities?: AgentCapability[];
 };
 
 export type CreatePersonaInput = {

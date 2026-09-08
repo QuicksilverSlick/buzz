@@ -1,4 +1,5 @@
 import * as React from "react";
+import { CapabilityGrantsField } from "./CapabilityGrantsField";
 import { useAgentAccessOwnerOnlyQuery } from "../useAgentAccessOwnerOnly";
 import { Input } from "@/shared/ui/input";
 import { cn } from "@/shared/lib/cn";
@@ -154,6 +155,14 @@ export function PersonaAdvancedFields({
           onBehaviorDraftChange({ ...behaviorDraft, respondTo: mode })
         }
         variant="persona"
+      />
+
+      <CapabilityGrantsField
+        disabled={disabled}
+        onChange={(capabilities) =>
+          onBehaviorDraftChange({ ...behaviorDraft, capabilities })
+        }
+        value={behaviorDraft.capabilities}
       />
 
       {afterRespondTo}
