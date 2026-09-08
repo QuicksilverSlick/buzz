@@ -3018,8 +3018,7 @@ pub async fn run_prompt_task(
     let refusals = agent.acp.take_permission_refusals();
     if !refusals.is_empty() {
         if let (Some(channel_id), Some(b)) = (source.channel_id(), batch.as_ref()) {
-            let mut tools: Vec<String> =
-                refusals.into_iter().map(|refusal| refusal.tool).collect();
+            let mut tools: Vec<String> = refusals.into_iter().map(|refusal| refusal.tool).collect();
             tools.sort();
             tools.dedup();
             let content = permission_refusal_notice_text(&tools);
@@ -5260,7 +5259,10 @@ mod tests {
     #[test]
     fn a_refusal_notice_names_what_stopped_and_what_to_do() {
         let text = super::permission_refusal_notice_text(&["Bash".to_string()]);
-        assert!(text.contains("Bash"), "the reader must learn what was blocked: {text}");
+        assert!(
+            text.contains("Bash"),
+            "the reader must learn what was blocked: {text}"
+        );
         assert!(
             text.contains("Nothing was changed"),
             "a refusal that does not say the system is unchanged reads as a \
@@ -5291,10 +5293,7 @@ mod tests {
         let one = super::permission_refusal_notice_text(&["Bash".to_string()]);
         assert!(one.contains("it needs approval"), "singular: {one}");
 
-        let many = super::permission_refusal_notice_text(&[
-            "Bash".to_string(),
-            "Read".to_string(),
-        ]);
+        let many = super::permission_refusal_notice_text(&["Bash".to_string(), "Read".to_string()]);
         assert!(many.contains("they need"), "plural: {many}");
         assert!(many.contains("Bash, Read"), "both tools listed: {many}");
     }
