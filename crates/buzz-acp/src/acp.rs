@@ -156,6 +156,14 @@ pub struct AcpClient {
     /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
     /// a `cancelled` outcome before the agent returns from `session/prompt`.
     pending_permission_id: Option<serde_json::Value>,
+    /// Who triggered the turn currently in flight.
+    ///
+    /// Set on every prompt dispatch, because the permission handler needs it
+    /// and nothing else in this layer carries it: the ACP transport otherwise
+    /// has no idea whether a tool call traces back to the owner or to someone
+    /// on the allowlist. Defaults to `Guest`, so a path that forgets to set it
+    /// is treated as untrusted rather than trusted.
+    current_turn_authority: TurnAuthority,
     /// Whether we have already sent a response to the pending permission request.
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
@@ -413,6 +421,23 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+/// Who triggered the turn a permission request belongs to.
+///
+/// The inbound author gate decides *whether* an event is admitted and then
+/// discards its verdict, so this is the only thing downstream that separates
+/// the owner's own instruction from an allowlisted collaborator's. It exists
+/// because those two arrive byte-identical otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnAuthority {
+    /// The owner, or one of the owner's own sibling agents.
+    Owner,
+    /// Anyone else the agent is configured to answer.
+    ///
+    /// The default everywhere, so that forgetting to classify a turn fails
+    /// toward asking rather than toward acting.
+    Guest,
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -551,6 +576,7 @@ impl AcpClient {
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             pending_permission_id: None,
+            current_turn_authority: TurnAuthority::Guest,
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
@@ -758,12 +784,14 @@ impl AcpClient {
         prompt_text: &str,
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
+        authority: TurnAuthority,
     ) -> Result<StopReason, AcpError> {
         self.session_prompt_blocks_with_idle_timeout(
             session_id,
             std::slice::from_ref(&prompt_text),
             idle_timeout,
             max_duration,
+            authority,
         )
         .await
     }
@@ -780,7 +808,14 @@ impl AcpClient {
         prompt_blocks: &[&str],
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
+        authority: TurnAuthority,
     ) -> Result<StopReason, AcpError> {
+        // A required parameter rather than a setter: every dispatch has to
+        // decide, and the compiler says so. A setter would let a new call site
+        // inherit whatever the previous turn left behind, which for a shared
+        // agent means one collaborator's turn running under the authority of
+        // whoever prompted last.
+        self.current_turn_authority = authority;
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1953,34 +1988,35 @@ impl AcpClient {
             options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        let decision = decide_permission(self.current_turn_authority, options);
 
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
-                target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
-                target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
+        let response = match &decision {
+            PermissionDecision::Approve(option_id) => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+                );
                 permission_response_selected(&id, option_id)
-            } else {
+            }
+            PermissionDecision::Refuse(option_id) => {
+                // warn, not debug: a refusal changes what the agent did, and on
+                // a guest turn it is the whole point of the gate. At debug this
+                // is invisible in practice, and "the agent just didn't do it"
+                // is indistinguishable from a bug.
+                let tool = msg["params"]["toolCall"]["title"]
+                    .as_str()
+                    .or_else(|| msg["params"]["toolCall"]["kind"].as_str())
+                    .unwrap_or("(untitled)");
+                tracing::warn!(
+                    target: "acp::permission",
+                    id = %id,
+                    tool = %tool,
+                    authority = ?self.current_turn_authority,
+                    "refusing permission request"
+                );
+                permission_response_selected(&id, option_id)
+            }
+            PermissionDecision::NoUsableOption => {
                 return Err(AcpError::Protocol(
                     "no suitable permission option found (neither allow_once nor reject_once)"
                         .into(),
@@ -2103,6 +2139,61 @@ fn steer_prompt_blocks(prompt_blocks: &[&str]) -> Vec<serde_json::Value> {
 }
 
 /// Build a JSON-RPC permission response with `outcome: "selected"`.
+/// What to do with a `session/request_permission`, decided without any I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionDecision {
+    /// Respond with this option id, approving the request.
+    Approve(String),
+    /// Respond with this option id, refusing it.
+    Refuse(String),
+    /// The agent offered nothing usable for the decision we reached.
+    NoUsableOption,
+}
+
+/// Decide a permission request from the turn's authority and the offered options.
+///
+/// Split out from the handler so the rule is testable without a live child
+/// process — the handler otherwise needs a spawned agent, and a rule nobody can
+/// test at the unit level is a rule that drifts.
+///
+/// Option ids are always looked up by `kind`, never hardcoded: the ids are the
+/// agent's to choose and differ between harnesses.
+pub(crate) fn decide_permission(
+    authority: TurnAuthority,
+    options: &[serde_json::Value],
+) -> PermissionDecision {
+    let by_kind = |wanted: &str| {
+        options
+            .iter()
+            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some(wanted))
+            .and_then(|opt| opt.get("optionId").and_then(|id| id.as_str()))
+            .map(str::to_string)
+    };
+
+    match authority {
+        // A turn answering someone other than the owner does not get silent
+        // approval. The agent holds an unrestricted shell, so the tool name
+        // says nothing useful about reach; who is asking is the axis that can
+        // actually be enforced.
+        TurnAuthority::Guest => match by_kind("reject_once") {
+            Some(id) => PermissionDecision::Refuse(id),
+            // Falling back to approval here would invert the rule, so
+            // report that nothing usable was offered and let the caller fail
+            // the turn.
+            None => PermissionDecision::NoUsableOption,
+        },
+        TurnAuthority::Owner => match by_kind("allow_once") {
+            Some(id) => PermissionDecision::Approve(id),
+            // No allow_once: refuse rather than guess. Historically this fell
+            // back to reject_once, which is the same outcome.
+            None => match by_kind("reject_once") {
+                Some(id) => PermissionDecision::Refuse(id),
+                None => PermissionDecision::NoUsableOption,
+            },
+        },
+    }
+}
+
 fn permission_response_selected(id: &serde_json::Value, option_id: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -2350,6 +2441,73 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 
 #[cfg(test)]
 mod tests {
+    use super::{decide_permission, PermissionDecision, TurnAuthority};
+
+    fn opt(kind: &str, id: &str) -> serde_json::Value {
+        serde_json::json!({ "kind": kind, "optionId": id })
+    }
+
+    #[test]
+    fn an_owner_turn_is_approved_with_the_agents_own_allow_once_id() {
+        let options = vec![
+            opt("reject_once", "reject-7"),
+            opt("allow_once", "allow-42"),
+        ];
+        assert_eq!(
+            decide_permission(TurnAuthority::Owner, &options),
+            // The id is the agent's to choose; looking it up by kind rather
+            // than hardcoding is the whole reason this is a lookup.
+            PermissionDecision::Approve("allow-42".to_string())
+        );
+    }
+
+    #[test]
+    fn a_guest_turn_is_refused_even_when_approval_is_offered() {
+        // The regression this exists to prevent: before the gate, every
+        // request was auto-approved in every mode, so anyone on the allowlist
+        // could drive tool calls on the owner's machine with nobody asked.
+        let options = vec![
+            opt("allow_once", "allow-42"),
+            opt("reject_once", "reject-7"),
+        ];
+        assert_eq!(
+            decide_permission(TurnAuthority::Guest, &options),
+            PermissionDecision::Refuse("reject-7".to_string()),
+            "an available allow_once must not tempt a guest turn into approval"
+        );
+    }
+
+    #[test]
+    fn a_guest_turn_with_no_reject_option_reports_no_usable_option() {
+        // Falling back to the offered allow_once would invert the rule
+        // precisely when the agent left us no way to say no.
+        let options = vec![opt("allow_once", "allow-42")];
+        assert_eq!(
+            decide_permission(TurnAuthority::Guest, &options),
+            PermissionDecision::NoUsableOption
+        );
+    }
+
+    #[test]
+    fn an_owner_turn_without_allow_once_falls_back_to_refusing() {
+        let options = vec![opt("reject_once", "reject-7")];
+        assert_eq!(
+            decide_permission(TurnAuthority::Owner, &options),
+            PermissionDecision::Refuse("reject-7".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_option_list_is_unusable_for_either_authority() {
+        for authority in [TurnAuthority::Owner, TurnAuthority::Guest] {
+            assert_eq!(
+                decide_permission(authority, &[]),
+                PermissionDecision::NoUsableOption,
+                "{authority:?} with no options must not invent one"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
