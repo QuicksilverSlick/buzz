@@ -150,12 +150,28 @@ pub struct AcpClient {
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
-    /// The id of a `session/request_permission` request that has been received
-    /// but not yet responded to. Stored as `serde_json::Value` because JSON-RPC 2.0
-    /// permits both numeric and string IDs from the agent.
-    /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
-    /// a `cancelled` outcome before the agent returns from `session/prompt`.
-    pending_permission_id: Option<serde_json::Value>,
+    /// Ids of `session/request_permission` requests received and not yet
+    /// answered. `serde_json::Value` because JSON-RPC 2.0 permits both numeric
+    /// and string ids from the agent.
+    ///
+    /// A FIELD, deliberately, not a local in the read loop. `pool.rs` wraps the
+    /// prompt future in a `select!` whose control arm (`!cancel`, `!rotate`, a
+    /// model switch) DROPS that future mid-poll — see "The prompt future was
+    /// dropped by `select!`" in `pool.rs`. No return path inside the loop runs
+    /// on that exit, so anything held as a local dies unanswered.
+    /// [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) executes after
+    /// the drop and is the only thing left that can tell the agent `cancelled`.
+    ///
+    /// A `Vec`, not an `Option`: one assistant message can carry several tool
+    /// calls, and their permission requests may be in flight together. With a
+    /// single slot the second request overwrites the first, and the first is
+    /// never answered — the agent blocks forever on a reply that can no longer
+    /// be addressed.
+    ///
+    /// Membership IS the "not yet responded" flag. An entry is removed only
+    /// after its response is on the wire, so a double response is impossible by
+    /// construction rather than by a companion bool that could disagree.
+    pending_permissions: crate::pending_permissions::PendingPermissions,
     /// Who triggered the turn currently in flight.
     ///
     /// Set on every prompt dispatch, because the permission handler needs it
@@ -171,10 +187,7 @@ pub struct AcpClient {
     /// with no extra task, no ordering question, and no way for a refusal to
     /// arrive after the notice that was supposed to mention it.
     permission_refusals: Vec<PermissionRefusal>,
-    /// Whether we have already sent a response to the pending permission request.
-    /// Guards against double-response if a timeout fires after the allow_once
-    /// response was written but before `pending_permission_id` was cleared.
-    permission_responded: bool,
+
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -597,10 +610,9 @@ impl AcpClient {
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
-            pending_permission_id: None,
+            pending_permissions: Default::default(),
             current_turn_authority: TurnAuthority::Guest,
             permission_refusals: Vec::new(),
-            permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -1086,17 +1098,22 @@ impl AcpClient {
 
         // Step 1: respond to any pending permission request with "cancelled",
         // but only if we haven't already responded (guards against double-response race).
-        if let Some(perm_id) = self.pending_permission_id.clone() {
-            if !self.permission_responded {
-                let response = permission_response_cancelled(&perm_id);
-                self.write_ndjson(&response).await?;
-                tracing::debug!(
-                    target: "acp::cancel",
-                    "responded cancelled to pending permission id={perm_id}"
-                );
-            }
-            self.pending_permission_id = None;
-            self.permission_responded = false;
+        // Answer EVERY outstanding request, not merely the most recent one.
+        // Leaving a sibling unanswered blocks the agent on a reply that can no
+        // longer be addressed once this connection moves on.
+        //
+        // An entry is removed only after its response is on the wire: if a
+        // write fails here the pipe is almost certainly dead, but the remaining
+        // ids stay recorded rather than being silently discarded by an early
+        // return.
+        while let Some(perm_id) = self.pending_permissions.next_owed().cloned() {
+            let response = permission_response_cancelled(&perm_id);
+            self.write_ndjson(&response).await?;
+            self.pending_permissions.forget(&perm_id);
+            tracing::debug!(
+                target: "acp::cancel",
+                "responded cancelled to pending permission id={perm_id}"
+            );
         }
 
         // Step 2: send session/cancel notification (no id)
@@ -2008,10 +2025,9 @@ impl AcpClient {
             .cloned()
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
 
-        // Store pending permission id so cancel_with_cleanup can respond to it.
-        self.pending_permission_id = Some(id.clone());
-        // Mark as not yet responded — guards against double-response race.
-        self.permission_responded = false;
+        // Record the id so cancel_with_cleanup can answer it. Pushed rather
+        // than assigned: a concurrent sibling request must not evict this one.
+        self.pending_permissions.record(id.clone());
 
         let options = msg["params"]["options"]
             .as_array()
@@ -2062,23 +2078,20 @@ impl AcpClient {
             }
         };
 
-        // Write the response first, then mark as responded.
+        // Write the response first, then forget the id.
         //
-        // Previous ordering (flag-before-write) was intended to guard against a
-        // double-response if a timeout fires between write and flag-set. However,
-        // the deadlock risk is worse: if write_ndjson fails (e.g. WriteTimeout),
-        // the flag would be true but no response was actually sent. Then
-        // cancel_with_cleanup would see permission_responded=true, skip sending
-        // the cancelled outcome, and the agent would hang waiting for a reply
-        // that never arrives — a guaranteed deadlock.
+        // Order is load-bearing and was a deadlock once. Clearing before the
+        // write means a failed `write_ndjson` (e.g. WriteTimeout) leaves the
+        // record saying "answered" when nothing was sent; `cancel_with_cleanup`
+        // then skips the cancelled outcome and the agent hangs on a reply that
+        // never arrives. Forgetting only after a successful write bounds the
+        // double-response window to a single memory store, where the deadlock
+        // window was unbounded.
         //
-        // The correct fix: set the flag AFTER a successful write. The double-
-        // response window (between write completion and flag-set) is negligibly
-        // small and bounded by a single memory store; the deadlock window was
-        // unbounded.
+        // Only THIS id is removed. A sibling request still in flight keeps its
+        // own entry and its own claim on an answer.
         self.write_ndjson(&response).await?;
-        self.permission_responded = true;
-        self.pending_permission_id = None;
+        self.pending_permissions.forget(&id);
         Ok(())
     }
 
