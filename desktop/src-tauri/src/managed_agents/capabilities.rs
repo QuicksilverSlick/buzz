@@ -153,9 +153,147 @@ pub fn capabilities_env_value(caps: &AgentCapabilities) -> String {
         .join(",")
 }
 
+/// Resolve the grants that govern a spawning agent.
+///
+/// # Why this is a resolve and not a field read
+///
+/// Grants have no instance-level override: an agent holds what its definition
+/// grants, or nothing. A property with no override semantics must never be
+/// *copied* onto the instance — a copy is a second source of truth, and the
+/// moment the owner edits the definition the two disagree with no signal that
+/// they have. That is exactly the bug this function exists to remove: a grant
+/// ticked after an agent was minted landed on the definition and never reached
+/// the running process, which reported `capabilities=[]` while the UI showed
+/// the box ticked.
+///
+/// Reading through to the definition on every spawn makes the drift
+/// unrepresentable rather than merely unlikely.
+///
+/// # Failing closed
+///
+/// An agent whose definition cannot be found spawns with nothing granted, and
+/// says so at `warn`. Returns the wire strings unvalidated; the caller parses
+/// them, so an unrecognized grant fails the spawn rather than being silently
+/// dropped.
+pub fn resolve_agent_capabilities(
+    persona_id: Option<&str>,
+    definitions: &[crate::managed_agents::types::AgentDefinition],
+) -> Vec<String> {
+    let Some(persona_id) = persona_id else {
+        // No linked definition: nothing to inherit, and no override exists to
+        // inherit it from. Silent because this is a normal shape, not a fault.
+        return Vec::new();
+    };
+
+    match definitions.iter().find(|d| d.id == persona_id) {
+        Some(definition) => definition.capabilities.clone(),
+        // Fail closed, but never silently.
+        //
+        // Two different situations land here and this function cannot tell
+        // them apart: the definition was deleted (returning nothing is
+        // correct), or `load_personas` failed and handed us an empty slice —
+        // it is called as `.unwrap_or_default()` — in which case every agent
+        // on the machine silently loses every grant.
+        //
+        // Both must fail closed; only one is a bug. The warning is what makes
+        // the bug reportable, and it carries `definitions_loaded` precisely so
+        // the two can be told apart after the fact: a lone unmatched id among
+        // many loaded definitions is a deletion, while a zero count across
+        // every agent is a failed load.
+        None => {
+            tracing::warn!(
+                persona_id = %persona_id,
+                definitions_loaded = definitions.len(),
+                "spawning agent with no capability grants: no definition matched its persona_id"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn definition(
+        id: &str,
+        capabilities: &[&str],
+    ) -> crate::managed_agents::types::AgentDefinition {
+        let mut d: crate::managed_agents::types::AgentDefinition =
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "display_name": id,
+                "system_prompt": "",
+                "created_at": "",
+                "updated_at": "",
+            }))
+            .expect("minimal definition must deserialize");
+        d.capabilities = capabilities.iter().map(|c| c.to_string()).collect();
+        d
+    }
+
+    #[test]
+    fn grants_are_read_from_the_linked_definition() {
+        let defs = vec![
+            definition("other", &["computer-control"]),
+            definition("linked", &["cross-session-note"]),
+        ];
+        assert_eq!(
+            resolve_agent_capabilities(Some("linked"), &defs),
+            vec!["cross-session-note".to_string()],
+            "an agent must hold what its own definition grants, not another's"
+        );
+    }
+
+    /// The regression this whole function exists for: a grant added to the
+    /// definition after an agent was minted must reach that agent's next
+    /// spawn. Nothing on the instance is consulted, so there is no copy left
+    /// to go stale.
+    #[test]
+    fn a_grant_added_after_minting_reaches_the_next_spawn() {
+        let mut defs = vec![definition("linked", &[])];
+        assert_eq!(
+            resolve_agent_capabilities(Some("linked"), &defs),
+            Vec::<String>::new()
+        );
+
+        defs[0].capabilities = vec!["cross-session-note".to_string()];
+
+        assert_eq!(
+            resolve_agent_capabilities(Some("linked"), &defs),
+            vec!["cross-session-note".to_string()],
+            "editing the definition must change what the next spawn is granted"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_definition_holds_nothing() {
+        let defs = vec![definition("linked", &["computer-control"])];
+        assert_eq!(
+            resolve_agent_capabilities(None, &defs),
+            Vec::<String>::new(),
+            "an unlinked agent must not inherit some other definition's grants"
+        );
+    }
+
+    /// Deleted definition and failed load are indistinguishable here. Both
+    /// fail closed; the `warn` is what makes the second one reportable.
+    #[test]
+    fn an_unresolvable_definition_fails_closed() {
+        assert_eq!(
+            resolve_agent_capabilities(
+                Some("deleted"),
+                &[definition("other", &["computer-control"])]
+            ),
+            Vec::<String>::new(),
+            "an agent whose definition is gone must not keep its grants"
+        );
+        assert_eq!(
+            resolve_agent_capabilities(Some("linked"), &[]),
+            Vec::<String>::new(),
+            "an empty definition list must not be treated as a grant"
+        );
+    }
 
     #[test]
     fn wire_strings_round_trip_through_parse() {

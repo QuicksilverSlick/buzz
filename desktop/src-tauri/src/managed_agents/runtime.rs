@@ -363,8 +363,9 @@ pub fn find_managed_agent_mut<'a>(
 pub(crate) fn build_respond_to_env(
     record: &ManagedAgentRecord,
     owner_hex: Option<&str>,
+    granted: &[String],
 ) -> Result<RespondToEnv, String> {
-    build_respond_to_env_with_policy(record, owner_hex, super::owner_only())
+    build_respond_to_env_with_policy(record, owner_hex, super::owner_only(), granted)
 }
 
 pub(crate) fn configure_runtime_cli(
@@ -714,7 +715,14 @@ pub fn spawn_agent_child(
     // Validation is strict here — a malformed allowlist on disk fails before
     // we spawn anything (the harness would also reject it, but we'd rather
     // fail with a clear error than crash-loop the child).
-    let (gate_set, gate_remove) = build_respond_to_env(record, owner_hex)?;
+    // Grants are resolved from the linked definition at every spawn rather
+    // than read off the record, so editing a grant reaches the next start of
+    // an already-minted agent. See `capabilities::resolve_agent_capabilities`.
+    let granted = crate::managed_agents::capabilities::resolve_agent_capabilities(
+        record.persona_id.as_deref(),
+        &personas,
+    );
+    let (gate_set, gate_remove) = build_respond_to_env(record, owner_hex, &granted)?;
     for (key, value) in &gate_set {
         command.env(key, value);
     }
