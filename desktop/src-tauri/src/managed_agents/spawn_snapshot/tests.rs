@@ -380,6 +380,71 @@ fn allowlist_normalization_equivalent_edits_do_not_change_snapshot() {
     );
 }
 
+/// The regression this field exists for. The harness reads
+/// `BUZZ_ACP_CAPABILITIES` only at startup, so a grant ticked while the agent
+/// runs must move the snapshot — otherwise no diff, no badge, no auto-restart,
+/// and the dialog shows a grant the running process never received.
+#[test]
+fn granting_a_capability_on_the_definition_changes_the_snapshot() {
+    let mut rec = record();
+    rec.persona_id = Some("p1".into());
+    let ungranted = vec![persona("p1", None, "prompt")];
+    let mut granted = ungranted.clone();
+    granted[0].capabilities = vec!["cross-session-note".into()];
+
+    assert_ne!(
+        snapshot(
+            &rec,
+            &ungranted,
+            &[],
+            "wss://ws.example",
+            &Default::default()
+        ),
+        snapshot(&rec, &granted, &[], "wss://ws.example", &Default::default()),
+        "ticking a grant must raise the restart badge on an already-running agent"
+    );
+}
+
+/// Revocation is the direction that matters most: the owner is told a
+/// capability was withdrawn, so an agent that still holds it must be flagged.
+#[test]
+fn revoking_a_capability_on_the_definition_changes_the_snapshot() {
+    let mut rec = record();
+    rec.persona_id = Some("p1".into());
+    let mut granted = vec![persona("p1", None, "prompt")];
+    granted[0].capabilities = vec!["computer-control".into()];
+    let revoked = vec![persona("p1", None, "prompt")];
+
+    assert_ne!(
+        snapshot(&rec, &granted, &[], "wss://ws.example", &Default::default()),
+        snapshot(&rec, &revoked, &[], "wss://ws.example", &Default::default()),
+        "revoking a grant must not report success while the process still holds it"
+    );
+}
+
+/// The env value is rendered from a `BTreeSet`, so reordering or duplicating
+/// grants leaves `BUZZ_ACP_CAPABILITIES` byte-identical and must not badge —
+/// the same contract `allowlist_normalization_equivalent_edits` pins.
+#[test]
+fn capability_reordering_does_not_change_the_snapshot() {
+    let mut rec = record();
+    rec.persona_id = Some("p1".into());
+    let mut one = vec![persona("p1", None, "prompt")];
+    one[0].capabilities = vec!["computer-control".into(), "cross-session-note".into()];
+    let mut other = vec![persona("p1", None, "prompt")];
+    other[0].capabilities = vec![
+        "cross-session-note".into(),
+        "computer-control".into(),
+        "cross-session-note".into(),
+    ];
+
+    assert_eq!(
+        snapshot(&rec, &one, &[], "wss://ws.example", &Default::default()),
+        snapshot(&rec, &other, &[], "wss://ws.example", &Default::default()),
+        "an edit that leaves the spawn env unchanged must not badge a restart"
+    );
+}
+
 #[test]
 fn allowlist_content_edit_still_changes_snapshot() {
     let mut rec = record();

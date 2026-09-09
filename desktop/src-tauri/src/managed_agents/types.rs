@@ -372,9 +372,19 @@ pub struct ManagedAgentRecord {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_code: Option<i64>,
-    /// Capabilities granted to this running agent, in wire shape. Copied from
-    /// the definition at mint time, exactly as `respond_to` is. Translates to
-    /// `BUZZ_ACP_CAPABILITIES`.
+    /// NOT AUTHORITATIVE — do not read this to decide what an agent may reach.
+    ///
+    /// A mint-time copy of the definition's grants, kept only so existing
+    /// `managed-agents.json` files round-trip unchanged. Capabilities have no
+    /// instance-level override: an agent holds what its *definition* grants, or
+    /// nothing, and the spawn path resolves that on every start through
+    /// [`crate::managed_agents::capabilities::resolve_agent_capabilities`].
+    ///
+    /// This field used to feed `BUZZ_ACP_CAPABILITIES`, and reading it is what
+    /// made a grant ticked after minting never reach the running agent — the
+    /// copy went stale the moment the owner edited the definition, with nothing
+    /// to signal that it had. It survives as inert state pending removal, which
+    /// is a persistence migration rather than a behaviour change.
     ///
     /// Empty means no grants, which is both the default and what every record
     /// written before this field existed deserializes to.
