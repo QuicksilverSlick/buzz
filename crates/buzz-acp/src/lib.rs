@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod observer;
+mod pending_permissions;
 mod pool;
 mod pool_lifecycle;
 mod prompt_framing;
