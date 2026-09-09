@@ -816,6 +816,10 @@ pub fn spawn_agent_child(
             provider: effective_provider.as_deref(),
             enforced_owner_only: super::owner_only_access_build(),
             session_policy: acp_session_policy,
+            // The same slice `build_respond_to_env` above turned into
+            // BUZZ_ACP_CAPABILITIES, so the stamp records what the child
+            // actually received rather than a second resolve that could drift.
+            capabilities: &granted,
         },
     );
 

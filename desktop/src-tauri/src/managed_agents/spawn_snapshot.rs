@@ -81,6 +81,10 @@ pub(crate) struct SpawnConfigInputs<'a> {
     /// drives the existing restart-required path (the harness only reads
     /// `BUZZ_ACP_SESSION_POLICY` at launch).
     pub session_policy: AcpSessionPolicy,
+    /// The capability grants this launch resolved from the agent's definition
+    /// — the same slice handed to `build_respond_to_env`, so the stamped
+    /// snapshot cannot disagree with what the child's environment received.
+    pub capabilities: &'a [String],
 }
 
 /// The effective spawn configuration of one managed-agent process.
@@ -152,6 +156,37 @@ pub(crate) struct SpawnConfigSnapshot {
     /// via layered env), so it must be captured explicitly rather than read back
     /// out of `env`.
     pub session_policy: String,
+    /// The capability grants this launch actually applied.
+    ///
+    /// Captured for the same reason as `session_policy`: the harness reads
+    /// `BUZZ_ACP_CAPABILITIES` only at startup, so without this field a grant
+    /// ticked or revoked while an agent runs produces no diff, no badge, and
+    /// no auto-restart — the process keeps its launch-time grant set while the
+    /// dialog shows the new one. Revocation is the worse direction: the owner
+    /// would be told a capability was withdrawn from an agent that still holds
+    /// it.
+    ///
+    /// Written directly on the spawn `Command` and reserved from every user env
+    /// tier, so it can never be read back out of `env` and must be captured
+    /// explicitly.
+    ///
+    /// Normalized exactly as the env receives it — `parse_capabilities` collects
+    /// into a `BTreeSet`, so the stored order is sorted and deduped. Capturing
+    /// the raw list instead would badge a restart for a reordering that leaves
+    /// `BUZZ_ACP_CAPABILITIES` byte-identical.
+    pub capabilities: Vec<String>,
+}
+
+/// Normalize a grant list the way the spawn environment receives it.
+///
+/// A list spawn would reject is captured raw, matching `respond_to_allowlist`:
+/// the stamped snapshot only ever comes from a successful spawn, so an edit
+/// that introduces an invalid grant correctly compares unequal.
+fn normalized_capabilities(granted: &[String]) -> Vec<String> {
+    match crate::managed_agents::capabilities::parse_capabilities(granted) {
+        Ok(parsed) => parsed.iter().map(|cap| cap.as_str().to_string()).collect(),
+        Err(_) => granted.to_vec(),
+    }
 }
 
 /// The startup effort a spawn actually applied, read from the single effort key
@@ -191,6 +226,7 @@ impl SpawnConfigSnapshot {
             provider,
             enforced_owner_only,
             session_policy,
+            capabilities,
         } = inputs;
         let (respond_to, respond_to_allowlist) =
             super::projected_access_with_policy(record, enforced_owner_only);
@@ -258,6 +294,7 @@ impl SpawnConfigSnapshot {
             // what launched regardless of which tier supplied the value.
             effort_level: effective_effort(descriptor),
             session_policy: session_policy.as_str().to_string(),
+            capabilities: normalized_capabilities(capabilities),
         }
     }
 
@@ -350,6 +387,13 @@ pub(crate) fn prospective_spawn_config_snapshot(
         provider: provider.as_deref(),
         enforced_owner_only,
         session_policy,
+        // Resolved through the SAME function the spawn path calls, against the
+        // same `personas` slice, so the prospective and stamped sides cannot
+        // disagree about what a restart would grant.
+        capabilities: &crate::managed_agents::capabilities::resolve_agent_capabilities(
+            record.persona_id.as_deref(),
+            personas,
+        ),
     })
 }
 
