@@ -127,7 +127,7 @@ use crate::managed_agents::types::{ManagedAgentRecord, RespondTo};
 #[test]
 fn build_env_owner_only_sets_mode_and_removes_others() {
     let rec = fixture(RespondTo::OwnerOnly, vec![], Some("tag".into()));
-    let (set, remove) = build_respond_to_env(&rec, Some("owner")).unwrap();
+    let (set, remove) = build_respond_to_env(&rec, Some("owner"), &[]).unwrap();
     let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
     assert_eq!(
         set_map.get("BUZZ_ACP_RESPOND_TO").map(String::as_str),
@@ -162,7 +162,7 @@ fn build_env_allowlist_sets_both_envs_and_joins() {
         vec![a.clone(), b.clone()],
         Some("tag".into()),
     );
-    let (set, _remove) = build_respond_to_env(&rec, Some("owner")).unwrap();
+    let (set, _remove) = build_respond_to_env(&rec, Some("owner"), &[]).unwrap();
     let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
     assert_eq!(
         set_map.get("BUZZ_ACP_RESPOND_TO").map(String::as_str),
@@ -184,7 +184,7 @@ fn build_env_allowlist_sets_both_envs_and_joins() {
 #[test]
 fn build_env_anyone_omits_allowlist_var() {
     let rec = fixture(RespondTo::Anyone, vec![], Some("tag".into()));
-    let (set, remove) = build_respond_to_env(&rec, Some("owner")).unwrap();
+    let (set, remove) = build_respond_to_env(&rec, Some("owner"), &[]).unwrap();
     let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
     assert_eq!(
         set_map.get("BUZZ_ACP_RESPOND_TO").map(String::as_str),
@@ -198,7 +198,7 @@ fn build_env_anyone_omits_allowlist_var() {
 #[test]
 fn owner_only_access_policy_overrides_stale_anyone_record_at_runtime() {
     let rec = fixture(RespondTo::Anyone, vec!["a".repeat(64)], Some("tag".into()));
-    let (set, remove) = build_respond_to_env_with_policy(&rec, Some("owner"), true).unwrap();
+    let (set, remove) = build_respond_to_env_with_policy(&rec, Some("owner"), true, &[]).unwrap();
     let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
 
     assert_eq!(
@@ -220,7 +220,7 @@ fn owner_only_access_policy_overrides_stale_anyone_record_at_runtime() {
 #[test]
 fn build_env_legacy_record_without_auth_tag_emits_agent_owner() {
     let rec = fixture(RespondTo::OwnerOnly, vec![], None);
-    let (set, remove) = build_respond_to_env(&rec, Some("ownerhex")).unwrap();
+    let (set, remove) = build_respond_to_env(&rec, Some("ownerhex"), &[]).unwrap();
     let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
     assert_eq!(
         set_map.get("BUZZ_ACP_AGENT_OWNER").map(String::as_str),
@@ -234,7 +234,7 @@ fn build_env_legacy_record_without_owner_hex_removes_agent_owner() {
     // No owner available to forward → make sure we don't inherit a leaked
     // env var from the parent.
     let rec = fixture(RespondTo::OwnerOnly, vec![], None);
-    let (_set, remove) = build_respond_to_env(&rec, None).unwrap();
+    let (_set, remove) = build_respond_to_env(&rec, None, &[]).unwrap();
     assert!(remove.contains(&"BUZZ_ACP_AGENT_OWNER"));
 }
 
@@ -245,21 +245,21 @@ fn build_env_rejects_corrupted_allowlist() {
         vec!["not-hex".into()],
         Some("tag".into()),
     );
-    assert!(build_respond_to_env(&rec, Some("owner")).is_err());
+    assert!(build_respond_to_env(&rec, Some("owner"), &[]).is_err());
 }
 
 #[test]
 fn build_env_rejects_empty_allowlist_in_allowlist_mode() {
     let rec = fixture(RespondTo::Allowlist, vec![], Some("tag".into()));
     if expected_owner_only() {
-        let (set, _) = build_respond_to_env(&rec, Some("owner")).unwrap();
+        let (set, _) = build_respond_to_env(&rec, Some("owner"), &[]).unwrap();
         let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
         assert_eq!(
             set_map.get("BUZZ_ACP_RESPOND_TO").map(String::as_str),
             Some("owner-only")
         );
     } else {
-        let err = build_respond_to_env(&rec, Some("owner")).unwrap_err();
+        let err = build_respond_to_env(&rec, Some("owner"), &[]).unwrap_err();
         assert!(err.contains("at least one pubkey"));
     }
 }

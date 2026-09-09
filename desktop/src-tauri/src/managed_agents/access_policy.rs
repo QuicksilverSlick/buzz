@@ -75,6 +75,7 @@ pub(crate) fn build_respond_to_env_with_policy(
     record: &ManagedAgentRecord,
     owner_hex: Option<&str>,
     enforced_owner_only: bool,
+    granted: &[String],
 ) -> Result<RespondToEnv, String> {
     let (respond_to, _) = projected_access_with_policy(record, enforced_owner_only);
     let normalized = validate_respond_to_allowlist(&record.respond_to_allowlist)?;
@@ -109,7 +110,12 @@ pub(crate) fn build_respond_to_env_with_policy(
     // a missing variable must mean the same thing to the harness, and pinning
     // it on every start means a stale value from a previous configuration can
     // never survive into a restart.
-    let granted = crate::managed_agents::capabilities::parse_capabilities(&record.capabilities)
+    // `granted` is resolved from the agent's *definition* by the caller, not
+    // read off the record. The record's own `capabilities` is a mint-time
+    // snapshot that goes stale the moment the owner edits the definition, and
+    // a stale grant list here is the difference between an agent the UI says
+    // is permitted and a process that was never told.
+    let granted = crate::managed_agents::capabilities::parse_capabilities(granted)
         .map_err(|e| format!("agent {} has invalid capabilities: {e}", record.pubkey))?;
     set.push((
         "BUZZ_ACP_CAPABILITIES",
@@ -132,14 +138,17 @@ pub(crate) fn build_respond_to_env_with_policy(
 mod tests {
     #[test]
     fn capability_grants_reach_the_spawn_env() {
-        let mut record = record(BackendKind::Local);
-        record.capabilities = vec![
+        let record = record(BackendKind::Local);
+        // Passed in, not read off the record: the caller resolves these from
+        // the agent's definition on every spawn.
+        let granted = vec![
             "computer-control".to_string(),
             "cross-session-note".to_string(),
         ];
 
-        let (set, _remove) = build_respond_to_env_with_policy(&record, Some("owner"), false)
-            .expect("valid record must build");
+        let (set, _remove) =
+            build_respond_to_env_with_policy(&record, Some("owner"), false, &granted)
+                .expect("valid record must build");
 
         let value = set
             .iter()
@@ -157,7 +166,7 @@ mod tests {
         // must mean the same thing, and pinning it every start stops a stale
         // grant from a previous configuration surviving a restart.
         let record = record(BackendKind::Local);
-        let (set, _remove) = build_respond_to_env_with_policy(&record, Some("owner"), false)
+        let (set, _remove) = build_respond_to_env_with_policy(&record, Some("owner"), false, &[])
             .expect("valid record must build");
 
         let value = set
@@ -170,10 +179,10 @@ mod tests {
 
     #[test]
     fn an_unknown_grant_refuses_the_spawn_rather_than_starting_unbounded() {
-        let mut record = record(BackendKind::Local);
-        record.capabilities = vec!["cross-session-everything".to_string()];
+        let record = record(BackendKind::Local);
+        let granted = vec!["cross-session-everything".to_string()];
 
-        let error = build_respond_to_env_with_policy(&record, Some("owner"), false)
+        let error = build_respond_to_env_with_policy(&record, Some("owner"), false, &granted)
             .expect_err("an unparseable grant must not reach a running agent");
         assert!(
             error.contains("cross-session-everything"),
@@ -204,7 +213,7 @@ mod tests {
         let mut record = record(BackendKind::Local);
         record.respond_to_allowlist = vec!["malformed stale allowlist".into()];
 
-        let error = build_respond_to_env_with_policy(&record, Some("owner"), true)
+        let error = build_respond_to_env_with_policy(&record, Some("owner"), true, &[])
             .expect_err("owner-only access policy accepted a malformed stored allowlist");
 
         assert!(
@@ -227,7 +236,7 @@ mod tests {
         ] {
             let record = record(backend);
             let (gate_set, _) =
-                build_respond_to_env_with_policy(&record, Some("owner"), true).unwrap();
+                build_respond_to_env_with_policy(&record, Some("owner"), true, &[]).unwrap();
             let gate_set: std::collections::HashMap<_, _> = gate_set.into_iter().collect();
             assert_eq!(
                 gate_set.get("BUZZ_ACP_RESPOND_TO").map(String::as_str),
