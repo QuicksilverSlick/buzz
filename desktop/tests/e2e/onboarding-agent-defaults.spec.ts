@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import { installMockBridge } from "../helpers/bridge";
 import { passThroughBackupStep } from "../helpers/onboarding";
 
@@ -691,7 +692,7 @@ test("Back preserves incomplete defaults draft without writing", async ({
       .getByTestId("onboarding-page-config")
       .locator(".buzz-onboarding-transition-line"),
   ).toHaveAttribute("data-onboarding-direction", "forward");
-  await expect(harness).toHaveText("Buzz");
+  await expect(harness).toHaveText(PRODUCT_NAME);
   await expect(page.getByTestId("global-agent-provider")).toHaveText(
     "Anthropic",
   );
@@ -1101,7 +1102,7 @@ test("Finish stays disabled until a provider-required harness is fully configure
   // buzz-agent auto-selects as the only ready harness, but with no provider
   // configured the default is not launchable — Finish must be gated.
   await expect(page.getByTestId("global-agent-default-harness")).toHaveText(
-    "Buzz",
+    PRODUCT_NAME,
   );
   const finish = page.getByTestId("onboarding-finish");
   await expect(finish).toBeDisabled();
@@ -1152,7 +1153,7 @@ test("baked build config keeps Finish enabled without manual provider setup", as
   // Internal builds bake provider/model/credentials — the gate must treat
   // baked config as complete and never block Finish.
   await expect(page.getByTestId("global-agent-default-harness")).toHaveText(
-    "Buzz",
+    PRODUCT_NAME,
   );
   await expect(page.getByTestId("onboarding-finish")).toBeEnabled();
 });

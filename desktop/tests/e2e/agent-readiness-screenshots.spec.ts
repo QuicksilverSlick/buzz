@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { SHARED_COMPUTE_LABEL } from "../../src/shared/constants/brand";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 const SHOTS = "test-results/agent-readiness";
@@ -160,7 +161,7 @@ test.describe("agent readiness gate screenshots", () => {
   test("02-create-buzzagent-automatic-model", async ({ page }) => {
     await installMockBridge(page);
     await openCreateDialog(page);
-    await selectProvider(page, "Buzz shared compute");
+    await selectProvider(page, SHARED_COMPUTE_LABEL);
 
     await expect(page.locator("#persona-model")).toContainText("Automatic");
     await expect(page.getByTestId("persona-dialog-submit")).toBeEnabled();

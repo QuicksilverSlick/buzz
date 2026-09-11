@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
@@ -758,7 +759,7 @@ test("app font size and conversation density apply independently", async ({
   await expect(comfortable).toHaveAttribute("aria-pressed", "true");
   await expect(defaultSize).toHaveAttribute("aria-pressed", "true");
   await expect(densityDescription).toHaveText(
-    "Spacing in conversations and Markdown content across Buzz",
+    `Spacing in conversations and Markdown content across ${PRODUCT_NAME}`,
   );
   await expect(fontSizeDescription).toHaveText(
     "Applies across conversations and interface text",

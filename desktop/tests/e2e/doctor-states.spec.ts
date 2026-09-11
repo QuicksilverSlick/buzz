@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 import { openSettings } from "../helpers/settings";
@@ -828,7 +829,7 @@ test.describe("Doctor panel state screenshots", () => {
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toContainText("Update Codex adapter?");
     await expect(dialog).toContainText(
-      "Older Buzz releases using the legacy adapter may lose community access",
+      `Older ${PRODUCT_NAME} releases using the legacy adapter may lose community access`,
     );
     await expect(page.getByTestId("doctor-runtime-loading-codex")).toHaveCount(
       0,
