@@ -2514,6 +2514,7 @@ pub async fn run_prompt_task(
                     // its own standing context, with no inbound request behind
                     // it. Nobody is being answered here, so there is no guest.
                     crate::acp::TurnAuthority::Owner,
+                    None,
                 )
                 .await;
 
@@ -2843,6 +2844,7 @@ pub async fn run_prompt_task(
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                     turn_authority,
+                    None,
                 ) => result,
             }
         }
@@ -2855,6 +2857,7 @@ pub async fn run_prompt_task(
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                     turn_authority,
+                    None,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
