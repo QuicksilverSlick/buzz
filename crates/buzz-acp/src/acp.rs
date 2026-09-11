@@ -449,13 +449,43 @@ fn build_client_capabilities() -> serde_json::Value {
 /// because those two arrive byte-identical otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnAuthority {
-    /// The owner, or one of the owner's own sibling agents.
+    /// The owner, and only the owner.
+    ///
+    /// Not the owner's sibling agents: their events are signed with their own
+    /// keys, so dispatch classifies them as `Guest` like any other author.
     Owner,
     /// Anyone else the agent is configured to answer.
     ///
     /// The default everywhere, so that forgetting to classify a turn fails
     /// toward asking rather than toward acting.
     Guest,
+}
+
+impl TurnAuthority {
+    /// The less trusted of two authorities.
+    ///
+    /// A turn's authority is that of the least-trusted author who has
+    /// influenced it. Every point where a new author's words join a turn -- the
+    /// batch that starts it, and each event steered into it later -- folds in
+    /// through this, so within a turn trust can only go down, never up.
+    pub(crate) fn weaker(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Owner, Self::Owner) => Self::Owner,
+            _ => Self::Guest,
+        }
+    }
+}
+
+/// Whether an author is the agent's owner.
+///
+/// The one owner comparison that both turn dispatch (`pool.rs`) and native
+/// steering (`lib.rs`) use, so the two cannot drift apart. An unknown owner
+/// verifies nobody: with nothing to compare against, every author is a guest.
+pub(crate) fn authority_for_author(author_hex: &str, owner_hex: Option<&str>) -> TurnAuthority {
+    match owner_hex {
+        Some(owner) if owner.eq_ignore_ascii_case(author_hex) => TurnAuthority::Owner,
+        _ => TurnAuthority::Guest,
+    }
 }
 
 /// A permission request this harness refused, kept so the layer above can
@@ -1336,7 +1366,10 @@ impl AcpClient {
                         self.handle_goose_usage_update(&msg);
                     }
                     "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
+                        // No turn is running here (session/new, set_config_option), so decide as
+                        // a guest -- never with whatever authority the last turn left behind.
+                        self.handle_permission_request(&msg, TurnAuthority::Guest)
+                            .await?;
                     }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
@@ -1477,6 +1510,19 @@ impl AcpClient {
                         None => None,
                     }
                 }, if pending_steer.is_none() => {
+                    // A steer writes another author's words into a turn that is already
+                    // running. Lower the turn's authority to that author's BEFORE anything is
+                    // written, so no permission request the agent raises in response can be
+                    // decided with more trust than its instructions came from. This loop is
+                    // single-threaded: nothing can be decided between these two steps.
+                    let lowered = self.current_turn_authority.weaker(req.authority);
+                    if lowered != self.current_turn_authority {
+                        tracing::info!(
+                            target: "acp::authority",
+                            "steered event from a non-owner: the rest of this turn runs as Guest"
+                        );
+                        self.current_turn_authority = lowered;
+                    }
                     // Selected: choose the steer transport and build its
                     // params at write time using the lexical `session_id`
                     // and the freshest `active_run_id`.
@@ -1784,7 +1830,8 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(&msg).await?;
+                                let authority = self.current_turn_authority;
+                                self.handle_permission_request(&msg, authority).await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -2018,7 +2065,15 @@ impl AcpClient {
         std::mem::take(&mut self.permission_refusals)
     }
 
-    async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
+    /// `authority` is passed in, not read off `self`. The setup loop decides as
+    /// `Guest` because no turn is running, and the prompt loop passes the turn's
+    /// current authority. Reading the field here once let the setup loop decide
+    /// with whatever authority the previous turn happened to leave behind.
+    async fn handle_permission_request(
+        &mut self,
+        msg: &serde_json::Value,
+        authority: TurnAuthority,
+    ) -> Result<(), AcpError> {
         // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
         let id = msg
             .get("id")
@@ -2039,7 +2094,7 @@ impl AcpClient {
             options.len()
         );
 
-        let decision = decide_permission(self.current_turn_authority, options);
+        let decision = decide_permission(authority, options);
 
         let response = match &decision {
             PermissionDecision::Approve(option_id) => {
@@ -2062,7 +2117,7 @@ impl AcpClient {
                     target: "acp::permission",
                     id = %id,
                     tool = %tool,
-                    authority = ?self.current_turn_authority,
+                    authority = ?authority,
                     "refusing permission request"
                 );
                 self.permission_refusals.push(PermissionRefusal {
@@ -2496,6 +2551,173 @@ mod tests {
 
     fn opt(kind: &str, id: &str) -> serde_json::Value {
         serde_json::json!({ "kind": kind, "optionId": id })
+    }
+
+    // ── Turn authority: how much a turn is trusted ───────────────────────────
+
+    #[test]
+    fn a_turn_is_only_as_trusted_as_its_least_trusted_author() {
+        use TurnAuthority::{Guest, Owner};
+        assert_eq!(Owner.weaker(Owner), Owner);
+        assert_eq!(Owner.weaker(Guest), Guest);
+        assert_eq!(
+            Guest.weaker(Owner),
+            Guest,
+            "an owner message joining a guest turn must not raise its trust"
+        );
+        assert_eq!(Guest.weaker(Guest), Guest);
+    }
+
+    #[test]
+    fn only_the_owners_own_key_counts_as_the_owner() {
+        let owner = "ab".repeat(32);
+        assert_eq!(
+            super::authority_for_author(&owner, Some(&owner)),
+            TurnAuthority::Owner
+        );
+        assert_eq!(
+            super::authority_for_author(&owner.to_uppercase(), Some(&owner)),
+            TurnAuthority::Owner,
+            "hex case must not decide trust"
+        );
+        assert_eq!(
+            super::authority_for_author(&"cd".repeat(32), Some(&owner)),
+            TurnAuthority::Guest
+        );
+        assert_eq!(
+            super::authority_for_author(&owner, None),
+            TurnAuthority::Guest,
+            "with no owner to compare against, nobody is the owner"
+        );
+    }
+
+    /// One permission request a fake agent raises. It offers both answers, so
+    /// the harness's choice shows which authority it decided with.
+    const PROBE_PERMISSION_REQUEST: &str = r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"sess-test","toolCall":{"toolCallId":"t1","title":"Bash","kind":"execute"},"options":[{"kind":"allow_once","optionId":"allow-1","name":"Allow"},{"kind":"reject_once","optionId":"reject-1","name":"Reject"}]}}"#;
+
+    fn probe_capture_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "buzz-acp-authority-{name}-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Forward slashes, quoted where it is used. These wire tests are for Linux
+    /// CI: on Windows, Rust finds WSL's `bash` before PATH, and WSL cannot see a
+    /// `C:/...` path -- the same reason the crate's other bash-script tests fail
+    /// there.
+    fn bash_path(path: &std::path::Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
+    /// The option id the harness answered the probe with.
+    fn captured_answer(path: &std::path::Path) -> String {
+        let raw = std::fs::read_to_string(path)
+            .expect("the fake agent must have captured the harness's answer");
+        let reply: serde_json::Value =
+            serde_json::from_str(&raw).expect("the harness's answer must be JSON");
+        reply["result"]["outcome"]["optionId"]
+            .as_str()
+            .expect("the answer must select an option")
+            .to_string()
+    }
+
+    /// Steer `authority`'s words into a running Owner turn, then have the agent
+    /// ask for permission. Returns the harness's answer and the turn's authority
+    /// afterwards.
+    async fn steer_then_ask(name: &str, authority: TurnAuthority) -> (String, TurnAuthority) {
+        let capture = probe_capture_path(name);
+        // The agent blocks until the steer arrives before it asks, so the order
+        // is fixed: steer written, then permission request, then answer.
+        let script = format!(
+            "read -r _steer; printf '%s\\n' '{req}'; read -r reply; \
+             printf '%s' \"$reply\" > '{capture}'; sleep 10",
+            req = PROBE_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+        );
+        let mut client = spawn_script(&script).await;
+        client.current_turn_authority = TurnAuthority::Owner;
+        client.steering_supported = true;
+
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        steer_tx
+            .send(crate::pool::SteerRequest {
+                authority,
+                prompt_blocks: vec!["a message from someone mid-turn".into()],
+                ack_tx,
+            })
+            .await
+            .expect("steer_tx send should succeed");
+
+        // Generous idle window: under load, bash can take a while to wake, and
+        // an idle timeout before the ask would fail the test for the wrong reason.
+        let idle = std::time::Duration::from_secs(4);
+        let max_dur = std::time::Duration::from_secs(12);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let _ = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+
+        let answer = captured_answer(&capture);
+        let _ = std::fs::remove_file(&capture);
+        (answer, client.current_turn_authority)
+    }
+
+    /// The hole this closes. A guest who posted while the owner's turn was
+    /// running had their words steered in under the owner's authority, so the
+    /// agent's next tool request was approved as though the owner had asked.
+    #[tokio::test]
+    async fn a_guest_steer_lowers_the_turn_before_the_agent_can_ask() {
+        let (answer, after) = steer_then_ask("guest-steer", TurnAuthority::Guest).await;
+        assert_eq!(
+            answer, "reject-1",
+            "a request raised after a guest's steer must be decided as a guest"
+        );
+        assert_eq!(after, TurnAuthority::Guest);
+    }
+
+    /// The control: steering is not what lowers trust. The owner's own steer
+    /// leaves the owner's turn exactly as trusted as it was.
+    #[tokio::test]
+    async fn an_owner_steer_leaves_an_owner_turn_trusted() {
+        let (answer, after) = steer_then_ask("owner-steer", TurnAuthority::Owner).await;
+        assert_eq!(answer, "allow-1");
+        assert_eq!(after, TurnAuthority::Owner);
+    }
+
+    /// The second hole. The setup loop (session/new, set_config_option) decided
+    /// with whatever authority the previous turn left on the connection.
+    #[tokio::test]
+    async fn setup_decides_permissions_as_a_guest_even_after_an_owner_turn() {
+        let capture = probe_capture_path("setup");
+        let script = format!(
+            "printf '%s\\n' '{req}'; read -r reply; printf '%s' \"$reply\" > '{capture}'; \
+             printf '%s\\n' '{done}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+            done = r#"{"jsonrpc":"2.0","id":5,"result":{"ok":true}}"#,
+        );
+        let mut client = spawn_script(&script).await;
+        // Left over from an owner turn that has already finished.
+        client.current_turn_authority = TurnAuthority::Owner;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_until_response(5),
+        )
+        .await
+        .expect("the setup loop must finish");
+        assert!(result.is_ok(), "setup should complete, got {result:?}");
+        assert_eq!(
+            captured_answer(&capture),
+            "reject-1",
+            "no turn is running during setup, so no one's authority applies"
+        );
+        let _ = std::fs::remove_file(&capture);
     }
 
     #[test]
@@ -4061,6 +4283,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -4130,6 +4353,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -4202,6 +4426,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4276,6 +4501,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4526,6 +4752,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4579,6 +4806,7 @@ mod tests {
         let send_task = tokio::spawn(async move {
             steer_tx
                 .send(crate::pool::SteerRequest {
+                    authority: crate::acp::TurnAuthority::Owner,
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })

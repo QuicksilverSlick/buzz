@@ -482,6 +482,15 @@ pub struct SteerRequest {
     /// `queue::native_steer_framing()` + `queue::format_event_block` so
     /// the wording cannot drift from the cancel+merge fallback path.
     pub prompt_blocks: Vec<String>,
+    /// Authority of the author whose event this steer carries, decided by the
+    /// same owner comparison dispatch uses (`crate::acp::authority_for_author`).
+    ///
+    /// Required, never defaulted: a steer writes someone's words into a turn
+    /// that is already running under a decided authority. If they are not the
+    /// owner, the rest of the turn must stop carrying the owner's authority --
+    /// otherwise a guest who waits until the owner is mid-turn gets their
+    /// instructions executed as the owner's.
+    pub authority: crate::acp::TurnAuthority,
     /// Oneshot for the read loop to report the outcome.
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
 }
@@ -2065,15 +2074,17 @@ pub async fn run_prompt_task(
             crate::acp::TurnAuthority::Guest
         }
         (Some(b), Some(owner)) => {
+            // The same comparison native steering applies to each event it writes
+            // into a running turn, so dispatch and steering cannot drift apart.
             let owner_hex = owner.to_hex();
-            if b.events
+            b.events
                 .iter()
-                .all(|be| be.event.pubkey.to_hex().eq_ignore_ascii_case(&owner_hex))
-            {
-                crate::acp::TurnAuthority::Owner
-            } else {
-                crate::acp::TurnAuthority::Guest
-            }
+                .fold(crate::acp::TurnAuthority::Owner, |authority, be| {
+                    authority.weaker(crate::acp::authority_for_author(
+                        &be.event.pubkey.to_hex(),
+                        Some(&owner_hex),
+                    ))
+                })
         }
     };
     let observer_channel_id = source.channel_id();
