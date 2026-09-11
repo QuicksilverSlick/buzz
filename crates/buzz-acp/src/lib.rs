@@ -659,6 +659,7 @@ impl QueuedNormalListenerEvent {
                 self.event_for_steer,
                 self.prompt_tag_for_steer,
                 steer_ack_tx,
+                owner,
             );
         if !native_attempted {
             signal_in_flight_task_for_scope(pool, &self.scope, signal);
@@ -4314,6 +4315,7 @@ fn try_native_steer(
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+    owner: Option<&str>,
 ) -> bool {
     let channel_id = scope.channel_id();
     // Build the steer body: framing strings come from
@@ -4331,6 +4333,10 @@ fn try_native_steer(
     // steering (which is to inject only what's new).
     let (tag, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
+    // Decided from the signing key, exactly as dispatch decides a batch, and
+    // not from any derived "effective" author: a steered event must never be
+    // trusted more than the same event would be if it had started the turn.
+    let authority = crate::acp::authority_for_author(&event.pubkey.to_hex(), owner);
     let be = queue::BatchEvent {
         event,
         prompt_tag: prompt_tag.clone(),
@@ -4348,6 +4354,7 @@ fn try_native_steer(
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
         prompt_blocks: vec![body],
+        authority,
         ack_tx,
     };
 
