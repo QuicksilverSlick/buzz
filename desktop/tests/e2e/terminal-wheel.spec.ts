@@ -1,7 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
+
+import { TERMINAL_LABEL } from "@/shared/constants/brand";
+
 import { installMockBridge } from "../helpers/bridge";
 
-const TERM = 'section[aria-label="Buzz Term"]';
+const TERM = `section[aria-label="${TERMINAL_LABEL}"]`;
 const NAMED = 0x0100_0000;
 const FG = NAMED | 256;
 const BG = NAMED | 257;

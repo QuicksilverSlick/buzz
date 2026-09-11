@@ -13,6 +13,7 @@
 
 import { expect, test } from "@playwright/test";
 
+import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 
@@ -428,7 +429,7 @@ test.describe("restart-diff screenshots", () => {
     const banner = panel.getByTestId("needs-restart-banner");
     await expect(banner).toBeVisible({ timeout: 10_000 });
     await expect(
-      banner.getByText("Buzz can restart it automatically"),
+      banner.getByText(`${PRODUCT_NAME} can restart it automatically`),
     ).toBeVisible();
 
     await waitForAnimations(page);

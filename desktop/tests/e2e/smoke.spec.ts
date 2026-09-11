@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { SHARED_COMPUTE_LABEL } from "../../src/shared/constants/brand";
 import { installMockBridge, openCreateChannelDialog } from "../helpers/bridge";
 
 async function getTimelineMetrics(page: import("@playwright/test").Page) {
@@ -103,7 +104,7 @@ async function chooseSharedComputeProvider(
   await page
     .getByRole("menuitemradio", {
       exact: true,
-      name: "Buzz shared compute",
+      name: SHARED_COMPUTE_LABEL,
     })
     .click();
 }

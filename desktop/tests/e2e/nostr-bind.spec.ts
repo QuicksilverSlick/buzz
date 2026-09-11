@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { installMockBridge } from "../helpers/bridge";
 
 type NostrBindPayload = {
@@ -459,7 +460,7 @@ test("keeps the signed response available when clipboard access fails", async ({
   await expect(
     page
       .getByTestId("nostr-bind-manual-fallback-content")
-      .getByText("Buzz couldn't access the clipboard. Try again."),
+      .getByText(`${PRODUCT_NAME} couldn't access the clipboard. Try again.`),
   ).toBeVisible();
   await expect(page.getByTestId("nostr-bind-signed-response")).toContainText(
     "e2e-signed-nostr-binding",

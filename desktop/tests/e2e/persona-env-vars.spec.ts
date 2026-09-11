@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { PRODUCT_NAME } from "@/shared/constants/brand";
+
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
@@ -319,7 +321,7 @@ test("persona model options follow the selected LLM provider", async ({
   await page.getByRole("tab", { name: "Customize for this agent" }).click();
   const llmProvider = page.locator("#persona-llm-provider");
   const model = page.locator("#persona-model");
-  await expect(provider).toContainText("Buzz Agent (default)");
+  await expect(provider).toContainText(`${PRODUCT_NAME} Agent (default)`);
   await expect(llmProvider).toBeVisible();
   await expect(model).toBeVisible();
   // Custom mode requires a model selection until a provider is chosen.

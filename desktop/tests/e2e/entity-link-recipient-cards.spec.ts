@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { PRODUCT_NAME } from "@/shared/constants/brand";
+
 import { waitForAnimations } from "../helpers/animations";
 import {
   installBridge,
@@ -399,7 +401,7 @@ test("entity tooltip uses project context while relay metadata is delayed", asyn
     page
       .getByRole("tooltip")
       .locator('[data-buzz-tooltip-metadata-content=""]'),
-  ).toHaveText("buzz · The complete Buzz community platform.");
+  ).toHaveText(`buzz · The complete ${PRODUCT_NAME} community platform.`);
 });
 
 test("desktop composer and sent message keep Buzz entities chip-only", async ({
