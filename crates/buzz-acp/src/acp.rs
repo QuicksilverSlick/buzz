@@ -204,6 +204,17 @@ pub struct AcpClient {
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
     last_prompt_id: Option<u64>,
+    /// The JSON-RPC error that answered the prompt, kept only while the pool
+    /// may still need it.
+    ///
+    /// The prompt's result normally carries the error back to the pool. But
+    /// the pool can drop the prompt future in its exit drain, after the error
+    /// was read. It then finds no prompt in flight and takes its "completed
+    /// before the control signal" branch, which would otherwise report the
+    /// turn as a success: its batch recorded as delivered and never retried.
+    /// That branch takes this instead. Cleared when the prompt call returns,
+    /// and again when the next prompt starts.
+    prompt_error_before_drain: Option<(i64, String)>,
     /// Hard deadline for the current turn, set by `session_prompt_with_idle_timeout`.
     /// Inherited by `cancel_with_cleanup` so the drain loop shares the same budget
     /// rather than starting a fresh timer (prevents double-jeopardy).
@@ -660,6 +671,7 @@ impl AcpClient {
             current_turn_authority: TurnAuthority::Guest,
             permission_refusals: Vec::new(),
             last_prompt_id: None,
+            prompt_error_before_drain: None,
             current_hard_deadline: None,
             observer: None,
             observer_agent_index: None,
@@ -919,6 +931,9 @@ impl AcpClient {
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
 
+        // Before the first yield, like `last_prompt_id`: an error kept from an
+        // earlier turn must never be reported as this one's.
+        self.prompt_error_before_drain = None;
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
         self.next_id += 1;
@@ -970,6 +985,9 @@ impl AcpClient {
         // be decided with its authority again. The next prompt sets its own,
         // and a cancel drain that follows a timeout decides as a guest.
         self.current_turn_authority = TurnAuthority::Guest;
+        // The result carries any error back itself; the copy was only for a
+        // pool that dropped this future before it could return.
+        self.prompt_error_before_drain = None;
 
         // On timeout errors, leave current_hard_deadline set so cancel_with_cleanup
         // can inherit the remaining budget. Clear it on all other outcomes.
@@ -1008,6 +1026,16 @@ impl AcpClient {
     /// Returns `true` if a `session/prompt` request is currently in flight.
     pub fn has_in_flight_prompt(&self) -> bool {
         self.last_prompt_id.is_some()
+    }
+
+    /// Take the JSON-RPC error that answered the prompt, if the pool dropped
+    /// the prompt future after it was read. For the pool's "completed before
+    /// the control signal" branch only; everywhere else the prompt's own
+    /// result carries the error.
+    pub(crate) fn take_prompt_error_before_drain(&mut self) -> Option<AcpError> {
+        self.prompt_error_before_drain
+            .take()
+            .map(|(code, message)| AcpError::AgentError { code, message })
     }
 
     /// Most recently observed goose `_meta.goose.activeRunId` from a
@@ -1564,11 +1592,15 @@ impl AcpClient {
         // Cleared here, a drop mid-drain takes the pool's "turn completed
         // before the control signal" branch, which runs no cleanup. Whatever
         // the drain had not answered stays owed, and the next prompt answers
-        // it before it is sent.
+        // it before it is sent. An error is kept for that branch, so a turn
+        // that failed is not reported as one that completed.
         if matches!(result, Ok(_) | Err(AcpError::AgentError { .. }))
             && self.last_prompt_id == Some(expected_id)
         {
             self.last_prompt_id = None;
+            if let Err(AcpError::AgentError { code, message }) = &result {
+                self.prompt_error_before_drain = Some((*code, message.clone()));
+            }
         }
         self.answer_owed_on_exit(gate.as_ref()).await;
         result
@@ -4002,6 +4034,71 @@ mod tests {
             "the error was the response, so the prompt is no longer in flight"
         );
         stalled.shutdown().await;
+    }
+
+    /// The pool drops the prompt future before it can return its error, so the
+    /// error has to wait on the client for the pool to take. Were it lost, the
+    /// pool would report a failed turn as completed: its batch recorded as
+    /// delivered and never retried.
+    #[tokio::test]
+    async fn a_prompt_error_read_before_a_drop_is_kept_for_the_pool() {
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": PROMPT_ID,
+            "error": {"code": -32000, "message": "the agent failed the turn"},
+        });
+        let (mut client, mut stalled) = drop_in_the_exit_drain(error).await;
+        match client.take_prompt_error_before_drain() {
+            Some(AcpError::AgentError { code, message }) => {
+                assert_eq!(code, -32000);
+                assert_eq!(message, "the agent failed the turn");
+            }
+            other => panic!("the pool must get the error the turn ended with, got {other:?}"),
+        }
+        assert!(
+            client.take_prompt_error_before_drain().is_none(),
+            "the error is reported once"
+        );
+        stalled.shutdown().await;
+    }
+
+    /// When the prompt call returns, its result already carries the error. A
+    /// copy left behind could be reported against a later turn.
+    #[tokio::test]
+    async fn an_error_the_prompt_returned_is_not_kept_for_the_pool() {
+        // Two cats, as in the owed-ids test below: the queued error answers the
+        // prompt as soon as it is sent. A fresh client's first request is id 0.
+        let mut client = spawn_inert_client().await;
+        let mut wire = spawn_inert_client().await;
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {"code": -32000, "message": "the agent failed the turn"},
+        });
+        client
+            .write_ndjson(&error)
+            .await
+            .expect("cat takes the response");
+        std::mem::swap(&mut client.stdin, &mut wire.stdin);
+
+        let result = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                TurnAuthority::Guest,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::AgentError { .. })),
+            "got {result:?}"
+        );
+        assert!(
+            client.take_prompt_error_before_drain().is_none(),
+            "the returned result carried the error, so nothing is kept"
+        );
     }
 
     /// The other side of the two above: a prompt that timed out still has its

@@ -2948,20 +2948,29 @@ pub async fn run_prompt_task(
                             }
                         }
                     } else {
-                        // Race 1 resolution: turn completed naturally before cancel
-                        // could fire. last_prompt_id is None — cleared by
-                        // session_prompt_with_idle_timeout() on success. The prompt
-                        // future was dropped by select! — its Ok result is gone.
+                        // Race 1 resolution: the read loop consumed the prompt's
+                        // response before cancel could fire. last_prompt_id is
+                        // None, cleared once the result, or a JSON-RPC error, was
+                        // read. The prompt future was dropped by select!, so its
+                        // result is gone; an error waits on the client instead
+                        // (take_prompt_error_before_drain), so a failed turn is
+                        // not reported as a completed one.
                         //
                         // Note: this `else` branch (last_prompt_id is None) cannot
                         // fire during the pre-prompt phase because `biased` select!
                         // polls the prompt arm first. That arm sets last_prompt_id
                         // synchronously before its first yield point, so by the time
                         // the cancel arm can win, last_prompt_id is already Some.
-                        // This branch only fires when the turn genuinely completed
-                        // and last_prompt_id was cleared by the success path.
+                        // This branch only fires once the prompt's response was
+                        // read and last_prompt_id cleared.
                         //
                         // MUST send a PromptResult or the main loop deadlocks.
+                        let completed = classify_completed_before_control_signal(
+                            &ctx,
+                            agent.acp.take_prompt_error_before_drain(),
+                            control_signal.clone(),
+                            batch,
+                        );
                         if matches!(
                             control_signal,
                             ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
@@ -2976,15 +2985,24 @@ pub async fn run_prompt_task(
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
-                        log_stop_reason(&source, &StopReason::EndTurn);
-                        if let PromptSource::Channel(scope) = &source {
-                            let standing_sent = !agent.has_system_prompt_support();
-                            record_scope_delivery_success(
-                                &mut agent,
-                                scope.clone(),
-                                standing_sent,
-                                &pending_delivered_event_ids,
+                        if let PromptOutcome::Error(error) = &completed.outcome {
+                            tracing::error!(
+                                target: "pool::prompt",
+                                "session_prompt error, read just before the control signal: {error}"
                             );
+                        } else {
+                            log_stop_reason(&source, &StopReason::EndTurn);
+                        }
+                        if completed.delivered {
+                            if let PromptSource::Channel(scope) = &source {
+                                let standing_sent = !agent.has_system_prompt_support();
+                                record_scope_delivery_success(
+                                    &mut agent,
+                                    scope.clone(),
+                                    standing_sent,
+                                    &pending_delivered_event_ids,
+                                );
+                            }
                         }
                         apply_completed_before_control_signal(
                             &mut agent.state,
@@ -2998,7 +3016,7 @@ pub async fn run_prompt_task(
                             observer_channel_id,
                             &session_id,
                             &turn_id,
-                            Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+                            Some(completed.metric),
                         )
                         .await;
                         send_prompt_result(
@@ -3006,8 +3024,8 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::Ok(StopReason::EndTurn),
-                            None, // turn succeeded — batch was processed, no requeue
+                            completed.outcome,
+                            completed.retry_batch,
                         );
                         return;
                     }
@@ -4552,6 +4570,49 @@ fn classify_control_cancel_failure(
         outcome,
         retry_batch: requeue_cancelled_batch(ctx, signal, batch),
         invalidate_all,
+    }
+}
+
+/// What the Race 1 branch of [`run_prompt_task`] reports: a control signal
+/// won the `select!` after the read loop had consumed the prompt's response,
+/// so the prompt future, and the result it held, were dropped.
+struct CompletedBeforeControlSignal {
+    outcome: PromptOutcome,
+    retry_batch: Option<FlushBatch>,
+    metric: buzz_core::agent_turn_metric::StopReason,
+    /// Only a turn that completed has delivered its batch.
+    delivered: bool,
+}
+
+/// Classify a turn the read loop had finished when a control signal dropped
+/// its prompt future. `prompt_error` is the JSON-RPC error that answered the
+/// prompt, if one did ([`AcpClient::take_prompt_error_before_drain`]).
+///
+/// A turn that completed is reported as completed, whatever the signal: its
+/// batch was processed. A turn that failed is reported as the error it was,
+/// like the undropped `Err` arm, with no delivery record. Its batch's fate
+/// follows the signal, as a cancel's would: a steer or interrupt re-prompts
+/// it, a stop or rotate drops it.
+fn classify_completed_before_control_signal(
+    ctx: &PromptContext,
+    prompt_error: Option<AcpError>,
+    signal: ControlSignal,
+    batch: Option<FlushBatch>,
+) -> CompletedBeforeControlSignal {
+    match prompt_error {
+        None => CompletedBeforeControlSignal {
+            outcome: PromptOutcome::Ok(StopReason::EndTurn),
+            // The turn succeeded: the batch was processed, so no requeue.
+            retry_batch: None,
+            metric: buzz_core::agent_turn_metric::StopReason::EndTurn,
+            delivered: true,
+        },
+        Some(error) => CompletedBeforeControlSignal {
+            outcome: PromptOutcome::Error(error),
+            retry_batch: requeue_cancelled_batch(ctx, signal, batch),
+            metric: buzz_core::agent_turn_metric::StopReason::Error,
+            delivered: false,
+        },
     }
 }
 
@@ -7838,6 +7899,76 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             label, expected,
             "got outcome shape {label}, want {expected}"
         );
+    }
+
+    #[test]
+    fn test_classify_completed_before_control_signal_reports_a_read_error() {
+        let ctx = {
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.dedup_mode = DedupMode::Queue;
+            ctx
+        };
+
+        // Completed: a success, not requeued, delivered, whatever the signal.
+        for signal in [
+            ControlSignal::Steer,
+            ControlSignal::Cancel,
+            ControlSignal::Rotate,
+        ] {
+            let completed = classify_completed_before_control_signal(
+                &ctx,
+                None,
+                signal.clone(),
+                Some(one_event_batch(Uuid::new_v4())),
+            );
+            assert_outcome_matches(&completed.outcome, "Ok");
+            assert!(
+                completed.retry_batch.is_none(),
+                "{signal:?}: a completed batch is not requeued"
+            );
+            assert!(
+                completed.delivered,
+                "{signal:?}: a completed batch was delivered"
+            );
+            assert_eq!(
+                completed.metric,
+                buzz_core::agent_turn_metric::StopReason::EndTurn
+            );
+        }
+
+        // Errored: reported as the error and never delivered. The batch
+        // follows the signal, as a cancel's would.
+        let cases = [
+            (ControlSignal::Steer, Some(CancelReason::Steer)),
+            (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
+            (ControlSignal::Cancel, None),
+            (ControlSignal::Rotate, None),
+        ];
+        for (signal, expected_reason) in cases {
+            let completed = classify_completed_before_control_signal(
+                &ctx,
+                Some(AcpError::AgentError {
+                    code: -32000,
+                    message: "the agent failed the turn".into(),
+                }),
+                signal.clone(),
+                Some(one_event_batch(Uuid::new_v4())),
+            );
+            assert_outcome_matches(&completed.outcome, "Error");
+            assert!(
+                !completed.delivered,
+                "{signal:?}: a failed turn delivered nothing"
+            );
+            assert_eq!(
+                completed.metric,
+                buzz_core::agent_turn_metric::StopReason::Error
+            );
+            assert_eq!(
+                completed.retry_batch.map(|batch| batch.cancel_reason),
+                expected_reason.map(Some),
+                "{signal:?}: batch fate"
+            );
+        }
     }
 
     #[test]
