@@ -2,8 +2,9 @@
 //! only by the Bench service with its own key. `item` is the trust boundary
 //! for drop files; this file is the service: constants and the debug fence,
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
-//! the writer's own events and inbox intake. The relay half lands next.
-#![allow(dead_code)] // until run() is wired (build-order step 4)
+//! the writer's own events, inbox intake, the pinned relay posts and the
+//! 2 s loop.
+#![allow(dead_code)] // until step 5 spawns run() and the archive calls is_bench_channel
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,8 @@ use std::time::{Duration, SystemTime};
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
 
+use crate::app_state::AppState;
+use crate::events;
 use crate::secret_store::SecretStore;
 
 mod item;
@@ -336,6 +339,513 @@ fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
         }
     }
     changed
+}
+
+// ── The relay half ──────────────────────────────────────────────────────
+
+/// Everything one tick needs; assembled by `run()`, built directly by tests
+/// with a loopback relay so no AppHandle or OS keyring is involved.
+pub(crate) struct Ctx<'a> {
+    pub state: &'a AppState,
+    /// `relay_http_base_url(relay_ws)`.
+    pub base: String,
+    pub owner: nostr::Keys,
+    pub writer: nostr::Keys,
+    pub root: PathBuf,
+}
+
+enum Outcome {
+    Accepted { event_id: String },
+    Duplicate,
+}
+
+/// One bounded POST through the pinned NIP-98 funnel. A `duplicate:` reply,
+/// whether the relay accepted or rejected, means the event is already there.
+async fn submit(
+    ctx: &Ctx<'_>,
+    ev: &nostr::Event,
+    keys: &nostr::Keys,
+    tag: Option<&str>,
+) -> Result<Result<Outcome, String>, String> {
+    let sent = tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        crate::relay::submit_signed_event_at_with_keys_tagged(ev, ctx.state, &ctx.base, keys, tag),
+    )
+    .await
+    .map_err(|_| "submit timed out".to_string())?;
+    Ok(match sent {
+        Ok(r) if r.message.starts_with("duplicate:") => Ok(Outcome::Duplicate),
+        Ok(r) => Ok(Outcome::Accepted {
+            event_id: r.event_id,
+        }),
+        Err(e) if e.contains("duplicate:") => Ok(Outcome::Duplicate),
+        Err(e) => Err(e),
+    })
+}
+
+/// Owner-signed bootstrap events: never a tag, the owner is a member.
+async fn post_as_owner(ctx: &Ctx<'_>, builder: nostr::EventBuilder) -> Result<Outcome, String> {
+    let ev = builder
+        .sign_with_keys(&ctx.owner)
+        .map_err(|e| e.to_string())?;
+    submit(ctx, &ev, &ctx.owner, None).await?
+}
+
+/// Writer-signed events on the monotonic clock. The NIP-OA tag is lazy: the
+/// relay materializes agent_owner on ANY verified tag, so it is sent only
+/// after the relay has refused an untagged request as a non-member.
+async fn post_as_writer(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    builder: nostr::EventBuilder,
+    now: u64,
+) -> Result<Outcome, String> {
+    let ev = builder
+        .custom_created_at(next_ts(s, now)?)
+        .sign_with_keys(&ctx.writer)
+        .map_err(|e| e.to_string())?;
+    let writer_pk = ctx.writer.public_key();
+    loop {
+        let tag = match s.admission {
+            Admission::ViaOwner => Some(owner_tag(&ctx.owner, &writer_pk, now)?),
+            _ => None,
+        };
+        match submit(ctx, &ev, &ctx.writer, tag.as_deref()).await? {
+            Err(e) if e.contains("403") && e.contains("must be a relay member") => {
+                if s.admission == Admission::ViaOwner {
+                    s.admission = Admission::Denied;
+                    return Err(format!(
+                        "not admitted: add writer pubkey {} in Settings > Members (or enable NIP-OA)",
+                        writer_pk.to_hex()
+                    ));
+                }
+                s.admission = Admission::ViaOwner;
+            }
+            Err(e) => return Err(e),
+            Ok(outcome) => {
+                if tag.is_none() {
+                    s.admission = Admission::Open;
+                }
+                return Ok(outcome);
+            }
+        }
+    }
+}
+
+/// The writer's own events, verified and filtered to its key: the query
+/// helper only parses JSON.
+async fn query_writer(
+    ctx: &Ctx<'_>,
+    s: &BenchState,
+    filter: serde_json::Value,
+    now: u64,
+) -> Result<Vec<nostr::Event>, String> {
+    let writer_pk = ctx.writer.public_key();
+    let tag = match s.admission {
+        Admission::ViaOwner => Some(owner_tag(&ctx.owner, &writer_pk, now)?),
+        _ => None,
+    };
+    let events = crate::relay::query_relay_at_with_keys(
+        ctx.state,
+        &ctx.base,
+        &[filter],
+        &ctx.writer,
+        tag.as_deref(),
+    )
+    .await?;
+    Ok(events
+        .into_iter()
+        .filter(|e| e.verify().is_ok() && e.pubkey == writer_pk)
+        .collect())
+}
+
+/// members.txt: one 64-hex pubkey per line, `#` comments; how the phone's own
+/// key joins private #bench without a UI.
+fn read_members(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("members.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            l.split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member (owner). Each
+/// step is retried every tick until its flag is set. The tag-free kind 0 goes
+/// first so a refused writer leaves no half-built channel behind.
+async fn bootstrap(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    budget: &mut usize,
+    now: u64,
+) -> Result<bool, String> {
+    let ch = channel_id(&s.owner_pubkey);
+    let writer_hex = ctx.writer.public_key().to_hex();
+    if !s.profile_published {
+        if *budget == 0 {
+            return Ok(false);
+        }
+        *budget -= 1;
+        let profile = events::build_profile(Some("Bench"), Some("bench"), None, Some(ABOUT), None)?;
+        post_as_writer(ctx, s, profile, now).await?;
+        s.profile_published = true;
+    }
+    if !s.channel_created {
+        if *budget == 0 {
+            return Ok(false);
+        }
+        *budget -= 1;
+        let create =
+            events::build_create_channel(ch, "bench", "private", "stream", Some(ABOUT), None)?;
+        post_as_owner(ctx, create).await?;
+        s.channel_created = true;
+    }
+    for hex in std::iter::once(writer_hex.clone()).chain(read_members(&ctx.root)) {
+        if s.members_added.contains(&hex) {
+            continue;
+        }
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        post_as_owner(ctx, events::build_add_member(ch, &hex, None)?).await?;
+        s.members_added.push(hex);
+    }
+    Ok(s.members_added.contains(&writer_hex))
+}
+
+/// Rebuild cards and board from the writer's own kind-9 events. Deletes
+/// nothing: soft-deleted rows never come back from /query, and anything else
+/// is listed as a stray for the owner.
+async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
+    let writer_hex = ctx.writer.public_key().to_hex();
+    let filter = serde_json::json!({
+        "kinds": [9], "authors": [writer_hex], "#h": [s.channel_id], "limit": RECOVER_LIMIT,
+    });
+    let events = query_writer(ctx, s, filter, now).await?;
+    let r = rebuild_map(&events, &writer_hex);
+    for (id, posted) in r.cards {
+        match s.items.get_mut(&id) {
+            Some(item) => item.card = Some(posted),
+            None => {
+                s.orphan_cards.insert(id, posted);
+            }
+        }
+    }
+    s.board = r.board;
+    s.strays = r.stray_ids;
+    if events.len() as u32 >= RECOVER_LIMIT {
+        s.last_error = Some("rebuild truncated".to_string());
+    }
+    s.needs_rebuild = false;
+    Ok(())
+}
+
+/// A kind 9 in #bench carrying its `client` marker; the p tag only when the
+/// card pings the owner.
+async fn post_message(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    text: &str,
+    ping: bool,
+    marker: String,
+    now: u64,
+) -> Result<Outcome, String> {
+    let owner_hex = s.owner_pubkey.clone();
+    let owner_p = [owner_hex.as_str()];
+    let mentions: &[&str] = if ping { &owner_p } else { &[] };
+    let builder = events::build_message_with_client_tags(
+        channel_id(&owner_hex),
+        text,
+        None,
+        mentions,
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &ctx.base,
+        &[vec!["client".to_string(), marker]],
+    )?;
+    post_as_writer(ctx, s, builder, now).await
+}
+
+/// kind 5 with h+e on one of the writer's own events (never 9005).
+async fn delete(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    event_id: &str,
+    now: u64,
+) -> Result<Outcome, String> {
+    let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
+    let builder = events::build_delete_compat(channel_id(&s.owner_pubkey), target)?;
+    post_as_writer(ctx, s, builder, now).await
+}
+
+/// Cards, seeds, then the board, at most `budget` posts; the next tick
+/// resumes where this one stopped because every step lands in state first.
+/// Cards are always delete + repost; only the board is ever edited.
+async fn publish(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    budget: &mut usize,
+    now: u64,
+    hhmm: &str,
+) -> Result<(), String> {
+    // (a) The live cards: pending + current by severity, at most MAX_CARDS.
+    let mut ranked: Vec<(u8, i64, String)> = s
+        .items
+        .values()
+        .filter(|i| i.kind == item::ItemKind::Pending && i.validity == item::Validity::Current)
+        .map(|i| (item::severity_rank(i.severity), i.order, i.id.clone()))
+        .collect();
+    ranked.sort();
+    let wanted: Vec<String> = ranked.into_iter().take(MAX_CARDS).map(|r| r.2).collect();
+
+    // (b) Delete cards that are stale or no longer wanted.
+    let stale: Vec<(String, String)> = s
+        .items
+        .values()
+        .filter_map(|i| {
+            let c = i.card.as_ref()?;
+            (c.hash != i.hash || !wanted.contains(&i.id))
+                .then(|| (i.id.clone(), c.event_id.clone()))
+        })
+        .collect();
+    for (id, event_id) in stale {
+        if *budget == 0 {
+            return Ok(());
+        }
+        *budget -= 1;
+        delete(ctx, s, &event_id, now).await?;
+        s.items.get_mut(&id).expect("stale card id").card = None;
+        s.board_dirty = true;
+    }
+
+    // (c) Post missing cards, adopting a recovered orphan when its hash matches.
+    for id in &wanted {
+        if s.items[id].card.is_some() {
+            continue;
+        }
+        if let Some(orphan) = s.orphan_cards.get(id).cloned() {
+            if orphan.hash == s.items[id].hash {
+                s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
+                continue;
+            }
+            if *budget == 0 {
+                return Ok(());
+            }
+            *budget -= 1;
+            delete(ctx, s, &orphan.event_id, now).await?;
+            s.orphan_cards.remove(id);
+        }
+        if *budget == 0 {
+            return Ok(());
+        }
+        *budget -= 1;
+        let item = s.items[id].clone();
+        let marker = format!("bench:card:{}@{}", item.id, item.hash);
+        let text = item::render_card(&item, hhmm);
+        match post_message(ctx, s, &text, item::ping_owner(&item), marker, now).await? {
+            Outcome::Accepted { event_id } => {
+                s.items.get_mut(id).expect("wanted id").card = Some(Posted {
+                    event_id,
+                    created_at: s.last_created_at,
+                    hash: item.hash,
+                    seeded: 0,
+                });
+                s.board_dirty = true;
+            }
+            Outcome::Duplicate => {
+                s.needs_rebuild = true;
+                return Ok(());
+            }
+        }
+    }
+
+    // (d) Seed one keycap reaction per option, in order, >= 1 s apart.
+    let ids: Vec<String> = s.items.keys().cloned().collect();
+    for id in ids {
+        loop {
+            let item = &s.items[&id];
+            let Some(card) = &item.card else { break };
+            if card.seeded >= item.options.len().min(item::OPTION_EMOJI.len()) {
+                break;
+            }
+            if *budget == 0 {
+                return Ok(());
+            }
+            *budget -= 1;
+            let target = nostr::EventId::from_hex(&card.event_id).map_err(|e| e.to_string())?;
+            let seed = events::build_reaction(target, item::OPTION_EMOJI[card.seeded])?;
+            post_as_writer(ctx, s, seed, now).await?;
+            let card = s
+                .items
+                .get_mut(&id)
+                .and_then(|i| i.card.as_mut())
+                .expect("seeded card");
+            card.seeded += 1;
+        }
+    }
+
+    // (e) The board: reposted after any card change or daily, edited in place
+    // for a text-only change so it keeps its id and stays newest.
+    let all: Vec<&item::Item> = s.items.values().collect();
+    let text = item::render_board(&all, &s.channel_id, hhmm);
+    let hash = item::board_hash(&text);
+    let aged = s
+        .board
+        .as_ref()
+        .is_none_or(|b| now.saturating_sub(b.created_at) > BOARD_MAX_AGE_SECS);
+    if s.board_dirty || aged {
+        if *budget == 0 {
+            return Ok(());
+        }
+        *budget -= 1;
+        match post_message(ctx, s, &text, false, format!("bench:board@{hash}"), now).await? {
+            Outcome::Accepted { event_id } => {
+                let old = s.board.replace(Posted {
+                    event_id,
+                    created_at: s.last_created_at,
+                    hash,
+                    seeded: 0,
+                });
+                s.board_dirty = false;
+                // Not budget-gated: a crash here leaves two boards, which
+                // rebuild_map resolves by keeping the newest.
+                if let Some(old) = old {
+                    delete(ctx, s, &old.event_id, now).await?;
+                }
+            }
+            Outcome::Duplicate => s.needs_rebuild = true,
+        }
+    } else if let Some(board) = s.board.as_ref().filter(|b| b.hash != hash) {
+        if *budget == 0 {
+            return Ok(());
+        }
+        *budget -= 1;
+        let target = nostr::EventId::from_hex(&board.event_id).map_err(|e| e.to_string())?;
+        let edit_tags = events::MessageEditTags {
+            media: &[],
+            custom_emoji: &[],
+            mentions: &[],
+            mention_refs: None,
+        };
+        let edit = events::build_message_edit(
+            channel_id(&s.owner_pubkey),
+            target,
+            &text,
+            edit_tags,
+            false,
+        )?;
+        post_as_writer(ctx, s, edit, now).await?;
+        s.board.as_mut().expect("board").hash = hash;
+    }
+    Ok(())
+}
+
+/// One 2 s tick: owner fence, bootstrap, recovery, intake, publish.
+pub(crate) async fn tick(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    now: u64,
+    hhmm: &str,
+    now_iso: &str,
+) -> Result<(), String> {
+    let owner_hex = ctx.owner.public_key().to_hex();
+    if s.owner_pubkey.is_empty() {
+        s.channel_id = channel_id(&owner_hex).to_string();
+        s.owner_pubkey = owner_hex;
+    } else if s.owner_pubkey != owner_hex {
+        return Err(
+            "owner identity changed; refusing to tick (BUZZ_PRIVATE_KEY or an identity \
+                    import would create a second #bench)"
+                .to_string(),
+        );
+    }
+    s.last_tick = now_iso.to_string();
+    let mut budget = MAX_POSTS_PER_TICK;
+    if !bootstrap(ctx, s, &mut budget, now).await? {
+        return Ok(());
+    }
+    if s.needs_rebuild {
+        recover(ctx, s, now).await?;
+    }
+    intake(s, &ctx.root, now_iso);
+    publish(ctx, s, &mut budget, now, hhmm).await
+}
+
+/// The service loop. state.json (lastTick / lastError / admission) is the
+/// observability surface: release builds have no console.
+pub(crate) async fn run(app: tauri::AppHandle) {
+    if let Err(e) = serve(app).await {
+        eprintln!("bench: {e}");
+    }
+}
+
+async fn serve(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let env = std::env::var("BUZZ_BENCH_RELAY_URL").ok();
+    let Some(relay) = relay_ws_from(env.as_deref()) else {
+        return Err(
+            "disabled (debug build without BUZZ_BENCH_RELAY_URL=ws://127.0.0.1:...)".to_string(),
+        );
+    };
+    let root = root_dir()?;
+    std::fs::create_dir_all(root.join("inbox"))
+        .map_err(|e| format!("create {}: {e}", root.display()))?;
+    let writer = writer_keys()?;
+    let writer_hex = writer.public_key().to_hex();
+    // The writer key must never double as a managed agent.
+    if crate::managed_agents::load_managed_agents(&app)?
+        .iter()
+        .any(|r| r.pubkey == writer_hex)
+    {
+        return Err("writer key is a managed agent; refusing to start".to_string());
+    }
+    let (mut s, fresh) = load_state(&root);
+    s.needs_rebuild |= fresh;
+    s.relay = relay.clone();
+    s.writer_pubkey = writer_hex;
+    s.version = 1;
+    let base = crate::relay::relay_http_base_url(&relay);
+    let mut last_written = String::new();
+    loop {
+        tokio::time::sleep(POLL).await;
+        let state = app.state::<AppState>();
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let result = match state.signing_keys() {
+            Ok(owner) => {
+                let ctx = Ctx {
+                    state: &state,
+                    base: base.clone(),
+                    owner,
+                    writer: writer.clone(),
+                    root: root.clone(),
+                };
+                let now = nostr::Timestamp::now().as_secs();
+                let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                tick(&ctx, &mut s, now, &hhmm, &now_iso).await
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => s.last_error = None,
+            Err(e) => {
+                eprintln!("bench: {e}");
+                s.last_error = Some(e);
+            }
+        }
+        if let Err(e) = save_state(&root, &s, &mut last_written) {
+            eprintln!("bench: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

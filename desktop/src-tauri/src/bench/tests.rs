@@ -1,5 +1,5 @@
-//! Bench tests. The pure item.rs checks live here now; the fake-relay tick
-//! tests join them with mod.rs.
+//! Bench tests: the pure item.rs and mod.rs checks, then the fake-relay
+//! tick tests. This file carries the only literal events route in bench/.
 
 use super::item::*;
 use super::*;
@@ -711,4 +711,504 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     assert_eq!(item.card, Some(card));
     assert_ne!(item.hash, item.card.as_ref().unwrap().hash);
     assert!(!inbox.join("good.json").exists());
+}
+
+// ── mod.rs: the relay half, driven through an axum loopback ─────────────
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::{routing::post, Json, Router};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Who the fake relay lets write: everyone, members or owner-tagged writers,
+/// or members only (the owner is always a member).
+#[derive(Clone, Copy, PartialEq)]
+enum Gate {
+    Open,
+    MemberOrTag,
+    MembersOnly,
+}
+
+struct Relay {
+    owner_hex: String,
+    gate: Gate,
+    /// Every POST in order: the event and its x-auth-tag header, if any.
+    log: Mutex<Vec<(Value, Option<String>)>>,
+    /// Kinds always answered with the canned `duplicate:` reply.
+    force_dup: HashSet<u64>,
+    seen: Mutex<HashSet<String>>,
+    query_reply: Mutex<Vec<Value>>,
+}
+
+fn tag_value(ev: &Value, name: &str) -> Option<String> {
+    ev["tags"]
+        .as_array()?
+        .iter()
+        .find_map(|t| (t[0] == name).then(|| t[1].as_str().unwrap_or("").to_string()))
+}
+
+async fn fake_events(
+    State(r): State<Arc<Relay>>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, Json<Value>) {
+    let ev: Value = serde_json::from_str(&body).unwrap();
+    let tag = headers
+        .get("x-auth-tag")
+        .map(|v| v.to_str().unwrap().to_string());
+    r.log.lock().unwrap().push((ev.clone(), tag.clone()));
+    let member = ev["pubkey"] == r.owner_hex.as_str();
+    let admitted = match r.gate {
+        Gate::Open => true,
+        Gate::MemberOrTag => member || tag.is_some(),
+        Gate::MembersOnly => member,
+    };
+    if !admitted {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "relay_membership_required",
+                "message": "You must be a relay member to access this relay",
+            })),
+        );
+    }
+    let kind = ev["kind"].as_u64().unwrap();
+    let key = match kind {
+        7 => Some(format!(
+            "7:{}:{}:{}",
+            ev["pubkey"],
+            tag_value(&ev, "e").unwrap_or_default(),
+            ev["content"]
+        )),
+        9007 => Some(format!("9007:{}", tag_value(&ev, "h").unwrap_or_default())),
+        _ => None,
+    };
+    let dup = r.force_dup.contains(&kind) || key.is_some_and(|k| !r.seen.lock().unwrap().insert(k));
+    let message = match (dup, kind) {
+        (false, _) => "",
+        (true, 7) => "duplicate: reaction already exists",
+        (true, _) => "duplicate: channel already exists",
+    };
+    let reply = json!({ "event_id": ev["id"], "accepted": !dup, "message": message });
+    (StatusCode::OK, Json(reply))
+}
+
+async fn fake_query(State(r): State<Arc<Relay>>) -> Json<Vec<Value>> {
+    Json(r.query_reply.lock().unwrap().clone())
+}
+
+/// Serve the fake relay on a loopback port; returns the http base.
+async fn fake_relay(relay: Arc<Relay>) -> String {
+    let app = Router::new()
+        .route("/events", post(fake_events))
+        .route("/query", post(fake_query))
+        .with_state(relay);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+/// One Bench under test: a TempDir root, fresh owner and writer keys, a fake
+/// relay and a clock that moves 2 s per tick.
+struct Bench {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    ctx: Ctx<'static>,
+    relay: Arc<Relay>,
+    s: BenchState,
+    now: u64,
+}
+
+impl Bench {
+    async fn new(gate: Gate, force_dup: &[u64]) -> Bench {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        let owner = Keys::generate();
+        let writer = Keys::generate();
+        let relay = Arc::new(Relay {
+            owner_hex: owner.public_key().to_hex(),
+            gate,
+            log: Mutex::new(Vec::new()),
+            force_dup: force_dup.iter().copied().collect(),
+            seen: Mutex::new(HashSet::new()),
+            query_reply: Mutex::new(Vec::new()),
+        });
+        let base = fake_relay(relay.clone()).await;
+        let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
+        let ctx = Ctx {
+            state,
+            base,
+            owner,
+            writer,
+            root: root.clone(),
+        };
+        let (s, fresh) = load_state(&root);
+        assert!(fresh);
+        Bench {
+            _dir: dir,
+            root,
+            ctx,
+            relay,
+            s,
+            now: 1_757_779_500,
+        }
+    }
+
+    fn owner_hex(&self) -> String {
+        self.ctx.owner.public_key().to_hex()
+    }
+
+    fn writer_hex(&self) -> String {
+        self.ctx.writer.public_key().to_hex()
+    }
+
+    fn channel(&self) -> String {
+        channel_id(&self.owner_hex()).to_string()
+    }
+
+    /// Write a drop and backdate it past the half-written window.
+    fn drop_file(&self, writer: &str, stem: &str, text: &str) {
+        let dir = self.root.join("inbox").join(writer);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{stem}.json"));
+        std::fs::write(&path, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
+    }
+
+    async fn tick(&mut self) -> Result<(), String> {
+        self.now += 2;
+        tick(&self.ctx, &mut self.s, self.now, "14:05", NOW).await
+    }
+
+    async fn settle(&mut self, ticks: usize) {
+        for _ in 0..ticks {
+            self.tick().await.unwrap();
+        }
+    }
+
+    fn posts(&self) -> Vec<(Value, Option<String>)> {
+        self.relay.log.lock().unwrap().clone()
+    }
+
+    fn kinds(&self) -> Vec<u64> {
+        self.posts()
+            .iter()
+            .map(|(e, _)| e["kind"].as_u64().unwrap())
+            .collect()
+    }
+
+    fn card(&self, id: &str) -> Posted {
+        self.s.items[id].card.clone().unwrap()
+    }
+}
+
+/// A bench with one pending drop (2 options) and one extra member, settled.
+async fn seeded_bench(gate: Gate, force_dup: &[u64]) -> Bench {
+    let mut b = Bench::new(gate, force_dup).await;
+    b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
+    std::fs::write(
+        b.root.join("members.txt"),
+        format!("# phone\n{}\nnot a key\n", "cd".repeat(32)),
+    )
+    .unwrap();
+    b.settle(6).await;
+    b
+}
+
+#[tokio::test]
+async fn one_tick_posts_canary_channel_member_card_seeds_board() {
+    let b = seeded_bench(Gate::Open, &[]).await;
+    let posts = b.posts();
+    assert_eq!(b.kinds(), [0, 9007, 9000, 9000, 9, 7, 7, 9]);
+    assert!(posts.iter().all(|(_, tag)| tag.is_none()));
+    let (owner, writer, ch) = (b.owner_hex(), b.writer_hex(), b.channel());
+    let by = |i: usize| posts[i].0["pubkey"].as_str().unwrap().to_string();
+    assert_eq!(by(0), writer);
+    for i in 1..4 {
+        assert_eq!(by(i), owner, "post {i} is owner-signed");
+    }
+    let e = |i: usize| &posts[i].0;
+    assert_eq!(tag_value(e(1), "name").as_deref(), Some("bench"));
+    assert_eq!(tag_value(e(1), "visibility").as_deref(), Some("private"));
+    assert_eq!(tag_value(e(1), "channel_type").as_deref(), Some("stream"));
+    assert_eq!(tag_value(e(1), "h").as_deref(), Some(ch.as_str()));
+    assert_eq!(tag_value(e(2), "p").as_deref(), Some(writer.as_str()));
+    assert_eq!(
+        tag_value(e(3), "p").as_deref(),
+        Some("cd".repeat(32).as_str())
+    );
+
+    let item = &b.s.items["orchestrator/relay-choice"];
+    let card = e(4);
+    assert_eq!(by(4), writer);
+    assert_eq!(tag_value(card, "h").as_deref(), Some(ch.as_str()));
+    assert_eq!(tag_value(card, "p").as_deref(), Some(owner.as_str()));
+    assert_eq!(tag_value(card, "e"), None);
+    assert_eq!(
+        tag_value(card, "client").unwrap(),
+        format!("bench:card:orchestrator/relay-choice@{}", item.hash)
+    );
+    let card_id = card["id"].as_str().unwrap();
+    for (i, emoji) in [(5, OPTION_EMOJI[0]), (6, OPTION_EMOJI[1])] {
+        assert_eq!(tag_value(e(i), "e").as_deref(), Some(card_id));
+        assert_eq!(e(i)["content"], emoji);
+    }
+    let board = e(7);
+    assert_eq!(by(7), writer);
+    assert!(tag_value(board, "client")
+        .unwrap()
+        .starts_with("bench:board@"));
+    assert_eq!(tag_value(board, "p"), None);
+    assert!(board["content"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("buzz://message?channel={ch}&id={card_id}")));
+
+    let writer_ts: Vec<u64> = posts
+        .iter()
+        .filter(|(e, _)| e["pubkey"] == writer.as_str())
+        .map(|(e, _)| e["created_at"].as_u64().unwrap())
+        .collect();
+    assert!(writer_ts.windows(2).all(|w| w[1] > w[0]), "{writer_ts:?}");
+
+    assert!(!b.root.join("inbox/orchestrator/relay-choice.json").exists());
+    assert_eq!(b.card("orchestrator/relay-choice").event_id, card_id);
+    assert_eq!(b.card("orchestrator/relay-choice").seeded, 2);
+    assert_eq!(
+        b.s.board.as_ref().unwrap().event_id,
+        board["id"].as_str().unwrap()
+    );
+    assert_eq!(b.s.admission, Admission::Open);
+    assert_eq!(b.s.members_added, [writer, "cd".repeat(32)]);
+    assert!(b.s.profile_published && b.s.channel_created && !b.s.needs_rebuild);
+    assert_eq!(b.s.last_tick, NOW);
+}
+
+#[tokio::test]
+async fn resync_is_idempotent() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let before = b.posts().len();
+    b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
+    b.settle(2).await;
+    assert_eq!(b.posts().len(), before);
+    assert!(!b.root.join("inbox/orchestrator/relay-choice.json").exists());
+}
+
+#[tokio::test]
+async fn pending_reword_deletes_and_reposts_never_edits() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old_card = b.card("orchestrator/relay-choice");
+    let old_board = b.s.board.clone().unwrap();
+    let before = b.posts().len();
+    b.drop_file(
+        "orchestrator",
+        "relay-choice",
+        &drop_json(&[("options", json!(["Stay", "Move away"]))]),
+    );
+    b.settle(3).await;
+    let posts = b.posts()[before..].to_vec();
+    let kinds: Vec<u64> = posts
+        .iter()
+        .map(|(e, _)| e["kind"].as_u64().unwrap())
+        .collect();
+    assert_eq!(kinds, [5, 9, 7, 7, 9, 5]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old_card.event_id);
+    let new_card = b.card("orchestrator/relay-choice");
+    assert_ne!(new_card.hash, old_card.hash);
+    assert_eq!(
+        tag_value(&posts[1].0, "client").unwrap(),
+        format!("bench:card:orchestrator/relay-choice@{}", new_card.hash)
+    );
+    assert_eq!(tag_value(&posts[5].0, "e").unwrap(), old_board.event_id);
+    assert!(!b.kinds().contains(&40003));
+}
+
+#[tokio::test]
+async fn status_change_edits_board_only() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let status = |state: &str| {
+        drop_json(&[
+            ("kind", json!("status")),
+            ("state", json!(state)),
+            ("title", json!("Bench M1")),
+            ("severity", Value::Null),
+            ("options", Value::Null),
+        ])
+    };
+    b.drop_file("orchestrator", "m1", &status("in-progress"));
+    b.settle(2).await;
+    let before = b.posts().len();
+    b.drop_file("orchestrator", "m1", &status("done"));
+    b.settle(2).await;
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(posts.len(), 1);
+    let edit = &posts[0].0;
+    assert_eq!(edit["kind"], 40003);
+    assert_eq!(tag_value(edit, "h").unwrap(), b.channel());
+    assert_eq!(
+        tag_value(edit, "e").unwrap(),
+        b.s.board.as_ref().unwrap().event_id
+    );
+    assert!(edit["content"]
+        .as_str()
+        .unwrap()
+        .contains("Bench M1 — done"));
+    assert_eq!(
+        b.s.board.as_ref().unwrap().hash,
+        board_hash(edit["content"].as_str().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn membership_403_triggers_lazy_tag_then_denied() {
+    let mut b = Bench::new(Gate::MemberOrTag, &[]).await;
+    b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
+    b.settle(3).await;
+    let posts = b.posts();
+    assert_eq!(b.kinds()[..3], [0, 0, 9007]);
+    assert_eq!(posts[0].1, None);
+    let tag = posts[1].1.clone().expect("the retry carries the tag");
+    assert_eq!(posts[0].0["id"], posts[1].0["id"]);
+    let now = posts[1].0["created_at"].as_u64().unwrap();
+    let parsed = buzz_sdk_pkg::nip_oa::parse_auth_tag(&tag).unwrap();
+    assert_eq!(parsed.as_slice()[1], b.owner_hex());
+    assert_eq!(parsed.as_slice()[2], format!("created_at<{}", now + 3600));
+    let bound = now + 3600;
+    let writer_pk = b.ctx.writer.public_key();
+    assert!(buzz_sdk_pkg::nip_oa::verify_auth_tag_for_auth_event(&tag, &writer_pk, now).is_ok());
+    assert!(buzz_sdk_pkg::nip_oa::verify_auth_tag_for_auth_event(&tag, &writer_pk, bound).is_err());
+    assert_eq!(b.s.admission, Admission::ViaOwner);
+    // After the 403, every writer request is tagged and no owner request is.
+    for (e, tag) in &posts[1..] {
+        let owner_signed = e["pubkey"] == b.owner_hex().as_str();
+        assert_eq!(tag.is_none(), owner_signed, "kind {}", e["kind"]);
+    }
+    assert!(posts.iter().any(|(e, _)| e["kind"] == 9));
+
+    let mut denied = Bench::new(Gate::MembersOnly, &[]).await;
+    let err = denied.tick().await.unwrap_err();
+    assert!(err.contains(&denied.writer_hex()), "{err}");
+    assert_eq!(denied.s.admission, Admission::Denied);
+    assert_eq!(denied.kinds(), [0, 0]);
+    assert!(!denied.s.profile_published);
+}
+
+#[tokio::test]
+async fn duplicate_reaction_counts_as_success() {
+    let b = seeded_bench(Gate::Open, &[7]).await;
+    assert_eq!(b.kinds(), [0, 9007, 9000, 9000, 9, 7, 7, 9]);
+    assert_eq!(b.card("orchestrator/relay-choice").seeded, 2);
+    assert_eq!(b.s.last_error, None);
+}
+
+#[tokio::test]
+async fn duplicate_channel_counts_as_success() {
+    let b = seeded_bench(Gate::Open, &[9007]).await;
+    assert_eq!(b.kinds(), [0, 9007, 9000, 9000, 9, 7, 7, 9]);
+    assert!(b.s.channel_created);
+}
+
+#[tokio::test]
+async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    let w = b.ctx.writer.clone();
+    let now = b.now;
+    let item = check(&[]).unwrap();
+    let card = kind9(
+        &w,
+        now - 50,
+        Some(&format!("bench:card:{}@{}", item.id, item.hash)),
+    );
+    let unknown = kind9(&w, now - 40, Some("bench:card:orchestrator/gone@abcd"));
+    let board_old = kind9(&w, now - 30, Some("bench:board@dddd"));
+    let board_new = kind9(&w, now - 20, Some("bench:board@eeee"));
+    let untagged = kind9(&w, now - 10, None);
+    let forged = kind9(&Keys::generate(), now - 5, Some("bench:board@ffff"));
+    *b.relay.query_reply.lock().unwrap() =
+        [&card, &unknown, &board_old, &board_new, &untagged, &forged]
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+    // State that knew the item but lost its card (a `duplicate:` on repost).
+    b.s.items.insert(item.id.clone(), item.clone());
+    assert!(b.s.needs_rebuild);
+    b.settle(2).await;
+
+    assert_eq!(b.card(&item.id).event_id, card.id.to_hex());
+    assert_eq!(b.card(&item.id).seeded, usize::MAX);
+    assert_eq!(
+        b.s.orphan_cards["orchestrator/gone"].event_id,
+        unknown.id.to_hex()
+    );
+    assert_eq!(b.s.strays, [board_old.id.to_hex(), untagged.id.to_hex()]);
+    assert!(!b.s.needs_rebuild);
+    // The recovered board is edited to the real text; no card is reposted and
+    // nothing is deleted.
+    assert_eq!(b.kinds(), [0, 9007, 9000, 40003]);
+    let board = b.s.board.clone().unwrap();
+    assert_eq!(board.event_id, board_new.id.to_hex());
+    assert_ne!(board.hash, "eeee");
+}
+
+#[tokio::test]
+async fn malformed_drop_is_rejected_in_place() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    b.drop_file("orchestrator", "bad", &drop_json(&[("answer", json!("x"))]));
+    b.drop_file("orchestrator", "big", &"x".repeat(65 * 1024));
+    b.settle(2).await;
+    let inbox = b.root.join("inbox/orchestrator");
+    for stem in ["bad", "big"] {
+        assert!(!inbox.join(format!("{stem}.json")).exists());
+        assert!(inbox.join(format!("{stem}.rejected.json")).exists());
+    }
+    let bad: Value =
+        serde_json::from_str(&std::fs::read_to_string(inbox.join("bad.rejected.json")).unwrap())
+            .unwrap();
+    assert!(bad["reason"]
+        .as_str()
+        .unwrap()
+        .contains("unknown field `answer`"));
+    let big: Value =
+        serde_json::from_str(&std::fs::read_to_string(inbox.join("big.rejected.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        (big["reason"].as_str(), &big["drop"]),
+        (Some("too large"), &Value::Null)
+    );
+    assert!(b.s.items.is_empty());
+    // Bootstrap and the empty board only: no card, seed or delete.
+    assert_eq!(b.kinds(), [0, 9007, 9000, 9]);
+    assert!(tag_value(&b.posts()[3].0, "client")
+        .unwrap()
+        .starts_with("bench:board@"));
+}
+
+#[tokio::test]
+async fn owner_change_refuses_to_tick() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    b.s.owner_pubkey = "bb".repeat(32);
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("owner identity changed"), "{err}");
+    assert!(b.posts().is_empty());
+}
+
+#[test]
+fn archive_guard_predicate() {
+    let owner = "aa".repeat(32);
+    assert!(is_bench_channel(&owner, &channel_id(&owner).to_string()));
+    assert!(!is_bench_channel(
+        &"bb".repeat(32),
+        &channel_id(&owner).to_string()
+    ));
 }
