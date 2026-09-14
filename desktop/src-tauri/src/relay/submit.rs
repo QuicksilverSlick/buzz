@@ -19,6 +19,18 @@ pub async fn submit_signed_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    submit_signed_event_at_with_keys_tagged(event, state, api_base_url, keys, None).await
+}
+
+/// [`submit_signed_event_at_with_keys`] plus an optional NIP-OA `x-auth-tag`
+/// header, for writers whose relay membership is backed by an owner.
+pub async fn submit_signed_event_at_with_keys_tagged(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+    auth_tag: Option<&str>,
+) -> Result<SubmitEventResponse, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
@@ -28,11 +40,16 @@ pub async fn submit_signed_event_at_with_keys(
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "relay event submit")?;
     let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
 
-    let response = state
+    let mut request = state
         .http_client
         .post(&url)
         .header("Authorization", auth_header)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(tag) = auth_tag {
+        request = request.header("x-auth-tag", tag);
+    }
+
+    let response = request
         .body(body_bytes)
         .send()
         .await
