@@ -520,6 +520,20 @@ pub fn spawn_agent_child(
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
     let resolved_acp_command = resolve_command(&record.acp_command)
         .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
+    append_log_marker(
+        &log_path,
+        &format!("harness: {}", resolved_acp_command.display()),
+    )?;
+    require_bundled_harness(
+        record.respond_to == super::types::RespondTo::Allowlist,
+        !cfg!(debug_assertions),
+        &resolved_acp_command,
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .as_deref(),
+    )
+    .map_err(|error| format!("{}: {error}", record.name))?;
     let effective_mcp_command = known_acp_runtime(effective_command)
         .and_then(|r| r.mcp_command)
         .unwrap_or("");
@@ -946,6 +960,30 @@ pub fn start_managed_agent_process(
 
 #[cfg(test)]
 mod test_fixtures;
+
+/// A guest-facing agent runs only the harness that shipped with this app.
+///
+/// Its permission gate lives in that binary. A harness picked up from PATH, a
+/// stale checkout or an override could predate the gate, and a guest would
+/// never know the difference. Owner-only agents keep their freedom, and a debug
+/// build has no bundle to insist on.
+fn require_bundled_harness(
+    faces_guests: bool,
+    release: bool,
+    harness: &std::path::Path,
+    bundled_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if !faces_guests || !release {
+        return Ok(());
+    }
+    if bundled_dir.is_some() && harness.parent() == bundled_dir {
+        return Ok(());
+    }
+    Err(format!(
+        "answers guests, so it only runs the harness bundled with this app; refusing {}",
+        harness.display()
+    ))
+}
 
 #[cfg(test)]
 mod tests;
