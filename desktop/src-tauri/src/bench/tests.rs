@@ -2,7 +2,7 @@
 //! tests join them with mod.rs.
 
 use super::item::*;
-use super::Posted;
+use super::*;
 use serde_json::{json, Value};
 
 const NOW: &str = "2026-09-13T14:05:00Z";
@@ -444,4 +444,271 @@ fn option_emoji_are_fully_qualified_keycaps() {
     for (i, e) in OPTION_EMOJI.iter().enumerate() {
         assert_eq!(*e, format!("{}\u{FE0F}\u{20E3}", i + 1));
     }
+}
+
+// ── mod.rs: the pure/local half of the service ──────────────────────────
+
+use nostr::Keys;
+use std::time::{Duration, SystemTime};
+
+#[test]
+fn relay_ws_from_admits_only_loopback_in_debug() {
+    // cfg(test) builds carry debug_assertions, so the fence is up here.
+    assert_eq!(relay_ws_from(None), None);
+    assert_eq!(relay_ws_from(Some(RELAY_WS)), None);
+    assert_eq!(relay_ws_from(Some("wss://127.0.0.1:1")), None);
+    assert_eq!(
+        relay_ws_from(Some("ws://127.0.0.1:1")).as_deref(),
+        Some("ws://127.0.0.1:1")
+    );
+    assert_eq!(
+        relay_ws_from(Some("ws://localhost:3000")).as_deref(),
+        Some("ws://localhost:3000")
+    );
+}
+
+#[test]
+fn channel_id_is_per_owner_and_the_archive_predicate_matches_it() {
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    assert_eq!(channel_id(&a), channel_id(&a));
+    assert_ne!(channel_id(&a), channel_id(&b));
+    let id = channel_id(&a).to_string();
+    assert!(is_bench_channel(&a, &id));
+    assert!(is_bench_channel(&a, &format!(" {} ", id.to_uppercase())));
+    assert!(!is_bench_channel(&b, &id));
+    assert!(!is_bench_channel(&a, UUID));
+}
+
+#[test]
+fn next_ts_is_strictly_increasing_and_bounded_by_the_clock_lead() {
+    let mut s = BenchState::default();
+    let now = 1_757_779_500;
+    let mut last = 0;
+    for _ in 0..200 {
+        let t = next_ts(&mut s, now).unwrap().as_secs();
+        assert!(t > last);
+        last = t;
+    }
+    assert_eq!(last, now + 199);
+    for _ in 200..=600 {
+        next_ts(&mut s, now).unwrap();
+    }
+    assert_eq!(s.last_created_at, now + 600);
+    assert!(next_ts(&mut s, now).is_err());
+    // Deferring does not move the floor; a wall-clock jump is followed.
+    assert_eq!(s.last_created_at, now + 600);
+    assert_eq!(
+        next_ts(&mut s, now + 10_000).unwrap().as_secs(),
+        now + 10_000
+    );
+}
+
+#[test]
+fn owner_tag_binds_the_writer_to_the_owner_for_an_hour() {
+    let owner = Keys::generate();
+    let writer = Keys::generate();
+    let now = 1_757_779_500;
+    let tag = owner_tag(&owner, &writer.public_key(), now).unwrap();
+    let parts: Vec<String> = serde_json::from_str(&tag).unwrap();
+    assert_eq!(parts[0], "auth");
+    assert_eq!(parts[1], owner.public_key().to_hex());
+    assert_eq!(parts[2], format!("created_at<{}", now + 3600));
+    assert_eq!(parts[3].len(), 128);
+    assert!(owner_tag(&owner, &owner.public_key(), now).is_err());
+}
+
+#[test]
+fn writer_profile_carries_no_tags() {
+    let ev = crate::events::build_profile(Some("Bench"), Some("bench"), None, Some(ABOUT), None)
+        .unwrap()
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    assert_eq!(ev.kind.as_u16(), 0);
+    assert!(ev.tags.is_empty());
+    assert!(!ev.content.contains("auth"));
+}
+
+fn kind9(keys: &Keys, created_at: u64, client: Option<&str>) -> nostr::Event {
+    let tags: Vec<Vec<String>> = client
+        .map(|m| vec!["client".to_string(), m.to_string()])
+        .into_iter()
+        .collect();
+    crate::events::build_message_with_client_tags(
+        channel_id(&"aa".repeat(32)),
+        "x",
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        "http://127.0.0.1:1",
+        &tags,
+    )
+    .unwrap()
+    .custom_created_at(nostr::Timestamp::from(created_at))
+    .sign_with_keys(keys)
+    .unwrap()
+}
+
+#[test]
+fn rebuild_map_keeps_the_newest_per_marker_and_lists_the_rest() {
+    let w = Keys::generate();
+    let card_old = kind9(&w, 100, Some("bench:card:orchestrator/x@aaaa"));
+    let card_new = kind9(&w, 101, Some("bench:card:orchestrator/x@bbbb"));
+    let card_y = kind9(&w, 102, Some("bench:card:orchestrator/y@cccc"));
+    let board_old = kind9(&w, 103, Some("bench:board@dddd"));
+    let board_new = kind9(&w, 104, Some("bench:board@eeee"));
+    let untagged = kind9(&w, 105, None);
+    let foreign = kind9(&Keys::generate(), 106, Some("bench:board@ffff"));
+    let events = [
+        &board_new, &card_old, &untagged, &card_y, &board_old, &card_new, &foreign,
+    ]
+    .map(|e| e.clone());
+
+    let r = rebuild_map(&events, &w.public_key().to_hex());
+    assert_eq!(r.cards.len(), 2);
+    let x = &r.cards["orchestrator/x"];
+    assert_eq!(
+        (x.event_id.as_str(), x.created_at, x.hash.as_str(), x.seeded),
+        (card_new.id.to_hex().as_str(), 101, "bbbb", usize::MAX)
+    );
+    assert_eq!(r.cards["orchestrator/y"].hash, "cccc");
+    let b = r.board.unwrap();
+    assert_eq!(
+        (b.event_id, b.hash),
+        (board_new.id.to_hex(), "eeee".to_string())
+    );
+    let mut strays = r.stray_ids;
+    strays.sort();
+    let mut want = vec![
+        card_old.id.to_hex(),
+        board_old.id.to_hex(),
+        untagged.id.to_hex(),
+    ];
+    want.sort();
+    assert_eq!(strays, want);
+}
+
+#[test]
+fn save_state_writes_only_on_change_and_load_state_falls_back_to_prev() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = root.join("state.json");
+    let prev = root.join("state.prev.json");
+    let mut s = BenchState::default();
+    let mut last = String::new();
+
+    save_state(root, &s, &mut last).unwrap();
+    let first = std::fs::read(&state).unwrap();
+    assert!(!prev.exists());
+    // Unchanged snapshot: nothing is written, even with the file gone.
+    std::fs::remove_file(&state).unwrap();
+    save_state(root, &s, &mut last).unwrap();
+    assert!(!state.exists());
+    std::fs::write(&state, &first).unwrap();
+
+    s.last_tick = "t1".to_string();
+    save_state(root, &s, &mut last).unwrap();
+    assert_eq!(std::fs::read(&prev).unwrap(), first);
+    assert_eq!(load_state(root).0.last_tick, "t1");
+
+    std::fs::write(&state, b"{not json").unwrap();
+    let (loaded, fresh) = load_state(root);
+    assert!(!fresh && loaded.last_tick.is_empty() && !loaded.needs_rebuild);
+
+    let (loaded, fresh) = load_state(&root.join("nowhere"));
+    assert!(fresh && loaded.needs_rebuild);
+}
+
+#[test]
+fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let inbox = root.join("inbox").join("orchestrator");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::create_dir_all(root.join("inbox").join("Bad Writer")).unwrap();
+    let bad = drop_json(&[("answer", json!("x"))]);
+    let files = [
+        ("orchestrator/good.json", drop_json(&[])),
+        ("orchestrator/bad.json", bad.clone()),
+        ("orchestrator/big.json", "x".repeat(65 * 1024)),
+        ("orchestrator/old.rejected.json", "{}".to_string()),
+        ("Bad Writer/z.json", drop_json(&[])),
+    ];
+    for (name, text) in &files {
+        std::fs::write(root.join("inbox").join(name), text).unwrap();
+    }
+    let now = SystemTime::now();
+    // Just-written files may be half written: they wait a tick.
+    assert!(scan_inbox(root, now).is_empty());
+    let backdate = |name: &str| {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("inbox").join(name))
+            .unwrap()
+            .set_modified(now - Duration::from_secs(2))
+            .unwrap();
+    };
+    for (name, _) in &files {
+        backdate(name);
+    }
+    assert_eq!(scan_inbox(root, now).len(), 3);
+
+    let mut s = BenchState::default();
+    assert!(intake(&mut s, root, NOW));
+    let item = &s.items["orchestrator/good"];
+    assert_eq!(
+        (item.writer.as_str(), item.updated_at.as_str()),
+        ("orchestrator", NOW)
+    );
+    let good_hash = item.hash.clone();
+    assert_eq!(s.items.len(), 1);
+    let rejected = |stem: &str| -> Value {
+        let text = std::fs::read_to_string(inbox.join(format!("{stem}.rejected.json"))).unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let r = rejected("bad");
+    assert!(r["reason"]
+        .as_str()
+        .unwrap()
+        .contains("unknown field `answer`"));
+    assert_eq!(r["drop"], bad);
+    let r = rejected("big");
+    assert_eq!(
+        (r["reason"].as_str(), &r["drop"]),
+        (Some("too large"), &Value::Null)
+    );
+    for stem in ["good", "bad", "big"] {
+        assert!(!inbox.join(format!("{stem}.json")).exists());
+    }
+    assert!(inbox.join("old.rejected.json").exists());
+    assert!(root.join("inbox/Bad Writer/z.json").exists());
+    assert!(!intake(&mut s, root, NOW));
+
+    // An identical re-drop is a no-op; a reworded one keeps the card.
+    let card = Posted {
+        event_id: "ee".repeat(32),
+        created_at: 1,
+        hash: good_hash,
+        seeded: 2,
+    };
+    s.items.get_mut("orchestrator/good").unwrap().card = Some(card.clone());
+    std::fs::write(inbox.join("good.json"), drop_json(&[])).unwrap();
+    backdate("orchestrator/good.json");
+    assert!(!intake(&mut s, root, "2026-09-13T15:00:00Z"));
+    assert_eq!(s.items["orchestrator/good"].updated_at, NOW);
+    std::fs::write(
+        inbox.join("good.json"),
+        drop_json(&[("title", json!("Relay choice, reworded"))]),
+    )
+    .unwrap();
+    backdate("orchestrator/good.json");
+    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z"));
+    let item = &s.items["orchestrator/good"];
+    assert_eq!(item.card, Some(card));
+    assert_ne!(item.hash, item.card.as_ref().unwrap().hash);
+    assert!(!inbox.join("good.json").exists());
 }

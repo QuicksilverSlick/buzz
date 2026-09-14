@@ -20,7 +20,7 @@ pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
 const TITLE_MAX: usize = 120;
 const BODY_MAX: usize = 4000;
-const NAME_MAX: usize = 32;
+pub(crate) const NAME_MAX: usize = 32;
 const ID_MAX: usize = 64;
 const OPTION_MAX: usize = 80;
 const OPTIONS_MAX: usize = 4;
