@@ -2,6 +2,7 @@
 mod app_menu;
 mod app_state;
 mod archive;
+mod bench;
 mod build_identity;
 mod builderlab;
 mod channel_head_cache;
