@@ -518,6 +518,9 @@ pub fn run() {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                 });
+                // The Bench posts under the owner's key for channel writes, so it
+                // must never run against a recovery identity either.
+                tauri::async_runtime::spawn(bench::run(app.handle().clone()));
             }
             Ok(())
         })

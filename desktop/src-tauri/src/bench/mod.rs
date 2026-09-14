@@ -4,7 +4,6 @@
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
 //! the writer's own events, inbox intake, the pinned relay posts and the
 //! 2 s loop.
-#![allow(dead_code)] // until step 5 spawns run() and the archive calls is_bench_channel
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
