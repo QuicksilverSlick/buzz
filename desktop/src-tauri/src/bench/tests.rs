@@ -1212,3 +1212,33 @@ fn archive_guard_predicate() {
         &channel_id(&owner).to_string()
     ));
 }
+
+/// Every drop the exporter (scripts/bench/export-board.py) wrote must pass
+/// the trust boundary. Needs a board dump, so it is opt-in:
+/// `BENCH_EXPORT_DIR=<inbox/claude-ai> cargo test -- --ignored exported_board`.
+#[test]
+#[ignore]
+fn exported_board_drops_all_validate() {
+    let dir = std::env::var("BENCH_EXPORT_DIR").expect("BENCH_EXPORT_DIR");
+    let (mut total, mut rejected) = (0, Vec::new());
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        total += 1;
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        if let Err(e) = validate(MIGRATION_WRITER, &stem, &raw, NOW) {
+            rejected.push(format!("{stem}: {e}"));
+        }
+    }
+    assert!(total > 0, "no drops under {dir}");
+    assert!(
+        rejected.is_empty(),
+        "{} of {total} rejected:\n{}",
+        rejected.len(),
+        rejected.join("\n")
+    );
+    println!("{total} drops validated");
+}
