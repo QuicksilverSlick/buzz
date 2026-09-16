@@ -8,3 +8,5 @@
 
 # Sidecar binaries (built by scripts/bundle-sidecars.sh)
 /binaries
+# Release-only config delta written by desktop/scripts/build-release-config.mjs
+/tauri.release.conf.json

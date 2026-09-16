@@ -71,7 +71,9 @@ REM ---- Bundle ----------------------------------------------------------------
 
 cd /d "%REPO_ROOT%\desktop"
 echo [build-installer] Running tauri build ^(this is the long part^) ...
-call pnpm tauri build
+REM TAURI_BUILD_ARGS (optional; scripts\release-windows.bat sets it) adds flags such as
+REM --config src-tauri/tauri.release.conf.json without a second copy of this script.
+call pnpm tauri build %TAURI_BUILD_ARGS%
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" goto :done
