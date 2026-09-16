@@ -473,3 +473,48 @@ async fn past_deadline_pending_folds() {
     b.tick().await.unwrap();
     assert_eq!(b.s.items[ITEM].validity, Validity::Current);
 }
+
+#[tokio::test]
+async fn retracted_answer_file_is_swept_when_state_forgot() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    assert!(outbox(&b).is_some());
+    // A crash before save_state (or a remove the consumer's open handle
+    // refused) left the file with no answer in state; then the owner untaps.
+    b.s.items.get_mut(ITEM).unwrap().answer = None;
+    reply(&b, &[]);
+    b.tick().await.unwrap();
+    assert!(outbox(&b).is_none());
+}
+
+#[tokio::test]
+async fn truncated_answers_are_reported() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &vec![&owner_tap; RECOVER_LIMIT as usize]);
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("answers truncated"), "{err}");
+    // A cut page never records an answer.
+    assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
+}
+
+#[tokio::test]
+async fn kept_answered_cards_count_against_max_cards() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    for i in 0..MAX_CARDS {
+        b.drop_file("orchestrator", &format!("c{i:02}"), &drop_json(&[]));
+    }
+    b.settle(26).await;
+    // The kept answered card holds one of the MAX_CARDS slots, so the last
+    // pending item (by id) waits for one.
+    let live = b.s.items.values().filter(|i| i.card.is_some()).count();
+    assert_eq!(live, MAX_CARDS);
+    assert!(b.s.items[ITEM].card.is_some());
+    assert!(b.s.items["orchestrator/c28"].card.is_some());
+    assert!(b.s.items["orchestrator/c29"].card.is_none());
+}

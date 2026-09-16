@@ -323,10 +323,9 @@ fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
                     let old = s.items.get(&item.id);
                     if old.is_none_or(|o| o.hash != item.hash) {
                         // The hash-change re-drop is the writer's ack: the
-                        // rebuilt item carries no answer, so the file goes too.
-                        if old.is_some_and(|o| o.answer.is_some()) {
-                            let _ = std::fs::remove_file(outbox_path(root, &item.id));
-                        }
+                        // rebuilt item carries no answer, so the file goes too,
+                        // whether or not state still remembers the answer.
+                        let _ = std::fs::remove_file(outbox_path(root, &item.id));
                         let card = old.and_then(|o| o.card.clone());
                         s.items.insert(item.id.clone(), item::Item { card, ..item });
                         changed = true;
@@ -637,19 +636,21 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
         ));
     }
     let writer_hex = ctx.writer.public_key().to_hex();
-    for id in s.items.keys().cloned().collect::<Vec<_>>() {
-        let item = &s.items[&id];
+    for (id, item) in s.items.iter_mut() {
         let Some(card) = live_card(item) else {
             continue;
         };
-        let picked = item::pick_answer(item, &events, &approvers, &writer_hex);
-        if picked.map(|(_, e)| e.id.to_hex()) == item.answer.as_ref().map(|a| a.reaction_id.clone())
-        {
-            continue;
-        }
-        let path = outbox_path(&ctx.root, &id);
-        let answer = match picked {
+        let path = outbox_path(&ctx.root, id);
+        item.answer = match item::pick_answer(item, &events, &approvers, &writer_hex) {
             Some((i, e)) => {
+                let reaction_id = e.id.to_hex();
+                if item
+                    .answer
+                    .as_ref()
+                    .is_some_and(|a| a.reaction_id == reaction_id)
+                {
+                    continue;
+                }
                 std::fs::create_dir_all(path.parent().expect("outbox dir"))
                     .map_err(|e| format!("create outbox: {e}"))?;
                 let body = serde_json::json!({
@@ -661,18 +662,20 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
                     body.to_string().as_bytes(),
                 )?;
                 Some(item::Answer {
-                    reaction_id: e.id.to_hex(),
+                    reaction_id,
                     option: i,
                     answered_at: now,
                 })
             }
+            // Retried every tick with every error ignored (Windows sharing
+            // violations included): a remove that failed, or a crash between
+            // the write and save_state, must not leave a withdrawn answer on
+            // disk for the writer to act on.
             None => {
-                // Every error ignored, Windows sharing violations included.
                 let _ = std::fs::remove_file(&path);
                 None
             }
         };
-        s.items.get_mut(&id).expect("polled id").answer = answer;
     }
     Ok(())
 }
