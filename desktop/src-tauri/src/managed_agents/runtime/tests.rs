@@ -1,5 +1,27 @@
 use crate::managed_agents::known_acp_runtime;
 
+#[test]
+fn guest_facing_agents_only_run_the_bundled_harness_in_release() {
+    use std::path::Path;
+    let bundled = Path::new("/app");
+    let ok = Path::new("/app/buzz-acp");
+    let stray = Path::new("/checkout/target/release/buzz-acp");
+    assert!(super::require_bundled_harness(true, true, ok, Some(bundled)).is_ok());
+    assert!(super::require_bundled_harness(true, true, stray, Some(bundled)).is_err());
+    assert!(
+        super::require_bundled_harness(true, true, ok, None).is_err(),
+        "no bundle dir means refuse"
+    );
+    assert!(
+        super::require_bundled_harness(false, true, stray, Some(bundled)).is_ok(),
+        "owner-only agents are unaffected"
+    );
+    assert!(
+        super::require_bundled_harness(true, false, stray, Some(bundled)).is_ok(),
+        "debug builds have no bundle"
+    );
+}
+
 #[path = "cli_tests.rs"]
 mod cli_tests;
 

@@ -361,16 +361,37 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
 }
 
 fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
-    }
-
-    dirs.extend(
+    ordered_search_dirs(
+        !cfg!(debug_assertions),
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+        std::env::current_dir().ok(),
+    )
+}
+
+/// Where a bare command such as `buzz-acp` is looked for, in order.
+///
+/// A release build looks only next to its own executable, where the bundled
+/// sidecars live. `workspace_root_dir` is `CARGO_MANIFEST_DIR`, the checkout
+/// the binary was built from: on the owner's machine that made the installed
+/// app spawn whatever `target/release/buzz-acp.exe` the last `cargo build` had
+/// left there, so a rebuild in that checkout silently changed the harness the
+/// live agents ran. A debug build keeps the target dirs first, since `just dev`
+/// builds fresh sidecars there and never bundles them.
+fn ordered_search_dirs(
+    release: bool,
+    exe_dir: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    if release {
+        return exe_dir.into_iter().collect();
+    }
+    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
+    if let Some(current_dir) = current_dir {
+        dirs.extend(profile_target_dirs(&current_dir));
+    }
+    dirs.extend(exe_dir);
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
@@ -1255,3 +1276,7 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "discovery/tests/search_dirs.rs"]
+mod search_dirs_tests;
