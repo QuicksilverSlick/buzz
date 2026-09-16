@@ -785,6 +785,8 @@ struct Relay {
     force_dup: HashSet<u64>,
     seen: Mutex<HashSet<String>>,
     query_reply: Mutex<Vec<Value>>,
+    /// Every /query body in order.
+    queries: Mutex<Vec<Value>>,
     /// Event ids the relay no longer has: a kind 5 or 40003 on them is refused.
     gone: Mutex<HashSet<String>>,
 }
@@ -847,7 +849,13 @@ async fn fake_events(
     (StatusCode::OK, Json(reply))
 }
 
-async fn fake_query(State(r): State<Arc<Relay>>) -> Json<Vec<Value>> {
+/// The reply is filter-agnostic: rebuild_map skips kind != 9 and pick_answer
+/// skips kind != 7, so one list serves recover and the poll.
+async fn fake_query(State(r): State<Arc<Relay>>, body: String) -> Json<Vec<Value>> {
+    r.queries
+        .lock()
+        .unwrap()
+        .push(serde_json::from_str(&body).unwrap());
     Json(r.query_reply.lock().unwrap().clone())
 }
 
@@ -890,6 +898,7 @@ impl Bench {
             force_dup: force_dup.iter().copied().collect(),
             seen: Mutex::new(HashSet::new()),
             query_reply: Mutex::new(Vec::new()),
+            queries: Mutex::new(Vec::new()),
             gone: Mutex::new(HashSet::new()),
         });
         let base = fake_relay(relay.clone()).await;

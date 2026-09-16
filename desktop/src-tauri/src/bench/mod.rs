@@ -2,8 +2,8 @@
 //! only by the Bench service with its own key. `item` is the trust boundary
 //! for drop files; this file is the service: constants and the debug fence,
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
-//! the writer's own events, inbox intake, the pinned relay posts and the
-//! 2 s loop.
+//! the writer's own events, the reaction poll and the outbox, inbox intake,
+//! the pinned relay posts and the 2 s loop.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -441,17 +441,16 @@ async fn post_as_writer(
     }
 }
 
-/// The writer's own events, verified and filtered to its key: the query
-/// helper only parses JSON.
-async fn query_writer(
+/// One /query as the writer, every event verified: the relay helper only
+/// parses JSON.
+async fn query(
     ctx: &Ctx<'_>,
     s: &BenchState,
     filter: serde_json::Value,
     now: u64,
 ) -> Result<Vec<nostr::Event>, String> {
-    let writer_pk = ctx.writer.public_key();
     let tag = match s.admission {
-        Admission::ViaOwner => Some(owner_tag(&ctx.owner, &writer_pk, now)?),
+        Admission::ViaOwner => Some(owner_tag(&ctx.owner, &ctx.writer.public_key(), now)?),
         _ => None,
     };
     let events = crate::relay::query_relay_at_with_keys(
@@ -462,9 +461,21 @@ async fn query_writer(
         tag.as_deref(),
     )
     .await?;
-    Ok(events
+    Ok(events.into_iter().filter(|e| e.verify().is_ok()).collect())
+}
+
+/// The writer's own events only.
+async fn query_writer(
+    ctx: &Ctx<'_>,
+    s: &BenchState,
+    filter: serde_json::Value,
+    now: u64,
+) -> Result<Vec<nostr::Event>, String> {
+    let pk = ctx.writer.public_key();
+    Ok(query(ctx, s, filter, now)
+        .await?
         .into_iter()
-        .filter(|e| e.verify().is_ok() && e.pubkey == writer_pk)
+        .filter(|e| e.pubkey == pk)
         .collect())
 }
 
@@ -574,6 +585,111 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+/// `outbox/<writer>/<id>.json`: the item id is `<writer>/<id>`, both
+/// valid_name, so no traversal.
+fn outbox_path(root: &Path, item_id: &str) -> PathBuf {
+    root.join("outbox").join(format!("{item_id}.json"))
+}
+
+/// The card that may carry an answer: present and at the item's current
+/// hash. After an ack re-drop the old card stays until publish (b) retires
+/// it, and it must never re-supply the answer just cleared.
+fn live_card(i: &item::Item) -> Option<&Posted> {
+    i.card.as_ref().filter(|c| c.hash == i.hash)
+}
+
+/// Re-derive every answer from the approvers' kind-7 reactions on the live
+/// cards. The whole set comes back each tick, so a retraction is a reaction
+/// that stopped coming back and nothing is ever double-applied. The outbox
+/// file lands before state records the answer: a failed write is retried
+/// next tick instead of being lost.
+// ponytail: one /query per 2 s tick (30/min of the 300/min budget); swap for
+// the live #h tail via native_relay_client::start when the relay complains.
+async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
+    let cards: Vec<String> = s
+        .items
+        .values()
+        .filter_map(live_card)
+        .map(|c| c.event_id.clone())
+        .collect();
+    if cards.is_empty() {
+        return Ok(());
+    }
+    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+        .chain(read_members(&ctx.root))
+        .collect();
+    let filter = serde_json::json!({
+        "kinds": [7], "authors": approvers, "#h": [s.channel_id], "#e": cards,
+        "limit": RECOVER_LIMIT,
+    });
+    let events = query(ctx, s, filter, now).await?;
+    // A cut page hides reactions: never infer a retraction from it.
+    if events.len() as u32 >= RECOVER_LIMIT {
+        return Err(format!(
+            "answers truncated (>= {RECOVER_LIMIT} reactions on live cards)"
+        ));
+    }
+    let writer_hex = ctx.writer.public_key().to_hex();
+    for id in s.items.keys().cloned().collect::<Vec<_>>() {
+        let item = &s.items[&id];
+        let Some(card) = live_card(item) else {
+            continue;
+        };
+        let picked = item::pick_answer(item, &events, &approvers, &writer_hex);
+        if picked.map(|(_, e)| e.id.to_hex()) == item.answer.as_ref().map(|a| a.reaction_id.clone())
+        {
+            continue;
+        }
+        let path = outbox_path(&ctx.root, &id);
+        let answer = match picked {
+            Some((i, e)) => {
+                std::fs::create_dir_all(path.parent().expect("outbox dir"))
+                    .map_err(|e| format!("create outbox: {e}"))?;
+                let body = serde_json::json!({
+                    "item": id, "writer": item.writer, "card": card.event_id,
+                    "option": i + 1, "text": item.options[i], "reaction": e,
+                });
+                crate::managed_agents::atomic_write_json_restricted(
+                    &path,
+                    body.to_string().as_bytes(),
+                )?;
+                Some(item::Answer {
+                    reaction_id: e.id.to_hex(),
+                    option: i,
+                    answered_at: now,
+                })
+            }
+            None => {
+                // Every error ignored, Windows sharing violations included.
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        };
+        s.items.get_mut(&id).expect("polled id").answer = answer;
+    }
+    Ok(())
+}
+
+/// A pending item past its deadline folds off the board: Superseded, so
+/// publish (b) retires its card. Answered items are left alone, and a
+/// same-hash re-drop cannot revive one: a new deadline is needed.
+fn expire(s: &mut BenchState, now: u64) {
+    for i in s.items.values_mut() {
+        let due = i
+            .deadline
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .is_some_and(|t| t.timestamp().max(0) as u64 <= now);
+        if due
+            && i.kind == item::ItemKind::Pending
+            && i.validity == item::Validity::Current
+            && i.answer.is_none()
+        {
+            i.validity = item::Validity::Superseded;
+        }
+    }
 }
 
 /// A kind 9 in #bench carrying its `client` marker; the p tag only when the
@@ -786,7 +902,9 @@ async fn publish(
     Ok(())
 }
 
-/// One 2 s tick: owner fence, bootstrap, recovery, intake, publish.
+/// One 2 s tick: owner fence, bootstrap, recovery, the reaction poll (before
+/// intake, so a query failure aborts the tick before any drop is read),
+/// intake, expiry, publish.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -813,7 +931,9 @@ pub(crate) async fn tick(
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
+    poll_answers(ctx, s, now).await?;
     intake(s, &ctx.root, now_iso);
+    expire(s, now);
     publish(ctx, s, &mut budget, now, hhmm).await
 }
 

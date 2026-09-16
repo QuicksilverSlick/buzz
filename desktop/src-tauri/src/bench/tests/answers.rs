@@ -19,6 +19,25 @@ fn answered(option: usize, answered_at: u64) -> Option<Answer> {
     })
 }
 
+fn reply(b: &Bench, evs: &[&nostr::Event]) {
+    *b.relay.query_reply.lock().unwrap() = evs
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+}
+
+fn outbox(b: &Bench) -> Option<Value> {
+    std::fs::read_to_string(b.root.join("outbox/orchestrator/relay-choice.json"))
+        .ok()
+        .map(|t| serde_json::from_str(&t).unwrap())
+}
+
+fn last_query(b: &Bench) -> Value {
+    b.relay.queries.lock().unwrap().last().cloned().unwrap()
+}
+
+const ITEM: &str = "orchestrator/relay-choice";
+
 #[test]
 fn pick_answer_rules() {
     let owner = Keys::generate();
@@ -179,4 +198,142 @@ fn m1_state_loads() {
     assert_eq!(v["recorded"], json!(1));
     let back: Item = serde_json::from_value(v).unwrap();
     assert!(back.answer == item.answer && back.recorded == Some(1));
+}
+
+#[tokio::test]
+async fn owner_tap_records_answer_and_writes_outbox() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now - 5);
+    reply(&b, &[&owner_tap]);
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert_eq!(
+        b.s.items[ITEM].answer,
+        Some(Answer {
+            reaction_id: owner_tap.id.to_hex(),
+            option: 1,
+            answered_at: b.now,
+        })
+    );
+    let out = outbox(&b).unwrap();
+    assert_eq!(out["item"], json!(ITEM));
+    assert_eq!(out["writer"], json!("orchestrator"));
+    assert_eq!(out["card"], json!(card.event_id));
+    assert_eq!(out["option"], json!(2));
+    assert_eq!(out["text"], json!("Move"));
+    let reaction: nostr::Event = serde_json::from_value(out["reaction"].clone()).unwrap();
+    assert!(reaction.verify().is_ok() && reaction.id == owner_tap.id);
+    assert_eq!(
+        last_query(&b),
+        json!([{
+            "kinds": [7],
+            "authors": [b.owner_hex(), "cd".repeat(32)],
+            "#h": [b.channel()],
+            "#e": [card.event_id],
+            "limit": 500,
+        }])
+    );
+    // Step 3 puts the card's Recorded edit in front of this board edit and
+    // sets `recorded`; until then only the board's Answered section changes.
+    assert_eq!(b.kinds()[before..], [40003]);
+    let queries = b.relay.queries.lock().unwrap().len();
+    b.tick().await.unwrap();
+    assert_eq!(b.posts().len(), before + 1);
+    assert_eq!(b.relay.queries.lock().unwrap().len(), queries + 1);
+}
+
+#[tokio::test]
+async fn ignored_reactions_never_answer() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    let (owner, writer) = (b.ctx.owner.clone(), b.ctx.writer.clone());
+    let noise = [
+        tap(&Keys::generate(), &card, OPTION_EMOJI[1], b.now),
+        tap(&writer, &card, OPTION_EMOJI[0], b.now),
+        tap(&owner, &card, "\u{2764}\u{FE0F}", b.now),
+        tap(&owner, &"ab".repeat(32), OPTION_EMOJI[0], b.now),
+        tap(&owner, &card, OPTION_EMOJI[2], b.now),
+    ];
+    reply(&b, &noise.iter().collect::<Vec<_>>());
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    let item = &b.s.items[ITEM];
+    assert!(item.answer.is_none() && item.recorded.is_none());
+    assert!(outbox(&b).is_none());
+    assert_eq!(b.posts().len(), before);
+}
+
+#[tokio::test]
+async fn idle_bench_sends_no_query() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    b.settle(3).await;
+    let queries = b.relay.queries.lock().unwrap().clone();
+    assert!(!queries.is_empty());
+    assert!(
+        queries.iter().all(|q| q[0]["kinds"] == json!([9])),
+        "{queries:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_card_never_supplies_an_answer() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    // A second live card, so the poll still runs once the first goes stale.
+    b.drop_file(
+        "orchestrator",
+        "other",
+        &drop_json(&[("title", json!("Other"))]),
+    );
+    b.settle(3).await;
+    let other = b.card("orchestrator/other").event_id;
+    let card = b.card(ITEM);
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ITEM].answer.is_some());
+    // The ack re-drop landed (intake cleared the answer and the outbox) but
+    // the budget ran out before (b) could retire the old card.
+    let item = b.s.items.get_mut(ITEM).unwrap();
+    item.hash = "ffff".to_string();
+    item.answer = None;
+    std::fs::remove_file(b.root.join("outbox/orchestrator/relay-choice.json")).unwrap();
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert!(b.s.items[ITEM].answer.is_none());
+    assert!(outbox(&b).is_none());
+    assert_eq!(last_query(&b)[0]["#e"], json!([other]));
+    // (b) retired the stale card and (c) reposted it fresh.
+    let retired = b.posts()[before..].iter().any(|(e, _)| {
+        e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.event_id.as_str())
+    });
+    assert!(retired);
+    assert_ne!(b.card(ITEM).event_id, card.event_id);
+}
+
+#[tokio::test]
+async fn past_deadline_pending_folds() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    b.drop_file(
+        "orchestrator",
+        "relay-choice",
+        &drop_json(&[("deadline", json!("2020-01-01T00:00:00Z"))]),
+    );
+    b.settle(4).await;
+    let item = &b.s.items[ITEM];
+    assert!(item.validity == Validity::Superseded && item.card.is_none());
+    let posts = b.posts();
+    assert!(!posts
+        .iter()
+        .any(|(e, _)| { tag_value(e, "client").is_some_and(|c| c.starts_with("bench:card:")) }));
+    let board = posts.iter().rev().find(|(e, _)| e["kind"] == 9).unwrap();
+    assert!(!board.0["content"].as_str().unwrap().contains("Needs you"));
+    // An answered item waits for the writer, deadline or not.
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    b.s.items.get_mut(ITEM).unwrap().deadline = Some("2020-01-01T00:00:00Z".to_string());
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].validity, Validity::Current);
 }
