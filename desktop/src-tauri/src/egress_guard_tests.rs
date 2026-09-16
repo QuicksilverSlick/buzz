@@ -281,6 +281,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // production archive/unarchive publish through the guarded boundary-1
     // funnel via `submit_event`.
     ("src/commands/identity_archive.rs", 1, 0),
+    // Loopback relay in the Bench tick tests (`bench/tests.rs`); the Bench
+    // service publishes through the guarded boundary-1 funnel via
+    // `submit_signed_event_at_with_keys_tagged`.
+    ("src/bench/tests.rs", 1, 0),
     // Mock-relay routes in team-sharing tests (accept/reject stub +
     // recording stub for the delete-then-share gate + gated recording stub for
     // the two-flush serialization gate + stalling stub for the per-scope

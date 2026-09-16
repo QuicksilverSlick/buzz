@@ -321,6 +321,9 @@ pub async fn create_save_subscription(
     // Per-scope access probe.
     match &scope_type {
         ScopeType::ChannelH => {
+            if crate::bench::is_bench_channel(&identity_pk, &scope_value) {
+                return Err("the Bench channel is never archived locally".to_string());
+            }
             probe_channel_access(&state, &identity_pk, &scope_value).await?;
         }
         ScopeType::ReferencedE => {
