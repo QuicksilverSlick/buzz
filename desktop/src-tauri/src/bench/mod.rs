@@ -2,8 +2,8 @@
 //! only by the Bench service with its own key. `item` is the trust boundary
 //! for drop files; this file is the service: constants and the debug fence,
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
-//! the writer's own events, inbox intake, the pinned relay posts and the
-//! 2 s loop.
+//! the writer's own events, the reaction poll and the outbox, inbox intake,
+//! the pinned relay posts and the 2 s loop.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,8 @@ pub(crate) fn is_bench_channel(owner_hex: &str, scope_value: &str) -> bool {
 pub(crate) struct Posted {
     pub event_id: String,
     pub created_at: u64,
+    /// A card: the `item::card_hash` its text shows (posted or last edited).
+    /// The board: `item::board_hash`.
     pub hash: String,
     /// Option seeds landed so far.
     #[serde(default)]
@@ -322,6 +324,10 @@ fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
                 Ok(item) => {
                     let old = s.items.get(&item.id);
                     if old.is_none_or(|o| o.hash != item.hash) {
+                        // The hash-change re-drop is the writer's ack: the
+                        // rebuilt item carries no answer, so the file goes too,
+                        // whether or not state still remembers the answer.
+                        let _ = std::fs::remove_file(outbox_path(root, &item.id));
                         let card = old.and_then(|o| o.card.clone());
                         s.items.insert(item.id.clone(), item::Item { card, ..item });
                         changed = true;
@@ -441,17 +447,16 @@ async fn post_as_writer(
     }
 }
 
-/// The writer's own events, verified and filtered to its key: the query
-/// helper only parses JSON.
-async fn query_writer(
+/// One /query as the writer, every event verified: the relay helper only
+/// parses JSON.
+async fn query(
     ctx: &Ctx<'_>,
     s: &BenchState,
     filter: serde_json::Value,
     now: u64,
 ) -> Result<Vec<nostr::Event>, String> {
-    let writer_pk = ctx.writer.public_key();
     let tag = match s.admission {
-        Admission::ViaOwner => Some(owner_tag(&ctx.owner, &writer_pk, now)?),
+        Admission::ViaOwner => Some(owner_tag(&ctx.owner, &ctx.writer.public_key(), now)?),
         _ => None,
     };
     let events = crate::relay::query_relay_at_with_keys(
@@ -462,9 +467,21 @@ async fn query_writer(
         tag.as_deref(),
     )
     .await?;
-    Ok(events
+    Ok(events.into_iter().filter(|e| e.verify().is_ok()).collect())
+}
+
+/// The writer's own events only.
+async fn query_writer(
+    ctx: &Ctx<'_>,
+    s: &BenchState,
+    filter: serde_json::Value,
+    now: u64,
+) -> Result<Vec<nostr::Event>, String> {
+    let pk = ctx.writer.public_key();
+    Ok(query(ctx, s, filter, now)
+        .await?
         .into_iter()
-        .filter(|e| e.verify().is_ok() && e.pubkey == writer_pk)
+        .filter(|e| e.pubkey == pk)
         .collect())
 }
 
@@ -576,6 +593,132 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// `outbox/<writer>/<id>.json`: the item id is `<writer>/<id>`, both
+/// valid_name, so no traversal.
+fn outbox_path(root: &Path, item_id: &str) -> PathBuf {
+    root.join("outbox").join(format!("{item_id}.json"))
+}
+
+/// Whether a card shows the item's current Drop, in any card format.
+fn same_drop(c: &Posted, i: &item::Item) -> bool {
+    c.hash.split('.').next() == Some(i.hash.as_str())
+}
+
+/// The card that may carry an answer: present and showing the item's current
+/// Drop, in any card format, so a tap on an older build's card counts before
+/// publish (b) refreshes it. After an ack re-drop the old card stays until
+/// (b) retires it, and it must never re-supply the answer just cleared.
+fn live_card(i: &item::Item) -> Option<&Posted> {
+    i.card.as_ref().filter(|c| same_drop(c, i))
+}
+
+/// Forget a card that is gone from the relay. The owner was already pinged
+/// for a card of the same Drop, so its replacement goes out quietly.
+fn forget_card(s: &mut BenchState, id: &str) {
+    let i = s.items.get_mut(id).expect("carded id");
+    let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));
+    i.quiet_repost |= same;
+    i.card = None;
+    i.recorded = None;
+    s.board_dirty = true;
+}
+
+/// Re-derive every answer from the approvers' kind-7 reactions on the live
+/// cards. The whole set comes back each tick, so a retraction is a reaction
+/// that stopped coming back and nothing is ever double-applied. The outbox
+/// file lands before state records the answer: a failed write is retried
+/// next tick instead of being lost.
+// ponytail: one /query per 2 s tick (30/min of the 300/min budget); swap for
+// the live #h tail via native_relay_client::start when the relay complains.
+async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
+    let cards: Vec<String> = s
+        .items
+        .values()
+        .filter_map(live_card)
+        .map(|c| c.event_id.clone())
+        .collect();
+    if cards.is_empty() {
+        return Ok(());
+    }
+    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+        .chain(read_members(&ctx.root))
+        .collect();
+    let filter = serde_json::json!({
+        "kinds": [7], "authors": approvers, "#h": [s.channel_id], "#e": cards,
+        "limit": RECOVER_LIMIT,
+    });
+    let events = query(ctx, s, filter, now).await?;
+    // A cut page hides reactions: never infer a retraction from it.
+    if events.len() as u32 >= RECOVER_LIMIT {
+        return Err(format!(
+            "answers truncated (>= {RECOVER_LIMIT} reactions on live cards)"
+        ));
+    }
+    let writer_hex = ctx.writer.public_key().to_hex();
+    for (id, item) in s.items.iter_mut() {
+        let Some(card) = live_card(item) else {
+            continue;
+        };
+        let path = outbox_path(&ctx.root, id);
+        item.answer = match item::pick_answer(item, &events, &approvers, &writer_hex) {
+            Some((i, e)) => {
+                let reaction_id = e.id.to_hex();
+                if item
+                    .answer
+                    .as_ref()
+                    .is_some_and(|a| a.reaction_id == reaction_id)
+                {
+                    continue;
+                }
+                std::fs::create_dir_all(path.parent().expect("outbox dir"))
+                    .map_err(|e| format!("create outbox: {e}"))?;
+                let body = serde_json::json!({
+                    "item": id, "writer": item.writer, "card": card.event_id,
+                    "option": i + 1, "text": item.options[i], "reaction": e,
+                });
+                crate::managed_agents::atomic_write_json_restricted(
+                    &path,
+                    body.to_string().as_bytes(),
+                )?;
+                Some(item::Answer {
+                    reaction_id,
+                    option: i,
+                    answered_at: now,
+                })
+            }
+            // Retried every tick with every error ignored (Windows sharing
+            // violations included): a remove that failed, or a crash between
+            // the write and save_state, must not leave a withdrawn answer on
+            // disk for the writer to act on.
+            None => {
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        };
+    }
+    Ok(())
+}
+
+/// A pending item past its deadline folds off the board: Superseded, so
+/// publish (b) retires its card. Answered items are left alone, and a
+/// same-hash re-drop cannot revive one: a new deadline is needed.
+fn expire(s: &mut BenchState, now: u64) {
+    for i in s.items.values_mut() {
+        let due = i
+            .deadline
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .is_some_and(|t| t.timestamp().max(0) as u64 <= now);
+        if due
+            && i.kind == item::ItemKind::Pending
+            && i.validity == item::Validity::Current
+            && i.answer.is_none()
+        {
+            i.validity = item::Validity::Superseded;
+        }
+    }
+}
+
 /// A kind 9 in #bench carrying its `client` marker; the p tag only when the
 /// card pings the owner.
 async fn post_message(
@@ -621,9 +764,30 @@ async fn delete(
     }
 }
 
+/// kind 40003 with h+e replacing the text of one of the writer's own kind 9s.
+async fn edit(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    event_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Outcome, String> {
+    let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
+    let edit_tags = events::MessageEditTags {
+        media: &[],
+        custom_emoji: &[],
+        mentions: &[],
+        mention_refs: None,
+    };
+    let builder =
+        events::build_message_edit(channel_id(&s.owner_pubkey), target, text, edit_tags, false)?;
+    post_as_writer(ctx, s, builder, now).await
+}
+
 /// Cards, seeds, then the board, at most `budget` posts; the next tick
 /// resumes where this one stopped because every step lands in state first.
-/// Cards are always delete + repost; only the board is ever edited.
+/// Cards are always delete + repost; only the board is ever edited, and the
+/// one-shot Recorded edit on an answered card.
 async fn publish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -631,24 +795,74 @@ async fn publish(
     now: u64,
     hhmm: &str,
 ) -> Result<(), String> {
-    // (a) The live cards: pending + current by severity, at most MAX_CARDS.
+    // (a) The live cards: pending + current + unanswered by severity; kept
+    // answered cards count against MAX_CARDS (the phone's pill window).
     let mut ranked: Vec<(u8, i64, String)> = s
         .items
         .values()
-        .filter(|i| i.kind == item::ItemKind::Pending && i.validity == item::Validity::Current)
+        .filter(|i| {
+            i.kind == item::ItemKind::Pending
+                && i.validity == item::Validity::Current
+                && i.answer.is_none()
+        })
         .map(|i| (item::severity_rank(i.severity), i.order, i.id.clone()))
         .collect();
     ranked.sort();
-    let wanted: Vec<String> = ranked.into_iter().take(MAX_CARDS).map(|r| r.2).collect();
+    let kept = s
+        .items
+        .values()
+        .filter(|i| i.answer.is_some() && i.card.is_some())
+        .count();
+    let wanted: Vec<String> = ranked
+        .into_iter()
+        .take(MAX_CARDS.saturating_sub(kept))
+        .map(|r| r.2)
+        .collect();
 
-    // (b) Delete cards that are stale or no longer wanted.
+    // (a2) Record / un-record on the live card, first so a tap is acknowledged
+    // within one tick. Diff-driven from what the card text shows (`recorded`)
+    // vs the answer, so it is a no-op after a restart.
+    for id in s.items.keys().cloned().collect::<Vec<_>>() {
+        let item = s.items[&id].clone();
+        let Some(card) = live_card(&item) else {
+            continue;
+        };
+        let want = item.answer.as_ref().map(|a| a.option);
+        if item.recorded == want {
+            continue;
+        }
+        if !spend(budget, 1) {
+            return Ok(());
+        }
+        let text = item::render_card(&item, hhmm);
+        match edit(ctx, s, &card.event_id, &text, now).await {
+            // The edit re-rendered the whole card, so it now shows this card
+            // format too: (b) must not retire it for an older one.
+            Ok(_) => {
+                let i = s.items.get_mut(&id).expect("edited id");
+                i.recorded = want;
+                i.card.as_mut().expect("edited card").hash = item::card_hash(&item);
+            }
+            // A hand-deleted card: the answer stays and is never reposted; an
+            // unanswered one comes back through (c).
+            Err(e) if e.contains("not found") => forget_card(s, &id),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // (b) Delete cards that are stale (another Drop or card format) or no
+    // longer wanted. An answered card is exempt for ANSWER_KEEP_SECS so late
+    // pills land, then retired here; it is never refreshed for format alone.
     let stale: Vec<(String, String)> = s
         .items
         .values()
         .filter_map(|i| {
             let c = i.card.as_ref()?;
-            (c.hash != i.hash || !wanted.contains(&i.id))
-                .then(|| (i.id.clone(), c.event_id.clone()))
+            let retire = match &i.answer {
+                Some(a) => now.saturating_sub(a.answered_at) > item::ANSWER_KEEP_SECS,
+                None => c.hash != item::card_hash(i) || !wanted.contains(&i.id),
+            };
+            retire.then(|| (i.id.clone(), c.event_id.clone()))
         })
         .collect();
     for (id, event_id) in stale {
@@ -656,8 +870,7 @@ async fn publish(
             return Ok(());
         }
         delete(ctx, s, &event_id, now).await?;
-        s.items.get_mut(&id).expect("stale card id").card = None;
-        s.board_dirty = true;
+        forget_card(s, &id);
     }
 
     // (c) Post missing cards, adopting a recovered orphan when its hash matches.
@@ -666,7 +879,7 @@ async fn publish(
             continue;
         }
         if let Some(orphan) = s.orphan_cards.get(id).cloned() {
-            if orphan.hash == s.items[id].hash {
+            if orphan.hash == item::card_hash(&s.items[id]) {
                 s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
                 continue;
             }
@@ -675,21 +888,28 @@ async fn publish(
             }
             delete(ctx, s, &orphan.event_id, now).await?;
             s.orphan_cards.remove(id);
+            let i = s.items.get_mut(id).expect("wanted id");
+            i.quiet_repost |= same_drop(&orphan, i);
         }
         if !spend(budget, 1) {
             return Ok(());
         }
         let item = s.items[id].clone();
-        let marker = format!("bench:card:{}@{}", item.id, item.hash);
+        let hash = item::card_hash(&item);
+        let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
-        match post_message(ctx, s, &text, item::ping_owner(&item), marker, now).await? {
+        let ping = item::ping_owner(&item) && !item.quiet_repost;
+        match post_message(ctx, s, &text, ping, marker, now).await? {
             Outcome::Accepted { event_id } => {
-                s.items.get_mut(id).expect("wanted id").card = Some(Posted {
+                let created_at = s.last_created_at;
+                let i = s.items.get_mut(id).expect("wanted id");
+                i.card = Some(Posted {
                     event_id,
-                    created_at: s.last_created_at,
-                    hash: item.hash,
+                    created_at,
+                    hash,
                     seeded: 0,
                 });
+                i.quiet_repost = false;
                 s.board_dirty = true;
             }
             Outcome::Duplicate => {
@@ -726,7 +946,7 @@ async fn publish(
     // (e) The board: reposted after any card change or daily, edited in place
     // for a text-only change so it keeps its id and stays newest.
     let all: Vec<&item::Item> = s.items.values().collect();
-    let text = item::render_board(&all, &s.channel_id, hhmm);
+    let text = item::render_board(&all, &s.channel_id, hhmm, now);
     let hash = item::board_hash(&text);
     let aged = s
         .board
@@ -754,25 +974,16 @@ async fn publish(
             }
             Outcome::Duplicate => s.needs_rebuild = true,
         }
-    } else if let Some(board) = s.board.as_ref().filter(|b| b.hash != hash) {
+    } else if let Some(board_id) = s
+        .board
+        .as_ref()
+        .filter(|b| b.hash != hash)
+        .map(|b| b.event_id.clone())
+    {
         if !spend(budget, 1) {
             return Ok(());
         }
-        let target = nostr::EventId::from_hex(&board.event_id).map_err(|e| e.to_string())?;
-        let edit_tags = events::MessageEditTags {
-            media: &[],
-            custom_emoji: &[],
-            mentions: &[],
-            mention_refs: None,
-        };
-        let edit = events::build_message_edit(
-            channel_id(&s.owner_pubkey),
-            target,
-            &text,
-            edit_tags,
-            false,
-        )?;
-        match post_as_writer(ctx, s, edit, now).await {
+        match edit(ctx, s, &board_id, &text, now).await {
             Ok(_) => s.board.as_mut().expect("board").hash = hash,
             // The board was deleted by hand: repost it next tick instead of
             // retrying the edit every 2 s until the daily repost.
@@ -786,7 +997,9 @@ async fn publish(
     Ok(())
 }
 
-/// One 2 s tick: owner fence, bootstrap, recovery, intake, publish.
+/// One 2 s tick: owner fence, bootstrap, recovery, the reaction poll (before
+/// intake, so a query failure aborts the tick before any drop is read),
+/// intake, expiry, publish.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -813,7 +1026,9 @@ pub(crate) async fn tick(
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
+    poll_answers(ctx, s, now).await?;
     intake(s, &ctx.root, now_iso);
+    expire(s, now);
     publish(ctx, s, &mut budget, now, hhmm).await
 }
 
@@ -891,6 +1106,11 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
             Ok(()) => s.last_error = None,
             Err(e) => {
                 eprintln!("bench: {e}");
+                // One toast per failure edge, re-armed by an Ok tick.
+                if s.last_error.is_none() {
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app.notification().builder().title("Bench").body(&e).show();
+                }
                 s.last_error = Some(e);
             }
         }

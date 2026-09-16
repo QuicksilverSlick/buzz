@@ -350,6 +350,7 @@ fn render_card_golden() {
          ```\n\
          due 2026-09-20T00:00:00Z\n\
          plan: https://github.com/QuicksilverSlick/buzz\n\
+         Tap one number below to answer.\n\
          as of 14:05"
     );
 }
@@ -452,18 +453,22 @@ fn render_board_orders_links_and_folds() {
     ])
     .unwrap();
     let all = [&att, &stale, &imported, &crit, &old, &att0, &status, &dec];
-    let board = render_board(&all, UUID, "14:05");
+    let board = render_board(&all, UUID, "14:05", 0);
     assert_eq!(
         board,
         format!(
-            "Bench · as of 14:05 · 3 need you\n\
+            "Bench · as of 14:05 · needs you: 3\n\
+             To answer: tap one number under a card. To undo or change it, tap that number again first.\n\
+             \n\
              Needs you\n\
-             1. 🔴 Relay choice (dreamforge) → buzz://message?channel={UUID}&id={hex64}\n\
-             2. 🟠 Installer (dreamforge) (no card yet)\n\
-             3. 🟠 Phone alerts (dreamforge) (no card yet)\n\
+             - 🔴 Relay choice (dreamforge) → buzz://message?channel={UUID}&id={hex64}\n\
+             - 🟠 Installer (dreamforge) (no card yet)\n\
+             - 🟠 Phone alerts (dreamforge) (no card yet)\n\
+             \n\
              Decisions\n\
              - 🧭 label(https:evil.example) Stay (dreamforge) (decided on claude.ai)\n\
              - 🧭 Own relay later (dreamforge) (claude)\n\
+             \n\
              Status\n\
              - ▪ dreamforge: Bench M1 — in-progress"
         )
@@ -473,11 +478,11 @@ fn render_board_orders_links_and_folds() {
     // The clock alone never changes the hash; a line change does.
     assert_eq!(
         board_hash(&board),
-        board_hash(&render_board(&all, UUID, "23:59"))
+        board_hash(&render_board(&all, UUID, "23:59", 0))
     );
     assert_ne!(
         board_hash(&board),
-        board_hash(&render_board(&all[1..], UUID, "14:05"))
+        board_hash(&render_board(&all[1..], UUID, "14:05", 0))
     );
     assert_eq!(board_hash(&board).len(), 16);
 }
@@ -785,6 +790,8 @@ struct Relay {
     force_dup: HashSet<u64>,
     seen: Mutex<HashSet<String>>,
     query_reply: Mutex<Vec<Value>>,
+    /// Every /query body in order.
+    queries: Mutex<Vec<Value>>,
     /// Event ids the relay no longer has: a kind 5 or 40003 on them is refused.
     gone: Mutex<HashSet<String>>,
 }
@@ -847,7 +854,13 @@ async fn fake_events(
     (StatusCode::OK, Json(reply))
 }
 
-async fn fake_query(State(r): State<Arc<Relay>>) -> Json<Vec<Value>> {
+/// The reply is filter-agnostic: rebuild_map skips kind != 9 and pick_answer
+/// skips kind != 7, so one list serves recover and the poll.
+async fn fake_query(State(r): State<Arc<Relay>>, body: String) -> Json<Vec<Value>> {
+    r.queries
+        .lock()
+        .unwrap()
+        .push(serde_json::from_str(&body).unwrap());
     Json(r.query_reply.lock().unwrap().clone())
 }
 
@@ -890,6 +903,7 @@ impl Bench {
             force_dup: force_dup.iter().copied().collect(),
             seen: Mutex::new(HashSet::new()),
             query_reply: Mutex::new(Vec::new()),
+            queries: Mutex::new(Vec::new()),
             gone: Mutex::new(HashSet::new()),
         });
         let base = fake_relay(relay.clone()).await;
@@ -1010,7 +1024,7 @@ async fn one_tick_posts_canary_channel_member_card_seeds_board() {
     assert_eq!(tag_value(card, "e"), None);
     assert_eq!(
         tag_value(card, "client").unwrap(),
-        format!("bench:card:orchestrator/relay-choice@{}", item.hash)
+        format!("bench:card:orchestrator/relay-choice@{}", card_hash(item))
     );
     let card_id = card["id"].as_str().unwrap();
     for (i, emoji) in [(5, OPTION_EMOJI[0]), (6, OPTION_EMOJI[1])] {
@@ -1181,14 +1195,14 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
     let card = kind9(
         &w,
         now - 50,
-        Some(&format!("bench:card:{}@{}", item.id, item.hash)),
+        Some(&format!("bench:card:{}@{}", item.id, card_hash(&item))),
     );
     let unknown = kind9(&w, now - 40, Some("bench:card:orchestrator/gone@abcd"));
     let y = check(&[("id", json!("y")), ("options", json!(["Only"]))]).unwrap();
     let card_y = kind9(
         &w,
         now - 35,
-        Some(&format!("bench:card:{}@{}", y.id, y.hash)),
+        Some(&format!("bench:card:{}@{}", y.id, card_hash(&y))),
     );
     let board_old = kind9(&w, now - 30, Some("bench:board@dddd"));
     let board_new = kind9(&w, now - 20, Some("bench:board@eeee"));
@@ -1206,7 +1220,7 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
     let tracked = Posted {
         event_id: card_y.id.to_hex(),
         created_at: now - 35,
-        hash: y.hash.clone(),
+        hash: card_hash(&y),
         seeded: 1,
     };
     b.s.items.insert(
@@ -1414,3 +1428,5 @@ fn exported_board_drops_all_validate() {
     );
     println!("{total} drops validated");
 }
+
+mod answers;
