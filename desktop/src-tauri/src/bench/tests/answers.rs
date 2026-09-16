@@ -131,9 +131,13 @@ fn render_card_recorded_trailer() {
     let plain = render_card(&item, "14:05");
     item.answer = answered(1, 1);
     let card = render_card(&item, "14:05");
+    // The Recorded trailer replaces the how-to-answer hint.
     assert_eq!(
         card,
-        format!("{plain}\nRecorded: 2. Move x(https:evil.example) · 14:05")
+        format!(
+            "{}\nRecorded: 2. Move x(https:evil.example) · 14:05",
+            plain.replace("\nTap a number below to answer.", "")
+        )
     );
     let tail = card.rsplit_once("\n```").unwrap().1;
     assert!(
@@ -156,10 +160,11 @@ fn render_board_answered_section() {
     assert_eq!(
         render_board(&[&open, &done, &first], UUID, "14:05", 0),
         "Bench · as of 14:05 · 3 need you\n\
+         To answer: tap the number under a card. Tap it again to undo.\n\
          Needs you\n\
-         1. 🔴 Relay choice (dreamforge) (no card yet)\n\
-         2. 🔴 Relay choice (dreamforge) (no card yet)\n\
-         3. 🔴 Earlier tap (dreamforge) (no card yet)"
+         - 🔴 Relay choice (dreamforge) (no card yet)\n\
+         - 🔴 Relay choice (dreamforge) (no card yet)\n\
+         - 🔴 Earlier tap (dreamforge) (no card yet)"
     );
     done.answer = answered(1, 100);
     first.answer = answered(0, 50);
@@ -168,8 +173,9 @@ fn render_board_answered_section() {
     assert_eq!(
         board,
         "Bench · as of 14:05 · 1 need you · 2 answered\n\
+         To answer: tap the number under a card. Tap it again to undo.\n\
          Needs you\n\
-         1. 🔴 Relay choice (dreamforge) (no card yet)\n\
+         - 🔴 Relay choice (dreamforge) (no card yet)\n\
          Answered, waiting for action (2)\n\
          - 🔴 Earlier tap (dreamforge) → 1. Stay\n\
          - 🔴 Relay choice (dreamforge) → 2. Move x(https:evil.example)"
@@ -517,4 +523,134 @@ async fn kept_answered_cards_count_against_max_cards() {
     assert!(b.s.items[ITEM].card.is_some());
     assert!(b.s.items["orchestrator/c28"].card.is_some());
     assert!(b.s.items["orchestrator/c29"].card.is_none());
+}
+
+// ── Saying how to answer ────────────────────────────────────────────────
+
+const LEGEND: &str = "To answer: tap the number under a card. Tap it again to undo.";
+const HINT: &str = "Tap a number below to answer.";
+
+#[tokio::test]
+async fn legend_is_board_line_2_and_lands_by_edit() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let board = text(&b.posts().last().unwrap().0).to_string();
+    assert_eq!(board.lines().nth(1), Some(LEGEND));
+    // The board an older build posted: the same text without the legend.
+    let mut older: Vec<&str> = board.lines().collect();
+    older.remove(1);
+    b.s.board.as_mut().unwrap().hash = board_hash(&older.join("\n"));
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [40003]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), board_id(&b));
+    assert_eq!(text(&posts[0].0), board);
+}
+
+#[test]
+fn needs_you_lines_are_bullets_not_numbers() {
+    let a = check(&[("id", json!("a"))]).unwrap();
+    let c = check(&[("id", json!("c")), ("severity", json!("info"))]).unwrap();
+    let board = render_board(&[&a, &c], UUID, "14:05", 0);
+    let needs: Vec<&str> = board
+        .lines()
+        .skip_while(|l| *l != "Needs you")
+        .skip(1)
+        .collect();
+    assert_eq!(needs.len(), 2);
+    assert!(needs.iter().all(|l| l.starts_with("- ")), "{board}");
+    assert!(
+        !board
+            .lines()
+            .any(|l| l.starts_with(|c: char| c.is_ascii_digit())),
+        "{board}"
+    );
+}
+
+#[test]
+fn answer_hint_only_on_unanswered_pending_cards() {
+    let mut pending = check(&[]).unwrap();
+    let card = render_card(&pending, "14:05");
+    assert!(
+        card.ends_with(&format!("```\n{HINT}\nas of 14:05")),
+        "{card}"
+    );
+    pending.answer = answered(0, 1);
+    let card = render_card(&pending, "14:05");
+    assert!(!card.contains(HINT) && card.ends_with("Recorded: 1. Stay · 14:05"));
+    let no_options = [("severity", Value::Null), ("options", Value::Null)];
+    let decision = check(
+        &[
+            [("kind", json!("decision")), ("decidedBy", json!("claude"))].as_slice(),
+            &no_options,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let status = check(
+        &[
+            [("kind", json!("status")), ("state", json!("done"))].as_slice(),
+            &no_options,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    for other in [decision, status] {
+        assert!(!render_card(&other, "14:05").contains(HINT));
+    }
+}
+
+#[tokio::test]
+async fn older_card_format_is_reposted_once_and_answers_survive() {
+    const OTHER: &str = "orchestrator/other";
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    b.drop_file(
+        "orchestrator",
+        "other",
+        &drop_json(&[("title", json!("Other"))]),
+    );
+    b.settle(3).await;
+    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    let answer = b.s.items[ITEM].answer.clone();
+    assert!(answer.is_some());
+    // Both cards as an older build tagged them: the bare Drop hash.
+    for i in b.s.items.values_mut() {
+        i.card.as_mut().unwrap().hash = i.hash.clone();
+    }
+    let (kept, old) = (b.card(ITEM).event_id, b.card(OTHER).event_id);
+    let before = b.posts().len();
+    b.settle(4).await;
+    // Only the unanswered card is refreshed: delete, repost, seeds, board pair.
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old);
+    let new_card = b.card(OTHER);
+    assert_eq!(
+        tag_value(&posts[1].0, "client").unwrap(),
+        format!("bench:card:{OTHER}@{}", card_hash(&b.s.items[OTHER]))
+    );
+    assert!(text(&posts[1].0).contains(HINT));
+    // The answered card, its answer and its outbox file stay.
+    assert_eq!(b.s.items[ITEM].answer, answer);
+    assert_eq!(b.card(ITEM).event_id, kept);
+    assert!(outbox(&b).is_some());
+    // A relaunch rebuilds from the relay's tags and reposts nothing again.
+    let board = board_id(&b);
+    let mut relay: Vec<nostr::Event> = b
+        .posts()
+        .into_iter()
+        .map(|(e, _)| serde_json::from_value::<nostr::Event>(e).unwrap())
+        .filter(|e| [&new_card.event_id, &board].contains(&&e.id.to_hex()))
+        .collect();
+    relay.push(owner_tap);
+    reply(&b, &relay.iter().collect::<Vec<_>>());
+    b.s.items.get_mut(OTHER).unwrap().card = None;
+    b.s.needs_rebuild = true;
+    let before = b.posts().len();
+    b.settle(3).await;
+    assert_eq!(b.posts().len(), before);
+    assert_eq!(b.card(OTHER).event_id, new_card.event_id);
+    assert_eq!(b.s.items[ITEM].answer, answer);
 }

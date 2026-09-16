@@ -470,8 +470,20 @@ fn state_name(s: StatusState) -> &'static str {
     }
 }
 
+/// Bump when render_card's text changes: every live unanswered card is then
+/// reposted once with the new text (publish (b) retires it as stale). An
+/// answered card keeps its text, its answer and its 24 h keep.
+pub(crate) const CARD_FORMAT: u32 = 2;
+
+/// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
+/// Cards posted before CARD_FORMAT existed carry the bare Drop hash.
+pub(crate) fn card_hash(item: &Item) -> String {
+    format!("{}.{CARD_FORMAT}", item.hash)
+}
+
 /// Card text: marker line, one fence holding title/summary/options, then the
-/// validated deadline and links outside the fence so the phone can open them.
+/// validated deadline and links outside the fence so the phone can open them,
+/// and on an unanswered pending card the line that says how to answer.
 pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     let mut inner = format!("{}\n\n{}", item.title, summary(&item.body));
     if item.kind == ItemKind::Pending {
@@ -492,6 +504,9 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     }
     for l in &item.links {
         out.push_str(&format!("\n{}: {}", l.label, l.url));
+    }
+    if item.kind == ItemKind::Pending && item.answer.is_none() {
+        out.push_str("\nTap a number below to answer.");
     }
     out.push_str(&format!("\nas of {hhmm}"));
     // Outside the fence, so through plain_title like every board line.
@@ -580,10 +595,13 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     if !answered.is_empty() {
         out.push_str(&format!(" \u{b7} {} answered", answered.len()));
     }
+    // Line 2, so board_hash sees it: an older board picks it up by edit.
+    out.push_str("\nTo answer: tap the number under a card. Tap it again to undo.");
+    // Bullets, not ordinals: a numbered line reads like an option keycap.
     section(
         &mut out,
         "Needs you",
-        pending.iter().enumerate().map(|(n, i)| {
+        pending.iter().map(|i| {
             let target = match &i.card {
                 Some(c) => format!(
                     "\u{2192} buzz://message?channel={channel}&id={}",
@@ -592,8 +610,7 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
                 None => "(no card yet)".to_string(),
             };
             format!(
-                "{}. {} {} ({}) {target}",
-                n + 1,
+                "- {} {} ({}) {target}",
                 marker(i),
                 plain_title(&i.title),
                 i.area

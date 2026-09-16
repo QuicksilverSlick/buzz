@@ -87,6 +87,7 @@ pub(crate) fn is_bench_channel(owner_hex: &str, scope_value: &str) -> bool {
 pub(crate) struct Posted {
     pub event_id: String,
     pub created_at: u64,
+    /// A card: `item::card_hash` when posted. The board: `item::board_hash`.
     pub hash: String,
     /// Option seeds landed so far.
     #[serde(default)]
@@ -597,11 +598,14 @@ fn outbox_path(root: &Path, item_id: &str) -> PathBuf {
     root.join("outbox").join(format!("{item_id}.json"))
 }
 
-/// The card that may carry an answer: present and at the item's current
-/// hash. After an ack re-drop the old card stays until publish (b) retires
-/// it, and it must never re-supply the answer just cleared.
+/// The card that may carry an answer: present and showing the item's current
+/// Drop, in any card format, so an answered card still takes late pills
+/// across a CARD_FORMAT bump. After an ack re-drop the old card stays until
+/// publish (b) retires it, and it must never re-supply the answer just cleared.
 fn live_card(i: &item::Item) -> Option<&Posted> {
-    i.card.as_ref().filter(|c| c.hash == i.hash)
+    i.card
+        .as_ref()
+        .filter(|c| c.hash.split('.').next() == Some(i.hash.as_str()))
 }
 
 /// Re-derive every answer from the approvers' kind-7 reactions on the live
@@ -830,8 +834,9 @@ async fn publish(
         }
     }
 
-    // (b) Delete cards that are stale or no longer wanted. An answered card
-    // is exempt for ANSWER_KEEP_SECS so late pills land, then retired here.
+    // (b) Delete cards that are stale (another Drop or card format) or no
+    // longer wanted. An answered card is exempt for ANSWER_KEEP_SECS so late
+    // pills land, then retired here; it is never refreshed for format alone.
     let stale: Vec<(String, String)> = s
         .items
         .values()
@@ -839,7 +844,7 @@ async fn publish(
             let c = i.card.as_ref()?;
             let retire = match &i.answer {
                 Some(a) => now.saturating_sub(a.answered_at) > item::ANSWER_KEEP_SECS,
-                None => c.hash != i.hash || !wanted.contains(&i.id),
+                None => c.hash != item::card_hash(i) || !wanted.contains(&i.id),
             };
             retire.then(|| (i.id.clone(), c.event_id.clone()))
         })
@@ -861,7 +866,7 @@ async fn publish(
             continue;
         }
         if let Some(orphan) = s.orphan_cards.get(id).cloned() {
-            if orphan.hash == s.items[id].hash {
+            if orphan.hash == item::card_hash(&s.items[id]) {
                 s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
                 continue;
             }
@@ -875,14 +880,15 @@ async fn publish(
             return Ok(());
         }
         let item = s.items[id].clone();
-        let marker = format!("bench:card:{}@{}", item.id, item.hash);
+        let hash = item::card_hash(&item);
+        let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
         match post_message(ctx, s, &text, item::ping_owner(&item), marker, now).await? {
             Outcome::Accepted { event_id } => {
                 s.items.get_mut(id).expect("wanted id").card = Some(Posted {
                     event_id,
                     created_at: s.last_created_at,
-                    hash: item.hash,
+                    hash,
                     seeded: 0,
                 });
                 s.board_dirty = true;

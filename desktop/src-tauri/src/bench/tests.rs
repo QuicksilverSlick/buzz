@@ -350,6 +350,7 @@ fn render_card_golden() {
          ```\n\
          due 2026-09-20T00:00:00Z\n\
          plan: https://github.com/QuicksilverSlick/buzz\n\
+         Tap a number below to answer.\n\
          as of 14:05"
     );
 }
@@ -457,10 +458,11 @@ fn render_board_orders_links_and_folds() {
         board,
         format!(
             "Bench · as of 14:05 · 3 need you\n\
+             To answer: tap the number under a card. Tap it again to undo.\n\
              Needs you\n\
-             1. 🔴 Relay choice (dreamforge) → buzz://message?channel={UUID}&id={hex64}\n\
-             2. 🟠 Installer (dreamforge) (no card yet)\n\
-             3. 🟠 Phone alerts (dreamforge) (no card yet)\n\
+             - 🔴 Relay choice (dreamforge) → buzz://message?channel={UUID}&id={hex64}\n\
+             - 🟠 Installer (dreamforge) (no card yet)\n\
+             - 🟠 Phone alerts (dreamforge) (no card yet)\n\
              Decisions\n\
              - 🧭 label(https:evil.example) Stay (dreamforge) (decided on claude.ai)\n\
              - 🧭 Own relay later (dreamforge) (claude)\n\
@@ -1019,7 +1021,7 @@ async fn one_tick_posts_canary_channel_member_card_seeds_board() {
     assert_eq!(tag_value(card, "e"), None);
     assert_eq!(
         tag_value(card, "client").unwrap(),
-        format!("bench:card:orchestrator/relay-choice@{}", item.hash)
+        format!("bench:card:orchestrator/relay-choice@{}", card_hash(item))
     );
     let card_id = card["id"].as_str().unwrap();
     for (i, emoji) in [(5, OPTION_EMOJI[0]), (6, OPTION_EMOJI[1])] {
@@ -1190,14 +1192,14 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
     let card = kind9(
         &w,
         now - 50,
-        Some(&format!("bench:card:{}@{}", item.id, item.hash)),
+        Some(&format!("bench:card:{}@{}", item.id, card_hash(&item))),
     );
     let unknown = kind9(&w, now - 40, Some("bench:card:orchestrator/gone@abcd"));
     let y = check(&[("id", json!("y")), ("options", json!(["Only"]))]).unwrap();
     let card_y = kind9(
         &w,
         now - 35,
-        Some(&format!("bench:card:{}@{}", y.id, y.hash)),
+        Some(&format!("bench:card:{}@{}", y.id, card_hash(&y))),
     );
     let board_old = kind9(&w, now - 30, Some("bench:board@dddd"));
     let board_new = kind9(&w, now - 20, Some("bench:board@eeee"));
@@ -1215,7 +1217,7 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
     let tracked = Posted {
         event_id: card_y.id.to_hex(),
         created_at: now - 35,
-        hash: y.hash.clone(),
+        hash: card_hash(&y),
         seeded: 1,
     };
     b.s.items.insert(
