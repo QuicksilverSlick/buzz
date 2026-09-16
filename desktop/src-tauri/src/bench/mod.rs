@@ -842,6 +842,11 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
         );
     }
     let root = root_dir()?;
+    // Opt-in: the owner enables the Bench by creating this folder. Until then
+    // an installer that carries this code posts nothing to the relay.
+    if !root.is_dir() {
+        return Err(format!("disabled (create {} to enable)", root.display()));
+    }
     std::fs::create_dir_all(root.join("inbox"))
         .map_err(|e| format!("create {}: {e}", root.display()))?;
     let writer = writer_keys()?;
