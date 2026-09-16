@@ -322,6 +322,11 @@ fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
                 Ok(item) => {
                     let old = s.items.get(&item.id);
                     if old.is_none_or(|o| o.hash != item.hash) {
+                        // The hash-change re-drop is the writer's ack: the
+                        // rebuilt item carries no answer, so the file goes too.
+                        if old.is_some_and(|o| o.answer.is_some()) {
+                            let _ = std::fs::remove_file(outbox_path(root, &item.id));
+                        }
                         let card = old.and_then(|o| o.card.clone());
                         s.items.insert(item.id.clone(), item::Item { card, ..item });
                         changed = true;
@@ -737,9 +742,30 @@ async fn delete(
     }
 }
 
+/// kind 40003 with h+e replacing the text of one of the writer's own kind 9s.
+async fn edit(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    event_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Outcome, String> {
+    let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
+    let edit_tags = events::MessageEditTags {
+        media: &[],
+        custom_emoji: &[],
+        mentions: &[],
+        mention_refs: None,
+    };
+    let builder =
+        events::build_message_edit(channel_id(&s.owner_pubkey), target, text, edit_tags, false)?;
+    post_as_writer(ctx, s, builder, now).await
+}
+
 /// Cards, seeds, then the board, at most `budget` posts; the next tick
 /// resumes where this one stopped because every step lands in state first.
-/// Cards are always delete + repost; only the board is ever edited.
+/// Cards are always delete + repost; only the board is ever edited, and the
+/// one-shot Recorded edit on an answered card.
 async fn publish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -747,24 +773,72 @@ async fn publish(
     now: u64,
     hhmm: &str,
 ) -> Result<(), String> {
-    // (a) The live cards: pending + current by severity, at most MAX_CARDS.
+    // (a) The live cards: pending + current + unanswered by severity; kept
+    // answered cards count against MAX_CARDS (the phone's pill window).
     let mut ranked: Vec<(u8, i64, String)> = s
         .items
         .values()
-        .filter(|i| i.kind == item::ItemKind::Pending && i.validity == item::Validity::Current)
+        .filter(|i| {
+            i.kind == item::ItemKind::Pending
+                && i.validity == item::Validity::Current
+                && i.answer.is_none()
+        })
         .map(|i| (item::severity_rank(i.severity), i.order, i.id.clone()))
         .collect();
     ranked.sort();
-    let wanted: Vec<String> = ranked.into_iter().take(MAX_CARDS).map(|r| r.2).collect();
+    let kept = s
+        .items
+        .values()
+        .filter(|i| i.answer.is_some() && i.card.is_some())
+        .count();
+    let wanted: Vec<String> = ranked
+        .into_iter()
+        .take(MAX_CARDS.saturating_sub(kept))
+        .map(|r| r.2)
+        .collect();
 
-    // (b) Delete cards that are stale or no longer wanted.
+    // (a2) Record / un-record on the live card, first so a tap is acknowledged
+    // within one tick. Diff-driven from what the card text shows (`recorded`)
+    // vs the answer, so it is a no-op after a restart.
+    for id in s.items.keys().cloned().collect::<Vec<_>>() {
+        let item = s.items[&id].clone();
+        let Some(card) = live_card(&item) else {
+            continue;
+        };
+        let want = item.answer.as_ref().map(|a| a.option);
+        if item.recorded == want {
+            continue;
+        }
+        if !spend(budget, 1) {
+            return Ok(());
+        }
+        let text = item::render_card(&item, hhmm);
+        match edit(ctx, s, &card.event_id, &text, now).await {
+            Ok(_) => s.items.get_mut(&id).expect("edited id").recorded = want,
+            // A hand-deleted card: the answer stays and is never reposted; an
+            // unanswered one comes back through (c).
+            Err(e) if e.contains("not found") => {
+                let i = s.items.get_mut(&id).expect("edited id");
+                i.card = None;
+                i.recorded = None;
+                s.board_dirty = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // (b) Delete cards that are stale or no longer wanted. An answered card
+    // is exempt for ANSWER_KEEP_SECS so late pills land, then retired here.
     let stale: Vec<(String, String)> = s
         .items
         .values()
         .filter_map(|i| {
             let c = i.card.as_ref()?;
-            (c.hash != i.hash || !wanted.contains(&i.id))
-                .then(|| (i.id.clone(), c.event_id.clone()))
+            let retire = match &i.answer {
+                Some(a) => now.saturating_sub(a.answered_at) > item::ANSWER_KEEP_SECS,
+                None => c.hash != i.hash || !wanted.contains(&i.id),
+            };
+            retire.then(|| (i.id.clone(), c.event_id.clone()))
         })
         .collect();
     for (id, event_id) in stale {
@@ -772,7 +846,9 @@ async fn publish(
             return Ok(());
         }
         delete(ctx, s, &event_id, now).await?;
-        s.items.get_mut(&id).expect("stale card id").card = None;
+        let i = s.items.get_mut(&id).expect("stale card id");
+        i.card = None;
+        i.recorded = None;
         s.board_dirty = true;
     }
 
@@ -870,25 +946,16 @@ async fn publish(
             }
             Outcome::Duplicate => s.needs_rebuild = true,
         }
-    } else if let Some(board) = s.board.as_ref().filter(|b| b.hash != hash) {
+    } else if let Some(board_id) = s
+        .board
+        .as_ref()
+        .filter(|b| b.hash != hash)
+        .map(|b| b.event_id.clone())
+    {
         if !spend(budget, 1) {
             return Ok(());
         }
-        let target = nostr::EventId::from_hex(&board.event_id).map_err(|e| e.to_string())?;
-        let edit_tags = events::MessageEditTags {
-            media: &[],
-            custom_emoji: &[],
-            mentions: &[],
-            mention_refs: None,
-        };
-        let edit = events::build_message_edit(
-            channel_id(&s.owner_pubkey),
-            target,
-            &text,
-            edit_tags,
-            false,
-        )?;
-        match post_as_writer(ctx, s, edit, now).await {
+        match edit(ctx, s, &board_id, &text, now).await {
             Ok(_) => s.board.as_mut().expect("board").hash = hash,
             // The board was deleted by hand: repost it next tick instead of
             // retrying the edit every 2 s until the daily repost.

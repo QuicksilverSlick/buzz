@@ -36,6 +36,14 @@ fn last_query(b: &Bench) -> Value {
     b.relay.queries.lock().unwrap().last().cloned().unwrap()
 }
 
+fn text(ev: &Value) -> &str {
+    ev["content"].as_str().unwrap()
+}
+
+fn board_id(b: &Bench) -> String {
+    b.s.board.as_ref().unwrap().event_id.clone()
+}
+
 const ITEM: &str = "orchestrator/relay-choice";
 
 #[test]
@@ -216,6 +224,7 @@ async fn owner_tap_records_answer_and_writes_outbox() {
             answered_at: b.now,
         })
     );
+    assert_eq!(b.s.items[ITEM].recorded, Some(1));
     let out = outbox(&b).unwrap();
     assert_eq!(out["item"], json!(ITEM));
     assert_eq!(out["writer"], json!("orchestrator"));
@@ -234,13 +243,140 @@ async fn owner_tap_records_answer_and_writes_outbox() {
             "limit": 500,
         }])
     );
-    // Step 3 puts the card's Recorded edit in front of this board edit and
-    // sets `recorded`; until then only the board's Answered section changes.
-    assert_eq!(b.kinds()[before..], [40003]);
+    // The card's Recorded edit lands first, then the board's Answered section.
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [40003, 40003]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
+    assert!(text(&posts[0].0).ends_with("Recorded: 2. Move · 14:05"));
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), board_id(&b));
+    let board = text(&posts[1].0);
+    assert!(
+        board.contains("Answered, waiting for action (1)")
+            && board.contains("0 need you · 1 answered"),
+        "{board:?}"
+    );
     let queries = b.relay.queries.lock().unwrap().len();
     b.tick().await.unwrap();
-    assert_eq!(b.posts().len(), before + 1);
+    assert_eq!(b.posts().len(), before + 2);
     assert_eq!(b.relay.queries.lock().unwrap().len(), queries + 1);
+}
+
+#[tokio::test]
+async fn retraction_unrecords_in_place_and_latest_wins() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let opt1 = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now - 10);
+    let opt0 = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[0], b.now - 5);
+    let before = b.posts().len();
+    reply(&b, &[&opt1, &opt0]);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].answer.as_ref().map(|a| a.option), Some(0));
+    assert_eq!(outbox(&b).unwrap()["option"], json!(1));
+    // Untapping the newest hands the answer to the one that stays.
+    reply(&b, &[&opt1]);
+    let n = b.posts().len();
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].answer.as_ref().map(|a| a.option), Some(1));
+    let out = outbox(&b).unwrap();
+    assert_eq!(out["option"], json!(2));
+    assert_eq!(out["reaction"]["id"], json!(opt1.id.to_hex()));
+    let posts = b.posts()[n..].to_vec();
+    assert_eq!(b.kinds()[n..], [40003, 40003]);
+    assert!(text(&posts[0].0).contains("Recorded: 2. Move"));
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), board_id(&b));
+    // Untapping the last one un-records in place.
+    reply(&b, &[]);
+    let n = b.posts().len();
+    b.tick().await.unwrap();
+    let item = &b.s.items[ITEM];
+    assert!(item.answer.is_none() && item.recorded.is_none());
+    assert!(outbox(&b).is_none());
+    let posts = b.posts()[n..].to_vec();
+    assert_eq!(b.kinds()[n..], [40003, 40003]);
+    assert!(!text(&posts[0].0).contains("Recorded"));
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), board_id(&b));
+    assert_eq!(b.card(ITEM).event_id, card.event_id);
+    assert!(!b.kinds()[before..].iter().any(|k| matches!(k, 5 | 9)));
+}
+
+#[tokio::test]
+async fn answered_card_kept_24h_then_retired_never_reposted() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    // A same-hash re-drop is a no-op: the answered card stays put.
+    let before = b.posts().len();
+    b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
+    b.settle(2).await;
+    assert!(!b.kinds()[before..].iter().any(|k| matches!(k, 5 | 9)));
+    b.now += 86_401;
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    // The retire, then the board repost pair.
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [5, 9, 5]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
+    let item = &b.s.items[ITEM];
+    assert!(item.card.is_none() && item.recorded.is_none() && item.answer.is_some());
+    assert!(outbox(&b).is_some());
+    assert!(
+        text(&posts[1].0).contains("🟠 24h"),
+        "{:?}",
+        text(&posts[1].0)
+    );
+    let before = b.posts().len();
+    b.settle(3).await;
+    assert!(!b.posts()[before..].iter().any(|(e, _)| {
+        tag_value(e, "client")
+            .is_some_and(|c| c.starts_with("bench:card:orchestrator/relay-choice"))
+    }));
+}
+
+#[tokio::test]
+async fn recorded_edit_not_found_drops_card_keeps_answer() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    b.relay.gone.lock().unwrap().insert(card.event_id.clone());
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    // The refused edit, then the board repost pair.
+    assert_eq!(b.kinds()[before..], [40003, 9, 5]);
+    let item = &b.s.items[ITEM];
+    assert!(item.card.is_none() && item.answer.is_some() && item.recorded.is_none());
+    let before = b.posts().len();
+    b.settle(3).await;
+    assert_eq!(b.posts().len(), before);
+    let posts = b.posts();
+    let board = posts.iter().rev().find(|(e, _)| e["kind"] == 9).unwrap();
+    assert!(text(&board.0).contains("Answered, waiting for action (1)"));
+}
+
+#[tokio::test]
+async fn ack_by_redrop_clears_answer_and_outbox() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    assert!(outbox(&b).is_some());
+    let before = b.posts().len();
+    b.drop_file(
+        "orchestrator",
+        "relay-choice",
+        &drop_json(&[("title", json!("Relay choice, reworded"))]),
+    );
+    b.settle(3).await;
+    // The existing reword flow: the old card goes, the new one is reposted
+    // and seeded, the board follows; the tap on the old card counts no more.
+    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
+    let item = &b.s.items[ITEM];
+    assert!(item.answer.is_none() && item.recorded.is_none());
+    assert!(outbox(&b).is_none());
+    assert_ne!(b.card(ITEM).event_id, card.event_id);
 }
 
 #[tokio::test]
