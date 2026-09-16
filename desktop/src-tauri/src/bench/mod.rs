@@ -1078,6 +1078,11 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
             Ok(()) => s.last_error = None,
             Err(e) => {
                 eprintln!("bench: {e}");
+                // One toast per failure edge, re-armed by an Ok tick.
+                if s.last_error.is_none() {
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app.notification().builder().title("Bench").body(&e).show();
+                }
                 s.last_error = Some(e);
             }
         }
