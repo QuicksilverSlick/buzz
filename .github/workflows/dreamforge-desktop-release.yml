@@ -2,12 +2,14 @@ name: Dreamforge desktop release
 
 # Builds Dreamforge for macOS (Apple Silicon and Intel) and Windows. A manual run
 # with publish=true uploads the installers and latest.json to the rolling release
-# dreamforge-desktop-latest, which installed apps poll for updates. Pull requests
-# touching this file only build; their installers are run artifacts.
+# dreamforge-desktop-latest, which installed apps poll for updates. Publishing only
+# works from main. Pull requests touching this file only build; their installers are
+# run artifacts.
 #
 # Updater signing needs the TAURI_SIGNING_PRIVATE_KEY secret: the minisign key whose
 # public half is desktop/src-tauri/dreamforge-updater.pub, with an empty password.
-# Without it builds still produce installers but no updater archives, and publish refuses.
+# The key only reaches manual runs on main, so it never meets unreviewed code. Other
+# runs still produce installers but no updater archives, and publish refuses.
 #
 # macOS builds are ad-hoc signed and not notarized (no Apple Developer account).
 
@@ -38,7 +40,7 @@ env:
   BUZZ_UPDATER_ENDPOINT: https://github.com/QuicksilverSlick/buzz/releases/download/dreamforge-desktop-latest/latest.json
   VERSION: ${{ inputs.version }}
   PUBLISH: ${{ inputs.publish }}
-  HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+  HAS_UPDATER_KEY: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
 
 jobs:
   macos:
@@ -79,7 +81,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Set version
-        if: env.VERSION != ''
+        if: github.event_name == 'workflow_dispatch'
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$VERSION'"; exit 1; }
           # Fail in minutes, not after the builds, when a publish would be refused.
@@ -89,10 +91,12 @@ jobs:
 
       - name: Generate release config
         run: |
-          if [ "$HAS_UPDATER_KEY" != true ]; then
-            [ "$PUBLISH" != true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
-            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; building without updater artifacts"
+          python3 scripts/release-latest-json.py --selftest
+          if [ "$PUBLISH" = true ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::publish only from main, not $GITHUB_REF"; exit 1; }
+            [ "$HAS_UPDATER_KEY" = true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
           fi
+          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only manual runs on main get it); building without updater artifacts"
           BUZZ_UPDATER_PUBLIC_KEY=$(cat desktop/src-tauri/dreamforge-updater.pub)
           export BUZZ_UPDATER_PUBLIC_KEY
           echo "BUZZ_UPDATER_PUBLIC_KEY=$BUZZ_UPDATER_PUBLIC_KEY" >> "$GITHUB_ENV"
@@ -116,7 +120,7 @@ jobs:
       - name: Build app and DMG
         run: cd desktop && pnpm tauri build --verbose --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_UPDATER_KEY == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"
@@ -135,8 +139,9 @@ jobs:
           mkdir out
           cp "$BUNDLE"/dmg/*.dmg out/
           if [ "$HAS_UPDATER_KEY" = true ]; then
-            cp "$BUNDLE/macos/Dreamforge.app.tar.gz" "out/Dreamforge_$ARCH.app.tar.gz"
-            cp "$BUNDLE/macos/Dreamforge.app.tar.gz.sig" "out/Dreamforge_$ARCH.app.tar.gz.sig"
+            # Versioned, so publishing never replaces a file the live latest.json points at.
+            cp "$BUNDLE/macos/Dreamforge.app.tar.gz" "out/Dreamforge_${VERSION}_$ARCH.app.tar.gz"
+            cp "$BUNDLE/macos/Dreamforge.app.tar.gz.sig" "out/Dreamforge_${VERSION}_$ARCH.app.tar.gz.sig"
           fi
           ls -l out
 
@@ -178,7 +183,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Set version
-        if: env.VERSION != ''
+        if: github.event_name == 'workflow_dispatch'
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$VERSION'"; exit 1; }
           cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
@@ -186,10 +191,11 @@ jobs:
 
       - name: Generate release config
         run: |
-          if [ "$HAS_UPDATER_KEY" != true ]; then
-            [ "$PUBLISH" != true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
-            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; building without updater artifacts"
+          if [ "$PUBLISH" = true ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::publish only from main, not $GITHUB_REF"; exit 1; }
+            [ "$HAS_UPDATER_KEY" = true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
           fi
+          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only manual runs on main get it); building without updater artifacts"
           BUZZ_UPDATER_PUBLIC_KEY=$(cat desktop/src-tauri/dreamforge-updater.pub)
           export BUZZ_UPDATER_PUBLIC_KEY
           echo "BUZZ_UPDATER_PUBLIC_KEY=$BUZZ_UPDATER_PUBLIC_KEY" >> "$GITHUB_ENV"
@@ -211,7 +217,7 @@ jobs:
       - name: Build NSIS installer
         run: cd desktop && pnpm tauri build --verbose --target "$TARGET" --bundles nsis --config src-tauri/tauri.release.conf.json
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_UPDATER_KEY == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
@@ -233,7 +239,7 @@ jobs:
 
   publish:
     name: Publish
-    if: github.repository == 'QuicksilverSlick/buzz' && github.event_name == 'workflow_dispatch' && inputs.publish
+    if: github.repository == 'QuicksilverSlick/buzz' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish
     needs: [macos, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -263,16 +269,19 @@ jobs:
 
       - name: Write latest.json
         run: |
-          ls -l dist
+          # Refuses a VERSION that is not plain x.y.z or not newer than the live feed.
           python3 scripts/release-latest-json.py --check "$VERSION" "$BUZZ_UPDATER_ENDPOINT"
+          ls -l dist
           BASE="https://github.com/$GH_REPO/releases/download/$TAG"
+          MAC="Dreamforge_${VERSION}"
           EXE="Dreamforge_${VERSION}_x64-setup.exe"
-          for f in Dreamforge_aarch64.app.tar.gz Dreamforge_x64.app.tar.gz "$EXE"; do
+          for f in "${MAC}_aarch64.app.tar.gz" "${MAC}_x64.app.tar.gz" "$EXE"; do
             [ -s "dist/$f" ] || { echo "::error::missing dist/$f"; exit 1; }
           done
-          python3 scripts/release-latest-json.py "$VERSION" \
-            "darwin-aarch64=dist/Dreamforge_aarch64.app.tar.gz.sig=$BASE/Dreamforge_aarch64.app.tar.gz" \
-            "darwin-x86_64=dist/Dreamforge_x64.app.tar.gz.sig=$BASE/Dreamforge_x64.app.tar.gz" \
+          # --pubkey refuses signatures from any key but the one installed apps trust.
+          python3 scripts/release-latest-json.py --pubkey desktop/src-tauri/dreamforge-updater.pub "$VERSION" \
+            "darwin-aarch64=dist/${MAC}_aarch64.app.tar.gz.sig=$BASE/${MAC}_aarch64.app.tar.gz" \
+            "darwin-x86_64=dist/${MAC}_x64.app.tar.gz.sig=$BASE/${MAC}_x64.app.tar.gz" \
             "windows-x86_64=dist/$EXE.sig=$BASE/$EXE" > latest.json
           cat latest.json
 
