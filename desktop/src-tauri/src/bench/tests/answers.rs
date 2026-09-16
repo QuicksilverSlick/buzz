@@ -136,7 +136,7 @@ fn render_card_recorded_trailer() {
         card,
         format!(
             "{}\nRecorded: 2. Move x(https:evil.example) · 14:05",
-            plain.replace("\nTap a number below to answer.", "")
+            plain.replace(&format!("\n{HINT}"), "")
         )
     );
     let tail = card.rsplit_once("\n```").unwrap().1;
@@ -159,26 +159,41 @@ fn render_board_answered_section() {
     let mut first = check(&[("id", json!("zz")), ("title", json!("Earlier tap"))]).unwrap();
     assert_eq!(
         render_board(&[&open, &done, &first], UUID, "14:05", 0),
-        "Bench · as of 14:05 · 3 need you\n\
-         To answer: tap the number under a card. Tap it again to undo.\n\
-         Needs you\n\
-         - 🔴 Relay choice (dreamforge) (no card yet)\n\
-         - 🔴 Relay choice (dreamforge) (no card yet)\n\
-         - 🔴 Earlier tap (dreamforge) (no card yet)"
+        format!(
+            "Bench · as of 14:05 · needs you: 3\n\
+             {LEGEND}\n\
+             \n\
+             Needs you\n\
+             - 🔴 Relay choice (dreamforge) (no card yet)\n\
+             - 🔴 Relay choice (dreamforge) (no card yet)\n\
+             - 🔴 Earlier tap (dreamforge) (no card yet)"
+        )
     );
     done.answer = answered(1, 100);
     first.answer = answered(0, 50);
+    // A kept card is linked, so an undo is one tap away.
+    let hex64 = "ab".repeat(32);
+    first.card = Some(Posted {
+        event_id: hex64.clone(),
+        created_at: 1,
+        hash: card_hash(&first),
+        seeded: 1,
+    });
     let all = [&open, &done, &first];
     let board = render_board(&all, UUID, "14:05", 100);
     assert_eq!(
         board,
-        "Bench · as of 14:05 · 1 need you · 2 answered\n\
-         To answer: tap the number under a card. Tap it again to undo.\n\
-         Needs you\n\
-         - 🔴 Relay choice (dreamforge) (no card yet)\n\
-         Answered, waiting for action (2)\n\
-         - 🔴 Earlier tap (dreamforge) → 1. Stay\n\
-         - 🔴 Relay choice (dreamforge) → 2. Move x(https:evil.example)"
+        format!(
+            "Bench · as of 14:05 · needs you: 1 · answered: 2\n\
+             {LEGEND}\n\
+             \n\
+             Needs you\n\
+             - 🔴 Relay choice (dreamforge) (no card yet)\n\
+             \n\
+             Answered, waiting for action (2)\n\
+             - 🔴 Earlier tap (dreamforge) → 1. Stay · buzz://message?channel={UUID}&id={hex64}\n\
+             - 🔴 Relay choice (dreamforge) → 2. Move x(https:evil.example)"
+        )
     );
     assert!(!board.contains("https://") && !board.contains('['));
     // 24 h exactly (for the earliest answer) is not late; one second past
@@ -200,9 +215,11 @@ fn m1_state_loads() {
     let mut item = check(&[]).unwrap();
     let mut v = serde_json::to_value(&item).unwrap();
     let o = v.as_object_mut().unwrap();
-    assert!(o.remove("answer").is_some() && o.remove("recorded").is_some());
+    for field in ["answer", "recorded", "quietRepost"] {
+        assert!(o.remove(field).is_some(), "{field}");
+    }
     let loaded: Item = serde_json::from_value(v).unwrap();
-    assert!(loaded.answer.is_none() && loaded.recorded.is_none());
+    assert!(loaded.answer.is_none() && loaded.recorded.is_none() && !loaded.quiet_repost);
     // And the M2 fields round-trip in camelCase.
     item.answer = answered(1, 7);
     item.recorded = Some(1);
@@ -258,7 +275,7 @@ async fn owner_tap_records_answer_and_writes_outbox() {
     let board = text(&posts[1].0);
     assert!(
         board.contains("Answered, waiting for action (1)")
-            && board.contains("0 need you · 1 answered"),
+            && board.contains("needs you: 0 · answered: 1"),
         "{board:?}"
     );
     let queries = b.relay.queries.lock().unwrap().len();
@@ -527,8 +544,9 @@ async fn kept_answered_cards_count_against_max_cards() {
 
 // ── Saying how to answer ────────────────────────────────────────────────
 
-const LEGEND: &str = "To answer: tap the number under a card. Tap it again to undo.";
-const HINT: &str = "Tap a number below to answer.";
+const LEGEND: &str =
+    "To answer: tap one number under a card. To undo or change it, tap that number again first.";
+const HINT: &str = "Tap one number below to answer.";
 
 #[tokio::test]
 async fn legend_is_board_line_2_and_lands_by_edit() {
@@ -610,30 +628,33 @@ async fn older_card_format_is_reposted_once_and_answers_survive() {
         &drop_json(&[("title", json!("Other"))]),
     );
     b.settle(3).await;
-    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
-    reply(&b, &[&owner_tap]);
-    b.tick().await.unwrap();
-    let answer = b.s.items[ITEM].answer.clone();
-    assert!(answer.is_some());
-    // Both cards as an older build tagged them: the bare Drop hash.
+    // Both cards as an older build tagged them (the bare Drop hash), one
+    // tapped before the upgrade.
     for i in b.s.items.values_mut() {
         i.card.as_mut().unwrap().hash = i.hash.clone();
     }
     let (kept, old) = (b.card(ITEM).event_id, b.card(OTHER).event_id);
+    let owner_tap = tap(&b.ctx.owner, &kept, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&owner_tap]);
     let before = b.posts().len();
     b.settle(4).await;
-    // Only the unanswered card is refreshed: delete, repost, seeds, board pair.
+    let answer = b.s.items[ITEM].answer.clone();
+    assert!(answer.is_some());
+    // The tapped card takes the new text by its Recorded edit; only the
+    // unanswered one is refreshed: delete, quiet repost, seeds, board pair.
     let posts = b.posts()[before..].to_vec();
-    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
-    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old);
+    assert_eq!(b.kinds()[before..], [40003, 5, 9, 7, 7, 9, 5]);
+    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), kept);
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), old);
     let new_card = b.card(OTHER);
     assert_eq!(
-        tag_value(&posts[1].0, "client").unwrap(),
+        tag_value(&posts[2].0, "client").unwrap(),
         format!("bench:card:{OTHER}@{}", card_hash(&b.s.items[OTHER]))
     );
-    assert!(text(&posts[1].0).contains(HINT));
+    assert!(text(&posts[2].0).contains(HINT));
+    assert_eq!(tag_value(&posts[2].0, "p"), None);
+    assert!(!b.s.items[OTHER].quiet_repost);
     // The answered card, its answer and its outbox file stay.
-    assert_eq!(b.s.items[ITEM].answer, answer);
     assert_eq!(b.card(ITEM).event_id, kept);
     assert!(outbox(&b).is_some());
     // A relaunch rebuilds from the relay's tags and reposts nothing again.
@@ -653,4 +674,11 @@ async fn older_card_format_is_reposted_once_and_answers_survive() {
     assert_eq!(b.posts().len(), before);
     assert_eq!(b.card(OTHER).event_id, new_card.event_id);
     assert_eq!(b.s.items[ITEM].answer, answer);
+    // Undo on the older card un-records it in place, like on any card.
+    reply(&b, &[]);
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert_eq!(b.kinds()[before..], [40003, 40003]);
+    assert_eq!(b.card(ITEM).event_id, kept);
+    assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
 }

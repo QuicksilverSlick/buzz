@@ -160,6 +160,10 @@ pub(crate) struct Item {
     /// The option the live card's text shows as Recorded; None = plain.
     #[serde(default)]
     pub recorded: Option<usize>,
+    /// The owner was already pinged for an earlier card of this Drop, so the
+    /// next one posts without the p tag. A new Drop starts false.
+    #[serde(default)]
+    pub quiet_repost: bool,
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area are
@@ -374,6 +378,7 @@ pub(crate) fn validate(
         card: None,
         answer: None,
         recorded: None,
+        quiet_repost: false,
     })
 }
 
@@ -471,8 +476,9 @@ fn state_name(s: StatusState) -> &'static str {
 }
 
 /// Bump when render_card's text changes: every live unanswered card is then
-/// reposted once with the new text (publish (b) retires it as stale). An
-/// answered card keeps its text, its answer and its 24 h keep.
+/// reposted once, without a ping, with the new text (publish (b) retires it
+/// as stale). An answered card gets the new text through its Recorded edit
+/// and keeps its answer and its 24 h keep.
 pub(crate) const CARD_FORMAT: u32 = 2;
 
 /// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
@@ -506,7 +512,7 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
         out.push_str(&format!("\n{}: {}", l.label, l.url));
     }
     if item.kind == ItemKind::Pending && item.answer.is_none() {
-        out.push_str("\nTap a number below to answer.");
+        out.push_str("\nTap one number below to answer.");
     }
     out.push_str(&format!("\nas of {hhmm}"));
     // Outside the fence, so through plain_title like every board line.
@@ -589,26 +595,29 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     status.sort_by_key(by_area);
 
     let mut out = format!(
-        "Bench \u{b7} as of {hhmm} \u{b7} {} need you",
+        "Bench \u{b7} as of {hhmm} \u{b7} needs you: {}",
         pending.len()
     );
     if !answered.is_empty() {
-        out.push_str(&format!(" \u{b7} {} answered", answered.len()));
+        out.push_str(&format!(" \u{b7} answered: {}", answered.len()));
     }
     // Line 2, so board_hash sees it: an older board picks it up by edit.
-    out.push_str("\nTo answer: tap the number under a card. Tap it again to undo.");
+    // Reactions toggle per keycap: untapping the answer before tapping
+    // another keeps one pill lit, so an untap never revives an old choice.
+    out.push_str(
+        "\nTo answer: tap one number under a card. To undo or change it, tap that number again first.",
+    );
+    let link = |i: &Item| {
+        i.card
+            .as_ref()
+            .map(|c| format!("buzz://message?channel={channel}&id={}", c.event_id))
+    };
     // Bullets, not ordinals: a numbered line reads like an option keycap.
     section(
         &mut out,
         "Needs you",
         pending.iter().map(|i| {
-            let target = match &i.card {
-                Some(c) => format!(
-                    "\u{2192} buzz://message?channel={channel}&id={}",
-                    c.event_id
-                ),
-                None => "(no card yet)".to_string(),
-            };
+            let target = link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
             format!(
                 "- {} {} ({}) {target}",
                 marker(i),
@@ -632,8 +641,10 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
             } else {
                 ""
             };
+            // The kept card is where an undo or a change is tapped.
+            let card = link(i).map(|l| format!(" \u{b7} {l}")).unwrap_or_default();
             format!(
-                "- {} {} ({}) \u{2192} {}. {opt}{late}",
+                "- {} {} ({}) \u{2192} {}. {opt}{late}{card}",
                 marker(i),
                 plain_title(&i.title),
                 i.area,
@@ -679,7 +690,9 @@ fn section(out: &mut String, name: &str, lines: impl Iterator<Item = String>) {
     if lines.peek().is_none() {
         return;
     }
-    out.push('\n');
+    // A blank line ends the list above; without it the desktop renders the
+    // name as a lazy continuation of the previous bullet.
+    out.push_str("\n\n");
     out.push_str(name);
     for l in lines {
         out.push('\n');

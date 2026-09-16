@@ -350,7 +350,7 @@ fn render_card_golden() {
          ```\n\
          due 2026-09-20T00:00:00Z\n\
          plan: https://github.com/QuicksilverSlick/buzz\n\
-         Tap a number below to answer.\n\
+         Tap one number below to answer.\n\
          as of 14:05"
     );
 }
@@ -457,15 +457,18 @@ fn render_board_orders_links_and_folds() {
     assert_eq!(
         board,
         format!(
-            "Bench · as of 14:05 · 3 need you\n\
-             To answer: tap the number under a card. Tap it again to undo.\n\
+            "Bench · as of 14:05 · needs you: 3\n\
+             To answer: tap one number under a card. To undo or change it, tap that number again first.\n\
+             \n\
              Needs you\n\
              - 🔴 Relay choice (dreamforge) → buzz://message?channel={UUID}&id={hex64}\n\
              - 🟠 Installer (dreamforge) (no card yet)\n\
              - 🟠 Phone alerts (dreamforge) (no card yet)\n\
+             \n\
              Decisions\n\
              - 🧭 label(https:evil.example) Stay (dreamforge) (decided on claude.ai)\n\
              - 🧭 Own relay later (dreamforge) (claude)\n\
+             \n\
              Status\n\
              - ▪ dreamforge: Bench M1 — in-progress"
         )

@@ -87,7 +87,8 @@ pub(crate) fn is_bench_channel(owner_hex: &str, scope_value: &str) -> bool {
 pub(crate) struct Posted {
     pub event_id: String,
     pub created_at: u64,
-    /// A card: `item::card_hash` when posted. The board: `item::board_hash`.
+    /// A card: the `item::card_hash` its text shows (posted or last edited).
+    /// The board: `item::board_hash`.
     pub hash: String,
     /// Option seeds landed so far.
     #[serde(default)]
@@ -598,14 +599,28 @@ fn outbox_path(root: &Path, item_id: &str) -> PathBuf {
     root.join("outbox").join(format!("{item_id}.json"))
 }
 
+/// Whether a card shows the item's current Drop, in any card format.
+fn same_drop(c: &Posted, i: &item::Item) -> bool {
+    c.hash.split('.').next() == Some(i.hash.as_str())
+}
+
 /// The card that may carry an answer: present and showing the item's current
-/// Drop, in any card format, so an answered card still takes late pills
-/// across a CARD_FORMAT bump. After an ack re-drop the old card stays until
-/// publish (b) retires it, and it must never re-supply the answer just cleared.
+/// Drop, in any card format, so a tap on an older build's card counts before
+/// publish (b) refreshes it. After an ack re-drop the old card stays until
+/// (b) retires it, and it must never re-supply the answer just cleared.
 fn live_card(i: &item::Item) -> Option<&Posted> {
-    i.card
-        .as_ref()
-        .filter(|c| c.hash.split('.').next() == Some(i.hash.as_str()))
+    i.card.as_ref().filter(|c| same_drop(c, i))
+}
+
+/// Forget a card that is gone from the relay. The owner was already pinged
+/// for a card of the same Drop, so its replacement goes out quietly.
+fn forget_card(s: &mut BenchState, id: &str) {
+    let i = s.items.get_mut(id).expect("carded id");
+    let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));
+    i.quiet_repost |= same;
+    i.card = None;
+    i.recorded = None;
+    s.board_dirty = true;
 }
 
 /// Re-derive every answer from the approvers' kind-7 reactions on the live
@@ -821,15 +836,16 @@ async fn publish(
         }
         let text = item::render_card(&item, hhmm);
         match edit(ctx, s, &card.event_id, &text, now).await {
-            Ok(_) => s.items.get_mut(&id).expect("edited id").recorded = want,
+            // The edit re-rendered the whole card, so it now shows this card
+            // format too: (b) must not retire it for an older one.
+            Ok(_) => {
+                let i = s.items.get_mut(&id).expect("edited id");
+                i.recorded = want;
+                i.card.as_mut().expect("edited card").hash = item::card_hash(&item);
+            }
             // A hand-deleted card: the answer stays and is never reposted; an
             // unanswered one comes back through (c).
-            Err(e) if e.contains("not found") => {
-                let i = s.items.get_mut(&id).expect("edited id");
-                i.card = None;
-                i.recorded = None;
-                s.board_dirty = true;
-            }
+            Err(e) if e.contains("not found") => forget_card(s, &id),
             Err(e) => return Err(e),
         }
     }
@@ -854,10 +870,7 @@ async fn publish(
             return Ok(());
         }
         delete(ctx, s, &event_id, now).await?;
-        let i = s.items.get_mut(&id).expect("stale card id");
-        i.card = None;
-        i.recorded = None;
-        s.board_dirty = true;
+        forget_card(s, &id);
     }
 
     // (c) Post missing cards, adopting a recovered orphan when its hash matches.
@@ -875,6 +888,8 @@ async fn publish(
             }
             delete(ctx, s, &orphan.event_id, now).await?;
             s.orphan_cards.remove(id);
+            let i = s.items.get_mut(id).expect("wanted id");
+            i.quiet_repost |= same_drop(&orphan, i);
         }
         if !spend(budget, 1) {
             return Ok(());
@@ -883,14 +898,18 @@ async fn publish(
         let hash = item::card_hash(&item);
         let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
-        match post_message(ctx, s, &text, item::ping_owner(&item), marker, now).await? {
+        let ping = item::ping_owner(&item) && !item.quiet_repost;
+        match post_message(ctx, s, &text, ping, marker, now).await? {
             Outcome::Accepted { event_id } => {
-                s.items.get_mut(id).expect("wanted id").card = Some(Posted {
+                let created_at = s.last_created_at;
+                let i = s.items.get_mut(id).expect("wanted id");
+                i.card = Some(Posted {
                     event_id,
-                    created_at: s.last_created_at,
+                    created_at,
                     hash,
                     seeded: 0,
                 });
+                i.quiet_repost = false;
                 s.board_dirty = true;
             }
             Outcome::Duplicate => {
