@@ -26,6 +26,7 @@ const OPTION_MAX: usize = 80;
 const OPTIONS_MAX: usize = 4;
 const LINKS_MAX: usize = 4;
 const LABEL_MAX: usize = 40;
+const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
 const BOARD_TITLE_MAX: usize = 60;
 
@@ -155,15 +156,30 @@ fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
     if s.chars().count() > max_chars {
         return Err(format!("{field}: longer than {max_chars} chars"));
     }
-    if s.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
-        return Err(format!("{field}: control character"));
+    // Cc except newline and tab, plus the zero-width and bidi format
+    // characters both apps honour inside a fence: an option list reordered
+    // on screen steers the one tap the board exists for.
+    let bad = |c: char| {
+        (c.is_control() && c != '\n' && c != '\t')
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    };
+    if s.chars().any(bad) {
+        return Err(format!("{field}: control or format character"));
     }
     // The egress guard only stops the encrypted-key prefix; a raw secret or a
     // nostr: URI in card text would otherwise publish. The encrypted prefix is
-    // assembled at runtime so the source word scan stays confined.
+    // assembled at runtime so the source word scan stays confined. "www." is
+    // a GFM autolink on the desktop even without a scheme or slash.
     let lower = s.to_lowercase();
     let encrypted = ["ncrypt", "sec1"].concat();
-    for needle in ["nsec1", "nostr:", encrypted.as_str()] {
+    for needle in ["nsec1", "nostr:", "www.", encrypted.as_str()] {
         if lower.contains(needle) {
             return Err(format!("{field}: contains {needle:?}"));
         }
@@ -208,6 +224,15 @@ fn valid_link(l: &Link) -> Result<(), String> {
             l.label
         ));
     }
+    // The card prints the raw url outside the fence, but the parser below
+    // drops tabs and newlines and encodes spaces: bound the raw bytes first.
+    if !l.url.chars().all(|c| c.is_ascii_graphic() && c != '@') {
+        return Err(format!(
+            "link url {:?}: printable ascii without spaces or '@' only",
+            l.url
+        ));
+    }
+    valid_text(&l.url, URL_MAX, "link url")?;
     if let Some(rest) = l.url.strip_prefix("buzz://message?") {
         return if valid_buzz_query(rest) {
             Ok(())
@@ -219,8 +244,15 @@ fn valid_link(l: &Link) -> Result<(), String> {
         };
     }
     let u = url::Url::parse(&l.url).map_err(|e| format!("link url {:?}: {e}", l.url))?;
-    if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
-        return Err(format!("link url {:?}: https without userinfo only", l.url));
+    if u.scheme() != "https"
+        || u.port().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return Err(format!(
+            "link url {:?}: https without userinfo or port only",
+            l.url
+        ));
     }
     if !ALLOWED_HTTPS_HOSTS.contains(&u.host_str().unwrap_or_default()) {
         return Err(format!(
@@ -282,9 +314,17 @@ pub(crate) fn validate(
     if d.private {
         return Err("private items ship in Phase 3".to_string());
     }
-    if let Some(deadline) = &d.deadline {
-        chrono::DateTime::parse_from_rfc3339(deadline).map_err(|e| format!("deadline: {e}"))?;
-    }
+    // Kept in canonical form: chrono also takes a space separator and any
+    // number of fractional digits, and the card prints it outside the fence.
+    let deadline = d
+        .deadline
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .map_err(|e| format!("deadline: {e}"))
+        })
+        .transpose()?;
     if d.links.len() > LINKS_MAX {
         return Err(format!("more than {LINKS_MAX} links"));
     }
@@ -308,7 +348,7 @@ pub(crate) fn validate(
         validity: d.validity,
         links: d.links,
         needs: d.needs,
-        deadline: d.deadline,
+        deadline,
         hash,
         updated_at: now_iso.to_string(),
         card: None,

@@ -41,14 +41,20 @@ const MAX_CLOCK_LEAD_SECS: u64 = 600;
 const MAX_DROP_BYTES: u64 = 64 * 1024;
 const RECOVER_LIMIT: u32 = 500;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const TIMED_OUT: &str = "submit timed out";
 
-/// The debug fence: a debug build may only ever reach a loopback relay.
+/// The debug fence: a debug build may only ever reach a loopback relay. The
+/// host is checked parsed, since `ws://localhost@evil.example` starts fine.
 pub(crate) fn relay_ws_from(env: Option<&str>) -> Option<String> {
     if !cfg!(debug_assertions) {
         return Some(RELAY_WS.to_string());
     }
-    env.filter(|u| u.starts_with("ws://localhost") || u.starts_with("ws://127.0.0.1"))
-        .map(str::to_string)
+    let loopback = |u: &&str| {
+        url::Url::parse(u).is_ok_and(|p| {
+            p.scheme() == "ws" && matches!(p.host_str(), Some("localhost" | "127.0.0.1"))
+        })
+    };
+    env.filter(loopback).map(str::to_string)
 }
 
 /// `~/.dreamforge/bench` (debug: `~/.dreamforge-dev/bench`): outside the app
@@ -365,21 +371,21 @@ async fn submit(
     ev: &nostr::Event,
     keys: &nostr::Keys,
     tag: Option<&str>,
-) -> Result<Result<Outcome, String>, String> {
+) -> Result<Outcome, String> {
     let sent = tokio::time::timeout(
         SUBMIT_TIMEOUT,
         crate::relay::submit_signed_event_at_with_keys_tagged(ev, ctx.state, &ctx.base, keys, tag),
     )
     .await
-    .map_err(|_| "submit timed out".to_string())?;
-    Ok(match sent {
+    .map_err(|_| TIMED_OUT.to_string())?;
+    match sent {
         Ok(r) if r.message.starts_with("duplicate:") => Ok(Outcome::Duplicate),
         Ok(r) => Ok(Outcome::Accepted {
             event_id: r.event_id,
         }),
         Err(e) if e.contains("duplicate:") => Ok(Outcome::Duplicate),
         Err(e) => Err(e),
-    })
+    }
 }
 
 /// Owner-signed bootstrap events: never a tag, the owner is a member.
@@ -387,7 +393,7 @@ async fn post_as_owner(ctx: &Ctx<'_>, builder: nostr::EventBuilder) -> Result<Ou
     let ev = builder
         .sign_with_keys(&ctx.owner)
         .map_err(|e| e.to_string())?;
-    submit(ctx, &ev, &ctx.owner, None).await?
+    submit(ctx, &ev, &ctx.owner, None).await
 }
 
 /// Writer-signed events on the monotonic clock. The NIP-OA tag is lazy: the
@@ -409,7 +415,7 @@ async fn post_as_writer(
             Admission::ViaOwner => Some(owner_tag(&ctx.owner, &writer_pk, now)?),
             _ => None,
         };
-        match submit(ctx, &ev, &ctx.writer, tag.as_deref()).await? {
+        match submit(ctx, &ev, &ctx.writer, tag.as_deref()).await {
             Err(e) if e.contains("403") && e.contains("must be a relay member") => {
                 if s.admission == Admission::ViaOwner {
                     s.admission = Admission::Denied;
@@ -420,7 +426,11 @@ async fn post_as_writer(
                 }
                 s.admission = Admission::ViaOwner;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A lost reply may hide a landed event: re-read the relay.
+                s.needs_rebuild |= e == TIMED_OUT;
+                return Err(e);
+            }
             Ok(outcome) => {
                 if tag.is_none() {
                     s.admission = Admission::Open;
@@ -475,6 +485,17 @@ fn read_members(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Take `n` posts from the tick's budget, or say no.
+fn spend(budget: &mut usize, n: usize) -> bool {
+    match budget.checked_sub(n) {
+        Some(left) => {
+            *budget = left;
+            true
+        }
+        None => false,
+    }
+}
+
 /// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member (owner). Each
 /// step is retried every tick until its flag is set. The tag-free kind 0 goes
 /// first so a refused writer leaves no half-built channel behind.
@@ -487,19 +508,17 @@ async fn bootstrap(
     let ch = channel_id(&s.owner_pubkey);
     let writer_hex = ctx.writer.public_key().to_hex();
     if !s.profile_published {
-        if *budget == 0 {
+        if !spend(budget, 1) {
             return Ok(false);
         }
-        *budget -= 1;
         let profile = events::build_profile(Some("Bench"), Some("bench"), None, Some(ABOUT), None)?;
         post_as_writer(ctx, s, profile, now).await?;
         s.profile_published = true;
     }
     if !s.channel_created {
-        if *budget == 0 {
+        if !spend(budget, 1) {
             return Ok(false);
         }
-        *budget -= 1;
         let create =
             events::build_create_channel(ch, "bench", "private", "stream", Some(ABOUT), None)?;
         post_as_owner(ctx, create).await?;
@@ -509,12 +528,14 @@ async fn bootstrap(
         if s.members_added.contains(&hex) {
             continue;
         }
-        if *budget == 0 {
+        if !spend(budget, 1) {
             break;
         }
-        *budget -= 1;
         post_as_owner(ctx, events::build_add_member(ch, &hex, None)?).await?;
         s.members_added.push(hex);
+        // The relay stamps a member_joined row after the 9000: repost the
+        // board so it stays newest.
+        s.board_dirty = true;
     }
     Ok(s.members_added.contains(&writer_hex))
 }
@@ -531,6 +552,12 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     let r = rebuild_map(&events, &writer_hex);
     for (id, posted) in r.cards {
         match s.items.get_mut(&id) {
+            // The card we already track keeps its seed count.
+            Some(item)
+                if item
+                    .card
+                    .as_ref()
+                    .is_some_and(|c| c.event_id == posted.event_id) => {}
             Some(item) => item.card = Some(posted),
             None => {
                 s.orphan_cards.insert(id, posted);
@@ -539,10 +566,13 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     }
     s.board = r.board;
     s.strays = r.stray_ids;
-    if events.len() as u32 >= RECOVER_LIMIT {
-        s.last_error = Some("rebuild truncated".to_string());
-    }
     s.needs_rebuild = false;
+    // The partial map is kept; the Err is how state.json learns of the cut.
+    if events.len() as u32 >= RECOVER_LIMIT {
+        return Err(format!(
+            "rebuild truncated (>= {RECOVER_LIMIT} writer kind-9 events in #bench)"
+        ));
+    }
     Ok(())
 }
 
@@ -584,7 +614,11 @@ async fn delete(
 ) -> Result<Outcome, String> {
     let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
     let builder = events::build_delete_compat(channel_id(&s.owner_pubkey), target)?;
-    post_as_writer(ctx, s, builder, now).await
+    match post_as_writer(ctx, s, builder, now).await {
+        // A hard-purged target is already gone: nothing left to retire.
+        Err(e) if e.contains("not found") => Ok(Outcome::Duplicate),
+        r => r,
+    }
 }
 
 /// Cards, seeds, then the board, at most `budget` posts; the next tick
@@ -618,10 +652,9 @@ async fn publish(
         })
         .collect();
     for (id, event_id) in stale {
-        if *budget == 0 {
+        if !spend(budget, 1) {
             return Ok(());
         }
-        *budget -= 1;
         delete(ctx, s, &event_id, now).await?;
         s.items.get_mut(&id).expect("stale card id").card = None;
         s.board_dirty = true;
@@ -637,17 +670,15 @@ async fn publish(
                 s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
                 continue;
             }
-            if *budget == 0 {
+            if !spend(budget, 1) {
                 return Ok(());
             }
-            *budget -= 1;
             delete(ctx, s, &orphan.event_id, now).await?;
             s.orphan_cards.remove(id);
         }
-        if *budget == 0 {
+        if !spend(budget, 1) {
             return Ok(());
         }
-        *budget -= 1;
         let item = s.items[id].clone();
         let marker = format!("bench:card:{}@{}", item.id, item.hash);
         let text = item::render_card(&item, hhmm);
@@ -677,10 +708,9 @@ async fn publish(
             if card.seeded >= item.options.len().min(item::OPTION_EMOJI.len()) {
                 break;
             }
-            if *budget == 0 {
+            if !spend(budget, 1) {
                 return Ok(());
             }
-            *budget -= 1;
             let target = nostr::EventId::from_hex(&card.event_id).map_err(|e| e.to_string())?;
             let seed = events::build_reaction(target, item::OPTION_EMOJI[card.seeded])?;
             post_as_writer(ctx, s, seed, now).await?;
@@ -703,10 +733,12 @@ async fn publish(
         .as_ref()
         .is_none_or(|b| now.saturating_sub(b.created_at) > BOARD_MAX_AGE_SECS);
     if s.board_dirty || aged {
-        if *budget == 0 {
+        // Both the post and the old board's delete, so the pair never splits
+        // the budget (a crash between them leaves two boards, which
+        // rebuild_map resolves by keeping the newest).
+        if !spend(budget, 2) {
             return Ok(());
         }
-        *budget -= 1;
         match post_message(ctx, s, &text, false, format!("bench:board@{hash}"), now).await? {
             Outcome::Accepted { event_id } => {
                 let old = s.board.replace(Posted {
@@ -716,8 +748,6 @@ async fn publish(
                     seeded: 0,
                 });
                 s.board_dirty = false;
-                // Not budget-gated: a crash here leaves two boards, which
-                // rebuild_map resolves by keeping the newest.
                 if let Some(old) = old {
                     delete(ctx, s, &old.event_id, now).await?;
                 }
@@ -725,10 +755,9 @@ async fn publish(
             Outcome::Duplicate => s.needs_rebuild = true,
         }
     } else if let Some(board) = s.board.as_ref().filter(|b| b.hash != hash) {
-        if *budget == 0 {
+        if !spend(budget, 1) {
             return Ok(());
         }
-        *budget -= 1;
         let target = nostr::EventId::from_hex(&board.event_id).map_err(|e| e.to_string())?;
         let edit_tags = events::MessageEditTags {
             media: &[],
@@ -743,8 +772,16 @@ async fn publish(
             edit_tags,
             false,
         )?;
-        post_as_writer(ctx, s, edit, now).await?;
-        s.board.as_mut().expect("board").hash = hash;
+        match post_as_writer(ctx, s, edit, now).await {
+            Ok(_) => s.board.as_mut().expect("board").hash = hash,
+            // The board was deleted by hand: repost it next tick instead of
+            // retrying the edit every 2 s until the daily repost.
+            Err(e) if e.contains("not found") => {
+                s.board = None;
+                s.board_dirty = true;
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -796,20 +833,31 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
             "disabled (debug build without BUZZ_BENCH_RELAY_URL=ws://127.0.0.1:...)".to_string(),
         );
     };
+    // The first tagged request binds the writer to whichever owner signs it,
+    // first write wins on the relay: never a release override identity.
+    if !cfg!(debug_assertions) && std::env::var_os("BUZZ_PRIVATE_KEY").is_some() {
+        return Err(
+            "BUZZ_PRIVATE_KEY is set; refusing to bind the Bench writer to an override identity"
+                .to_string(),
+        );
+    }
     let root = root_dir()?;
     std::fs::create_dir_all(root.join("inbox"))
         .map_err(|e| format!("create {}: {e}", root.display()))?;
     let writer = writer_keys()?;
     let writer_hex = writer.public_key().to_hex();
-    // The writer key must never double as a managed agent.
-    if crate::managed_agents::load_managed_agents(&app)?
+    // The writer key must never double as a managed agent. The raw store:
+    // a pubkey compare has no business pulling agent secrets from the keyring.
+    if crate::managed_agents::load_agent_store(&app)?
         .iter()
         .any(|r| r.pubkey == writer_hex)
     {
         return Err("writer key is a managed agent; refusing to start".to_string());
     }
-    let (mut s, fresh) = load_state(&root);
-    s.needs_rebuild |= fresh;
+    let (mut s, _fresh) = load_state(&root);
+    // Every launch re-reads the relay: a kill between a post and save_state
+    // would otherwise leave an unlisted card behind for good.
+    s.needs_rebuild = true;
     s.relay = relay.clone();
     s.writer_pubkey = writer_hex;
     s.version = 1;

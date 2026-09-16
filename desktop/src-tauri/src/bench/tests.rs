@@ -109,6 +109,39 @@ fn validate_rejects_bad_drops() {
         ("http", link("http://github.com/x")),
         ("https host not allowlisted", link("https://evil.example/x")),
         ("https with userinfo", link("https://user@github.com/x")),
+        ("https with port", link("https://github.com:1337/x")),
+        // The parser encodes or drops these; the card prints the raw string.
+        (
+            "https with a space",
+            link("https://github.com/ [Approve](https://evil.example)"),
+        ),
+        (
+            "https with a newline",
+            link("https://github.com/\nnostr:npub1x @Honey"),
+        ),
+        ("https with a tab", link("https://github.com/\tx")),
+        (
+            "https with nsec in the path",
+            link("https://github.com/nsec1abc"),
+        ),
+        (
+            "https with @ in the fragment",
+            link("https://github.com/x#@Honey"),
+        ),
+        (
+            "https 513 bytes",
+            link(&format!("https://github.com/{}", "a".repeat(494))),
+        ),
+        ("title www.", vec![("title", json!("see www.evil.example"))]),
+        (
+            "label www.",
+            vec![("links", json!([{"label": "www.evil.example", "url": good}]))],
+        ),
+        ("bidi override", vec![("title", json!("a\u{202E}b"))]),
+        (
+            "zero width",
+            vec![("options", json!(["Stay\u{200B}", "Move"]))],
+        ),
         (
             "buzz with path",
             link(&format!("buzz://message/x?channel={UUID}&id={hex64}")),
@@ -214,6 +247,16 @@ fn validate_accepts_minimal_drops_with_defaults() {
     assert_eq!(full.validity, Validity::SuspectedStale);
     assert_eq!(full.order, 3);
     assert_eq!(full.links.len(), 2);
+    assert_eq!(full.deadline.as_deref(), Some("2026-09-20T00:00:00Z"));
+    // The deadline is kept canonical, however loosely chrono parsed it.
+    let sloppy = format!("2026-09-20 00:00:00.{}Z", "0".repeat(60));
+    assert_eq!(
+        check(&[("deadline", json!(sloppy))])
+            .unwrap()
+            .deadline
+            .as_deref(),
+        Some("2026-09-20T00:00:00Z")
+    );
 }
 
 #[test]
@@ -457,6 +500,8 @@ fn relay_ws_from_admits_only_loopback_in_debug() {
     assert_eq!(relay_ws_from(None), None);
     assert_eq!(relay_ws_from(Some(RELAY_WS)), None);
     assert_eq!(relay_ws_from(Some("wss://127.0.0.1:1")), None);
+    assert_eq!(relay_ws_from(Some("ws://localhost@evil.example/")), None);
+    assert_eq!(relay_ws_from(Some("ws://localhost.evil.example/")), None);
     assert_eq!(
         relay_ws_from(Some("ws://127.0.0.1:1")).as_deref(),
         Some("ws://127.0.0.1:1")
@@ -740,6 +785,8 @@ struct Relay {
     force_dup: HashSet<u64>,
     seen: Mutex<HashSet<String>>,
     query_reply: Mutex<Vec<Value>>,
+    /// Event ids the relay no longer has: a kind 5 or 40003 on them is refused.
+    gone: Mutex<HashSet<String>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -775,13 +822,18 @@ async fn fake_events(
         );
     }
     let kind = ev["kind"].as_u64().unwrap();
+    let target = tag_value(&ev, "e").unwrap_or_default();
+    if matches!(kind, 5 | 40003) && r.gone.lock().unwrap().contains(&target) {
+        let message = if kind == 5 {
+            "target event not found"
+        } else {
+            "invalid: edit target event not found"
+        };
+        let reply = json!({ "event_id": ev["id"], "accepted": false, "message": message });
+        return (StatusCode::OK, Json(reply));
+    }
     let key = match kind {
-        7 => Some(format!(
-            "7:{}:{}:{}",
-            ev["pubkey"],
-            tag_value(&ev, "e").unwrap_or_default(),
-            ev["content"]
-        )),
+        7 => Some(format!("7:{}:{target}:{}", ev["pubkey"], ev["content"])),
         9007 => Some(format!("9007:{}", tag_value(&ev, "h").unwrap_or_default())),
         _ => None,
     };
@@ -838,6 +890,7 @@ impl Bench {
             force_dup: force_dup.iter().copied().collect(),
             seen: Mutex::new(HashSet::new()),
             query_reply: Mutex::new(Vec::new()),
+            gone: Mutex::new(HashSet::new()),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
@@ -1131,34 +1184,153 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
         Some(&format!("bench:card:{}@{}", item.id, item.hash)),
     );
     let unknown = kind9(&w, now - 40, Some("bench:card:orchestrator/gone@abcd"));
+    let y = check(&[("id", json!("y")), ("options", json!(["Only"]))]).unwrap();
+    let card_y = kind9(
+        &w,
+        now - 35,
+        Some(&format!("bench:card:{}@{}", y.id, y.hash)),
+    );
     let board_old = kind9(&w, now - 30, Some("bench:board@dddd"));
     let board_new = kind9(&w, now - 20, Some("bench:board@eeee"));
     let untagged = kind9(&w, now - 10, None);
     let forged = kind9(&Keys::generate(), now - 5, Some("bench:board@ffff"));
-    *b.relay.query_reply.lock().unwrap() =
-        [&card, &unknown, &board_old, &board_new, &untagged, &forged]
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap())
-            .collect();
-    // State that knew the item but lost its card (a `duplicate:` on repost).
+    *b.relay.query_reply.lock().unwrap() = [
+        &card, &unknown, &card_y, &board_old, &board_new, &untagged, &forged,
+    ]
+    .iter()
+    .map(|e| serde_json::to_value(e).unwrap())
+    .collect();
+    // State that knew the item but lost its card (a `duplicate:` on repost),
+    // and one whose card it still tracks (a rebuild at launch).
     b.s.items.insert(item.id.clone(), item.clone());
+    let tracked = Posted {
+        event_id: card_y.id.to_hex(),
+        created_at: now - 35,
+        hash: y.hash.clone(),
+        seeded: 1,
+    };
+    b.s.items.insert(
+        y.id.clone(),
+        Item {
+            card: Some(tracked.clone()),
+            ..y.clone()
+        },
+    );
     assert!(b.s.needs_rebuild);
     b.settle(2).await;
 
     assert_eq!(b.card(&item.id).event_id, card.id.to_hex());
     assert_eq!(b.card(&item.id).seeded, usize::MAX);
+    assert_eq!(b.card(&y.id), tracked);
     assert_eq!(
         b.s.orphan_cards["orchestrator/gone"].event_id,
         unknown.id.to_hex()
     );
     assert_eq!(b.s.strays, [board_old.id.to_hex(), untagged.id.to_hex()]);
     assert!(!b.s.needs_rebuild);
-    // The recovered board is edited to the real text; no card is reposted and
-    // nothing is deleted.
-    assert_eq!(b.kinds(), [0, 9007, 9000, 40003]);
+    // The writer's own re-add stamps a member_joined row above the recovered
+    // board, so the board is reposted and the recovered one retired; no card
+    // is reposted and no orphan or stray is deleted.
+    assert_eq!(b.kinds(), [0, 9007, 9000, 9, 5]);
+    let posts = b.posts();
+    assert_eq!(tag_value(&posts[4].0, "e").unwrap(), board_new.id.to_hex());
     let board = b.s.board.clone().unwrap();
-    assert_eq!(board.event_id, board_new.id.to_hex());
+    assert_eq!(board.event_id, posts[3].0["id"].as_str().unwrap());
     assert_ne!(board.hash, "eeee");
+}
+
+#[tokio::test]
+async fn truncated_rebuild_is_reported() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    let stray = serde_json::to_value(kind9(&b.ctx.writer, b.now - 10, None)).unwrap();
+    *b.relay.query_reply.lock().unwrap() = vec![stray; RECOVER_LIMIT as usize];
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("rebuild truncated"), "{err}");
+    // The partial map is kept and the next tick carries on.
+    assert!(!b.s.needs_rebuild);
+    assert_eq!(b.s.strays.len(), RECOVER_LIMIT as usize);
+    b.tick().await.unwrap();
+}
+
+#[tokio::test]
+async fn vanished_targets_are_dropped_not_retried() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    // The owner deleted the board by hand: the text-only edit finds no target,
+    // so the board is reposted instead of the edit retrying every tick.
+    let old_board = b.s.board.clone().unwrap();
+    b.relay
+        .gone
+        .lock()
+        .unwrap()
+        .insert(old_board.event_id.clone());
+    let before = b.posts().len();
+    b.drop_file(
+        "orchestrator",
+        "m1",
+        &drop_json(&[
+            ("kind", json!("status")),
+            ("state", json!("done")),
+            ("title", json!("Bench M1")),
+            ("severity", Value::Null),
+            ("options", Value::Null),
+        ]),
+    );
+    b.settle(2).await;
+    assert_eq!(b.kinds()[before..], [40003, 9]);
+    assert_ne!(b.s.board.as_ref().unwrap().event_id, old_board.event_id);
+    // A hard-purged card: the retiring kind 5 is refused, the repost goes on.
+    let old_card = b.card("orchestrator/relay-choice");
+    b.relay
+        .gone
+        .lock()
+        .unwrap()
+        .insert(old_card.event_id.clone());
+    let before = b.posts().len();
+    b.drop_file(
+        "orchestrator",
+        "relay-choice",
+        &drop_json(&[("options", json!(["Stay", "Go"]))]),
+    );
+    b.settle(3).await;
+    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
+    assert_ne!(
+        b.card("orchestrator/relay-choice").event_id,
+        old_card.event_id
+    );
+}
+
+#[tokio::test]
+async fn member_added_later_reposts_the_board() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old_board = b.s.board.clone().unwrap();
+    let before = b.posts().len();
+    std::fs::write(b.root.join("members.txt"), "ef".repeat(32)).unwrap();
+    b.settle(2).await;
+    let posts = b.posts()[before..].to_vec();
+    // The relay stamps a member_joined row after the 9000; the board follows.
+    assert_eq!(b.kinds()[before..], [9000, 9, 5]);
+    assert_eq!(
+        tag_value(&posts[0].0, "p").as_deref(),
+        Some("ef".repeat(32).as_str())
+    );
+    assert_eq!(tag_value(&posts[2].0, "e").unwrap(), old_board.event_id);
+}
+
+#[tokio::test]
+async fn a_tick_never_exceeds_the_post_budget() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    let one = |opt: &str| drop_json(&[("options", json!([opt]))]);
+    b.drop_file("orchestrator", "relay-choice", &one("Stay"));
+    b.settle(4).await;
+    let before = b.posts().len();
+    b.drop_file("orchestrator", "relay-choice", &one("Go"));
+    for _ in 0..3 {
+        let n = b.posts().len();
+        b.tick().await.unwrap();
+        assert!(b.posts().len() - n <= MAX_POSTS_PER_TICK);
+    }
+    // Delete, card, seed; then the board and its predecessor's delete as a pair.
+    assert_eq!(b.kinds()[before..], [5, 9, 7, 9, 5]);
 }
 
 #[tokio::test]
