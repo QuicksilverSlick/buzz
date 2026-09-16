@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod approval_gate;
 mod config;
 mod engram_fetch;
 mod filter;

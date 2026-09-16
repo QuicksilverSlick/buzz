@@ -13,7 +13,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::approval_gate::{
+    admit, request_digest, resolve, tool_label, Admission, ApprovalAsk, ApprovalEvent,
+    ApprovalLink, ApprovalSettled, ApprovalVerdict, Fire, ParkGate, ParkId, RefusalReason,
+    Settlement, TurnClock, VerdictOutcome,
+};
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::pending_permissions::ParkedAsk;
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
@@ -179,6 +185,12 @@ pub struct AcpClient {
     /// has no idea whether a tool call traces back to the owner or to someone
     /// on the allowlist. Defaults to `Guest`, so a path that forgets to set it
     /// is treated as untrusted rather than trusted.
+    ///
+    /// Reset to `Guest` when the prompt returns, and by a cancel that takes
+    /// over a turn whose prompt future was dropped before it could return.
+    /// Only the prompt loop reads it today, but an owner turn's trust left
+    /// lying on the connection is one careless read away from approving a
+    /// later guest's request.
     current_turn_authority: TurnAuthority,
     /// Permission requests refused during the turn in flight.
     ///
@@ -192,6 +204,17 @@ pub struct AcpClient {
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
     last_prompt_id: Option<u64>,
+    /// The JSON-RPC error that answered the prompt, kept only while the pool
+    /// may still need it.
+    ///
+    /// The prompt's result normally carries the error back to the pool. But
+    /// the pool can drop the prompt future in its exit drain, after the error
+    /// was read. It then finds no prompt in flight and takes its "completed
+    /// before the control signal" branch, which would otherwise report the
+    /// turn as a success: its batch recorded as delivered and never retried.
+    /// That branch takes this instead. Cleared when the prompt call returns,
+    /// and again when the next prompt starts.
+    prompt_error_before_drain: Option<(i64, String)>,
     /// Hard deadline for the current turn, set by `session_prompt_with_idle_timeout`.
     /// Inherited by `cancel_with_cleanup` so the drain loop shares the same budget
     /// rather than starting a fresh timer (prevents double-jeopardy).
@@ -501,6 +524,10 @@ pub struct PermissionRefusal {
     /// Tool title or kind as the agent reported it, for the person reading the
     /// notice. `(untitled)` when the agent sent neither.
     pub tool: String,
+    /// Why it was refused. A request refused before anyone was asked reads
+    /// differently to the person who made it than one an approver declined,
+    /// and this is the only thing that tells the two apart.
+    pub reason: RefusalReason,
 }
 
 impl AcpClient {
@@ -644,6 +671,7 @@ impl AcpClient {
             current_turn_authority: TurnAuthority::Guest,
             permission_refusals: Vec::new(),
             last_prompt_id: None,
+            prompt_error_before_drain: None,
             current_hard_deadline: None,
             observer: None,
             observer_agent_index: None,
@@ -850,6 +878,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
         authority: TurnAuthority,
+        approvals: Option<ApprovalLink>,
     ) -> Result<StopReason, AcpError> {
         self.session_prompt_blocks_with_idle_timeout(
             session_id,
@@ -857,6 +886,7 @@ impl AcpClient {
             idle_timeout,
             max_duration,
             authority,
+            approvals,
         )
         .await
     }
@@ -874,12 +904,19 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
         authority: TurnAuthority,
+        approvals: Option<ApprovalLink>,
     ) -> Result<StopReason, AcpError> {
         // A required parameter rather than a setter: every dispatch has to
         // decide, and the compiler says so. A setter would let a new call site
         // inherit whatever the previous turn left behind, which for a shared
         // agent means one collaborator's turn running under the authority of
         // whoever prompted last.
+        //
+        // `approvals` is required for the same reason, and for one more: a
+        // link installed on the connection would be taken by whichever read
+        // loop ran first. A new session's `initial_message` runs its own
+        // prompt before the turn's, so that turn could never park. `None`
+        // means no request can wait on a person.
         self.current_turn_authority = authority;
         // Cleared per turn: a refusal from a previous turn reported against
         // this one would name the wrong request to the wrong person.
@@ -894,6 +931,9 @@ impl AcpClient {
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
 
+        // Before the first yield, like `last_prompt_id`: an error kept from an
+        // earlier turn must never be reported as this one's.
+        self.prompt_error_before_drain = None;
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
         self.next_id += 1;
@@ -905,22 +945,49 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
-        if let Err(e) = self.write_ndjson(&msg).await {
+        // Answer whatever an earlier turn left owed, `cancelled`, before this
+        // prompt goes out. A prompt future dropped in its exit drain, after
+        // its response arrived, leaves no prompt in flight, so the pool runs no
+        // cancel and the ids that drain had not reached stay owed. Left owed
+        // into this turn, a new request that reuses one of those ids would be
+        // ignored as a retransmit, and the agent would wait on it forever.
+        //
+        // After `last_prompt_id` is set, never before. These writes can yield,
+        // and `pool.rs` relies on this call setting it before its first yield
+        // point (see its Race 1 branch): a control signal that won the
+        // `select!` here would otherwise find no prompt in flight and report
+        // this turn completed when its prompt was never sent.
+        let sent = match self.answer_owed_cancelled().await {
+            Ok(()) => {
+                tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+                self.write_ndjson(&msg).await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
+            self.current_turn_authority = TurnAuthority::Guest;
             return Err(e);
         }
 
         let result = self
-            .read_until_response_with_idle_timeout(
+            .read_until_response_gated(
                 session_id,
                 id,
                 idle_timeout,
                 hard_deadline,
                 max_duration,
+                approvals,
             )
             .await;
+        // The turn is over, however it ended: nothing on this connection may
+        // be decided with its authority again. The next prompt sets its own,
+        // and a cancel drain that follows a timeout decides as a guest.
+        self.current_turn_authority = TurnAuthority::Guest;
+        // The result carries any error back itself; the copy was only for a
+        // pool that dropped this future before it could return.
+        self.prompt_error_before_drain = None;
 
         // On timeout errors, leave current_hard_deadline set so cancel_with_cleanup
         // can inherit the remaining budget. Clear it on all other outcomes.
@@ -959,6 +1026,16 @@ impl AcpClient {
     /// Returns `true` if a `session/prompt` request is currently in flight.
     pub fn has_in_flight_prompt(&self) -> bool {
         self.last_prompt_id.is_some()
+    }
+
+    /// Take the JSON-RPC error that answered the prompt, if the pool dropped
+    /// the prompt future after it was read. For the pool's "completed before
+    /// the control signal" branch only; everywhere else the prompt's own
+    /// result carries the error.
+    pub(crate) fn take_prompt_error_before_drain(&mut self) -> Option<AcpError> {
+        self.prompt_error_before_drain
+            .take()
+            .map(|(code, message)| AcpError::AgentError { code, message })
     }
 
     /// Most recently observed goose `_meta.goose.activeRunId` from a
@@ -1048,8 +1125,8 @@ impl AcpClient {
     /// Cancel a turn cleanly, handling any pending permission request first.
     ///
     /// Steps:
-    /// 1. If there is a pending `session/request_permission` that hasn't been
-    ///    responded to yet, respond with `outcome: "cancelled"`.
+    /// 1. Answer every `session/request_permission` still owed a response,
+    ///    parked ones included, with `outcome: "cancelled"`.
     /// 2. Send `session/cancel` notification (no id).
     /// 3. Continue reading until the `session/prompt` response arrives with `stopReason: "cancelled"`.
     ///
@@ -1125,6 +1202,12 @@ impl AcpClient {
         let prompt_id = self.last_prompt_id.take().ok_or_else(|| {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
+        // The turn this cancels is over from here. When `pool.rs` drops the
+        // prompt future, the reset at the end of the prompt call never runs, so
+        // without this the drain below would decide what the agent asks while
+        // it winds down with the dead turn's authority: after an owner's turn,
+        // it would approve it.
+        self.current_turn_authority = TurnAuthority::Guest;
 
         // Step 1: respond to any pending permission request with "cancelled",
         // but only if we haven't already responded (guards against double-response race).
@@ -1136,15 +1219,12 @@ impl AcpClient {
         // write fails here the pipe is almost certainly dead, but the remaining
         // ids stay recorded rather than being silently discarded by an early
         // return.
-        while let Some(perm_id) = self.pending_permissions.next_owed().cloned() {
-            let response = permission_response_cancelled(&perm_id);
-            self.write_ndjson(&response).await?;
-            self.pending_permissions.forget(&perm_id);
-            tracing::debug!(
-                target: "acp::cancel",
-                "responded cancelled to pending permission id={perm_id}"
-            );
-        }
+        //
+        // Parked requests are answered here too: this is the only cleanup
+        // that runs after `pool.rs` drops a prompt future mid-wait. Their
+        // verdict receivers are retired before the first write, so the main
+        // loop's `send` already fails even if a write below does too.
+        self.answer_owed_cancelled().await?;
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
@@ -1157,6 +1237,9 @@ impl AcpClient {
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
+        // The ungated loop: a cancel drain is not a turn and has nobody to
+        // ask, so a request raised while the agent winds down is answered at
+        // once and can never page a person.
         let result = self
             .read_until_response_with_idle_timeout(
                 session_id,
@@ -1290,16 +1373,32 @@ impl AcpClient {
     ///
     /// While waiting, handles:
     /// - `session/update` notifications → logged via tracing
-    /// - `session/request_permission` requests → auto-approved with `allow_once`
+    /// - `session/request_permission` requests → decided as a guest and never
+    ///   parked: no turn is running, so there is nobody to ask
     /// - Any other messages → debug-logged and ignored; if they carry an `id`
     ///   (i.e. they are requests, not notifications), a JSON-RPC -32601 error is sent.
     ///
     /// Compares the incoming `id` field as a `serde_json::Value` against
     /// `json!(expected_id)` so that both numeric and string IDs work correctly.
+    ///
+    /// When the loop fails, every request it leaves owed is answered before
+    /// returning. Its `?` exits (a request with no usable option or no options
+    /// at all, a failed `-32601` write) would otherwise strand the id: nothing
+    /// else answers it until the next prompt's loop exits or a cancel runs,
+    /// and the agent may be blocked on it until then.
     async fn read_until_response(
         &mut self,
         expected_id: u64,
     ) -> Result<serde_json::Value, AcpError> {
+        let result = self.read_setup_loop(expected_id).await;
+        if result.is_err() {
+            self.answer_owed_on_exit(None).await;
+        }
+        result
+    }
+
+    /// The body of [`read_until_response`](Self::read_until_response).
+    async fn read_setup_loop(&mut self, expected_id: u64) -> Result<serde_json::Value, AcpError> {
         loop {
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
             // read level — the buffer never grows beyond the limit, preventing
@@ -1368,7 +1467,9 @@ impl AcpClient {
                     "session/request_permission" => {
                         // No turn is running here (session/new, set_config_option), so decide as
                         // a guest -- never with whatever authority the last turn left behind.
-                        self.handle_permission_request(&msg, TurnAuthority::Guest)
+                        // And with no `ParkContext`: an RPC with no turn behind it has
+                        // nobody to ask, so it must never wait on one.
+                        self.handle_permission_request(&msg, TurnAuthority::Guest, None)
                             .await?;
                     }
                     other => {
@@ -1410,8 +1511,9 @@ impl AcpClient {
     ///   from the original turn rather than starting a fresh timer.
     ///
     /// While reading, the loop interleaves goose-native non-cancelling steer
-    /// requests via `tokio::select!`. The select uses `biased` for
-    /// reader-first throughput, with a pre-select deadline check at the top
+    /// requests via `tokio::select!`. The select uses `biased`: a parked
+    /// request's verdict first, so a busy agent cannot starve an approval,
+    /// then the reader for throughput, with a pre-select deadline check at the top
     /// of every loop iteration so a continuously-ready reader arm cannot
     /// starve the hard deadline (Max's review gate). The steer arm is
     /// guarded by `pending_steer.is_none()` so at most one steer is in
@@ -1423,6 +1525,9 @@ impl AcpClient {
     /// write time without needing access to outer state. See
     /// [`crate::pool::SteerRequest`] for why params are built here and not
     /// in the main loop.
+    ///
+    /// Cannot park: it passes no approval link, so a request that needs an
+    /// approver is refused at once. The cancel re-entry goes through here.
     async fn read_until_response_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -1430,6 +1535,87 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         hard_deadline: tokio::time::Instant,
         max_duration: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.read_until_response_gated(
+            session_id,
+            expected_id,
+            idle_timeout,
+            hard_deadline,
+            max_duration,
+            None,
+        )
+        .await
+    }
+
+    /// The prompt read loop, able to park requests when given a link, and
+    /// one drain that covers every way out of it.
+    ///
+    /// The drain wraps the loop rather than sitting at each `return` because
+    /// the loop has many exits, `?` among them, and a request left owed on any
+    /// one of them blocks the agent. The only exit it cannot cover is the
+    /// future being dropped mid-poll. Dropped before the prompt's response
+    /// arrived, `cancel_with_cleanup` answers what it left from the
+    /// connection's registry; dropped after, in this drain, the next prompt
+    /// does.
+    async fn read_until_response_gated(
+        &mut self,
+        session_id: &str,
+        expected_id: u64,
+        idle_timeout: std::time::Duration,
+        hard_deadline: tokio::time::Instant,
+        max_duration: std::time::Duration,
+        approvals: Option<ApprovalLink>,
+    ) -> Result<serde_json::Value, AcpError> {
+        let mut gate = approvals.map(ParkGate::new);
+        let result = self
+            .read_loop(
+                session_id,
+                expected_id,
+                idle_timeout,
+                hard_deadline,
+                max_duration,
+                &mut gate,
+            )
+            .await;
+        // The prompt response has been consumed, so the prompt is no longer in
+        // flight, even though the drain below may still await writes. Say so
+        // before draining: if the pool drops this future mid-drain, it must not
+        // run a cancel that waits out its grace for a response that already
+        // arrived, and then re-run a turn that completed.
+        //
+        // A JSON-RPC error answering the prompt consumes that response as
+        // surely as a result does, and nothing else in the loop returns
+        // `AgentError`. Every other error (a timeout, a broken or oversized
+        // stream) leaves the response unread: the prompt stays in flight, and
+        // the pool's cancel drains it.
+        //
+        // Cleared here, a drop mid-drain takes the pool's "turn completed
+        // before the control signal" branch, which runs no cleanup. Whatever
+        // the drain had not answered stays owed, and the next prompt answers
+        // it before it is sent. An error is kept for that branch, so a turn
+        // that failed is not reported as one that completed.
+        if matches!(result, Ok(_) | Err(AcpError::AgentError { .. }))
+            && self.last_prompt_id == Some(expected_id)
+        {
+            self.last_prompt_id = None;
+            if let Err(AcpError::AgentError { code, message }) = &result {
+                self.prompt_error_before_drain = Some((*code, message.clone()));
+            }
+        }
+        self.answer_owed_on_exit(gate.as_ref()).await;
+        result
+    }
+
+    /// The body of the prompt read loop. `gate` is `Some` only for a turn
+    /// that may park requests.
+    async fn read_loop(
+        &mut self,
+        session_id: &str,
+        expected_id: u64,
+        idle_timeout: std::time::Duration,
+        hard_deadline: tokio::time::Instant,
+        max_duration: std::time::Duration,
+        gate: &mut Option<ParkGate>,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
@@ -1452,20 +1638,41 @@ impl AcpClient {
             tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
         )> = None;
 
-        let now = Instant::now();
-        let mut idle_deadline = now + idle_timeout;
-        let mut hard_deadline = hard_deadline;
-        let mut last_activity_at = now;
+        let credit_cap = gate
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |gate| gate.limits().credit_cap);
+        let mut clock = TurnClock::new(Instant::now(), idle_timeout, hard_deadline, credit_cap);
+        let entry_hard = hard_deadline;
+
+        // Nothing should be parked on entry: every exit drains, and a dropped
+        // future is cleaned up by cancel_with_cleanup. A cancel that failed
+        // before answering could leave one behind, though, and a stale parked
+        // state would suspend idle for a wait nobody is having. Retire it; the
+        // id stays owed, and this loop's exit drain answers it.
+        let stale = self.pending_permissions.retire_all_parked();
+        if !stale.is_empty() {
+            tracing::error!(
+                target: "acp::permission",
+                count = stale.len(),
+                "parked permission requests outlived their turn; retired unanswered"
+            );
+        }
 
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
-            let next_deadline = if idle_fires_first {
-                idle_deadline
-            } else {
-                hard_deadline
-            };
+            let now = Instant::now();
+            clock.sync(now, self.pending_permissions.parked_count() > 0);
+            // Publish a credited or renewed hard deadline, so a cancel after an
+            // idle timeout inherits it. Only when it has moved from the entry
+            // value, so a loop whose deadline never moves (the cancel re-entry
+            // above all) leaves the field exactly as it found it.
+            let effective_hard = clock.effective_hard(now);
+            if effective_hard != entry_hard {
+                self.current_hard_deadline = Some(effective_hard);
+            }
+            let (next_deadline, fire) =
+                clock.next_deadline(now, self.pending_permissions.earliest_expiry());
 
             // Pre-select deadline check — required by Max's review. Under
             // `biased`, a continuously-ready reader arm wins every poll and
@@ -1474,28 +1681,47 @@ impl AcpClient {
             // producing output (see `acp.rs:608` for why the hard deadline
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
-            if Instant::now() >= next_deadline {
-                if let Some((_, _, ack_tx)) = pending_steer.take() {
-                    // Prompt is timing out — release the withheld event via
-                    // PromptCompletedNeutral (no fallback signal: there is
-                    // no in-flight turn to signal once we return, and
-                    // normal dispatch handles redelivery).
-                    let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
-                }
-                if idle_fires_first {
-                    tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
-                    return Err(AcpError::IdleTimeout(idle_timeout));
-                } else {
-                    let silence = Instant::now().saturating_duration_since(last_activity_at);
-                    tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                    return Err(AcpError::HardTimeout { silence });
+            if now >= next_deadline {
+                match fire {
+                    // An expired ask is refused and the turn carries on. Settled
+                    // only here, so expiries have exactly one place to happen.
+                    Fire::Approval => {
+                        self.expire_due_approvals(now, gate).await?;
+                        continue;
+                    }
+                    Fire::Idle | Fire::Hard => {
+                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                            // Prompt is timing out — release the withheld event via
+                            // PromptCompletedNeutral (no fallback signal: there is
+                            // no in-flight turn to signal once we return, and
+                            // normal dispatch handles redelivery).
+                            let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                        }
+                        if fire == Fire::Idle {
+                            tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
+                            return Err(AcpError::IdleTimeout(idle_timeout));
+                        }
+                        let silence = clock.silence(now);
+                        tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
+                        return Err(AcpError::HardTimeout { silence });
+                    }
                 }
             }
+
+            let parked_any = self.pending_permissions.parked_count() > 0;
 
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
             // read level — the buffer never grows beyond the limit.
             let read_result = tokio::select! {
                 biased;
+                // Ahead of the reader, so an agent that streams output without
+                // pause cannot keep an approver's verdict from being applied.
+                // Disabled while nothing is parked; `next_verdict` is lazy, so
+                // building it for a disabled branch touches no receiver.
+                (park_id, verdict) = self.pending_permissions.next_verdict(), if parked_any => {
+                    self.settle_parked(park_id, SettleSource::Arm(verdict), gate).await?;
+                    None
+                }
                 read_result = self.reader.next() => Some(read_result),
                 // Steer arm: gated off whenever a steer write is already in
                 // flight so we don't stack two writes against the same
@@ -1613,16 +1839,23 @@ impl AcpClient {
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
-                    if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
-                    }
-                    if idle_fires_first {
-                        tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
-                        return Err(AcpError::IdleTimeout(idle_timeout));
-                    } else {
-                        let silence = Instant::now().saturating_duration_since(last_activity_at);
-                        tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                        return Err(AcpError::HardTimeout { silence });
+                    //
+                    // An approval expiry is left to that check, so expiries
+                    // are settled in one place only.
+                    match fire {
+                        Fire::Approval => None,
+                        Fire::Idle | Fire::Hard => {
+                            if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                            }
+                            if fire == Fire::Idle {
+                                tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
+                                return Err(AcpError::IdleTimeout(idle_timeout));
+                            }
+                            let silence = clock.silence(Instant::now());
+                            tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
+                            return Err(AcpError::HardTimeout { silence });
+                        }
                     }
                 }
             };
@@ -1683,9 +1916,7 @@ impl AcpClient {
                     };
                     self.observe("acp_read", msg.clone());
 
-                    let activity_now = Instant::now();
-                    idle_deadline = activity_now + idle_timeout;
-                    last_activity_at = activity_now;
+                    clock.on_activity(Instant::now());
 
                     // Steer response routing must come BEFORE the prompt
                     // response check: a steer response is a regular
@@ -1757,10 +1988,11 @@ impl AcpClient {
                                             }
                                             Some(_) => {
                                                 let renew_now = Instant::now();
-                                                let new_deadline = renew_now + max_duration;
-                                                if new_deadline > hard_deadline {
-                                                    hard_deadline = new_deadline;
-                                                    self.current_hard_deadline = Some(new_deadline);
+                                                if clock
+                                                    .renew_hard(renew_now, renew_now + max_duration)
+                                                {
+                                                    self.current_hard_deadline =
+                                                        Some(clock.effective_hard(renew_now));
                                                     tracing::info!(
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
@@ -1820,9 +2052,7 @@ impl AcpClient {
                         match method {
                             "session/update" => {
                                 if self.handle_session_update(&msg) {
-                                    let activity_now = Instant::now();
-                                    idle_deadline = activity_now + idle_timeout;
-                                    last_activity_at = activity_now;
+                                    clock.on_activity(Instant::now());
                                     tracing::debug!("idle clock reset: tool call started");
                                 }
                             }
@@ -1831,7 +2061,13 @@ impl AcpClient {
                             }
                             "session/request_permission" => {
                                 let authority = self.current_turn_authority;
-                                self.handle_permission_request(&msg, authority).await?;
+                                let park = gate.as_mut().map(|gate| ParkContext {
+                                    gate,
+                                    clock: &clock,
+                                    session_id,
+                                });
+                                self.handle_permission_request(&msg, authority, park)
+                                    .await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -2047,15 +2283,6 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
-    ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
-    ///
-    /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
-    ///
-    /// The request `id` is stored as `serde_json::Value` to support both numeric
-    /// and string IDs per JSON-RPC 2.0.
     /// Take the refusals recorded during the turn that just finished.
     ///
     /// Draining rather than borrowing, so the caller cannot post the same
@@ -2065,20 +2292,45 @@ impl AcpClient {
         std::mem::take(&mut self.permission_refusals)
     }
 
+    /// Answer, refuse, or park a `session/request_permission` from the agent.
+    ///
+    /// Decides first, then acts. [`decide_permission`] says what the turn's
+    /// authority allows, and only a request that needs an approver can park.
+    /// Option ids are always the agent's own, found by `kind`, and the request
+    /// `id` stays a `serde_json::Value` because JSON-RPC 2.0 allows both
+    /// numeric and string ids.
+    ///
     /// `authority` is passed in, not read off `self`. The setup loop decides as
     /// `Guest` because no turn is running, and the prompt loop passes the turn's
     /// current authority. Reading the field here once let the setup loop decide
     /// with whatever authority the previous turn happened to leave behind.
+    ///
+    /// `park` is the turn's capability to wait on a person, and only the gated
+    /// prompt loop builds one. Without it, a request that needs an approver is
+    /// refused exactly as a guest's request always was.
     async fn handle_permission_request(
         &mut self,
         msg: &serde_json::Value,
         authority: TurnAuthority,
+        park: Option<ParkContext<'_>>,
     ) -> Result<(), AcpError> {
         // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
         let id = msg
             .get("id")
             .cloned()
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
+
+        // An id that is still owed is a retransmit. Answering it would send
+        // two responses to one id, and parking it would ask twice about one
+        // request; the answer already owed covers both copies.
+        if self.pending_permissions.contains(&id) {
+            tracing::warn!(
+                target: "acp::permission",
+                id = %id,
+                "ignoring a repeated permission request that is still owed an answer"
+            );
+            return Ok(());
+        }
 
         // Record the id so cancel_with_cleanup can answer it. Pushed rather
         // than assigned: a concurrent sibling request must not evict this one.
@@ -2094,45 +2346,195 @@ impl AcpClient {
             options.len()
         );
 
-        let decision = decide_permission(authority, options);
+        let tool = tool_label(&msg["params"]["toolCall"]);
 
-        let response = match &decision {
+        match decide_permission(authority, options) {
             PermissionDecision::Approve(option_id) => {
                 tracing::info!(
                     target: "acp::permission",
                     "auto-approving permission id={id} with allow_once optionId={option_id:?}"
                 );
-                permission_response_selected(&id, option_id)
+                self.answer_permission(&id, permission_response_selected(&id, &option_id))
+                    .await
             }
             PermissionDecision::Refuse(option_id) => {
-                // warn, not debug: a refusal changes what the agent did, and on
-                // a guest turn it is the whole point of the gate. At debug this
-                // is invisible in practice, and "the agent just didn't do it"
-                // is indistinguishable from a bug.
-                let tool = msg["params"]["toolCall"]["title"]
-                    .as_str()
-                    .or_else(|| msg["params"]["toolCall"]["kind"].as_str())
-                    .unwrap_or("(untitled)");
-                tracing::warn!(
-                    target: "acp::permission",
-                    id = %id,
-                    tool = %tool,
-                    authority = ?authority,
-                    "refusing permission request"
-                );
-                self.permission_refusals.push(PermissionRefusal {
-                    tool: tool.to_string(),
-                });
-                permission_response_selected(&id, option_id)
+                self.refuse_permission(
+                    &id,
+                    &option_id,
+                    tool,
+                    RefusalReason::NoAllowOffered,
+                    authority,
+                )
+                .await
             }
-            PermissionDecision::NoUsableOption => {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
+            PermissionDecision::NoUsableOption => Err(AcpError::Protocol(
+                "no suitable permission option found (neither allow_once nor reject_once)".into(),
+            )),
+            PermissionDecision::NeedsApprover { allow, reject } => {
+                let reason = match park {
+                    // Parked: nothing is written now. The id stays owed until a
+                    // verdict, an expiry, or the loop's exit answers it.
+                    Some(ctx) => match self.park_permission(&id, msg, &tool, allow, &reject, ctx) {
+                        Ok(()) => return Ok(()),
+                        Err(reason) => reason,
+                    },
+                    None => RefusalReason::NoApprovalPath,
+                };
+                self.refuse_permission(&id, &reject, tool, reason, authority)
+                    .await
             }
+        }
+    }
+
+    /// Park a request that needs an approver, and hand it to the main loop.
+    ///
+    /// Synchronous on purpose: parking writes nothing to the agent and the
+    /// hand-off is an unbounded send, so no await can fall between recording
+    /// the parked state and the main loop hearing about it.
+    ///
+    /// `Err` is the reason to refuse instead; the caller writes the refusal.
+    fn park_permission(
+        &mut self,
+        id: &serde_json::Value,
+        msg: &serde_json::Value,
+        tool: &str,
+        allow: String,
+        reject: &str,
+        ctx: ParkContext<'_>,
+    ) -> Result<(), RefusalReason> {
+        let now = tokio::time::Instant::now();
+        let limits = *ctx.gate.limits();
+        // A request that names no session is taken to be for this one. One
+        // that names another is refused, never parked against this turn.
+        let session_matches = msg["params"]["sessionId"]
+            .as_str()
+            .is_none_or(|sid| sid == ctx.session_id);
+        let expires_at = match admit(
+            self.pending_permissions.parked_count(),
+            ctx.gate.asks_charged(),
+            session_matches,
+            ctx.clock.ask_expiry(now, &limits),
+            &limits,
+        ) {
+            Admission::Park { expires_at } => expires_at,
+            Admission::Refuse(reason) => return Err(reason),
         };
 
+        let tool_call = &msg["params"]["toolCall"];
+        let digest = request_digest(ctx.session_id, tool_call);
+        let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+        let park_id = ParkId::mint();
+        // Parked before the ask goes out, so a verdict that comes straight
+        // back always finds its receiver in place.
+        let parked = self.pending_permissions.park(
+            id,
+            ParkedAsk {
+                park_id,
+                allow_option_id: allow,
+                reject_option_id: reject.to_string(),
+                digest,
+                tool: tool.to_string(),
+                parked_at: now,
+                expires_at,
+                verdict_rx,
+            },
+        );
+        if let Err(rejected) = parked {
+            // The id was recorded unparked just before this call, so this
+            // cannot happen. Refused rather than trusted if it ever does.
+            tracing::error!(
+                target: "acp::permission",
+                id = %id,
+                ?rejected,
+                "could not park a permission request"
+            );
+            return Err(RefusalReason::NoApprovalPath);
+        }
+        let sent = ctx.gate.send(ApprovalEvent::Ask(ApprovalAsk {
+            park_id,
+            turn_id: ctx.gate.turn_id().to_string(),
+            session_id: ctx.session_id.to_string(),
+            digest,
+            tool_call: tool_call.clone(),
+            parked_at: now,
+            expires_at,
+            verdict_tx,
+        }));
+        if !sent {
+            // The main loop is gone, so nobody will ever see this ask. Refuse
+            // now instead of holding the agent until the ask expires.
+            let _ = self.pending_permissions.take_parked(park_id);
+            tracing::warn!(
+                target: "acp::permission",
+                id = %id,
+                tool = %tool,
+                "no approval path: the main loop is not listening"
+            );
+            return Err(RefusalReason::NoApprovalPath);
+        }
+        ctx.gate.charge();
+
+        let expires_in = expires_at.saturating_duration_since(now);
+        tracing::info!(
+            target: "acp::permission",
+            id = %id,
+            park_id = park_id.0,
+            turn_id = %ctx.gate.turn_id(),
+            tool = %tool,
+            digest = %digest.to_hex(),
+            "parked permission request for an approver (expires in {expires_in:?})"
+        );
+        self.observe(
+            "approval_parked",
+            serde_json::json!({
+                "parkId": park_id.0,
+                "turnId": ctx.gate.turn_id(),
+                "digest": digest.to_hex(),
+                "tool": tool,
+                "kind": tool_call.get("kind"),
+                "expiresInMs": u64::try_from(expires_in.as_millis()).unwrap_or(u64::MAX),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Refuse a request with the agent's own `reject_once`, recording why so
+    /// the person who asked can be told.
+    async fn refuse_permission(
+        &mut self,
+        id: &serde_json::Value,
+        reject_option_id: &str,
+        tool: String,
+        reason: RefusalReason,
+        authority: TurnAuthority,
+    ) -> Result<(), AcpError> {
+        // warn, not debug: a refusal changes what the agent did, and on
+        // a guest turn it is the whole point of the gate. At debug this
+        // is invisible in practice, and "the agent just didn't do it"
+        // is indistinguishable from a bug.
+        tracing::warn!(
+            target: "acp::permission",
+            id = %id,
+            tool = %tool,
+            authority = ?authority,
+            reason = ?reason,
+            "refusing permission request"
+        );
+        self.permission_refusals
+            .push(PermissionRefusal { tool, reason });
+        self.answer_permission(id, permission_response_selected(id, reject_option_id))
+            .await
+    }
+
+    /// Write one answer to a permission request, then forget its id.
+    ///
+    /// Every answer goes through here, parked or not, so the order below holds
+    /// on every path.
+    async fn answer_permission(
+        &mut self,
+        id: &serde_json::Value,
+        response: serde_json::Value,
+    ) -> Result<(), AcpError> {
         // Write the response first, then forget the id.
         //
         // Order is load-bearing and was a deadlock once. Clearing before the
@@ -2146,8 +2548,238 @@ impl AcpClient {
         // Only THIS id is removed. A sibling request still in flight keeps its
         // own entry and its own claim on an answer.
         self.write_ndjson(&response).await?;
-        self.pending_permissions.forget(&id);
+        self.pending_permissions.forget(id);
         Ok(())
+    }
+
+    /// Answer one parked request, from its verdict or from its expiry.
+    async fn settle_parked(
+        &mut self,
+        park_id: ParkId,
+        source: SettleSource,
+        gate: &mut Option<ParkGate>,
+    ) -> Result<(), AcpError> {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        // First, and before any await: the verdict arm has just seen this
+        // receiver complete, and a tokio oneshot receiver panics if it is
+        // polled again. Out of the registry is out of the arm.
+        let Some((rpc_id, mut ask)) = self.pending_permissions.take_parked(park_id) else {
+            return Ok(());
+        };
+        let outcome = match source {
+            SettleSource::Arm(Ok(verdict)) => VerdictOutcome::Delivered(verdict),
+            SettleSource::Arm(Err(_)) => VerdictOutcome::Closed,
+            // A verdict that landed by the expiry instant still counts: the
+            // approver answered in time, and the loop only just noticed.
+            SettleSource::Expiry => match ask.verdict_rx.try_recv() {
+                Ok(verdict) => VerdictOutcome::Delivered(verdict),
+                Err(TryRecvError::Closed) => VerdictOutcome::Closed,
+                Err(TryRecvError::Empty) => {
+                    // Close, then look once more. A verdict sent in between
+                    // is honoured, and any send after the close fails, so the
+                    // main loop is never told a verdict landed on a request
+                    // that is about to be refused as expired.
+                    ask.verdict_rx.close();
+                    match ask.verdict_rx.try_recv() {
+                        Ok(verdict) => VerdictOutcome::Delivered(verdict),
+                        Err(_) => VerdictOutcome::Expired,
+                    }
+                }
+            },
+        };
+        // Gone before the write below can await. Alive during that await, with
+        // no loop polling it, it would let the main loop's `send` succeed for a
+        // request this is about to answer another way.
+        drop(ask.verdict_rx);
+
+        let resolution = resolve(&ask.digest, outcome);
+        let option_id = if resolution.allow {
+            &ask.allow_option_id
+        } else {
+            &ask.reject_option_id
+        };
+        self.answer_permission(&rpc_id, permission_response_selected(&rpc_id, option_id))
+            .await?;
+        if let Some(reason) = resolution.refusal {
+            self.permission_refusals.push(PermissionRefusal {
+                tool: ask.tool.clone(),
+                reason,
+            });
+        }
+        let waited = tokio::time::Instant::now().saturating_duration_since(ask.parked_at);
+        if let Some(gate) = gate.as_mut() {
+            if resolution.refund_ask {
+                gate.refund();
+            }
+            // After the write, never before: `Allowed` must mean the agent was
+            // told. If this send fails the main loop is gone, and there is
+            // nobody left to tell.
+            gate.send(ApprovalEvent::Settled(ApprovalSettled {
+                park_id,
+                turn_id: gate.turn_id().to_string(),
+                settlement: resolution.settlement,
+                waited,
+            }));
+        }
+        self.report_settled(
+            &rpc_id,
+            park_id,
+            gate.as_ref().map(ParkGate::turn_id),
+            &ask.tool,
+            resolution.settlement,
+            waited,
+        );
+        Ok(())
+    }
+
+    /// Refuse every parked request whose expiry has passed. The turn carries on.
+    async fn expire_due_approvals(
+        &mut self,
+        now: tokio::time::Instant,
+        gate: &mut Option<ParkGate>,
+    ) -> Result<(), AcpError> {
+        while let Some(park_id) = self.pending_permissions.first_expired(now) {
+            self.settle_parked(park_id, SettleSource::Expiry, gate)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Answer every request a read loop is leaving owed, whichever way it left.
+    ///
+    /// Parked requests get the agent's own `reject_once`, and the main loop a
+    /// `Settled`. Anything else still owed (a failed write, a request with no
+    /// usable option) gets `cancelled`. Stops at the first failed write: the
+    /// pipe is almost certainly dead, and whatever is left stays owed for
+    /// `cancel_with_cleanup`.
+    async fn answer_owed_on_exit(&mut self, gate: Option<&ParkGate>) {
+        // Retire every parked request before writing to any of them. Each write
+        // can await for up to its timeout, and no receiver may outlive the loop
+        // that was polling it while that happens.
+        for ask in self.pending_permissions.retire_all_parked() {
+            let resolution = resolve(&ask.digest, VerdictOutcome::TurnEnded);
+            let response = permission_response_selected(&ask.rpc_id, &ask.reject_option_id);
+            if let Err(e) = self.answer_permission(&ask.rpc_id, response).await {
+                tracing::warn!(
+                    target: "acp::permission",
+                    "exit drain stopped at a failed write ({e}); the rest stay owed"
+                );
+                return;
+            }
+            if let Some(reason) = resolution.refusal {
+                self.permission_refusals.push(PermissionRefusal {
+                    tool: ask.tool.clone(),
+                    reason,
+                });
+            }
+            let waited = tokio::time::Instant::now().saturating_duration_since(ask.parked_at);
+            if let Some(gate) = gate {
+                gate.send(ApprovalEvent::Settled(ApprovalSettled {
+                    park_id: ask.park_id,
+                    turn_id: gate.turn_id().to_string(),
+                    settlement: resolution.settlement,
+                    waited,
+                }));
+            }
+            self.report_settled(
+                &ask.rpc_id,
+                ask.park_id,
+                gate.map(ParkGate::turn_id),
+                &ask.tool,
+                resolution.settlement,
+                waited,
+            );
+        }
+        if let Err(e) = self.answer_owed_cancelled().await {
+            tracing::warn!(
+                target: "acp::permission",
+                "exit drain stopped at a failed write ({e}); the rest stay owed"
+            );
+        }
+    }
+
+    /// Answer `cancelled` to every request still owed, oldest first.
+    ///
+    /// Anything still parked is retired first, which drops its verdict
+    /// receiver before the first write can await. Stops at, and returns, the
+    /// first failed write; the ids it did not reach stay owed.
+    async fn answer_owed_cancelled(&mut self) -> Result<(), AcpError> {
+        for ask in self.pending_permissions.retire_all_parked() {
+            tracing::info!(
+                target: "acp::permission",
+                id = %ask.rpc_id,
+                park_id = ask.park_id.0,
+                tool = %ask.tool,
+                "answering a parked permission request cancelled"
+            );
+        }
+        while let Some(id) = self.pending_permissions.next_owed().cloned() {
+            self.answer_permission(&id, permission_response_cancelled(&id))
+                .await?;
+            tracing::debug!(
+                target: "acp::permission",
+                "responded cancelled to pending permission id={id}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Log and observe how a parked request ended.
+    fn report_settled(
+        &self,
+        rpc_id: &serde_json::Value,
+        park_id: ParkId,
+        turn_id: Option<&str>,
+        tool: &str,
+        settlement: Settlement,
+        waited: std::time::Duration,
+    ) {
+        let name = settlement.as_str();
+        match settlement {
+            Settlement::Allowed { .. } | Settlement::Denied(_) | Settlement::TurnEnded => {
+                tracing::info!(
+                    target: "acp::permission",
+                    id = %rpc_id,
+                    park_id = park_id.0,
+                    tool = %tool,
+                    ?waited,
+                    "parked permission request settled: {name}"
+                );
+            }
+            Settlement::Expired | Settlement::VerdictChannelClosed => {
+                tracing::warn!(
+                    target: "acp::permission",
+                    id = %rpc_id,
+                    park_id = park_id.0,
+                    tool = %tool,
+                    ?waited,
+                    "parked permission request refused unanswered: {name}"
+                );
+            }
+            // The main loop answered one request with another's verdict. It was
+            // refused, so nothing ran, but the binding between asks and
+            // verdicts is broken somewhere.
+            Settlement::DigestMismatch => {
+                tracing::error!(
+                    target: "acp::permission",
+                    id = %rpc_id,
+                    park_id = park_id.0,
+                    tool = %tool,
+                    "verdict digest did not match the parked request; refused"
+                );
+            }
+        }
+        let mut payload = serde_json::json!({
+            "parkId": park_id.0,
+            "turnId": turn_id,
+            "settlement": name,
+            "waitedMs": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        });
+        if let Settlement::Allowed { via } = settlement {
+            payload["via"] = serde_json::json!(via.as_str());
+        }
+        self.observe("approval_settled", payload);
     }
 
     /// Parse a completed prompt response and retain its optional per-turn usage.
@@ -2254,6 +2886,30 @@ pub(crate) enum PermissionDecision {
     Refuse(String),
     /// The agent offered nothing usable for the decision we reached.
     NoUsableOption,
+    /// Only someone with authority can allow this. `allow` is written if they
+    /// do; `reject` if they do not, or if nobody can be asked.
+    NeedsApprover { allow: String, reject: String },
+}
+
+/// What a parked request is being settled from.
+enum SettleSource {
+    /// The verdict arm saw its channel complete: a verdict, or a dropped
+    /// sender.
+    Arm(Result<ApprovalVerdict, tokio::sync::oneshot::error::RecvError>),
+    /// Its expiry passed.
+    Expiry,
+}
+
+/// What the prompt loop lends the permission handler so a request can park.
+///
+/// Built per request from the loop's own locals and gone when the handler
+/// returns, so the capability can never outlive the turn that holds it.
+struct ParkContext<'a> {
+    gate: &'a mut ParkGate,
+    clock: &'a TurnClock,
+    /// The read loop's own session id: what the digest binds, and what a
+    /// request's `sessionId` must match.
+    session_id: &'a str,
 }
 
 /// Decide a permission request from the turn's authority and the offered options.
@@ -2281,12 +2937,17 @@ pub(crate) fn decide_permission(
         // approval. The agent holds an unrestricted shell, so the tool name
         // says nothing useful about reach; who is asking is the axis that can
         // actually be enforced.
-        TurnAuthority::Guest => match by_kind("reject_once") {
-            Some(id) => PermissionDecision::Refuse(id),
+        TurnAuthority::Guest => match (by_kind("allow_once"), by_kind("reject_once")) {
+            // Never approved here. Only someone with authority can allow a
+            // guest's request, so it waits for one if the turn can reach one,
+            // and is refused if it cannot.
+            (Some(allow), Some(reject)) => PermissionDecision::NeedsApprover { allow, reject },
+            // Nothing to approve, so nobody to ask.
+            (None, Some(reject)) => PermissionDecision::Refuse(reject),
             // Falling back to approval here would invert the rule, so
             // report that nothing usable was offered and let the caller fail
             // the turn.
-            None => PermissionDecision::NoUsableOption,
+            (_, None) => PermissionDecision::NoUsableOption,
         },
         TurnAuthority::Owner => match by_kind("allow_once") {
             Some(id) => PermissionDecision::Approve(id),
@@ -2735,18 +3396,34 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_turn_is_refused_even_when_approval_is_offered() {
+    fn a_guest_turn_needs_an_approver_when_both_options_are_offered() {
         // The regression this exists to prevent: before the gate, every
         // request was auto-approved in every mode, so anyone on the allowlist
-        // could drive tool calls on the owner's machine with nobody asked.
+        // could drive tool calls on the owner's machine with nobody asked. An
+        // offered allow_once means someone may be asked, never that the
+        // guest's turn may take it. Both ids are the agent's own, by kind.
         let options = vec![
             opt("allow_once", "allow-42"),
             opt("reject_once", "reject-7"),
         ];
         assert_eq!(
             decide_permission(TurnAuthority::Guest, &options),
-            PermissionDecision::Refuse("reject-7".to_string()),
+            PermissionDecision::NeedsApprover {
+                allow: "allow-42".to_string(),
+                reject: "reject-7".to_string(),
+            },
             "an available allow_once must not tempt a guest turn into approval"
+        );
+    }
+
+    #[test]
+    fn a_guest_turn_offering_only_reject_is_refused_without_asking() {
+        // With no allow_once there is nothing an approver could say yes to,
+        // so paging one would only waste their time.
+        let options = vec![opt("reject_once", "reject-7")];
+        assert_eq!(
+            decide_permission(TurnAuthority::Guest, &options),
+            PermissionDecision::Refuse("reject-7".to_string())
         );
     }
 
@@ -2779,6 +3456,1160 @@ mod tests {
                 "{authority:?} with no options must not invent one"
             );
         }
+    }
+
+    // ── Parking a guest's request ────────────────────────────────────────────
+    //
+    // `cat` stands in for the agent in these: every line the harness writes
+    // comes straight back on the reader, so a test can see exactly what was
+    // answered without a bash script, and they run on every platform.
+
+    use crate::approval_gate::{AllowVia, ApprovalDecision, GateLimits, RequestDigest};
+
+    const PARK_SESSION: &str = "sess-test";
+
+    fn approval_link(
+        limits: GateLimits,
+    ) -> (
+        ApprovalLink,
+        tokio::sync::mpsc::UnboundedReceiver<ApprovalEvent>,
+    ) {
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let link = ApprovalLink {
+            events_tx,
+            turn_id: "turn-1".into(),
+            limits,
+        };
+        (link, events_rx)
+    }
+
+    fn probe_request_with_id(id: u64) -> serde_json::Value {
+        let mut request: serde_json::Value =
+            serde_json::from_str(PROBE_PERMISSION_REQUEST).expect("probe is JSON");
+        request["id"] = serde_json::json!(id);
+        request
+    }
+
+    fn probe_tool_call() -> serde_json::Value {
+        probe_request_with_id(7)["params"]["toolCall"].clone()
+    }
+
+    /// A clock with plenty of turn left, so a fresh ask gets its full window.
+    fn roomy_clock(limits: &GateLimits) -> TurnClock {
+        let now = tokio::time::Instant::now();
+        TurnClock::new(
+            now,
+            std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(3600),
+            limits.credit_cap,
+        )
+    }
+
+    /// The next line the harness wrote, as `cat` echoed it back.
+    async fn next_written(client: &mut AcpClient) -> serde_json::Value {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), client.reader.next())
+            .await
+            .expect("the harness should have written an answer")
+            .expect("cat closed its stdout")
+            .expect("cat's line was readable");
+        serde_json::from_str(&line).expect("the harness writes JSON")
+    }
+
+    /// Whether the harness wrote nothing within a short window.
+    async fn nothing_written(client: &mut AcpClient) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(300), client.reader.next())
+            .await
+            .is_err()
+    }
+
+    /// Park the probe request as the handler would, and hand back what the
+    /// main loop would hold.
+    fn park_directly(
+        client: &mut AcpClient,
+        id: u64,
+        expires_in: std::time::Duration,
+    ) -> (tokio::sync::oneshot::Sender<ApprovalVerdict>, RequestDigest) {
+        let rpc_id = serde_json::json!(id);
+        client.pending_permissions.record(rpc_id.clone());
+        let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+        let now = tokio::time::Instant::now();
+        let digest = request_digest(PARK_SESSION, &probe_tool_call());
+        client
+            .pending_permissions
+            .park(
+                &rpc_id,
+                ParkedAsk {
+                    park_id: ParkId::mint(),
+                    allow_option_id: "allow-1".into(),
+                    reject_option_id: "reject-1".into(),
+                    digest,
+                    tool: "Bash".into(),
+                    parked_at: now,
+                    expires_at: now + expires_in,
+                    verdict_rx,
+                },
+            )
+            .expect("recorded just above");
+        (verdict_tx, digest)
+    }
+
+    fn refusal(reason: RefusalReason) -> PermissionRefusal {
+        PermissionRefusal {
+            tool: "Bash".into(),
+            reason,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guest_request_parks_without_answering_and_asks_once() {
+        let mut client = spawn_inert_client().await;
+        let limits = GateLimits::default();
+        let (link, mut events) = approval_link(limits);
+        let mut gate = ParkGate::new(link);
+        let clock = roomy_clock(&limits);
+        let request = probe_request_with_id(7);
+
+        client
+            .handle_permission_request(
+                &request,
+                TurnAuthority::Guest,
+                Some(ParkContext {
+                    gate: &mut gate,
+                    clock: &clock,
+                    session_id: PARK_SESSION,
+                }),
+            )
+            .await
+            .expect("parking writes nothing, so it cannot fail");
+
+        assert!(
+            nothing_written(&mut client).await,
+            "a parked request is not answered yet"
+        );
+        assert_eq!(
+            client.pending_permissions.next_owed(),
+            Some(&serde_json::json!(7)),
+            "a parked request is still owed, so a cancel would answer it"
+        );
+        assert_eq!(gate.asks_charged(), 1);
+        let ask = match events.try_recv() {
+            Ok(ApprovalEvent::Ask(ask)) => ask,
+            other => panic!("expected one ask, got {other:?}"),
+        };
+        assert_eq!(
+            ask.digest,
+            request_digest(PARK_SESSION, &probe_tool_call()),
+            "the ask is bound to exactly what the agent asked"
+        );
+        assert_eq!(ask.turn_id, "turn-1");
+        assert_eq!(ask.session_id, PARK_SESSION);
+        assert_eq!(
+            ask.tool_call,
+            probe_tool_call(),
+            "the renderer gets the tool call verbatim"
+        );
+        assert_eq!(ask.expires_at - ask.parked_at, limits.approval_timeout);
+        assert_eq!(
+            client.pending_permissions.first_expired(ask.expires_at),
+            Some(ask.park_id),
+            "the ask names the request that is parked"
+        );
+        assert!(!ask.verdict_tx.is_closed());
+
+        // A retransmit of an id still owed is neither answered nor asked twice.
+        client
+            .handle_permission_request(
+                &request,
+                TurnAuthority::Guest,
+                Some(ParkContext {
+                    gate: &mut gate,
+                    clock: &clock,
+                    session_id: PARK_SESSION,
+                }),
+            )
+            .await
+            .expect("a retransmit is ignored");
+        assert!(nothing_written(&mut client).await);
+        assert!(events.try_recv().is_err(), "one request, one ask");
+        assert_eq!(gate.asks_charged(), 1);
+        assert!(client.take_permission_refusals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_guest_request_is_refused_at_once_when_nobody_is_listening() {
+        let mut client = spawn_inert_client().await;
+        let limits = GateLimits::default();
+        let (link, events) = approval_link(limits);
+        drop(events);
+        let mut gate = ParkGate::new(link);
+        let clock = roomy_clock(&limits);
+
+        client
+            .handle_permission_request(
+                &probe_request_with_id(7),
+                TurnAuthority::Guest,
+                Some(ParkContext {
+                    gate: &mut gate,
+                    clock: &clock,
+                    session_id: PARK_SESSION,
+                }),
+            )
+            .await
+            .expect("the refusal is written");
+
+        let answer = next_written(&mut client).await;
+        assert_eq!(
+            answer["result"]["outcome"]["optionId"], "reject-1",
+            "an ask nobody can see must not hold the agent until it expires"
+        );
+        assert_eq!(client.pending_permissions.parked_count(), 0);
+        assert!(client.pending_permissions.next_owed().is_none());
+        assert_eq!(
+            gate.asks_charged(),
+            0,
+            "an ask that never went out costs nothing"
+        );
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::NoApprovalPath)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_for_another_session_is_refused_not_parked() {
+        let mut client = spawn_inert_client().await;
+        let limits = GateLimits::default();
+        let (link, mut events) = approval_link(limits);
+        let mut gate = ParkGate::new(link);
+        let clock = roomy_clock(&limits);
+        let mut request = probe_request_with_id(7);
+        request["params"]["sessionId"] = serde_json::json!("another-session");
+
+        client
+            .handle_permission_request(
+                &request,
+                TurnAuthority::Guest,
+                Some(ParkContext {
+                    gate: &mut gate,
+                    clock: &clock,
+                    session_id: PARK_SESSION,
+                }),
+            )
+            .await
+            .expect("the refusal is written");
+
+        let answer = next_written(&mut client).await;
+        assert_eq!(answer["result"]["outcome"]["optionId"], "reject-1");
+        assert!(events.try_recv().is_err(), "nobody is asked about it");
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::SessionMismatch)]
+        );
+    }
+
+    /// The approver answered in time; the loop was merely late to look.
+    #[tokio::test]
+    async fn a_verdict_delivered_by_the_expiry_instant_is_honoured() {
+        let mut client = spawn_inert_client().await;
+        let (link, mut events) = approval_link(GateLimits::default());
+        let mut gate = Some(ParkGate::new(link));
+        let window = std::time::Duration::from_secs(600);
+        let (verdict_tx, digest) = park_directly(&mut client, 7, window);
+        verdict_tx
+            .send(ApprovalVerdict {
+                digest,
+                decision: ApprovalDecision::Allow {
+                    via: AllowVia::Approver,
+                },
+            })
+            .expect("the request is parked");
+
+        client
+            .expire_due_approvals(tokio::time::Instant::now() + window, &mut gate)
+            .await
+            .expect("the answer is written");
+
+        let answer = next_written(&mut client).await;
+        assert_eq!(answer["result"]["outcome"]["optionId"], "allow-1");
+        match events.try_recv() {
+            Ok(ApprovalEvent::Settled(settled)) => assert_eq!(
+                settled.settlement,
+                Settlement::Allowed {
+                    via: AllowVia::Approver
+                }
+            ),
+            other => panic!("expected settled, got {other:?}"),
+        }
+        assert!(client.take_permission_refusals().is_empty());
+        assert!(client.pending_permissions.next_owed().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_ask_expires_to_reject_and_closes_its_channel() {
+        let mut client = spawn_inert_client().await;
+        let (link, mut events) = approval_link(GateLimits::default());
+        let mut gate = Some(ParkGate::new(link));
+        let window = std::time::Duration::from_secs(600);
+        let (verdict_tx, _) = park_directly(&mut client, 7, window);
+
+        client
+            .expire_due_approvals(tokio::time::Instant::now() + window, &mut gate)
+            .await
+            .expect("the refusal is written");
+
+        let answer = next_written(&mut client).await;
+        assert_eq!(answer["result"]["outcome"]["optionId"], "reject-1");
+        match events.try_recv() {
+            Ok(ApprovalEvent::Settled(settled)) => {
+                assert_eq!(settled.settlement, Settlement::Expired)
+            }
+            other => panic!("expected settled, got {other:?}"),
+        }
+        assert!(
+            verdict_tx.is_closed(),
+            "a yes that arrives now must be told it is too late"
+        );
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::Expired)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_drain_write_stops_and_leaves_ids_owed_for_cancel() {
+        let mut client = spawn_inert_client().await;
+        // The agent is gone, so every write fails.
+        client.shutdown().await;
+        let mut senders = Vec::new();
+        for id in 1..=3 {
+            let (verdict_tx, _) =
+                park_directly(&mut client, id, std::time::Duration::from_secs(600));
+            senders.push(verdict_tx);
+        }
+
+        client.answer_owed_on_exit(None).await;
+
+        assert_eq!(
+            client.pending_permissions.parked_count(),
+            0,
+            "every request is retired even though no write got through"
+        );
+        assert!(senders.iter().all(|tx| tx.is_closed()));
+        assert_eq!(
+            client.pending_permissions.next_owed(),
+            Some(&serde_json::json!(1)),
+            "the ids stay owed for cancel_with_cleanup"
+        );
+    }
+
+    /// Cancel is the one cleanup after `pool.rs` drops a prompt future
+    /// mid-wait. It retires parked requests before its first write, so even
+    /// when that write fails the main loop learns the ask is dead instead of
+    /// being told, until the ask expires, that its verdicts are delivered.
+    #[tokio::test]
+    async fn cancel_retires_parked_receivers_before_a_write_can_fail() {
+        let mut client = spawn_inert_client().await;
+        client.shutdown().await;
+        let (verdict_tx, _) = park_directly(&mut client, 7, std::time::Duration::from_secs(600));
+        client.last_prompt_id = Some(1);
+
+        let result = client
+            .cancel_with_cleanup_grace(PARK_SESSION, std::time::Duration::from_secs(1))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the pipe is dead, so the cancel cannot finish"
+        );
+        assert!(verdict_tx.is_closed());
+        assert_eq!(client.pending_permissions.parked_count(), 0);
+        assert_eq!(
+            client.pending_permissions.next_owed(),
+            Some(&serde_json::json!(7)),
+            "nothing reached the agent, so the id is still owed"
+        );
+    }
+
+    /// `cat` echoes the prompt back as a request the harness does not know,
+    /// the harness answers `-32601`, and `cat` echoes that back as the
+    /// prompt's error response: a prompt that ends at once, with no script.
+    #[tokio::test]
+    async fn a_finished_prompt_leaves_the_connection_untrusted() {
+        let mut client = spawn_inert_client().await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                TurnAuthority::Owner,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::AgentError { code: -32601, .. })),
+            "expected the echoed -32601, got {result:?}"
+        );
+        assert_eq!(
+            client.current_turn_authority,
+            TurnAuthority::Guest,
+            "an owner turn's trust must not outlive the turn"
+        );
+    }
+
+    // ── Around a write that has not finished (cat and sleep, every platform) ──
+    //
+    // Some orderings only show while an answer is still on its way to the
+    // agent: what the harness has already let go of by then, and what it still
+    // holds. The wire cannot show that, so these tests hold a write open on
+    // purpose, and look at the harness, or drop it, while it waits.
+
+    /// The prompt's id in tests that answer the prompt by hand.
+    const PROMPT_ID: u64 = 41;
+
+    fn prompt_response(stop_reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": PROMPT_ID,
+            "result": {"stopReason": stop_reason},
+        })
+    }
+
+    /// A child whose stdin will not take another byte.
+    ///
+    /// `sleep` never reads stdin, so the pipe is filled here until a write
+    /// stalls, and every write after that waits for as long as the child lives.
+    /// Swap its `stdin` into a client under test to hold that client's next
+    /// write open.
+    ///
+    /// End the test with `shutdown` on it. On Windows a stuck write occupies a
+    /// blocking thread until the pipe breaks, and the runtime waits for that
+    /// thread before the test can finish.
+    async fn stalled_stdin() -> AcpClient {
+        use tokio::io::AsyncWriteExt;
+        let mut stalled = AcpClient::spawn("sleep", &["3600".to_string()], &[], false)
+            .await
+            .expect("spawn sleep as an agent that never reads");
+        let chunk = vec![b'x'; 64 * 1024];
+        // `write`, not `write_all`, so a stalled attempt leaves nothing
+        // half-written. A whole second without progress means the pipe is
+        // full, and nothing will ever empty it.
+        loop {
+            let attempt = stalled.stdin.write(&chunk);
+            match tokio::time::timeout(std::time::Duration::from_secs(1), attempt).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("filling the stalled pipe failed: {e}"),
+                Err(_) => return stalled,
+            }
+        }
+    }
+
+    /// Expiry closes the ask before its refusal is written, not after. The
+    /// write can take up to its timeout, and a receiver alive that long, with
+    /// no loop polling it, would let the main loop's `send` succeed for a
+    /// request that is being refused.
+    #[tokio::test]
+    async fn an_expired_ask_is_closed_while_its_refusal_is_still_being_written() {
+        let mut client = spawn_inert_client().await;
+        let (link, _events) = approval_link(GateLimits::default());
+        let mut gate = Some(ParkGate::new(link));
+        let window = std::time::Duration::from_secs(600);
+        let (verdict_tx, digest) = park_directly(&mut client, 7, window);
+        let mut stalled = stalled_stdin().await;
+        std::mem::swap(&mut client.stdin, &mut stalled.stdin);
+
+        let mut expiry =
+            Box::pin(client.expire_due_approvals(tokio::time::Instant::now() + window, &mut gate));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut expiry)
+                .await
+                .is_err(),
+            "the refusal should be stuck in its write"
+        );
+        assert!(
+            verdict_tx.is_closed(),
+            "the ask must be closed before its refusal is written"
+        );
+        let late = ApprovalVerdict {
+            digest,
+            decision: ApprovalDecision::Allow {
+                via: AllowVia::Approver,
+            },
+        };
+        assert!(
+            verdict_tx.send(late).is_err(),
+            "a yes sent now must be told it is too late, not taken"
+        );
+        drop(expiry);
+        stalled.shutdown().await;
+    }
+
+    /// Run the gated read loop to the prompt's `response` with a guest's
+    /// request parked, and drop it where `pool.rs`'s `select!` can: in the exit
+    /// drain, with that request's refusal stuck in its write.
+    ///
+    /// `cat` plays the agent, echoing the request and then the response
+    /// written to it here; the stalled stdin swapped in afterwards holds the
+    /// drain's first write. Returns the client, and the stalled child for the
+    /// test to shut down.
+    async fn drop_in_the_exit_drain(response: serde_json::Value) -> (AcpClient, AcpClient) {
+        let mut client = spawn_inert_client().await;
+        for line in [probe_request_with_id(7), response] {
+            client
+                .write_ndjson(&line)
+                .await
+                .expect("cat takes the line");
+        }
+        let mut stalled = stalled_stdin().await;
+        std::mem::swap(&mut client.stdin, &mut stalled.stdin);
+        client.last_prompt_id = Some(PROMPT_ID);
+
+        let (link, mut events) = approval_link(GateLimits::default());
+        let max = std::time::Duration::from_secs(3600);
+        let mut turn = Box::pin(client.read_until_response_gated(
+            PARK_SESSION,
+            PROMPT_ID,
+            std::time::Duration::from_secs(30),
+            tokio::time::Instant::now() + max,
+            max,
+            Some(link),
+        ));
+        // The drain retires the parked request, closing its ask, before its
+        // first write. A closed ask on a turn still pending therefore means the
+        // turn is in that write. Polled in steps, so a slow `cat` only makes
+        // this wait longer.
+        let mut ask = None;
+        let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(result) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut turn).await
+            {
+                panic!("the turn should be stuck in its exit drain, but it ended: {result:?}");
+            }
+            if ask.is_none() {
+                ask = match events.try_recv() {
+                    Ok(ApprovalEvent::Ask(ask)) => Some(ask),
+                    Ok(other) => panic!("expected the request's ask, got {other:?}"),
+                    Err(_) => None,
+                };
+            }
+            if ask.as_ref().is_some_and(|ask| ask.verdict_tx.is_closed()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < give_up,
+                "the turn never reached its exit drain"
+            );
+        }
+        drop(turn);
+        (client, stalled)
+    }
+
+    /// `has_in_flight_prompt` is all the pool asks after dropping a turn. Were
+    /// it still true once the response had been read, the pool would cancel,
+    /// wait out its grace for a response that is not coming, and re-run a turn
+    /// that completed.
+    #[tokio::test]
+    async fn a_prompt_whose_result_was_read_is_not_in_flight_during_the_drain() {
+        let (client, mut stalled) = drop_in_the_exit_drain(prompt_response("end_turn")).await;
+        assert!(
+            !client.has_in_flight_prompt(),
+            "the response was read, so the prompt is no longer in flight"
+        );
+        stalled.shutdown().await;
+    }
+
+    /// A JSON-RPC error answering the prompt is its response too: read, and
+    /// not coming again.
+    #[tokio::test]
+    async fn a_prompt_whose_error_was_read_is_not_in_flight_during_the_drain() {
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": PROMPT_ID,
+            "error": {"code": -32000, "message": "the agent failed the turn"},
+        });
+        let (client, mut stalled) = drop_in_the_exit_drain(error).await;
+        assert!(
+            !client.has_in_flight_prompt(),
+            "the error was the response, so the prompt is no longer in flight"
+        );
+        stalled.shutdown().await;
+    }
+
+    /// The pool drops the prompt future before it can return its error, so the
+    /// error has to wait on the client for the pool to take. Were it lost, the
+    /// pool would report a failed turn as completed: its batch recorded as
+    /// delivered and never retried.
+    #[tokio::test]
+    async fn a_prompt_error_read_before_a_drop_is_kept_for_the_pool() {
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": PROMPT_ID,
+            "error": {"code": -32000, "message": "the agent failed the turn"},
+        });
+        let (mut client, mut stalled) = drop_in_the_exit_drain(error).await;
+        match client.take_prompt_error_before_drain() {
+            Some(AcpError::AgentError { code, message }) => {
+                assert_eq!(code, -32000);
+                assert_eq!(message, "the agent failed the turn");
+            }
+            other => panic!("the pool must get the error the turn ended with, got {other:?}"),
+        }
+        assert!(
+            client.take_prompt_error_before_drain().is_none(),
+            "the error is reported once"
+        );
+        stalled.shutdown().await;
+    }
+
+    /// When the prompt call returns, its result already carries the error. A
+    /// copy left behind could be reported against a later turn.
+    #[tokio::test]
+    async fn an_error_the_prompt_returned_is_not_kept_for_the_pool() {
+        // Two cats, as in the owed-ids test below: the queued error answers the
+        // prompt as soon as it is sent. A fresh client's first request is id 0.
+        let mut client = spawn_inert_client().await;
+        let mut wire = spawn_inert_client().await;
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {"code": -32000, "message": "the agent failed the turn"},
+        });
+        client
+            .write_ndjson(&error)
+            .await
+            .expect("cat takes the response");
+        std::mem::swap(&mut client.stdin, &mut wire.stdin);
+
+        let result = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                TurnAuthority::Guest,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::AgentError { .. })),
+            "got {result:?}"
+        );
+        assert!(
+            client.take_prompt_error_before_drain().is_none(),
+            "the returned result carried the error, so nothing is kept"
+        );
+    }
+
+    /// The other side of the two above: a prompt that timed out still has its
+    /// response coming, so it stays in flight for the pool's cancel to drain.
+    #[tokio::test]
+    async fn a_prompt_that_timed_out_stays_in_flight_for_the_cancel() {
+        let mut client = spawn_inert_client().await;
+        client.last_prompt_id = Some(PROMPT_ID);
+        let max = std::time::Duration::from_secs(3600);
+        let result = client
+            .read_until_response_gated(
+                PARK_SESSION,
+                PROMPT_ID,
+                std::time::Duration::from_millis(200),
+                tokio::time::Instant::now() + max,
+                max,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::IdleTimeout(_))),
+            "expected an idle timeout, got {result:?}"
+        );
+        assert_eq!(
+            client.last_prompt_id,
+            Some(PROMPT_ID),
+            "the response is still coming, and the cancel must drain it"
+        );
+    }
+
+    /// A turn dropped in its exit drain leaves the ids that drain had not
+    /// reached still owed, and no prompt in flight for a cancel to find. The
+    /// next prompt answers them before it is written.
+    #[tokio::test]
+    async fn a_new_prompt_first_answers_what_an_earlier_turn_left_owed() {
+        // Two cats: `client` reads the first and writes to the second, so the
+        // test reads, in order, exactly what the harness wrote.
+        let mut client = spawn_inert_client().await;
+        let mut wire = spawn_inert_client().await;
+        // Queued before the swap, so the prompt ends as soon as it is sent. A
+        // fresh client's first request, the prompt, is id 0.
+        let end_turn = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {"stopReason": "end_turn"},
+        });
+        client
+            .write_ndjson(&end_turn)
+            .await
+            .expect("cat takes the response");
+        std::mem::swap(&mut client.stdin, &mut wire.stdin);
+        client.pending_permissions.record(serde_json::json!(7));
+
+        let result = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                TurnAuthority::Guest,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Ok(StopReason::EndTurn)), "got {result:?}");
+
+        let first = next_written(&mut wire).await;
+        assert_eq!(
+            first["id"], 7,
+            "the stale id must be answered before the prompt, got {first}"
+        );
+        assert_eq!(first["result"]["outcome"]["outcome"], "cancelled");
+        let second = next_written(&mut wire).await;
+        assert_eq!(second["method"], "session/prompt", "got {second}");
+        assert!(client.pending_permissions.is_empty());
+    }
+
+    /// `pool.rs` drops the prompt future before it cancels, so the reset at the
+    /// end of the prompt call never runs. The cancel drain must still decide
+    /// what the agent asks while it winds down as nobody's turn, not as the
+    /// dead one's.
+    #[tokio::test]
+    async fn a_cancel_after_a_dropped_owner_turn_decides_as_a_guest() {
+        let mut client = spawn_inert_client().await;
+        // What the agent says while it winds down, queued for `cat` to echo: a
+        // request, then the cancelled prompt's response.
+        for line in [probe_request_with_id(7), prompt_response("cancelled")] {
+            client
+                .write_ndjson(&line)
+                .await
+                .expect("cat takes the line");
+        }
+        // As a dropped owner turn leaves them.
+        client.current_turn_authority = TurnAuthority::Owner;
+        client.last_prompt_id = Some(PROMPT_ID);
+
+        let result = client
+            .cancel_with_cleanup_grace(PARK_SESSION, std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(result, Ok(StopReason::Cancelled)),
+            "got {result:?}"
+        );
+        assert_eq!(client.current_turn_authority, TurnAuthority::Guest);
+
+        // The drain's answer comes back through `cat`, behind `session/cancel`.
+        let answer = loop {
+            let line = next_written(&mut client).await;
+            if line["id"] == 7 {
+                break line;
+            }
+        };
+        assert_eq!(
+            answer["result"]["outcome"]["optionId"], "reject-1",
+            "a request raised during a cancel is decided as a guest's"
+        );
+    }
+
+    // ── Parking on the real read loop (bash fake agents, Linux CI) ───────────
+
+    /// A fresh client's first request, the prompt, is always id 0.
+    #[cfg(unix)]
+    const END_FIRST_PROMPT: &str = r#"{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}"#;
+
+    /// The same request as the probe, with no `options`, which the handler
+    /// can only fail with `?`.
+    #[cfg(unix)]
+    const OPTIONLESS_PERMISSION_REQUEST: &str = r#"{"jsonrpc":"2.0","id":8,"method":"session/request_permission","params":{"sessionId":"sess-test","toolCall":{"toolCallId":"t2","title":"Bash","kind":"execute"}}}"#;
+
+    /// The replies a fake agent captured, waiting until it has written `n`.
+    /// A loop that answers on its way out can return before the agent has
+    /// read the answer.
+    #[cfg(unix)]
+    async fn awaited_replies(path: &std::path::Path, n: usize) -> Vec<serde_json::Value> {
+        for _ in 0..100 {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+                if lines.len() >= n {
+                    return lines
+                        .iter()
+                        .map(|l| serde_json::from_str(l).expect("the harness writes JSON"))
+                        .collect();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the fake agent never captured {n} replies");
+    }
+
+    /// Prompt, get asked, capture the answer, then end the turn.
+    #[cfg(unix)]
+    fn ask_then_end_script(capture: &std::path::Path) -> String {
+        format!(
+            "read -r _prompt; printf '%s\\n' '{req}'; read -r reply; \
+             printf '%s' \"$reply\" > '{capture}'; printf '%s\\n' '{done}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            capture = bash_path(capture),
+            done = END_FIRST_PROMPT,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guest_permission_parks_and_an_allow_verdict_writes_allow_once() {
+        let capture = probe_capture_path("park-allow");
+        let mut client = spawn_script(&ask_then_end_script(&capture)).await;
+        let (link, mut events) = approval_link(GateLimits::default());
+        let approver = tokio::spawn(async move {
+            let ask = match events.recv().await {
+                Some(ApprovalEvent::Ask(ask)) => ask,
+                other => panic!("expected an ask, got {other:?}"),
+            };
+            assert_eq!(
+                ask.digest,
+                request_digest(PARK_SESSION, &probe_tool_call()),
+                "the ask carries the digest of what the agent asked"
+            );
+            ask.verdict_tx
+                .send(ApprovalVerdict {
+                    digest: ask.digest,
+                    decision: ApprovalDecision::Allow {
+                        via: AllowVia::Approver,
+                    },
+                })
+                .expect("the read loop is waiting on this verdict");
+            match events.recv().await {
+                Some(ApprovalEvent::Settled(settled)) => settled,
+                other => panic!("expected settled, got {other:?}"),
+            }
+        });
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                Some(link),
+            )
+            .await
+            .expect("the turn ends normally");
+
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(captured_answer(&capture), "allow-1");
+        let settled = approver.await.expect("approver task");
+        assert_eq!(
+            settled.settlement,
+            Settlement::Allowed {
+                via: AllowVia::Approver
+            }
+        );
+        assert!(client.take_permission_refusals().is_empty());
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// With no link, a guest's request is refused exactly as it was before
+    /// parking existed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guest_permission_without_a_link_is_refused_inline() {
+        let capture = probe_capture_path("park-nolink");
+        let mut client = spawn_script(&ask_then_end_script(&capture)).await;
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                None,
+            )
+            .await
+            .expect("the turn ends normally");
+
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(captured_answer(&capture), "reject-1");
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::NoApprovalPath)]
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// An ask nobody answers is refused at its expiry and the turn carries on.
+    /// The idle timeout is shorter than the window, so this also shows idle
+    /// is suspended while a person is being asked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unanswered_ask_expires_to_reject_and_the_turn_continues() {
+        let capture = probe_capture_path("park-expire");
+        let mut client = spawn_script(&ask_then_end_script(&capture)).await;
+        let limits = GateLimits {
+            approval_timeout: std::time::Duration::from_secs(1),
+            min_ask_window: std::time::Duration::from_millis(100),
+            hard_margin: std::time::Duration::from_millis(100),
+            ..GateLimits::default()
+        };
+        let (link, mut events) = approval_link(limits);
+        let started = tokio::time::Instant::now();
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                Some(link),
+            )
+            .await
+            .expect("an expiry refuses the request; it does not end the turn");
+
+        assert_eq!(stop, StopReason::EndTurn);
+        assert!(started.elapsed() >= limits.approval_timeout);
+        assert_eq!(captured_answer(&capture), "reject-1");
+        let _ask = match events.try_recv() {
+            Ok(ApprovalEvent::Ask(ask)) => ask,
+            other => panic!("expected an ask, got {other:?}"),
+        };
+        match events.try_recv() {
+            Ok(ApprovalEvent::Settled(settled)) => {
+                assert_eq!(settled.settlement, Settlement::Expired)
+            }
+            other => panic!("expected settled, got {other:?}"),
+        }
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::Expired)]
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// The prompt response arrives while a request is still parked. The exit
+    /// drain refuses it before the call returns. The in-flight check below
+    /// runs after the call has returned, where the prompt is cleared either
+    /// way; that a drop mid-drain finds no prompt in flight is pinned by
+    /// `a_prompt_whose_result_was_read_is_not_in_flight_during_the_drain`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_result_while_parked_answers_reject_before_returning() {
+        let capture = probe_capture_path("park-exit");
+        let script = format!(
+            "read -r _prompt; printf '%s\\n' '{req}'; printf '%s\\n' '{done}'; \
+             read -r reply; printf '%s\\n' \"$reply\" > '{capture}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            done = END_FIRST_PROMPT,
+            capture = bash_path(&capture),
+        );
+        let mut client = spawn_script(&script).await;
+        let (link, mut events) = approval_link(GateLimits::default());
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                Some(link),
+            )
+            .await
+            .expect("the turn ends normally");
+
+        assert_eq!(stop, StopReason::EndTurn);
+        assert!(!client.has_in_flight_prompt());
+        let ask = match events.try_recv() {
+            Ok(ApprovalEvent::Ask(ask)) => ask,
+            other => panic!("expected an ask, got {other:?}"),
+        };
+        match events.try_recv() {
+            Ok(ApprovalEvent::Settled(settled)) => {
+                assert_eq!(settled.settlement, Settlement::TurnEnded);
+                assert_eq!(settled.park_id, ask.park_id);
+            }
+            other => panic!("expected settled, got {other:?}"),
+        }
+        assert!(
+            ask.verdict_tx.is_closed(),
+            "a verdict sent now must be told it is too late"
+        );
+        let replies = awaited_replies(&capture, 1).await;
+        assert_eq!(replies[0]["result"]["outcome"]["optionId"], "reject-1");
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::TurnEnded)]
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// A request with no options fails the handler with `?`. The drain still
+    /// refuses the parked request and answers the broken one `cancelled`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_question_mark_exit_answers_the_parked_request() {
+        let capture = probe_capture_path("park-qmark");
+        let script = format!(
+            "read -r _prompt; printf '%s\\n' '{req}'; printf '%s\\n' '{broken}'; \
+             read -r first; read -r second; \
+             printf '%s\\n%s\\n' \"$first\" \"$second\" > '{capture}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            broken = OPTIONLESS_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+        );
+        let mut client = spawn_script(&script).await;
+        let (link, mut events) = approval_link(GateLimits::default());
+
+        let result = client
+            .session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                Some(link),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AcpError::Protocol(_))),
+            "got {result:?}"
+        );
+        let replies = awaited_replies(&capture, 2).await;
+        assert_eq!(replies[0]["id"], 7);
+        assert_eq!(replies[0]["result"]["outcome"]["optionId"], "reject-1");
+        assert_eq!(replies[1]["id"], 8);
+        assert_eq!(replies[1]["result"]["outcome"]["outcome"], "cancelled");
+        let ask = match events.try_recv() {
+            Ok(ApprovalEvent::Ask(ask)) => ask,
+            other => panic!("expected an ask, got {other:?}"),
+        };
+        assert!(ask.verdict_tx.is_closed());
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// The `pool.rs` control arm drops the prompt future while a request is
+    /// parked. Only `cancel_with_cleanup_grace` runs after that, and it must
+    /// answer the parked request before it sends `session/cancel`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_prompt_future_is_answered_cancelled_by_cancel_with_cleanup_grace() {
+        let capture = probe_capture_path("park-drop");
+        let script = format!(
+            "read -r _prompt; printf '%s\\n' '{req}'; read -r reply; \
+             printf '%s\\n' \"$reply\" > '{capture}'; read -r _cancel; \
+             printf '%s\\n' '{cancelled}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+            cancelled = r#"{"jsonrpc":"2.0","id":0,"result":{"stopReason":"cancelled"}}"#,
+        );
+        let mut client = spawn_script(&script).await;
+        let (link, mut events) = approval_link(GateLimits::default());
+
+        let ask = {
+            let prompt = client.session_prompt_with_idle_timeout(
+                PARK_SESSION,
+                "hello",
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(12),
+                TurnAuthority::Guest,
+                Some(link),
+            );
+            tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Some(ApprovalEvent::Ask(ask)) => ask,
+                    other => panic!("expected an ask, got {other:?}"),
+                },
+                result = prompt => panic!("the prompt must still be parked, got {result:?}"),
+            }
+        };
+
+        let stop = client
+            .cancel_with_cleanup_grace(PARK_SESSION, std::time::Duration::from_secs(5))
+            .await
+            .expect("the agent acknowledges the cancel");
+
+        assert_eq!(stop, StopReason::Cancelled);
+        let replies = awaited_replies(&capture, 1).await;
+        assert_eq!(replies[0]["id"], 7);
+        assert_eq!(replies[0]["result"]["outcome"]["outcome"], "cancelled");
+        assert!(
+            ask.verdict_tx.is_closed(),
+            "the main loop must see that the ask is dead"
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// The setup loop has no turn behind it and so nobody to ask: a guest's
+    /// request there is refused inline and can never leave an untimed RPC
+    /// waiting on a person.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_rpc_permission_request_never_parks() {
+        let capture = probe_capture_path("park-setup");
+        let script = format!(
+            "printf '%s\\n' '{req}'; read -r reply; printf '%s' \"$reply\" > '{capture}'; \
+             printf '%s\\n' '{done}'; sleep 5",
+            req = PROBE_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+            done = r#"{"jsonrpc":"2.0","id":5,"result":{"ok":true}}"#,
+        );
+        let mut client = spawn_script(&script).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_until_response(5),
+        )
+        .await
+        .expect("the setup loop must finish");
+
+        assert!(result.is_ok(), "setup should complete, got {result:?}");
+        assert_eq!(captured_answer(&capture), "reject-1");
+        assert_eq!(client.pending_permissions.parked_count(), 0);
+        assert_eq!(
+            client.take_permission_refusals(),
+            vec![refusal(RefusalReason::NoApprovalPath)]
+        );
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// A setup RPC whose loop fails on a broken request answers that request
+    /// on the way out, rather than leaving the agent blocked on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_setup_loop_error_answers_the_request_it_left_owed() {
+        let capture = probe_capture_path("park-setup-err");
+        let script = format!(
+            "printf '%s\\n' '{broken}'; read -r reply; printf '%s\\n' \"$reply\" > '{capture}'; \
+             sleep 5",
+            broken = OPTIONLESS_PERMISSION_REQUEST,
+            capture = bash_path(&capture),
+        );
+        let mut client = spawn_script(&script).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_until_response(5),
+        )
+        .await
+        .expect("the setup loop must finish");
+
+        assert!(
+            matches!(result, Err(AcpError::Protocol(_))),
+            "got {result:?}"
+        );
+        let replies = awaited_replies(&capture, 1).await;
+        assert_eq!(replies[0]["id"], 8);
+        assert_eq!(replies[0]["result"]["outcome"]["outcome"], "cancelled");
+        assert!(client.pending_permissions.next_owed().is_none());
+        let _ = std::fs::remove_file(&capture);
     }
 
     use super::*;
@@ -5004,6 +6835,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 // A harness-driven wire test, not a channel turn: no inbound author.
                 TurnAuthority::Owner,
+                None,
             )
             .await
             .expect("wire prompt");
