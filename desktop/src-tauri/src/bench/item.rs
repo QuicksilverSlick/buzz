@@ -16,6 +16,9 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
     "3\u{FE0F}\u{20E3}",
     "4\u{FE0F}\u{20E3}",
 ];
+/// An answered card stays 24 h so late pills still land, then it is retired;
+/// also the attention clock on the board.
+pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
 const TITLE_MAX: usize = 120;
@@ -116,6 +119,18 @@ pub(crate) enum Needs {
     Delegable,
 }
 
+/// The approver's answer on a pending item, derived from a kind-7 reaction.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Answer {
+    /// The approver's kind-7 id: the change key.
+    pub reaction_id: String,
+    /// 0-based index into `options`.
+    pub option: usize,
+    /// Bench clock when first seen.
+    pub answered_at: u64,
+}
+
 /// A validated drop, namespaced by writer, as kept in state.json.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +155,11 @@ pub(crate) struct Item {
     pub updated_at: String,
     #[serde(default)]
     pub card: Option<super::Posted>,
+    #[serde(default)]
+    pub answer: Option<Answer>,
+    /// The option the live card's text shows as Recorded; None = plain.
+    #[serde(default)]
+    pub recorded: Option<usize>,
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area are
@@ -352,6 +372,8 @@ pub(crate) fn validate(
         hash,
         updated_at: now_iso.to_string(),
         card: None,
+        answer: None,
+        recorded: None,
     })
 }
 
@@ -472,6 +494,16 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
         out.push_str(&format!("\n{}: {}", l.label, l.url));
     }
     out.push_str(&format!("\nas of {hhmm}"));
+    // Outside the fence, so through plain_title like every board line.
+    if let Some(a) = &item.answer {
+        if let Some(o) = item.options.get(a.option) {
+            out.push_str(&format!(
+                "\nRecorded: {}. {} \u{b7} {hhmm}",
+                a.option + 1,
+                plain_title(o)
+            ));
+        }
+    }
     out
 }
 
@@ -484,8 +516,45 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.writer != MIGRATION_WRITER
 }
 
+/// The answer on `item`'s live card: the NEWEST valid kind 7 by an approver
+/// other than the writer, aimed at the card by its last `e` tag (how the
+/// relay scopes a reaction) and echoing one seeded keycap byte-for-byte.
+/// Latest wins so a second tap changes the answer; a retraction is the
+/// reaction no longer coming back from the relay, which hands the answer to
+/// the next newest.
+pub(crate) fn pick_answer<'e>(
+    item: &Item,
+    events: &'e [nostr::Event],
+    approvers: &[String],
+    writer_hex: &str,
+) -> Option<(usize, &'e nostr::Event)> {
+    let card = item.card.as_ref()?;
+    let n = item.options.len().min(OPTION_EMOJI.len());
+    events
+        .iter()
+        .filter_map(|e| {
+            let pk = e.pubkey.to_hex();
+            let target = e
+                .tags
+                .iter()
+                .filter_map(|t| match t.as_slice() {
+                    [k, v, ..] if k == "e" => Some(v.as_str()),
+                    _ => None,
+                })
+                .last();
+            let ok = e.kind.as_u16() == 7
+                && pk != writer_hex
+                && approvers.contains(&pk)
+                && target == Some(card.event_id.as_str())
+                && e.verify().is_ok();
+            let i = OPTION_EMOJI[..n].iter().position(|o| *o == e.content)?;
+            ok.then_some((i, e))
+        })
+        .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
+}
+
 /// Board text. Stale and superseded items are folded (not rendered).
-pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str) -> String {
+pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64) -> String {
     let current = |kind: ItemKind| -> Vec<&Item> {
         items
             .iter()
@@ -494,8 +563,11 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str) -> String
             .collect()
     };
     let by_area = |i: &&Item| (i.area.clone(), i.order, i.id.clone());
-    let mut pending = current(ItemKind::Pending);
+    let (mut answered, mut pending): (Vec<&Item>, Vec<&Item>) = current(ItemKind::Pending)
+        .into_iter()
+        .partition(|i| i.answer.is_some());
     pending.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
+    answered.sort_by_key(|i| (i.answer.as_ref().map(|a| a.answered_at), i.id.clone()));
     let mut decisions = current(ItemKind::Decision);
     decisions.sort_by_key(by_area);
     let mut status = current(ItemKind::Status);
@@ -505,6 +577,9 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str) -> String
         "Bench \u{b7} as of {hhmm} \u{b7} {} need you",
         pending.len()
     );
+    if !answered.is_empty() {
+        out.push_str(&format!(" \u{b7} {} answered", answered.len()));
+    }
     section(
         &mut out,
         "Needs you",
@@ -522,6 +597,30 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str) -> String
                 marker(i),
                 plain_title(&i.title),
                 i.area
+            )
+        }),
+    );
+    section(
+        &mut out,
+        &format!("Answered, waiting for action ({})", answered.len()),
+        answered.iter().map(|i| {
+            let a = i.answer.as_ref().expect("answered");
+            let opt = i
+                .options
+                .get(a.option)
+                .map(|o| plain_title(o))
+                .unwrap_or_default();
+            let late = if now.saturating_sub(a.answered_at) > ANSWER_KEEP_SECS {
+                " \u{1F7E0} 24h"
+            } else {
+                ""
+            };
+            format!(
+                "- {} {} ({}) \u{2192} {}. {opt}{late}",
+                marker(i),
+                plain_title(&i.title),
+                i.area,
+                a.option + 1
             )
         }),
     );

@@ -452,7 +452,7 @@ fn render_board_orders_links_and_folds() {
     ])
     .unwrap();
     let all = [&att, &stale, &imported, &crit, &old, &att0, &status, &dec];
-    let board = render_board(&all, UUID, "14:05");
+    let board = render_board(&all, UUID, "14:05", 0);
     assert_eq!(
         board,
         format!(
@@ -473,11 +473,11 @@ fn render_board_orders_links_and_folds() {
     // The clock alone never changes the hash; a line change does.
     assert_eq!(
         board_hash(&board),
-        board_hash(&render_board(&all, UUID, "23:59"))
+        board_hash(&render_board(&all, UUID, "23:59", 0))
     );
     assert_ne!(
         board_hash(&board),
-        board_hash(&render_board(&all[1..], UUID, "14:05"))
+        board_hash(&render_board(&all[1..], UUID, "14:05", 0))
     );
     assert_eq!(board_hash(&board).len(), 16);
 }
@@ -1414,3 +1414,5 @@ fn exported_board_drops_all_validate() {
     );
     println!("{total} drops validated");
 }
+
+mod answers;

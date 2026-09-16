@@ -726,7 +726,7 @@ async fn publish(
     // (e) The board: reposted after any card change or daily, edited in place
     // for a text-only change so it keeps its id and stays newest.
     let all: Vec<&item::Item> = s.items.values().collect();
-    let text = item::render_board(&all, &s.channel_id, hhmm);
+    let text = item::render_board(&all, &s.channel_id, hhmm, now);
     let hash = item::board_hash(&text);
     let aged = s
         .board
