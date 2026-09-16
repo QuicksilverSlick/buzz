@@ -682,3 +682,21 @@ async fn older_card_format_is_reposted_once_and_answers_survive() {
     assert_eq!(b.card(ITEM).event_id, kept);
     assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
 }
+
+#[tokio::test]
+async fn recorded_answer_on_older_format_card_survives_the_refresh() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now - 5);
+    reply(&b, &[&owner_tap]);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].recorded, Some(1));
+    // As an M2 build without CARD_FORMAT saved it: answered, older tag.
+    let hash = b.s.items[ITEM].hash.clone();
+    b.s.items.get_mut(ITEM).unwrap().card.as_mut().unwrap().hash = hash;
+    let before = b.posts().len();
+    b.settle(3).await;
+    assert!(!b.kinds()[before..].iter().any(|k| *k == 5 || *k == 9));
+    assert_eq!(b.card(ITEM).event_id, card.event_id);
+    assert!(b.s.items[ITEM].answer.is_some() && outbox(&b).is_some());
+}
