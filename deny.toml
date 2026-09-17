@@ -15,6 +15,19 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # Desktop workspace (desktop/src-tauri) — unmaintained crates with no safe upgrade.
+    # audiopus_sys: via `opus` 0.3 (huddle Opus decoder); fix is switching Opus bindings.
+    { id = "RUSTSEC-2026-0150", reason = "desktop: audiopus_sys via opus; no maintained replacement adopted yet" },
+    # mach 0.1.2 / 0.3.2: via `user-idle` 0.6 (macOS idle detection).
+    { id = "RUSTSEC-2020-0168", reason = "desktop: mach via user-idle; no upstream fix available" },
+    # proc-macro-error: via tauri → tray-icon → gtk 0.18 → glib-macros (Linux only).
+    { id = "RUSTSEC-2024-0370", reason = "desktop: proc-macro-error via tauri's gtk 0.18 stack; waits on tauri" },
+    # unic-*: via tauri-utils → urlpattern 0.3.
+    { id = "RUSTSEC-2025-0075", reason = "desktop: unic-char-range via tauri-utils → urlpattern; waits on tauri" },
+    { id = "RUSTSEC-2025-0080", reason = "desktop: unic-common via tauri-utils → urlpattern; waits on tauri" },
+    { id = "RUSTSEC-2025-0081", reason = "desktop: unic-char-property via tauri-utils → urlpattern; waits on tauri" },
+    { id = "RUSTSEC-2025-0098", reason = "desktop: unic-ucd-version via tauri-utils → urlpattern; waits on tauri" },
+    { id = "RUSTSEC-2025-0100", reason = "desktop: unic-ucd-ident via tauri-utils → urlpattern; waits on tauri" },
 ]
 
 [licenses]
