@@ -66,11 +66,19 @@ fn probe_requirements(
             let Some((program, argv)) =
                 cli_probe::probe_command(probe_args, adapter_path, codex_path)
             else {
-                return vec![missing_requirement(
-                    probe_args,
-                    setup_copy,
-                    AcpAvailabilityStatus::Available,
-                )];
+                // With `codex_path` set, only a CODEX_PATH that does not
+                // resolve lands here: codex-acp would fail to spawn it, so
+                // name that setting rather than asking for a login.
+                return vec![match codex_path {
+                    Some(path) => Requirement::MissingBinary {
+                        command: format!("CODEX_PATH={path}"),
+                    },
+                    None => missing_requirement(
+                        probe_args,
+                        setup_copy,
+                        AcpAvailabilityStatus::Available,
+                    ),
+                }];
             };
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             let augmented_path = cli_probe::augmented_path();

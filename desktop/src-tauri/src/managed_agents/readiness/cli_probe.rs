@@ -65,6 +65,10 @@ pub(crate) fn codex_path_env(agent_env: Option<&BTreeMap<String, String>>) -> Op
 /// is first on PATH: codex-acp spawns `CODEX_PATH` when set, else the
 /// `@openai/codex` it bundles. An older global CLI can reject config values
 /// the bundled engine accepts, which parks a working agent in setup mode.
+///
+/// A set `CODEX_PATH` is strict, as in codex-acp: when it does not resolve
+/// this returns `None` rather than falling back to an engine the agent
+/// would never run.
 pub(crate) fn probe_command(
     probe_args: &[&str],
     adapter_path: Option<&Path>,
@@ -72,8 +76,8 @@ pub(crate) fn probe_command(
 ) -> Option<(PathBuf, Vec<String>)> {
     let owned = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
     if probe_args[0] == "codex" {
-        if let Some(path) = codex_path.and_then(resolve_command) {
-            return Some((path, owned(probe_args)));
+        if let Some(path) = codex_path {
+            return Some((resolve_command(path)?, owned(probe_args)));
         }
         if let Some(codex_js) = adapter_path.and_then(bundled_codex_js) {
             let mut argv = vec!["node".to_string(), codex_js.to_string_lossy().into_owned()];
@@ -325,6 +329,14 @@ mod tests {
         let shim = temp.path().join("codex-acp.cmd");
         std::fs::write(&shim, "").expect("write shim");
         assert_eq!(probe(&shim), expected(&codex_js));
+
+        // A set CODEX_PATH is the engine codex-acp runs even when it is broken:
+        // no silent fallback to the bundled engine.
+        let missing = temp.path().join("missing-codex").display().to_string();
+        assert_eq!(
+            super::probe_command(&["codex", "login", "status"], Some(&shim), Some(&missing)),
+            None
+        );
 
         // Unix npm-global layout: bin/codex-acp links into the package's dist/.
         #[cfg(unix)]
