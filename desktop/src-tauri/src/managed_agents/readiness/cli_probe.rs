@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use crate::managed_agents::runtime::build_augmented_path;
+use crate::managed_agents::{resolve_command, runtime::build_augmented_path};
 
 /// Build the augmented PATH for CLI probes and other native child processes
 /// (auth commands, `buzz-acp models` discovery), including nvm's default
@@ -48,6 +49,65 @@ pub(crate) enum ProbeOutcome {
 /// present, avoiding false positives from unrelated errors that mention only
 /// one term.
 const CONFIG_PARSE_SIGNALS: &[&str] = &["error loading configuration", "unknown variant"];
+
+/// `CODEX_PATH` as a spawned codex-acp sees it: the agent's env over the app
+/// env the spawn inherits. Empty counts as unset, as it does in codex-acp.
+pub(crate) fn codex_path_env(agent_env: Option<&BTreeMap<String, String>>) -> Option<String> {
+    agent_env
+        .and_then(|env| env.get("CODEX_PATH").cloned())
+        .or_else(|| std::env::var("CODEX_PATH").ok())
+        .filter(|path| !path.is_empty())
+}
+
+/// The program and argv (`argv[0]` is only a label) a login probe runs.
+///
+/// Codex is probed with the engine the agent will run, not whichever `codex`
+/// is first on PATH: codex-acp spawns `CODEX_PATH` when set, else the
+/// `@openai/codex` it bundles. An older global CLI can reject config values
+/// the bundled engine accepts, which parks a working agent in setup mode.
+pub(crate) fn probe_command(
+    probe_args: &[&str],
+    adapter_path: Option<&Path>,
+    codex_path: Option<&str>,
+) -> Option<(PathBuf, Vec<String>)> {
+    let owned = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    if probe_args[0] == "codex" {
+        if let Some(path) = codex_path.and_then(resolve_command) {
+            return Some((path, owned(probe_args)));
+        }
+        if let Some(codex_js) = adapter_path.and_then(bundled_codex_js) {
+            let mut argv = vec!["node".to_string(), codex_js.to_string_lossy().into_owned()];
+            argv.extend(owned(&probe_args[1..]));
+            // Bare `node`, resolved through the probe's augmented PATH exactly
+            // as the adapter's own shim resolves it.
+            return Some((PathBuf::from("node"), argv));
+        }
+    }
+    Some((resolve_command(probe_args[0])?, owned(probe_args)))
+}
+
+/// `@openai/codex/bin/codex.js` as Node resolves it from the codex-acp
+/// package: nested under the package first, then hoisted into an ancestor.
+fn bundled_codex_js(adapter_path: &Path) -> Option<PathBuf> {
+    // npm's Windows `.cmd` (and sh) shims sit beside `node_modules`; a unix
+    // bin symlink resolves into the package's `dist/`.
+    let shim_package: PathBuf = ["node_modules", "@agentclientprotocol", "codex-acp"]
+        .iter()
+        .collect();
+    let shim_package = adapter_path.parent()?.join(shim_package);
+    let start = if shim_package.is_dir() {
+        shim_package
+    } else {
+        adapter_path.canonicalize().ok()?.parent()?.to_path_buf()
+    };
+    let codex_js: PathBuf = ["node_modules", "@openai", "codex", "bin", "codex.js"]
+        .iter()
+        .collect();
+    start
+        .ancestors()
+        .map(|dir| dir.join(&codex_js))
+        .find(|path| path.is_file())
+}
 
 /// Run the probe at the resolved absolute path so the GUI-PATH gap is
 /// bypassed. Injects the same augmented PATH used for launched agents so
@@ -231,6 +291,54 @@ mod tests {
             ProbeOutcome::LoggedOut,
             "non-config stderr should produce LoggedOut"
         );
+    }
+
+    /// The probe must run the Codex engine codex-acp bundles, not whichever
+    /// `codex` is first on PATH: an older global CLI rejects config values the
+    /// bundled engine accepts and parks a working agent in setup mode.
+    #[test]
+    fn codex_probe_runs_engine_bundled_with_adapter_not_path_codex() {
+        use std::path::PathBuf;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let package: PathBuf = ["node_modules", "@agentclientprotocol", "codex-acp"]
+            .iter()
+            .collect();
+        let package = temp.path().join(package);
+        let codex_bin: PathBuf = ["node_modules", "@openai", "codex", "bin"].iter().collect();
+        std::fs::create_dir_all(package.join(&codex_bin)).expect("bundled codex dir");
+        let codex_js = package.join(&codex_bin).join("codex.js");
+        std::fs::write(&codex_js, "").expect("write codex.js");
+        let probe = |adapter: &std::path::Path| {
+            super::probe_command(&["codex", "login", "status"], Some(adapter), None)
+                .expect("a codex probe command")
+        };
+        let expected = |js: &std::path::Path| {
+            let js = js.to_string_lossy().into_owned();
+            (
+                PathBuf::from("node"),
+                vec!["node".to_string(), js, "login".into(), "status".into()],
+            )
+        };
+
+        // npm's Windows `.cmd` / sh shim layout: the shim sits beside node_modules.
+        let shim = temp.path().join("codex-acp.cmd");
+        std::fs::write(&shim, "").expect("write shim");
+        assert_eq!(probe(&shim), expected(&codex_js));
+
+        // Unix npm-global layout: bin/codex-acp links into the package's dist/.
+        #[cfg(unix)]
+        {
+            let dist = package.join("dist");
+            std::fs::create_dir_all(&dist).expect("dist dir");
+            std::fs::write(dist.join("index.js"), "").expect("write index.js");
+            let bin = temp.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("bin dir");
+            std::os::unix::fs::symlink(dist.join("index.js"), bin.join("codex-acp"))
+                .expect("symlink adapter");
+            let codex_js = codex_js.canonicalize().expect("canonical codex.js");
+            assert_eq!(probe(&bin.join("codex-acp")), expected(&codex_js));
+        }
     }
 
     /// Verify that every string in CONFIG_PARSE_SIGNALS is lowercased so the
