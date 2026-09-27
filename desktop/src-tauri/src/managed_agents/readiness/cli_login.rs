@@ -17,7 +17,8 @@ pub(super) fn codex_requirements(
     let codex_path = cli_probe::codex_path_env(Some(agent_env));
     probe_requirements(
         &["codex", "login", "status"],
-        "run `codex login`",
+        // A global Codex CLI is optional, so lead with the in-app connect flow.
+        "connect your Codex account in Agent runtimes, or run `codex login` if the Codex CLI is installed",
         runtime,
         codex_path.as_deref(),
     )
