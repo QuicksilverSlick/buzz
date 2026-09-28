@@ -18,6 +18,10 @@ ignore = [
     # Desktop workspace (desktop/src-tauri) — unmaintained crates with no safe upgrade.
     # audiopus_sys: via `opus` 0.3 (huddle Opus decoder); fix is switching Opus bindings.
     { id = "RUSTSEC-2026-0150", reason = "desktop: audiopus_sys via opus; no maintained replacement adopted yet" },
+    # ringbuf 0.3.3: via `neteq` 0.8 (huddle jitter buffer). neteq declares ringbuf but its source never
+    # calls it, so Consumer::skip/clear (the affected functions) are unreachable; every neteq release,
+    # 0.9.1 included, still requires ringbuf ^0.3. Drop this when neteq moves to ringbuf >= 0.5.2.
+    { id = "RUSTSEC-2026-0293", reason = "desktop: ringbuf 0.3 via neteq, which never calls it; no neteq release allows >= 0.5.2" },
     # mach 0.1.2 / 0.3.2: via `user-idle` 0.6 (macOS idle detection).
     { id = "RUSTSEC-2020-0168", reason = "desktop: mach via user-idle; no upstream fix available" },
     # proc-macro-error: via tauri → tray-icon → gtk 0.18 → glib-macros (Linux only).
