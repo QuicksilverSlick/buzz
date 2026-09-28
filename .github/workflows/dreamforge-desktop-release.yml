@@ -275,7 +275,7 @@ jobs:
           BASE="https://github.com/$GH_REPO/releases/download/$TAG"
           MAC="Dreamforge_${VERSION}"
           EXE="Dreamforge_${VERSION}_x64-setup.exe"
-          for f in "${MAC}_aarch64.app.tar.gz" "${MAC}_x64.app.tar.gz" "$EXE"; do
+          for f in "${MAC}_aarch64.app.tar.gz" "${MAC}_x64.app.tar.gz" "${MAC}_aarch64.dmg" "${MAC}_x64.dmg" "$EXE"; do
             [ -s "dist/$f" ] || { echo "::error::missing dist/$f"; exit 1; }
           done
           # --pubkey refuses signatures from any key but the one installed apps trust.
@@ -293,14 +293,17 @@ jobs:
           ! grep -q '[{}]' notes.md || { echo "::error::unfilled placeholder in the release notes"; exit 1; }
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --title "Dreamforge $VERSION" --notes-file notes.md
           gh release upload "$TAG" dist/*.dmg dist/*.app.tar.gz dist/*.exe dist/*.sig --clobber
+          # The notes only link files uploaded above, so the page may run ahead of the feed.
+          gh release edit "$TAG" --title "Dreamforge $VERSION" --notes-file notes.md
           # latest.json last, so apps only see the new version once every file it names is uploaded.
           gh release upload "$TAG" latest.json --clobber
-          gh release edit "$TAG" --title "Dreamforge $VERSION" --notes-file notes.md
+          # Live from here, and a rerun would be refused as "not newer": warn, never fail.
           # Remove the previous version's files: latest.json no longer names them,
           # and a single set keeps "which file is mine" obvious on the page.
-          gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
+          names=$(gh release view "$TAG" --json assets --jq '.assets[].name') || echo "::warning::could not list release assets; remove old files by hand"
+          for name in $names; do
             case "$name" in
               latest.json|*"_${VERSION}_"*) ;;
-              *) gh release delete-asset "$TAG" "$name" --yes ;;
+              *) gh release delete-asset "$TAG" "$name" --yes || echo "::warning::could not delete $name; remove it by hand" ;;
             esac
           done
