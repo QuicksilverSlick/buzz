@@ -27,6 +27,11 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Dependency policy
         run: cargo-deny check
+      # desktop/src-tauri is excluded from the root workspace and has its own
+      # Cargo.lock; it uses the root deny.toml.
+      - name: Desktop dependency policy
+        if: ${{ !cancelled() }}
+        run: cargo-deny --manifest-path desktop/src-tauri/Cargo.toml check
 
 
   results:
