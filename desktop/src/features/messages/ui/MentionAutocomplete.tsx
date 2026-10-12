@@ -31,6 +31,10 @@ export type MentionSuggestion = {
   notInChannel?: boolean;
   ownerLabel?: string | null;
   role?: string | null;
+  /** The agent's public description (profile About), on one line. */
+  description?: string | null;
+  /** "Answers only <owner>" when the agent will not answer the person typing. */
+  audienceNote?: string | null;
 };
 
 type MentionAutocompleteProps = {
@@ -87,6 +91,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
   const optionsSurfaceRef = React.useRef<HTMLDivElement>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
   const keepPinnedSwitchId = React.useId();
+  const rowDetailsIdPrefix = React.useId();
   const handledOptionsRequestRef = React.useRef(0);
   const alwaysAddressShortcut = getPlatformKeysById("always-address-agent");
 
@@ -255,20 +260,46 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               (nameCounts.get(suggestion.displayName.toLowerCase()) ?? 0) > 1;
             const showAgentProvenanceMarker =
               showMentionAgentProvenanceMarker(suggestion);
+            const audienceNote = suggestion.isAgent
+              ? (suggestion.audienceNote ?? null)
+              : null;
+            const description = suggestion.isAgent
+              ? (suggestion.description ?? null)
+              : null;
+            const noteId = audienceNote
+              ? `${rowDetailsIdPrefix}-${index}-note`
+              : undefined;
+            const descriptionId = description
+              ? `${rowDetailsIdPrefix}-${index}-description`
+              : undefined;
+            const detailsIds =
+              [noteId, descriptionId].filter(Boolean).join(" ") || undefined;
+            // The audience note names the owner, so it takes the place of
+            // "managed by <owner>".
             const ownerLabel =
-              hasNameCollision && suggestion.agentProvenance
+              audienceNote || (hasNameCollision && suggestion.agentProvenance)
                 ? null
                 : suggestion.ownerLabel;
             const collisionNpub =
               hasNameCollision && suggestion.pubkey
                 ? safeNpub(suggestion.pubkey)
                 : null;
+            const metadataLabel =
+              audienceNote && suggestion.notInChannel
+                ? `${audienceNote} · not in channel`
+                : (audienceNote ??
+                  (ownerLabel && suggestion.notInChannel
+                    ? `managed by ${ownerLabel} · not in channel`
+                    : ownerLabel
+                      ? `managed by ${ownerLabel}`
+                      : suggestion.notInChannel
+                        ? "not in channel"
+                        : null));
             const hasMetadataBeforeNpub = Boolean(
               suggestion.kind === "team" ||
                 suggestion.isAgent ||
                 suggestion.role ||
-                ownerLabel ||
-                suggestion.notInChannel,
+                metadataLabel,
             );
             const canAlwaysAddress = Boolean(
               onToggleAlwaysAddressAgent &&
@@ -293,6 +324,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 key={suggestionKey}
               >
                 <button
+                  aria-describedby={detailsIds}
                   aria-label={`Mention ${suggestion.displayName}`}
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
@@ -363,22 +395,18 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             {suggestion.role}
                           </Badge>
                         ) : null}
-                        {ownerLabel || suggestion.notInChannel ? (
+                        {metadataLabel ? (
                           <span
                             className="min-w-0 truncate"
-                            title={
-                              ownerLabel && suggestion.notInChannel
-                                ? `managed by ${ownerLabel} · not in channel`
-                                : ownerLabel
-                                  ? `managed by ${ownerLabel}`
-                                  : "not in channel"
+                            data-testid={
+                              audienceNote
+                                ? "mention-agent-audience-note"
+                                : undefined
                             }
+                            id={noteId}
+                            title={metadataLabel}
                           >
-                            {ownerLabel && suggestion.notInChannel
-                              ? `managed by ${ownerLabel} · not in channel`
-                              : ownerLabel
-                                ? `managed by ${ownerLabel}`
-                                : "not in channel"}
+                            {metadataLabel}
                           </span>
                         ) : null}
                         {collisionNpub ? (
@@ -390,6 +418,21 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             {truncateNpub(collisionNpub)}
                           </span>
                         ) : null}
+                      </span>
+                    ) : null}
+                    {description ? (
+                      <span
+                        className={cn(
+                          "min-w-0 truncate text-2xs leading-snug",
+                          index === selectedIndex
+                            ? "text-accent-foreground/70"
+                            : "text-muted-foreground",
+                        )}
+                        data-testid="mention-agent-description"
+                        id={descriptionId}
+                        title={description}
+                      >
+                        {description}
                       </span>
                     ) : null}
                   </span>

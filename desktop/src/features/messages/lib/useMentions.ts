@@ -34,6 +34,7 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
 import { useDefaultAgentSuggestion } from "./useDefaultAgentSuggestion";
+import { useMentionAgentDetails } from "./useMentionAgentDetails";
 import { flushMentionDebounce, isPlainSpace } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
 import type { MentionIdentity } from "./mentionClipboard";
@@ -418,7 +419,7 @@ export function useMentions(
       void userSearchQuery.fetchNextPage();
     }
   }, [userSearchQuery]);
-  const suggestions = React.useMemo<MentionSuggestion[]>(() => {
+  const rankedSuggestions = React.useMemo<MentionSuggestion[]>(() => {
     if (mentionQuery === null) {
       return [];
     }
@@ -438,6 +439,13 @@ export function useMentions(
     mentionQuery,
     userSearchQuery.isFetching,
   ]);
+  const suggestions = useMentionAgentDetails(rankedSuggestions, {
+    currentPubkey,
+    managedAgents: managedAgentsQuery.data,
+    ownerProfiles: ownerProfilesQuery.data?.profiles,
+    personas: personasQuery.data,
+    relayAgents: relayAgentsQuery.data,
+  });
   React.useEffect(() => {
     if (mentionQuery === null) {
       previousSuggestionsRef.current = [];
