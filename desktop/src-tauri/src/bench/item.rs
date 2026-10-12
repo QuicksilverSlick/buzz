@@ -537,9 +537,21 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.writer != MIGRATION_WRITER
 }
 
+/// The event a reaction is aimed at: its last `e` tag, how the relay scopes
+/// a reaction.
+pub(crate) fn reaction_target(e: &nostr::Event) -> Option<&str> {
+    e.tags
+        .iter()
+        .filter_map(|t| match t.as_slice() {
+            [k, v, ..] if k == "e" => Some(v.as_str()),
+            _ => None,
+        })
+        .last()
+}
+
 /// The answer on `item`'s live card: the NEWEST valid kind 7 by an approver
-/// other than the writer, aimed at the card by its last `e` tag (how the
-/// relay scopes a reaction) and echoing one seeded keycap byte-for-byte.
+/// other than the writer, aimed at the card by its `reaction_target` and
+/// echoing one seeded keycap byte-for-byte.
 /// Latest wins so a second tap changes the answer; a retraction is the
 /// reaction no longer coming back from the relay, which hands the answer to
 /// the next newest.
@@ -555,18 +567,10 @@ pub(crate) fn pick_answer<'e>(
         .iter()
         .filter_map(|e| {
             let pk = e.pubkey.to_hex();
-            let target = e
-                .tags
-                .iter()
-                .filter_map(|t| match t.as_slice() {
-                    [k, v, ..] if k == "e" => Some(v.as_str()),
-                    _ => None,
-                })
-                .last();
             let ok = e.kind.as_u16() == 7
                 && pk != writer_hex
                 && approvers.contains(&pk)
-                && target == Some(card.event_id.as_str())
+                && reaction_target(e) == Some(card.event_id.as_str())
                 && e.verify().is_ok();
             let i = OPTION_EMOJI[..n].iter().position(|o| *o == e.content)?;
             ok.then_some((i, e))

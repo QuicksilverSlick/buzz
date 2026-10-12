@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn tap(keys: &Keys, card_hex: &str, emoji: &str, created_at: u64) -> nostr::Event {
+pub(super) fn tap(keys: &Keys, card_hex: &str, emoji: &str, created_at: u64) -> nostr::Event {
     crate::events::build_reaction(nostr::EventId::from_hex(card_hex).unwrap(), emoji)
         .unwrap()
         .custom_created_at(nostr::Timestamp::from(created_at))
@@ -19,20 +19,20 @@ fn answered(option: usize, answered_at: u64) -> Option<Answer> {
     })
 }
 
-fn reply(b: &Bench, evs: &[&nostr::Event]) {
+pub(super) fn reply(b: &Bench, evs: &[&nostr::Event]) {
     *b.relay.query_reply.lock().unwrap() = evs
         .iter()
         .map(|e| serde_json::to_value(e).unwrap())
         .collect();
 }
 
-fn outbox(b: &Bench) -> Option<Value> {
+pub(super) fn outbox(b: &Bench) -> Option<Value> {
     std::fs::read_to_string(b.root.join("outbox/orchestrator/relay-choice.json"))
         .ok()
         .map(|t| serde_json::from_str(&t).unwrap())
 }
 
-fn last_query(b: &Bench) -> Value {
+pub(super) fn last_query(b: &Bench) -> Value {
     b.relay.queries.lock().unwrap().last().cloned().unwrap()
 }
 
@@ -44,7 +44,7 @@ fn board_id(b: &Bench) -> String {
     b.s.board.as_ref().unwrap().event_id.clone()
 }
 
-const ITEM: &str = "orchestrator/relay-choice";
+pub(super) const ITEM: &str = "orchestrator/relay-choice";
 
 #[test]
 fn pick_answer_rules() {
