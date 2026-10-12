@@ -713,9 +713,9 @@ async fn recorded_answer_on_older_format_card_survives_the_refresh() {
 #[test]
 fn render_card_text_outside_the_fence_is_inert() {
     // Everything either app gives meaning to, an entity, a dropped character
-    // that would join "www.", and a trailing rule.
+    // that would join "www.", a custom emoji shortcode and a trailing rule.
     let active = "[a](https://x.example) ![i](u) @Honey #general |a|b| *em* _em_ `c` \
-                  ~~s~~ <u>u</u> \\(x\\) \\[y\\] $z$ &num;ch w[w]w.x.example ---";
+                  ~~s~~ <u>u</u> \\(x\\) \\[y\\] $z$ &num;ch w[w]w.x.example :party: ---";
     let mut item = check(&[]).unwrap();
     item.title = format!("# {active}");
     item.options = ["- ", "> ", "1. ", "(x) "]
@@ -734,7 +734,16 @@ fn render_card_text_outside_the_fence_is_inert() {
         for (i, n) in ["1. ", "2. ", "3. ", "4. "].iter().enumerate() {
             assert!(lines[i + 1].starts_with(n), "{card}");
         }
-        for line in lines.iter().filter(|l| !l.is_empty()) {
+        for (i, line) in lines.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+            // No `:name:` the phone resolves against the community palette.
+            let parts: Vec<&str> = line.split(':').collect();
+            let shortcode = parts.len() > 2
+                && parts[1..parts.len() - 1].iter().any(|p| {
+                    !p.is_empty()
+                        && p.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                });
+            assert!(!shortcode, "{line:?}");
             let text = line
                 .strip_prefix("**")
                 .and_then(|l| l.strip_suffix("**"))
@@ -748,6 +757,14 @@ fn render_card_text_outside_the_fence_is_inert() {
                 "{text:?}"
             );
             assert!(!text.contains("www.") && !text.ends_with('-'), "{text:?}");
+            // The title and the options are plain_text alone.
+            if i < 5 {
+                let glued = text
+                    .as_bytes()
+                    .windows(2)
+                    .any(|w| w[0] == b':' && w[1] != b' ');
+                assert!(!glued, "{text:?}");
+            }
             // No nested list, quote, heading or radio button either.
             assert!(
                 text.starts_with(|c: char| c.is_ascii_alphanumeric()),
@@ -759,5 +776,72 @@ fn render_card_text_outside_the_fence_is_inert() {
                 .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
             assert!(!ordinal, "{text:?}");
         }
+    }
+}
+
+#[test]
+fn render_card_summary_never_breaks_the_fence() {
+    // The phone ends a block at the first line of exactly three backticks,
+    // so a longer fence never shielded what came after an inner one.
+    for body in [
+        "x\n```\n[a](https://e.example)\n```",
+        "Run this first:\n```bash\ncargo test\n```\nthen pick.",
+        "inline ```x``` and ````y````",
+    ] {
+        let card = render_card(&check(&[("body", json!(body))]).unwrap(), "14:05");
+        let lines: Vec<&str> = card.lines().collect();
+        let fences: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("```"))
+            .collect();
+        assert_eq!(fences.len(), 2, "{card}");
+        assert_eq!((lines[fences[0]], lines[fences[1]]), ("```text", "```"));
+        assert_eq!(lines[fences[1] + 1], "1. Stay", "{card}");
+        assert!(lines[fences[0] + 1..fences[1]]
+            .iter()
+            .all(|l| !l.contains('`')));
+    }
+}
+
+#[test]
+fn render_card_wraps_the_summary_for_the_phone() {
+    let body = "Block's hosted relay rejects the new event kinds, so Bench-in-Buzz \
+                cannot ship there. Stay and wait for upstream, or move the community \
+                to our own relay?\n\nSee\tthe   plan: a_na\u{EF}ve_identifier_longer_than_one_row.";
+    let card = render_card(&check(&[("body", json!(body))]).unwrap(), "14:05");
+    let (_, rest) = card.split_once("```text\n").unwrap();
+    let (inner, _) = rest.split_once("\n```\n").unwrap();
+    assert!(
+        inner.lines().all(|l| l.chars().count() <= FENCE_WIDTH),
+        "{inner}"
+    );
+    // Only the extra whitespace goes; the blank line stays.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    assert_eq!(squash(inner), squash(body));
+    assert!(inner.contains("\n\n"), "{inner}");
+    assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
+    assert_eq!(wrap("a  b\n\n\t c  ", 26), "a b\n\nc");
+    assert_eq!(
+        wrap(&"x".repeat(30), 26),
+        format!("{}\nxxxx", "x".repeat(26))
+    );
+}
+
+#[test]
+fn plain_text_folds_typography_and_spaces_colons() {
+    for (raw, plain) in [
+        (
+            "Don\u{2019}t merge \u{2014} wait for CI",
+            "Don't merge - wait for CI",
+        ),
+        ("Merge \u{201C}now\u{201D}", "Merge \"now\""),
+        (
+            "it\u{02BC}s \u{2018}a\u{2019} \u{2013} b\u{2026}",
+            "it's 'a' - b...",
+        ),
+        ("\u{2014} later \u{2014}", "later"),
+        ("Ship it :party:", "Ship it : party:"),
+        ("Note: at 14:05", "Note: at 14: 05"),
+    ] {
+        assert_eq!(plain_text(raw, usize::MAX), plain, "{raw:?}");
     }
 }

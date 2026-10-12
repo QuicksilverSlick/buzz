@@ -143,6 +143,14 @@ fn validate_rejects_bad_drops() {
             vec![("options", json!(["Stay\u{200B}", "Move"]))],
         ),
         (
+            "emoji-only option",
+            vec![("options", json!(["Stay", "👍"]))],
+        ),
+        (
+            "punctuation-only option",
+            vec![("options", json!(["?!", "Move"]))],
+        ),
+        (
             "buzz with path",
             link(&format!("buzz://message/x?channel={UUID}&id={hex64}")),
         ),
@@ -377,7 +385,7 @@ fn render_card_keeps_mentions_inside_the_fence() {
     let (head, rest) = card.split_once("```text\n").unwrap();
     let (inner, tail) = rest.split_once("\n```").unwrap();
     assert_eq!(inner, "ping @Honey nostr:npub1abc");
-    assert!(head.ends_with("\n**Honey nostr:npub1abc**\n"), "{head:?}");
+    assert!(head.ends_with("\n**Honey nostr: npub1abc**\n"), "{head:?}");
     for outside in [head, tail] {
         assert!(!outside.contains('@'), "{outside:?}");
     }
