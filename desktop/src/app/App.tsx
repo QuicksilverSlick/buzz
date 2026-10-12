@@ -37,6 +37,7 @@ import {
   commitGuestEntry,
   prepareGuestEntry,
 } from "@/features/onboarding/guestEntry";
+import { isInviteJoin } from "@/features/onboarding/guestMode";
 import { CommunityOnboardingFlow } from "@/features/onboarding/ui/CommunityOnboardingFlow";
 import {
   MachineOnboardingFlow,
@@ -811,6 +812,9 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
         identityLost={machine.identityLost}
         initialPage={machineInitialPage}
         queryClient={machine.queryClient}
+        // Someone arriving through an invite joins a community whose owner
+        // already set up its agents; AI-provider setup stays in Settings.
+        skipProviderSetup={isInviteJoin(transaction)}
       />
       {shouldAcknowledgeDeepLink ? <PendingInviteGate /> : null}
     </>

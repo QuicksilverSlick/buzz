@@ -419,9 +419,9 @@ test("persisted deep-link invite hands off to Joining after machine onboarding",
   await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
 });
 
-// Guest mode: someone who joins a community through an invite gets no
-// private Welcome channel, Welcome Team or kickoff, and lands in a channel
-// the owner set up for them.
+// Guest mode: someone who joins a community through an invite skips
+// AI-provider setup, gets no private Welcome channel, Welcome Team or
+// kickoff, and lands in a channel the owner set up for them.
 
 const GUEST_STORAGE_KEY = `buzz-community-guest.v1:${encodeURIComponent(
   COMMUNITY_RELAY_URL,
@@ -521,6 +521,35 @@ function fulfillInviteClaim(page: Page) {
     }),
   );
 }
+
+test("an invite link takes a new person past AI-provider setup to their channel", async ({
+  page,
+}) => {
+  await fulfillInviteClaim(page);
+  await installMockBridge(
+    page,
+    { pendingCommunityDeepLinks: [PENDING_JOIN_LINK], profileHasEvent: false },
+    { skipCommunitySeed: true, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("pending-invite-continue").click();
+  await page.getByRole("button", { name: "Create a new identity key" }).click();
+  await page.getByRole("button", { name: "Create my private key" }).click();
+  await page.getByTestId("onboarding-next").click();
+
+  // Straight from the identity key to the community, as "Set up later" would.
+  await expect(
+    page.getByRole("heading", { name: "Build your profile" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Connect your AI provider" }),
+  ).toHaveCount(0);
+  await page.getByTestId("community-profile-name-key").fill("Craig");
+  await page.getByTestId("community-profile-next").click();
+
+  await expectGuestLanding(page);
+});
 
 test("an invited guest skips the starter team and lands in their channel", async ({
   page,
