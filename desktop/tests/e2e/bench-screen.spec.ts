@@ -7,12 +7,18 @@ import { installMockBridge } from "../helpers/bridge";
 const OWNER = "deadbeef".repeat(8);
 const ITEM_ID = "dreamforge/ship-release";
 
-function benchSnapshot(answeredOption: number | null): BenchCards {
+const WRITER = "a".repeat(64);
+
+function benchSnapshot(
+  answeredOption: number | null,
+  channelId = "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
+  cardEventId = "e".repeat(64),
+): BenchCards {
   const answeredAt = Math.floor(Date.now() / 1_000);
   return {
     enabled: true,
-    channelId: "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
-    writerPubkey: "a".repeat(64),
+    channelId,
+    writerPubkey: WRITER,
     ownerPubkey: OWNER,
     lastError: null,
     lastTick: new Date().toISOString(),
@@ -32,7 +38,7 @@ function benchSnapshot(answeredOption: number | null): BenchCards {
         links: [],
         order: 0,
         validity: "current",
-        cardEventId: "e".repeat(64),
+        cardEventId,
         answer:
           answeredOption === null
             ? null
@@ -112,4 +118,66 @@ test("Bench screen answers a pending card and shows it recorded", async ({
     needsYou.getByText("Nothing needs you right now."),
   ).toBeVisible();
   await expect(page.getByTestId("sidebar-bench-count")).toHaveCount(0);
+});
+
+test("a live card hides its keycap pills; other messages keep theirs", async ({
+  page,
+}) => {
+  // The mock's #general stands in for #bench.
+  const generalId = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+  const cardId = "9".repeat(64);
+  await installMockBridge(page, {
+    benchCards: benchSnapshot(null, generalId, cardId),
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await page.waitForFunction(
+    () =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+        kind: 7,
+      }) === true,
+  );
+
+  await page.evaluate(
+    ({ cardId, owner, writer }) => {
+      const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      const react = (target: string, content: string, pubkey: string) =>
+        emit?.({
+          channelName: "general",
+          content,
+          extraTags: [["e", target]],
+          kind: 7,
+          pubkey,
+        });
+      emit?.({
+        channelName: "general",
+        content: "card",
+        id: cardId,
+        pubkey: writer,
+      });
+      // The writer's seeded keycaps and the owner's tap, as phones see them.
+      react(cardId, "1️⃣", writer);
+      react(cardId, "2️⃣", writer);
+      react(cardId, "2️⃣", owner);
+      // The mock's "React to me with a custom emoji" message.
+      react("d".repeat(64), "1️⃣", owner);
+      react(cardId, "\u{1F44D}", owner);
+    },
+    { cardId, owner: OWNER, writer: WRITER },
+  );
+
+  const rows = page.getByTestId("message-row");
+  const cardRow = rows.filter({ has: page.getByTestId("bench-card") });
+  const plainRow = rows
+    .filter({ hasText: "React to me with a custom emoji" })
+    .last();
+  const pill = (row: typeof rows, emoji: string) =>
+    row.getByRole("button", { name: `Toggle ${emoji} reaction` });
+  await expect(cardRow).toContainText("Ship the 0.6 release?");
+  await expect(pill(cardRow, "\u{1F44D}")).toBeVisible();
+  await expect(pill(plainRow, "1️⃣")).toBeVisible();
+  await expect(pill(cardRow, "1️⃣")).toHaveCount(0);
+  await expect(pill(cardRow, "2️⃣")).toHaveCount(0);
 });

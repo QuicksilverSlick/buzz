@@ -16,6 +16,7 @@ import {
   benchValidityLabel,
   createPollGroup,
   indexBenchCards,
+  isBenchAnswerKeycap,
   isBenchCandidate,
   safeBenchLinks,
 } from "./benchCards.ts";
@@ -511,6 +512,22 @@ test("retired card: the Bench's answer still shows, read-only", () => {
     benchOptionViews(live, INITIAL_BENCH_ANSWER_STATE, true).every(
       (o) => !o.selected,
     ),
+  );
+});
+
+test("keycaps: only the card's own answer keycaps, as the Bench reads them", () => {
+  const two = card();
+  assert.equal(isBenchAnswerKeycap(two, "1️⃣"), true);
+  assert.equal(isBenchAnswerKeycap(two, "2️⃣"), true);
+  assert.equal(isBenchAnswerKeycap(two, "3️⃣"), false, "no option 3");
+  assert.equal(isBenchAnswerKeycap(two, "1⃣"), false, "not the seeded form");
+  assert.equal(isBenchAnswerKeycap(two, "\u{1F44D}"), false);
+  const five = card({ options: ["a", "b", "c", "d", "e"] });
+  assert.equal(isBenchAnswerKeycap(five, "4️⃣"), true);
+  assert.equal(isBenchAnswerKeycap(five, "5️⃣"), false, "stops at 4");
+  assert.equal(
+    isBenchAnswerKeycap(card({ kind: "status", options: [] }), "1️⃣"),
+    false,
   );
 });
 
