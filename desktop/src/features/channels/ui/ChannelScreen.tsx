@@ -16,6 +16,7 @@ import {
   MSG_PREFIX,
   THREAD_PREFIX,
 } from "@/features/channels/readState/readStateFormat";
+import { requestChannelEdit } from "@/features/channels/lib/channelEditRequest";
 import { ChannelScreenEmptyState } from "@/features/channels/ui/ChannelScreenEmptyState";
 import { ChannelScreenHeader } from "@/features/channels/ui/ChannelScreenHeader";
 import { WelcomeAgentCreateDialog } from "@/features/channels/ui/WelcomeAgentCreateDialog";
@@ -734,6 +735,12 @@ export function ChannelScreen({
     handleCloseAgentSession,
     setProfilePanelPubkey,
   ]);
+  const handleAddChannelDescription = React.useCallback(() => {
+    if (!activeChannelId) return;
+    requestChannelEdit(activeChannelId);
+    // An open settings panel takes the request itself; toggling would close it.
+    if (activeChannel?.channelType === "forum" || !channelManagementOpen) handleManageChannel();
+  }, [activeChannel?.channelType, activeChannelId, channelManagementOpen, handleManageChannel]);
   const handleToggleMembers = React.useCallback(
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
@@ -753,6 +760,7 @@ export function ChannelScreen({
         isAddBotOpen={isAddBotOpen}
         isJoining={joinChannelMutation.isPending}
         onAddBotOpenChange={setIsAddBotOpen}
+        onAddDescription={handleAddChannelDescription}
         onJoinChannel={joinChannelMutation.mutateAsync}
         onManageChannel={handleManageChannel}
         onToggleMembers={handleToggleMembers}
@@ -762,6 +770,7 @@ export function ChannelScreen({
     ),
     [
       activeChannel,
+      handleAddChannelDescription,
       activeChannelEphemeralDisplay,
       activeChannelTitle,
       shouldCompactHeaderActions,

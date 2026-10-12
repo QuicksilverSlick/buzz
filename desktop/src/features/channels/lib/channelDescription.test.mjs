@@ -4,11 +4,13 @@ import test from "node:test";
 import {
   getChannelDescription,
   getChannelDetail,
+  getChannelHeaderLine,
 } from "./channelDescription.ts";
 
 function makeChannel(overrides = {}) {
   return {
     archivedAt: null,
+    channelType: "stream",
     description: "",
     isMember: true,
     purpose: "",
@@ -24,11 +26,8 @@ test("getChannelDescription falls back when channel is null", () => {
   );
 });
 
-test("getChannelDescription falls back when no detail fields are set", () => {
-  assert.equal(
-    getChannelDescription(makeChannel()),
-    "Channel details and activity.",
-  );
+test("getChannelDescription is empty when no detail fields are set", () => {
+  assert.equal(getChannelDescription(makeChannel()), "");
 });
 
 test("getChannelDetail provides one shared field order for every surface", () => {
@@ -79,4 +78,87 @@ test("getChannelDescription shows prefixes alone when no detail exists", () => {
     getChannelDescription(makeChannel({ archivedAt: "2026-01-01T00:00:00Z" })),
     "Archived.",
   );
+});
+
+test("getChannelHeaderLine covers every channel, detail and permission case", () => {
+  const archivedAt = "2026-01-01T00:00:00Z";
+  const cases = [
+    { name: "no channel", channel: null, canManage: true, kind: "none" },
+    {
+      name: "direct message",
+      channel: makeChannel({ channelType: "dm", description: "Hi" }),
+      canManage: true,
+      kind: "none",
+    },
+    {
+      name: "described, member",
+      channel: makeChannel({ description: "Ask here." }),
+      canManage: false,
+      kind: "description",
+    },
+    {
+      name: "described, manager",
+      channel: makeChannel({ description: "Ask here." }),
+      canManage: true,
+      kind: "description",
+    },
+    {
+      name: "described, archived",
+      channel: makeChannel({ archivedAt, description: "Ask here." }),
+      canManage: true,
+      kind: "description",
+    },
+    {
+      name: "described forum",
+      channel: makeChannel({ channelType: "forum", description: "Posts." }),
+      canManage: false,
+      kind: "description",
+    },
+    {
+      name: "empty, member",
+      channel: makeChannel(),
+      canManage: false,
+      kind: "none",
+    },
+    {
+      name: "empty, manager",
+      channel: makeChannel(),
+      canManage: true,
+      kind: "add-description",
+    },
+    {
+      name: "whitespace only, manager",
+      channel: makeChannel({ description: "  \n " }),
+      canManage: true,
+      kind: "add-description",
+    },
+    {
+      name: "empty, archived, manager",
+      channel: makeChannel({ archivedAt }),
+      canManage: true,
+      kind: "none",
+    },
+  ];
+
+  for (const { name, channel, canManage, kind } of cases) {
+    assert.equal(
+      getChannelHeaderLine(channel, canManage).kind,
+      kind,
+      `${name} should be ${kind}`,
+    );
+  }
+});
+
+test("getChannelHeaderLine shows one line but keeps the full text for hover", () => {
+  const description = "Your Reset room.\n\nType @Reset Worker to ask.";
+  const line = getChannelHeaderLine(
+    makeChannel({ description, isMember: false }),
+    false,
+  );
+
+  assert.deepEqual(line, {
+    kind: "description",
+    text: "Your Reset room. Type @Reset Worker to ask.",
+    title: `Read-only until you join this open channel.\n${description}`,
+  });
 });
