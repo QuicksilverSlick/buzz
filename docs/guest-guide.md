@@ -49,10 +49,12 @@ Stuck at any point? Ask the person who invited you.
    Apple chip file. "Processor: Intel" means the Intel file.
 3. On a Mac, open the downloaded file, drag **Dreamforge** into
    **Applications**, and open it from there. The first time, your Mac says
-   Dreamforge was not opened. Click **Done**. Then open **System Settings**,
-   click **Privacy & Security**, scroll down to **Security**, and click
-   **Open Anyway** next to Dreamforge. Click **Open Anyway** again and enter
-   your Mac password. You only do this once.
+   Dreamforge was not opened. Click **Done**. Then, within the hour, open
+   **System Settings**, click **Privacy & Security**, scroll down to
+   **Security**, and click **Open Anyway** next to Dreamforge. Click
+   **Open Anyway** again and enter your Mac password. You only do this once.
+   If **Open Anyway** isn't there, open Dreamforge from Applications again,
+   click **Done**, and go straight back to **Privacy & Security**.
 4. On Windows, open the downloaded file. If Windows says "Windows protected
    your PC", click **More info**, then **Run anyway**.
 
@@ -81,11 +83,11 @@ connect the other (see [Use both a computer and a phone](#use-both-a-computer-an
 1. Open Dreamforge and click **Create a new identity key**, then **Next**. If
    your Mac asks for your login password so Dreamforge can use the keychain,
    type it.
-2. On **Set up your agent harnesses** and on
-   **Configure your default model settings**, click **Skip for now**. Those
-   screens are for people who run their own agents.
-3. Click **Join a community**, paste your invite link, and click **Next**. If
-   you're asked, confirm your age and agree to the terms.
+2. On **Set up your agent harnesses**, click **Skip for now**. That screen is
+   for people who run their own agents.
+3. Click **Join a community** and paste your invite link. If boxes appear
+   under it, tick them to confirm your age and agree to the terms. Then click
+   **Next**.
 4. Type the name people will see and click **Next**. On the next screen,
    click **Take me to Dreamforge**.
 
@@ -105,16 +107,17 @@ community's channels are in the sidebar under **Channels**.
 2. Tap your invite link. A web page opens that says you're invited.
 3. If the page asks, confirm your age and agree to the terms.
 4. Tap **Accept invite in Buzz** (some invite pages say
-   **Accept invite in Dreamforge**). Buzz opens and asks
-   **Join this Buzz community?** Tap **Join**.
-5. Tap **Continue to #welcome-everyone** (or **Not now**).
+   **Accept invite in Dreamforge**). If Safari asks to open this page in Buzz,
+   tap **Open**. Buzz opens and asks **Join this Buzz community?** Tap
+   **Join**.
+5. Buzz says you joined and warns that this phone is the only copy of your
+   account, with a big **Back it up now** button. That can wait. Tap
+   **Continue to #welcome-everyone** underneath it (or **Not now**).
 6. To set your name, tap your picture in the top-right corner of Home, then
    **Display name**.
 
-After you join, Buzz warns that this phone is the only copy of your account
-and offers **Back it up now**. That can wait. It connects your phone to
-Dreamforge on a computer, and the person who invited you can help with it
-later.
+**Back it up now** connects your phone to Dreamforge on a computer. The person
+who invited you can help with it later.
 
 ## Use both a computer and a phone
 
@@ -125,8 +128,9 @@ Android.
 1. In Dreamforge, click your picture at the bottom of the sidebar, then
    **Settings**. Choose **Mobile**, then click **Start pairing**. A square
    code (a QR code) appears.
-2. Open Buzz on your iPhone, tap **Scan a QR code**, and point the camera at
-   the code on your Mac.
+2. Open Buzz on your iPhone and tap **Scan a QR code**. If your iPhone asks to
+   let Buzz use the camera, tap **Allow**. Point the camera at the code on
+   your Mac.
 3. Your Mac shows six digits. Type them on your iPhone. If your iPhone offers
    to protect your account with Face ID, choose that or **Skip**.
 4. On your Mac, click **Codes match**.
@@ -141,14 +145,15 @@ computer. Ask the person who invited you to help you connect it.
 
 ### Mac or Windows PC
 
-- Open the channel. In Dreamforge 0.5.22 and later, the line under the
-  channel name at the top says what it's for. In earlier versions, rest the
-  pointer on the channel name at the top to see it.
-- In Dreamforge 0.5.22 and later, rest the pointer on a channel in the sidebar
-  to see its name and description.
+- Open the channel. If there's a short line under the channel name at the
+  top, it says what the channel is for. If there isn't, rest the pointer on
+  the channel name at the top to see it.
+- In newer versions of Dreamforge, resting the pointer on a channel in the
+  sidebar also shows its description.
 - To browse every public channel, point at **Channels** in the sidebar and
   click **+**, or press Shift-Command-O (Shift-Ctrl-O on Windows). Each
-  channel shows its description. Click **Join** to join one.
+  channel shows its description. Point at a channel and click the **Join**
+  button that appears.
 
 ### iPhone or Android phone
 
@@ -184,20 +189,27 @@ agent only answers the person who runs it.
 ### If an agent doesn't answer
 
 Each agent only answers the people its owner chose. If you're not one of them,
-the agent stays quiet: usually you won't see an error, just no reply. If you
-see a note that an agent can't reply to you, it means the same thing. If a few
-minutes pass with no answer, ask the person who invited you to let the agent
-answer you.
+the agent stays quiet: you won't see an error, just no reply. An agent that's
+switched off also stays quiet. If a few minutes pass with no answer, tell the
+person who invited you which agent you asked.
 
 ## Notifications
 
 ### Mac or Windows PC
 
 Dreamforge alerts are on by default. To change them, click your picture at
-the bottom of the sidebar, then **Settings**, then **Notifications**. If your
-computer blocks them, turn on notifications for Dreamforge in your system
-settings. On a Mac, closing the Dreamforge window keeps it running, so alerts
-still arrive. Quitting it stops them.
+the bottom of the sidebar, then **Settings**, then **Notifications**.
+
+The first time something would alert you, your Mac asks whether Dreamforge
+can send notifications. Click **Allow**. If you clicked **Don't Allow**,
+Dreamforge turns its alerts off. To get them back, turn on notifications for
+Dreamforge in **System Settings**, then **Notifications**. Then turn on
+**Desktop alerts** in Dreamforge's **Settings**, **Notifications**. On
+Windows, if alerts don't appear, turn on notifications for Dreamforge in
+Windows **Settings**.
+
+On a Mac, closing the Dreamforge window keeps it running, so alerts still
+arrive. Quitting it stops them.
 
 ### iPhone
 
