@@ -976,6 +976,46 @@ for (const { relayRole, staysGuest } of [
   });
 }
 
+test("a saved guest whom a slow relay lists as owner is corrected in the open channel", async ({
+  page,
+}) => {
+  // Hold the relay's role answer so #welcome-everyone is already open when it
+  // arrives; the open view must drop guest mode without a reload.
+  await page.addInitScript(() => {
+    const internals = window.__TAURI_INTERNALS__ ?? {};
+    let wrapped: unknown;
+    Object.defineProperty(internals, "invoke", {
+      configurable: true,
+      get: () => wrapped,
+      set: (fn: (command: string, ...rest: unknown[]) => Promise<unknown>) => {
+        wrapped = async (command: string, ...rest: unknown[]) => {
+          if (command === "relay_requires_membership") {
+            await new Promise((resolve) => setTimeout(resolve, 4_000));
+          }
+          return fn(command, ...rest);
+        };
+      },
+    });
+    window.__TAURI_INTERNALS__ = internals;
+  });
+  await openWelcomeEveryoneAsGuest(page, {
+    relayAgents: [resetWorker()],
+    relayRequiresMembership: true,
+    relayRole: "owner",
+  });
+  expect(
+    await page.evaluate((key) => localStorage.getItem(key), GUEST_STORAGE_KEY),
+  ).toBe("true");
+
+  await expect(
+    page.getByTestId("welcome-composer-persona-mention"),
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(guestHint(page)).toHaveCount(0);
+  expect(
+    await page.evaluate((key) => localStorage.getItem(key), GUEST_STORAGE_KEY),
+  ).toBe(null);
+});
+
 test("in #welcome-everyone a guest who can see no agents gets no hint", async ({
   page,
 }) => {
