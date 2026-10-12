@@ -111,6 +111,7 @@ export function CreateChannelFormFields({
         </label>
         <div className={CHANNEL_FORM_FIELD_SHELL_CLASS}>
           <Textarea
+            aria-describedby="create-channel-description-hint"
             className={cn(
               "min-h-20 resize-none px-3 py-3 leading-5",
               CHANNEL_FORM_FIELD_CONTROL_CLASS,
@@ -119,11 +120,18 @@ export function CreateChannelFormFields({
             disabled={isCreating}
             id="create-channel-description"
             onChange={(event) => form.setDescription(event.target.value)}
-            placeholder={`What this ${kindLabel} is for`}
             rows={2}
             value={form.description}
           />
         </div>
+        <p
+          className="px-3 text-xs text-muted-foreground"
+          data-testid="create-channel-description-hint"
+          id="create-channel-description-hint"
+        >
+          Guests see this. Say what the {kindLabel} is for. Phones show only
+          this field.
+        </p>
       </div>
 
       <ChannelTypeSettings

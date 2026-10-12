@@ -1,11 +1,25 @@
 import * as React from "react";
 import { Bot, FolderPlus, Plus, Sparkles, UserPlus } from "lucide-react";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useChannelsQuery } from "@/features/channels/hooks";
+import {
+  canBuildCommunity,
+  showsCreateActions,
+  selectWelcomeChannelGuide,
+} from "@/features/channels/lib/welcomeChannelGuide";
+import {
+  mergeOpenChannelDirectory,
+  useWarmOpenChannelDirectory,
+} from "@/features/channels/openChannelDirectory";
 import {
   getChannelIntroDescription,
   getChannelIntroKind,
 } from "@/features/channels/ui/ChannelPane.helpers";
+import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
+import type { ChannelIntroChannel } from "@/features/messages/ui/ChannelIntroBlock";
 import {
+  isStarterWelcomeChannel,
   isWelcomeChannel,
   isWelcomeExperienceChannel,
 } from "@/features/onboarding/welcome";
@@ -13,6 +27,8 @@ import { useIsProjectHomeChannel } from "@/features/projects/lib/projectHomeChan
 import { ProjectChannelIcon } from "@/features/projects/ui/ProjectChannelIcon";
 import type { Channel } from "@/shared/api/types";
 import { HashSearch } from "@/shared/ui/icons";
+
+const NO_CHANNELS: Channel[] = [];
 
 type ChannelIntroAction = {
   description?: string;
@@ -26,7 +42,9 @@ type ChannelIntroAction = {
  * Builds the empty-channel intro block (heading, description, action cards)
  * for the channel timeline. The Welcome channel gets its onboarding trio
  * (browse / create channel / create agent); other channels get contextual
- * member actions.
+ * member actions. #welcome-everyone also lists the community's channels
+ * with what each is for, and shows the create cards only to the people who
+ * build the community, so guests see where to go rather than how to build.
  */
 export function useChannelIntro({
   activeChannel,
@@ -46,6 +64,33 @@ export function useChannelIntro({
   onWelcomeAddAgent?: () => void;
 }) {
   const projectHome = useIsProjectHomeChannel(activeChannel?.id);
+  const { goChannel } = useAppNavigation();
+  const isStarterWelcome = isStarterWelcomeChannel(activeChannel);
+  const canBuild = canBuildCommunity(useMyRelayMembershipLookupQuery().data);
+  const memberChannels = useChannelsQuery().data ?? NO_CHANNELS;
+  // Cache only: open channels the viewer hasn't joined appear once Browse
+  // channels or search has loaded the directory. Opening #welcome-everyone
+  // never starts the all-open relay scan itself.
+  const directoryChannels = useWarmOpenChannelDirectory();
+  const guideChannels = React.useMemo<ChannelIntroChannel[]>(() => {
+    if (!isStarterWelcome || !activeChannel) {
+      return [];
+    }
+
+    return selectWelcomeChannelGuide(
+      mergeOpenChannelDirectory(memberChannels, directoryChannels),
+      activeChannel.id,
+    ).map((entry) => ({
+      ...entry,
+      onOpen: () => void goChannel(entry.id),
+    }));
+  }, [
+    activeChannel,
+    directoryChannels,
+    goChannel,
+    isStarterWelcome,
+    memberChannels,
+  ]);
 
   return React.useMemo(() => {
     if (!activeChannel || activeChannel.channelType === "dm") {
@@ -54,6 +99,7 @@ export function useChannelIntro({
 
     const actions: ChannelIntroAction[] = [];
     if (isWelcomeExperienceChannel(activeChannel)) {
+      const showsCreate = showsCreateActions(isStarterWelcome, canBuild);
       if (onBrowseChannels) {
         actions.push({
           icon: <HashSearch aria-hidden className="h-6 w-6" />,
@@ -63,7 +109,7 @@ export function useChannelIntro({
         });
       }
 
-      if (onCreateChannel) {
+      if (onCreateChannel && showsCreate) {
         actions.push({
           icon: <Plus aria-hidden className="h-6 w-6" />,
           label: "Create a channel",
@@ -72,7 +118,7 @@ export function useChannelIntro({
         });
       }
 
-      if (onWelcomeAddAgent) {
+      if (onWelcomeAddAgent && showsCreate) {
         actions.push({
           icon: <Bot aria-hidden className="h-6 w-6" />,
           label: "Create an agent",
@@ -87,6 +133,7 @@ export function useChannelIntro({
           ? "private welcome channel"
           : getChannelIntroKind(activeChannel, projectHome),
         channelName: activeChannel.name,
+        channels: guideChannels,
         description: isWelcomeChannel(activeChannel)
           ? null
           : getChannelIntroDescription(activeChannel),
@@ -138,6 +185,9 @@ export function useChannelIntro({
     };
   }, [
     activeChannel,
+    canBuild,
+    guideChannels,
+    isStarterWelcome,
     onAddAgent,
     onAddFiles,
     onBrowseChannels,

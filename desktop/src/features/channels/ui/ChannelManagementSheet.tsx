@@ -23,6 +23,11 @@ import {
 } from "@/features/channels/hooks";
 import { canvasIngressOpen } from "./canvasIngress";
 import { compareMembersByRole } from "@/features/channels/lib/memberUtils";
+import {
+  clearChannelEditRequest,
+  isChannelEditRequested,
+  useChannelEditRequest,
+} from "@/features/channels/lib/channelEditRequest";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelWorkflowsQuery } from "@/features/workflows/hooks";
 import { DEFAULT_EPHEMERAL_TTL_SECONDS } from "@/features/channels/lib/ephemeralChannel";
@@ -226,6 +231,25 @@ export function ChannelManagementSheet({
     setHasUserEditedChannelDraft(false);
     setActiveView("summary");
   }, [cancelDeferredModalOpen, detail, open]);
+
+  // The header's "Add a description" action opens settings straight into
+  // the edit dialog. The request is cleared only once the dialog opens.
+  const editRequest = useChannelEditRequest();
+  React.useEffect(() => {
+    if (
+      !open ||
+      !canEditChannel ||
+      !channelId ||
+      !isChannelEditRequested(editRequest, channelId)
+    ) {
+      return;
+    }
+
+    openModalNextFrame(() => {
+      clearChannelEditRequest(channelId);
+      setIsEditDialogOpen(true);
+    });
+  }, [canEditChannel, channelId, editRequest, open, openModalNextFrame]);
 
   if (!channel) {
     return null;

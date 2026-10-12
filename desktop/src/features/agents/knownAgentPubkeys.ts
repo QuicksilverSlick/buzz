@@ -52,6 +52,41 @@ export function mergeOwnedAgentPubkeys(
 }
 
 /**
+ * Whether the current user owns any agent: one this desktop manages, or one
+ * the relay lists with the current user as its owner. Agents on
+ * `starterTeamId` don't count on either list, because onboarding gives that
+ * team to every new member, guests included. Guests who own no other agent
+ * have no use for agent tooling such as the terminal.
+ */
+export function ownsAnyAgent(
+  managedAgents:
+    | readonly { pubkey: string; teamId?: string | null }[]
+    | undefined,
+  relayAgents:
+    | readonly { pubkey: string; ownerPubkey: string | null }[]
+    | undefined,
+  currentPubkey: string | null | undefined,
+  starterTeamId?: string,
+): boolean {
+  const starterPubkeys = new Set<string>();
+  for (const agent of managedAgents ?? []) {
+    if (starterTeamId === undefined || agent.teamId !== starterTeamId) {
+      return true;
+    }
+    starterPubkeys.add(normalizePubkey(agent.pubkey));
+  }
+  if (!currentPubkey) return false;
+
+  const ownerPubkey = normalizePubkey(currentPubkey);
+  return (relayAgents ?? []).some(
+    (agent) =>
+      agent.ownerPubkey !== null &&
+      normalizePubkey(agent.ownerPubkey) === ownerPubkey &&
+      !starterPubkeys.has(normalizePubkey(agent.pubkey)),
+  );
+}
+
+/**
  * Channel-scoped variant: the managed ∪ relay baseline plus this channel's
  * bot members (role `bot` or `isAgent`), so member-only agents are included.
  */
