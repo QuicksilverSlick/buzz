@@ -38,6 +38,7 @@ pub(super) fn fixture(
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        session_policy: Default::default(),
         description: None,
         pubkey: "p".into(),
         name: "n".into(),

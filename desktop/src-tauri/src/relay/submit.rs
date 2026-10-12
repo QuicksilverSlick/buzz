@@ -40,20 +40,18 @@ pub async fn submit_signed_event_at_with_keys_tagged(
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "relay event submit")?;
     let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
 
-    let mut request = state
-        .http_client
-        .post(&url)
-        .header("Authorization", auth_header)
-        .header("Content-Type", "application/json");
-    if let Some(tag) = auth_tag {
-        request = request.header("x-auth-tag", tag);
-    }
-
-    let response = request
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_request_error(&e))?;
+    let response = build_authenticated_relay_request(
+        &state.http_client,
+        Method::POST,
+        &url,
+        &auth_header,
+        Some(body_bytes),
+        auth_tag,
+        None,
+    )
+    .send()
+    .await
+    .map_err(|e| classify_request_error(&e))?;
 
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);

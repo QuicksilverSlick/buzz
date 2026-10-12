@@ -66,6 +66,7 @@ mod tests {
         ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            session_policy: Default::default(),
             description: None,
             pubkey: String::new(),
             name: "r".to_string(),
@@ -133,11 +134,13 @@ mod tests {
         use crate::managed_agents::types::AgentDefinition;
         AgentDefinition {
             capabilities: Vec::new(),
+            session_policy: Default::default(),
             description: None,
             id: id.to_string(),
             display_name: String::new(),
             avatar_url: None,
             system_prompt: String::new(),
+            acp_command: None,
             runtime: runtime.map(str::to_string),
             model: None,
             provider: None,

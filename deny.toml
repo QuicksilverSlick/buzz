@@ -15,6 +15,9 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # unsafe-libyaml 0.2.11: unmaintained (no vulnerability), via serde_yaml. No maintained
+    # drop-in is adopted upstream yet; owner chose to ignore it on 2026-10-12.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade; via serde_yaml" },
 ]
 
 [licenses]

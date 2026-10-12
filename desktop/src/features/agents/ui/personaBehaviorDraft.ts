@@ -1,4 +1,5 @@
 import type {
+  AcpSessionPolicy,
   AgentCapability,
   PersonaBehaviorInput,
   RespondToMode,
@@ -24,6 +25,7 @@ export type PersonaBehaviorDraft = {
    * agent is granted nothing — the deny-by-default value.
    */
   capabilities: AgentCapability[];
+  sessionPolicy: AcpSessionPolicy;
 };
 
 export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
@@ -31,6 +33,7 @@ export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
   respondToAllowlist: [],
   parallelism: "",
   capabilities: [],
+  sessionPolicy: "channel",
 };
 
 /** Seed the draft from a dialog-state behavior group (edit/duplicate). */
@@ -43,6 +46,7 @@ export function draftFromBehavior(
     parallelism:
       behavior?.parallelism != null ? String(behavior.parallelism) : "",
     capabilities: [...(behavior?.capabilities ?? [])],
+    sessionPolicy: behavior?.sessionPolicy ?? "channel",
   };
 }
 
@@ -56,9 +60,7 @@ export function personaBehaviorDraftValid(draft: PersonaBehaviorDraft) {
   return draft.respondTo !== "allowlist" || draft.respondToAllowlist.length > 0;
 }
 
-function behaviorFromDraft(
-  draft: PersonaBehaviorDraft,
-): PersonaBehaviorInput | undefined {
+function behaviorFromDraft(draft: PersonaBehaviorDraft): PersonaBehaviorInput {
   const parallelism = Number.parseInt(draft.parallelism, 10);
   const group: PersonaBehaviorInput = {
     respondTo: draft.respondTo ?? undefined,
@@ -73,12 +75,9 @@ function behaviorFromDraft(
       draft.capabilities.length > 0
         ? [...draft.capabilities].sort()
         : undefined,
+    sessionPolicy: draft.sessionPolicy,
   };
-  const isEmpty =
-    group.respondTo === undefined &&
-    group.parallelism === undefined &&
-    group.capabilities === undefined;
-  return isEmpty ? undefined : group;
+  return group;
 }
 
 /**
@@ -89,12 +88,11 @@ function behaviorFromDraft(
  * - a behavior group that is untouched relative to its seed submits nothing — an
  *   unrelated edit (rename, prompt tweak) must not rewrite the published
  *   definition's behavior bytes or flip its content hash;
- * - an empty behavior group submits nothing — plain creates stay without
- *   behavioral fields;
+ * - creates always submit the selected session policy; the channel default is
+ *   omitted from durable/public JSON by the backend for wire compatibility;
  * - any real change submits the full group (replace-as-a-unit semantics);
- * - EXCEPT a full clear on edit: draft empty but seed non-empty submits an
- *   explicit empty group, because "submit nothing" would silently no-op the
- *   clear and the stored behavior group would resurrect on reopen.
+ * - clearing the optional fields on edit still submits the channel default,
+ *   because "submit nothing" would silently no-op the clear.
  *
  * Duplicate flows pass the source persona's behavior group as `seed` but with
  * `isEdit: false`: a duplicate is a CREATE, so a non-empty inherited
@@ -114,5 +112,5 @@ export function behaviorForSubmit(
   if (JSON.stringify(group) === JSON.stringify(seedGroup)) {
     return undefined;
   }
-  return group ?? {};
+  return group;
 }

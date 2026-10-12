@@ -332,6 +332,8 @@ mod tests {
             format: FORMAT_DISCRIMINATOR.to_string(),
             version: FORMAT_VERSION,
             definition: AgentSnapshotDefinition {
+                session_policy: Default::default(),
+                acp_command: None,
                 name: "Locked Test".to_string(),
                 system_prompt: Some("You are a locked test agent.".to_string()),
                 runtime: None,
@@ -368,6 +370,7 @@ mod tests {
         ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            session_policy: Default::default(),
             description: None,
             pubkey,
             name: "Locked Test".to_string(),
