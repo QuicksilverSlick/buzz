@@ -104,6 +104,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goBench = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/bench",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -459,6 +470,7 @@ export function useAppNavigation() {
     closeSettings,
     closeWorkflowDetail,
     goAgents,
+    goBench,
     goChannel,
     goDuplicateWorkflow,
     goEditWorkflow,

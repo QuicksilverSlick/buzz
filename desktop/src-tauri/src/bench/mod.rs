@@ -17,6 +17,7 @@ use crate::app_state::AppState;
 use crate::events;
 use crate::secret_store::SecretStore;
 
+pub(crate) mod commands;
 mod item;
 
 pub(crate) const RELAY_WS: &str = "wss://greymatterllc.communities.buzz.xyz";

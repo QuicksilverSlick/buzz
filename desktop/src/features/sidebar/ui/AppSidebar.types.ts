@@ -45,7 +45,8 @@ export type AppSidebarProps = {
     | "agents"
     | "workflows"
     | "pulse"
-    | "projects";
+    | "projects"
+    | "bench";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
   highPriorityUnreadChannelIds: ReadonlySet<string>;
@@ -86,6 +87,7 @@ export type AppSidebarProps = {
   onRemoveCommunityFromDevice: (id: string) => Promise<void>;
   onCreateAgent: () => void;
   onSelectAgents: () => void;
+  onSelectBench: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;

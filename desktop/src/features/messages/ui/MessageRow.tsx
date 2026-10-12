@@ -12,6 +12,8 @@ import {
 } from "@/features/messages/lib/canSendToChannel";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { BenchCard } from "@/features/bench/ui/BenchCard";
+import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAuthorWithIndicators";
@@ -380,6 +382,15 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
+    // Non-null only for a live Bench card in #bench signed by the Bench
+    // writer key (see benchRowState); every other row renders as before.
+    const benchCard = useBenchCardForMessage({
+      channelId,
+      id: message.id,
+      kind: message.kind,
+      pending: message.pending,
+      signerPubkey: message.signerPubkey,
+    });
 
     const renderBody = () => {
       switch (message.kind) {
@@ -415,6 +426,15 @@ export const MessageRow = React.memo(
             />
           );
         default: {
+          if (benchCard) {
+            return (
+              <BenchCard
+                card={benchCard.card}
+                ownerPubkey={benchCard.ownerPubkey}
+                viewerPubkey={currentPubkey}
+              />
+            );
+          }
           const waveMessage = parseWaveMessageContent(message.body);
           if (waveMessage) {
             return (
@@ -942,6 +962,8 @@ export const MessageRow = React.memo(
   (prev, next) =>
     prev.message.id === next.message.id &&
     prev.message.pubkey === next.message.pubkey &&
+    // The Bench card guard checks the raw signer.
+    prev.message.signerPubkey === next.message.signerPubkey &&
     prev.message.body === next.message.body &&
     prev.message.author === next.message.author &&
     prev.message.isAgent === next.message.isAgent &&
