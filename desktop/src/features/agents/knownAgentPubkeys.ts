@@ -52,6 +52,27 @@ export function mergeOwnedAgentPubkeys(
 }
 
 /**
+ * Whether the current user owns any agent: one this desktop manages, or one
+ * the relay lists with the current user as its owner. Guests who own none
+ * have no use for agent tooling such as the terminal.
+ */
+export function ownsAnyAgent(
+  managedAgents: readonly { pubkey: string }[] | undefined,
+  relayAgents: readonly { ownerPubkey: string | null }[] | undefined,
+  currentPubkey: string | null | undefined,
+): boolean {
+  if ((managedAgents?.length ?? 0) > 0) return true;
+  if (!currentPubkey) return false;
+
+  const ownerPubkey = normalizePubkey(currentPubkey);
+  return (relayAgents ?? []).some(
+    (agent) =>
+      agent.ownerPubkey !== null &&
+      normalizePubkey(agent.ownerPubkey) === ownerPubkey,
+  );
+}
+
+/**
  * Channel-scoped variant: the managed ∪ relay baseline plus this channel's
  * bot members (role `bot` or `isAgent`), so member-only agents are included.
  */

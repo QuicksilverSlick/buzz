@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   mergeKnownAgentPubkeys,
   mergeOwnedAgentPubkeys,
+  ownsAnyAgent,
 } from "./knownAgentPubkeys.ts";
 
 const MANAGED =
@@ -59,4 +60,25 @@ test("owned agents exclude agents controlled by somebody else", () => {
   );
 
   assert.equal(merged.size, 0);
+});
+
+test("ownsAnyAgent counts managed agents and relay agents owned by the viewer", () => {
+  const cases = [
+    [[{ pubkey: MANAGED }], [], "owner", true],
+    [[{ pubkey: MANAGED }], undefined, null, true],
+    [[], [{ ownerPubkey: " OWNER " }], "owner", true],
+    [undefined, [{ ownerPubkey: "owner" }], "OWNER", true],
+    [[], [{ ownerPubkey: "somebody-else" }], "owner", false],
+    [[], [{ ownerPubkey: null }], "owner", false],
+    [[], [{ ownerPubkey: "owner" }], null, false],
+    [undefined, undefined, "owner", false],
+  ];
+
+  for (const [managed, relay, viewer, expected] of cases) {
+    assert.equal(
+      ownsAnyAgent(managed, relay, viewer),
+      expected,
+      JSON.stringify({ managed, relay, viewer }),
+    );
+  }
 });

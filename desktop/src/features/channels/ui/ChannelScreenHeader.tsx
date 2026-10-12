@@ -20,6 +20,11 @@ import {
   ProfileAvatarWithStatus,
   scaleProfileAvatarStatusGeometry,
 } from "@/features/profile/ui/ProfileAvatarWithStatus";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
+import { ownsAnyAgent } from "@/features/agents/knownAgentPubkeys";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
@@ -31,6 +36,7 @@ import {
   useTerminalPanel,
 } from "@/features/terminal/terminalPanelStore";
 import { TERMINAL_LABEL } from "@/shared/constants/brand";
+import { isMacPlatform } from "@/shared/lib/platform";
 
 const DM_HEADER_AVATAR_SIZE = 32;
 const DM_HEADER_AVATAR_STATUS_GEOMETRY = scaleProfileAvatarStatusGeometry(
@@ -132,7 +138,19 @@ export function ChannelScreenHeader({
     ) : null;
 
   const terminalPanel = useTerminalPanel();
-  const terminalButton = activeChannel ? (
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const relayAgentsQuery = useRelayAgentsQuery();
+  // The terminal is agent tooling. Hide it from people who own no agents,
+  // unless it is already open, so the button can still close it.
+  const showTerminalButton =
+    activeChannel !== null &&
+    (terminalPanel.mode !== "closed" ||
+      ownsAnyAgent(
+        managedAgentsQuery.data,
+        relayAgentsQuery.data,
+        currentPubkey,
+      ));
+  const terminalButton = showTerminalButton ? (
     <Button
       aria-label={
         terminalPanel.mode === "closed"
@@ -141,7 +159,7 @@ export function ChannelScreenHeader({
       }
       onClick={toggleTerminalPanel}
       size="icon"
-      title={`${TERMINAL_LABEL} (⌘J)`}
+      title={`${TERMINAL_LABEL} (${isMacPlatform() ? "⌘J" : "Ctrl+J"})`}
       type="button"
       variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
     >
