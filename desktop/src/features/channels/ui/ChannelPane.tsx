@@ -67,6 +67,8 @@ import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMes
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
+import { resolveWelcomeComposerHint } from "@/features/channels/lib/welcomeComposerHint";
+import { useIsCommunityGuest } from "@/features/onboarding/useIsCommunityGuest";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
@@ -234,6 +236,11 @@ export const ChannelPane = React.memo(function ChannelPane({
     agentPubkeysPending && hasOtherDmParticipant(activeChannel, currentPubkey);
   const isActiveWelcomeChannel =
     activeChannel !== null && isWelcomeExperience(activeChannel);
+  const isCommunityGuest = useIsCommunityGuest();
+  const welcomeComposerHint = resolveWelcomeComposerHint({
+    hasVisibleAgents: (agentPubkeys?.size ?? 0) > 0,
+    isGuest: isCommunityGuest,
+  });
   useComposerHeightPadding(
     timelineScrollRef,
     composerWrapperRef,
@@ -738,8 +745,11 @@ export const ChannelPane = React.memo(function ChannelPane({
                     hasComposerBottomActivity && "composer-dock--with-activity",
                   )}
                 >
-                  {isActiveWelcomeChannel && !timeoutActive ? (
+                  {isActiveWelcomeChannel &&
+                  welcomeComposerHint &&
+                  !timeoutActive ? (
                     <WelcomeComposerGuidanceLayer
+                      hint={welcomeComposerHint}
                       onDismiss={handleDismissWelcomeBanner}
                       settingUp={welcomeKickoffSettingUp}
                       state={welcomeComposerBannerState}

@@ -619,3 +619,63 @@ test("a community admin who uses an invite keeps the starter team", async ({
     ),
   ).toBeNull();
 });
+
+async function openWelcomeEveryoneAsGuest(
+  page: Page,
+  mock: Parameters<typeof installMockBridge>[1],
+) {
+  await page.addInitScript((key) => {
+    window.localStorage.setItem(key, "true");
+  }, GUEST_STORAGE_KEY);
+  await installMockBridge(page, mock, { relayWsUrl: COMMUNITY_RELAY_URL });
+  await page.goto("/");
+  await page.getByTestId("channel-welcome-everyone").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("welcome-everyone");
+}
+
+test("in #welcome-everyone a guest is told how to ask the community's agents", async ({
+  page,
+}) => {
+  await openWelcomeEveryoneAsGuest(page, {
+    relayAgents: [
+      {
+        pubkey: "ab".repeat(32),
+        name: "Reset Worker",
+        respondTo: "anyone",
+      },
+    ],
+  });
+
+  const banner = page.getByTestId("welcome-composer-guide-banner");
+  await expect(banner.getByTestId("welcome-composer-guest-hint")).toHaveText(
+    "Type @ and an agent's name to ask it for something.",
+  );
+  await expect(banner).not.toContainText("Fizz");
+  await expect(
+    page.getByTestId("welcome-composer-persona-mention"),
+  ).toHaveCount(0);
+});
+
+test("in #welcome-everyone a guest who can see no agents gets no hint", async ({
+  page,
+}) => {
+  // The fixture community has relay agents; an unreadable agent directory
+  // leaves this guest with none they can see.
+  await openWelcomeEveryoneAsGuest(page, {
+    relayAgentListErrors: Array.from({ length: 50 }, () => "unavailable"),
+  });
+
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  // Let both agent sources answer before checking that no hint appeared.
+  await expect
+    .poll(async () =>
+      Math.min(
+        await commandCount(page, "list_relay_agents"),
+        await commandCount(page, "list_managed_agents"),
+      ),
+    )
+    .toBeGreaterThan(0);
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+});
