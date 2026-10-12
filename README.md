@@ -1,3 +1,5 @@
+Using Dreamforge? Start with the [guest guide](docs/guest-guide.md).
+
 > **This is Dreamforge**, a fork of [`block/buzz`](https://github.com/block/buzz).
 >
 > The product ships as Dreamforge and every screen says so. Everything below the
