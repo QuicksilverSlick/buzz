@@ -90,7 +90,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         avatar_url: CODEX_AVATAR_URL,
         mcp_command: Some("buzz-dev-mcp"),
         mcp_hooks: false,
-        underlying_cli: Some("codex"),
+        // No global `codex` needed: every supported codex-acp (>= MIN_CODEX_ACP_VERSION)
+        // depends on @openai/codex and runs that bundled engine unless CODEX_PATH is set.
+        // Requiring a PATH `codex` marked working installs CliMissing and hid Connect.
+        // The cli_install_* fields below go unused while this is None.
+        underlying_cli: None,
         cli_install_commands: &["curl -fsSL https://chatgpt.com/codex/install.sh | sh"],
         cli_install_commands_windows: &[windows_install_command!("codex", "https://chatgpt.com/codex/install.ps1")],
         adapter_install_commands: &["npm install -g @agentclientprotocol/codex-acp"],
