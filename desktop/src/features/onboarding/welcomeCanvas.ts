@@ -16,7 +16,7 @@ Bring the team something you are building, or give them a quick challenge to see
 
 ## Get help
 
-Ask the team a question here, or read the [Dreamforge user guide](https://github.com/block/buzz#readme).
+Ask the team a question here, or read the [Dreamforge guest guide](https://github.com/QuicksilverSlick/buzz/blob/main/docs/guest-guide.md).
 `;
 
 type WelcomeCanvasClient = {
