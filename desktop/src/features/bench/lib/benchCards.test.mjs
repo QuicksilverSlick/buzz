@@ -477,6 +477,43 @@ test("recorded line: option number, text and the answer time", () => {
   assert.equal(benchRecordedLine(card({ recorded: 5 }), formatTime), null);
 });
 
+test("retired card: the Bench's answer still shows, read-only", () => {
+  // state.json 24 h after the answer: the card is retired, `recorded` is
+  // forgotten and `answer` stays.
+  const retired = card({
+    cardEventId: null,
+    answer: { option: 1, answeredAt: 99 },
+    recorded: null,
+  });
+  assert.equal(
+    benchRecordedLine(retired, (s) => `t${s}`),
+    "Recorded: 2. Hold · t99",
+  );
+  const mode = benchCardMode(retired, OWNER, OWNER);
+  assert.equal(mode.interactive, false);
+  assert.deepEqual(
+    benchOptionViews(retired, INITIAL_BENCH_ANSWER_STATE, mode.interactive).map(
+      (o) => [o.selected, o.disabled],
+    ),
+    [
+      [false, true],
+      [true, true],
+    ],
+  );
+  // A live card shows only what its text records, not an answer the Bench
+  // has yet to edit in.
+  const live = card({ answer: { option: 1, answeredAt: 99 }, recorded: null });
+  assert.equal(
+    benchRecordedLine(live, (s) => `t${s}`),
+    null,
+  );
+  assert.ok(
+    benchOptionViews(live, INITIAL_BENCH_ANSWER_STATE, true).every(
+      (o) => !o.selected,
+    ),
+  );
+});
+
 test("deadline: RFC 3339 to unix seconds, null when unparseable", () => {
   assert.equal(benchDeadlineSeconds("2026-10-14T15:00:00Z"), 1_791_990_000);
   assert.equal(benchDeadlineSeconds("soon"), null);

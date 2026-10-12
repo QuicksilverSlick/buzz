@@ -149,9 +149,15 @@ pub(crate) fn plan_answer(
     }
 }
 
-/// bench_answer's relay half. Reads the owner's reactions on the live card
-/// with the poll's own /query, then publishes the add before the deletes, so
-/// a failed delete never loses the new answer (latest wins in pick_answer).
+/// Refused clear: a tap by another approver key would still answer the card.
+pub(crate) const ANSWERED_ELSEWHERE: &str = "answered from another device; change or undo it there";
+
+/// bench_answer's relay half. Reads every approver's reactions on the live
+/// card with the poll's own /query and plans against pick_answer's latest
+/// wins: an owner keycap outranked by a newer tap from a members.txt key is
+/// posted again, and a clear such a tap would survive is refused. The add
+/// goes before the other deletes, so a failed delete never loses the new
+/// answer.
 pub(crate) async fn answer_card(
     ctx: &Ctx<'_>,
     s: &BenchState,
@@ -181,8 +187,12 @@ pub(crate) async fn answer_card(
     if s.owner_pubkey != owner.to_hex() {
         return Err("owner identity changed; refusing to answer".to_string());
     }
+    // The poll's approvers: the owner plus the phone's own key in members.txt.
+    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+        .chain(super::read_members(&ctx.root))
+        .collect();
     let filter = serde_json::json!({
-        "kinds": [7], "authors": [s.owner_pubkey], "#h": [s.channel_id], "#e": [card],
+        "kinds": [7], "authors": approvers, "#h": [s.channel_id], "#e": [card],
         "limit": super::RECOVER_LIMIT,
     });
     let events = query(ctx, s, filter, now).await?;
@@ -199,15 +209,57 @@ pub(crate) async fn answer_card(
         })
         .map(|e| (e.id.to_hex(), e.content.clone()))
         .collect();
-    let plan = plan_answer(&existing, chosen, n);
+    let mut plan = plan_answer(&existing, chosen, n);
+    // What pick_answer reads once the planned deletes land.
+    let remaining: Vec<nostr::Event> = events
+        .into_iter()
+        .filter(|e| !plan.delete.contains(&e.id.to_hex()))
+        .collect();
+    let writer_hex = ctx.writer.public_key().to_hex();
+    let top = item::pick_answer(item, &remaining, &approvers, &writer_hex);
+    // Owner keycaps to delete before the same keycap is posted again: the
+    // relay refuses an identical active reaction as a duplicate.
+    let mut repost: Vec<String> = Vec::new();
+    match (chosen, top) {
+        // Only that key can delete its own tap.
+        (None, Some(_)) => return Err(ANSWERED_ELSEWHERE.to_string()),
+        // The owner's keycap is there but a newer tap outranks it.
+        (Some(i), Some((shown, _))) if shown != i && plan.add.is_none() => {
+            let keycap = OPTION_EMOJI[i];
+            repost = existing
+                .iter()
+                .filter(|(_, c)| c == keycap)
+                .map(|(id, _)| id.clone())
+                .collect();
+            plan.add = Some(keycap);
+        }
+        _ => {}
+    }
+    // Latest wins by created_at: the add is stamped past the newest tap left
+    // standing, so a phone clock running ahead cannot keep outranking it.
+    let at = top.map_or(now, |(_, e)| now.max(e.created_at.as_secs() + 1));
+    if plan.add.is_some() && at - now > super::MAX_CLOCK_LEAD_SECS {
+        return Err("another device's tap is dated in the future; change it there".to_string());
+    }
     let target = nostr::EventId::from_hex(&card).map_err(|e| e.to_string())?;
+    for id in &repost {
+        remove_reaction(ctx, id).await?;
+    }
     if let Some(emoji) = plan.add {
-        post_as_owner(ctx, events::build_reaction(target, emoji)?).await?;
+        let reaction =
+            events::build_reaction(target, emoji)?.custom_created_at(nostr::Timestamp::from(at));
+        post_as_owner(ctx, reaction).await?;
     }
-    for id in plan.delete {
-        let id = nostr::EventId::from_hex(&id).map_err(|e| e.to_string())?;
-        post_as_owner(ctx, events::build_remove_reaction(id)?).await?;
+    for id in &plan.delete {
+        remove_reaction(ctx, id).await?;
     }
+    Ok(())
+}
+
+/// The owner's kind 5 on one of the owner's own reactions.
+async fn remove_reaction(ctx: &Ctx<'_>, id: &str) -> Result<(), String> {
+    let id = nostr::EventId::from_hex(id).map_err(|e| e.to_string())?;
+    post_as_owner(ctx, events::build_remove_reaction(id)?).await?;
     Ok(())
 }
 

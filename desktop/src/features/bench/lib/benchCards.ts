@@ -405,19 +405,32 @@ export type BenchOptionView = {
   disabled: boolean;
 };
 
+/**
+ * The option the card shows as answered: what the live card's text records,
+ * or, once the card is retired or deleted (the Bench forgets `recorded` then
+ * and keeps `answer`), the Bench's answer. Such a card is never interactive,
+ * so the reducer still settles on `recorded` alone.
+ */
+function shownOption(card: BenchCard): number | null {
+  return (
+    card.recorded ?? (card.cardEventId ? null : (card.answer?.option ?? null))
+  );
+}
+
 export function benchOptionViews(
   card: BenchCard,
   state: BenchAnswerState,
   interactive: boolean,
 ): BenchOptionView[] {
   const saving = state.phase === "saving";
+  const shown = shownOption(card);
   return card.options.map((text, index) => {
     const pending = saving && state.clicked === index;
     return {
       index,
       number: String(index + 1),
       text,
-      selected: card.recorded === index,
+      selected: shown === index,
       pending,
       disabled: !interactive || (saving && !pending),
     };
@@ -429,7 +442,7 @@ export function benchRecordedLine(
   card: BenchCard,
   formatTime: (unixSeconds: number) => string,
 ): string | null {
-  const recorded = card.recorded;
+  const recorded = shownOption(card);
   if (recorded === null || recorded < 0) return null;
   const text = card.options[recorded];
   if (text === undefined) return null;

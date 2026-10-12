@@ -203,11 +203,17 @@ function BenchOptionButton({
   option: BenchOptionView;
 }) {
   const label = `${option.number}. ${option.text}`;
+  // A retired card shows its answer on a disabled button: nothing to undo.
+  const undoable = option.selected && !option.disabled;
   return (
     <Button
       aria-busy={option.pending || undefined}
       aria-label={
-        option.selected ? `${label} (recorded, click to undo)` : label
+        undoable
+          ? `${label} (recorded, click to undo)`
+          : option.selected
+            ? `${label} (recorded)`
+            : label
       }
       aria-pressed={option.selected}
       className={cn(
@@ -217,7 +223,7 @@ function BenchOptionButton({
       disabled={option.disabled}
       onClick={() => onSelect(option.index)}
       size="sm"
-      title={option.selected ? "Recorded. Click to undo." : undefined}
+      title={undoable ? "Recorded. Click to undo." : undefined}
       type="button"
       variant={option.selected ? "default" : "outline"}
     >
