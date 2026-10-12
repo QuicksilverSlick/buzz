@@ -32,6 +32,9 @@ const LABEL_MAX: usize = 40;
 const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
 const BOARD_TITLE_MAX: usize = 60;
+/// Columns of a card's fence a 360 dp phone shows without scrolling: about
+/// 208 dp beside the avatar and code padding, at ~7.8 dp per 13 px glyph.
+pub(crate) const FENCE_WIDTH: usize = 26;
 
 /// A drop file exactly as a writer may author it. `deny_unknown_fields` is
 /// the whole "a drop never carries answer/verdict/source/version/card/
@@ -166,8 +169,8 @@ pub(crate) struct Item {
     pub quiet_repost: bool,
 }
 
-/// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area are
-/// the only untrusted strings printed outside the fence on a card.
+/// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
+/// like a validated link url, print outside the fence as they are.
 pub(crate) fn valid_name(s: &str, max: usize) -> bool {
     let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     !s.is_empty()
@@ -309,6 +312,14 @@ pub(crate) fn validate(
     valid_text(&d.body, BODY_MAX, "body")?;
     for o in &d.options {
         valid_text(o, OPTION_MAX, "option")?;
+        // Printed through plain_text: an emoji-only option would leave the
+        // owner a bare "1." beside its keycap.
+        if !plain_text(o, usize::MAX)
+            .bytes()
+            .any(|b| b.is_ascii_alphanumeric())
+        {
+            return Err("option: no plain letters or digits".to_string());
+        }
     }
     match d.kind {
         ItemKind::Pending => {
@@ -427,19 +438,78 @@ pub(crate) fn summary(body: &str) -> String {
     }
 }
 
-/// Board lines sit outside any fence, where both apps linkify bare URLs and
-/// `[x](url)`: keep only characters that can form neither.
+/// Hard-wrap each line at `width` chars on spaces, cutting longer words;
+/// runs of spaces and tabs become one space and newlines stay. The phone
+/// never wraps a fence: each line is one row it scrolls sideways.
+pub(crate) fn wrap(text: &str, width: usize) -> String {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let (mut row, mut len) = (String::new(), 0);
+        for word in line.split_whitespace() {
+            let chars: Vec<char> = word.chars().collect();
+            for piece in chars.chunks(width) {
+                if len > 0 && len + 1 + piece.len() > width {
+                    lines.push(std::mem::take(&mut row));
+                    len = 0;
+                }
+                if len > 0 {
+                    row.push(' ');
+                    len += 1;
+                }
+                row.extend(piece);
+                len += piece.len();
+            }
+        }
+        lines.push(row);
+    }
+    lines.join("\n")
+}
+
+/// Text outside any fence: board lines and a card's title, options and link
+/// labels. Both apps render markdown there and the phone has no backslash
+/// escape, so anything outside a plainly inert set becomes a space: `_`
+/// pairs into emphasis on the desktop, `;` closes an entity (`&num;`) the
+/// desktop decodes into a live `#channel` or `buzz://` link, and a space
+/// rather than nothing so a dropped character never joins `w[w]w.` into an
+/// autolink. It also never opens a block after a card's `1. ` (both apps
+/// nest blocks in a list item): it starts at a letter, digit or quote, a
+/// leading `1.` or `1)` loses its mark, and trailing dashes go (the phone
+/// draws any line ending in `---` as a rule). Curly quotes, en and em dashes
+/// and the ellipsis fold to ASCII first, so "Don’t" never reads "Don t".
+/// Nothing but a space follows a `:`: the phone draws `:name:` as the image
+/// any community member published under that shortcode.
+pub(crate) fn plain_text(t: &str, max: usize) -> String {
+    let inert = |c: char| c.is_ascii_alphanumeric() || " ,.!?'\"()&+-".contains(c);
+    let mut spaced = String::with_capacity(t.len());
+    for c in t.chars() {
+        match c {
+            '\u{2018}' | '\u{2019}' | '\u{02BC}' => spaced.push('\''),
+            '\u{201C}' | '\u{201D}' => spaced.push('"'),
+            '\u{2013}' | '\u{2014}' => spaced.push('-'),
+            '\u{2026}' => spaced.push_str("..."),
+            ':' => spaced.push_str(": "),
+            c if inert(c) => spaced.push(c),
+            _ => spaced.push(' '),
+        }
+    }
+    let words = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s = words
+        .trim_start_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '"' || c == '\''))
+        .to_string();
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let b = s.as_bytes();
+    if digits > 0
+        && matches!(b.get(digits), Some(b'.' | b')'))
+        && matches!(b.get(digits + 1), None | Some(b' '))
+    {
+        s.remove(digits);
+    }
+    let s: String = s.chars().take(max).collect();
+    s.trim_end_matches(['-', ' ']).to_string()
+}
+
 pub(crate) fn plain_title(t: &str) -> String {
-    let kept: String = t
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || " ,.;:!?'\"()&+_-".contains(*c))
-        .collect();
-    kept.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(BOARD_TITLE_MAX)
-        .collect()
+    plain_text(t, BOARD_TITLE_MAX)
 }
 
 pub(crate) fn severity_rank(s: Option<Severity>) -> u8 {
@@ -478,8 +548,10 @@ fn state_name(s: StatusState) -> &'static str {
 /// Bump when render_card's text changes: every live unanswered card is then
 /// reposted once, without a ping, with the new text (publish (b) retires it
 /// as stale). An answered card gets the new text through its Recorded edit
-/// and keeps its answer and its 24 h keep.
-pub(crate) const CARD_FORMAT: u32 = 2;
+/// and keeps its answer and its 24 h keep. 3: title and options moved out of
+/// the fence, which the phone draws as unwrapped monospace, and the summary
+/// left in it is hard-wrapped.
+pub(crate) const CARD_FORMAT: u32 = 3;
 
 /// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
 /// Cards posted before CARD_FORMAT existed carry the bare Drop hash.
@@ -487,29 +559,46 @@ pub(crate) fn card_hash(item: &Item) -> String {
     format!("{}.{CARD_FORMAT}", item.hash)
 }
 
-/// Card text: marker line, one fence holding title/summary/options, then the
-/// validated deadline and links outside the fence so the phone can open them,
-/// and on an unanswered pending card the line that says how to answer.
+/// Card text: marker line, the title in bold, the summary alone in a fence
+/// (agent prose stays inert) wrapped to FENCE_WIDTH, the options as a
+/// numbered list, then the validated deadline and links so the phone can
+/// open them, and on an unanswered pending card the line that says how to
+/// answer. Everything outside the fence but the url goes through plain_text.
 pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
-    let mut inner = format!("{}\n\n{}", item.title, summary(&item.body));
-    if item.kind == ItemKind::Pending {
-        inner.push('\n');
-        for (i, o) in item.options.iter().enumerate() {
-            inner.push_str(&format!("\n{}. {o}", i + 1));
-        }
-    }
     let mut out = format!(
-        "{} \u{b7} {} \u{b7} {}\n{}",
+        "{} \u{b7} {} \u{b7} {}",
         marker(item),
         item.area,
-        item.writer,
-        fence(&inner)
+        item.writer
     );
+    let title = plain_text(&item.title, usize::MAX);
+    // An empty one would print `****`, a rule on both apps.
+    if !title.is_empty() {
+        out.push_str(&format!("\n**{title}**"));
+    }
+    if !item.body.trim().is_empty() {
+        // No backtick survives, so the fence is always three: the phone ends
+        // a block at the first line of exactly three backticks, never at a
+        // longer fence, and the text after it would render live. U+02CB
+        // looks the same and is markdown on neither app.
+        let body = summary(&item.body).replace('`', "\u{02CB}");
+        out.push('\n');
+        out.push_str(&fence(&wrap(&body, FENCE_WIDTH)));
+    }
+    if item.kind == ItemKind::Pending {
+        for (i, o) in item.options.iter().enumerate() {
+            out.push_str(&format!("\n{}. {}", i + 1, plain_text(o, usize::MAX)));
+        }
+        // A blank line ends the list, or the desktop folds the lines below
+        // into the last option.
+        out.push('\n');
+    }
     if let Some(d) = &item.deadline {
         out.push_str(&format!("\ndue {d}"));
     }
     for l in &item.links {
-        out.push_str(&format!("\n{}: {}", l.label, l.url));
+        let label = plain_text(&l.label, usize::MAX);
+        out.push_str(&format!("\n{label}: {}", l.url));
     }
     if item.kind == ItemKind::Pending && item.answer.is_none() {
         out.push_str("\nTap one number below to answer.");
