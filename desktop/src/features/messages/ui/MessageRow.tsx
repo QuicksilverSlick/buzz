@@ -12,6 +12,7 @@ import {
 } from "@/features/messages/lib/canSendToChannel";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
@@ -385,6 +386,17 @@ export const MessageRow = React.memo(
       pending: message.pending,
       signerPubkey: message.signerPubkey,
     });
+    // A live card's option buttons already show its answer keycaps.
+    const shownReactions = React.useMemo(
+      () =>
+        benchCard
+          ? reactions.filter(
+              (reaction) =>
+                !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
+            )
+          : reactions,
+      [benchCard, reactions],
+    );
 
     const renderBody = () => {
       switch (message.kind) {
@@ -700,7 +712,7 @@ export const MessageRow = React.memo(
         {continuationMetadataNode}
         <MessageReactions
           messageId={message.id}
-          reactions={reactions}
+          reactions={shownReactions}
           canToggle={canToggleReactions}
           pending={reactionPending}
           burstEmojiOnRender={badgeBurstEmoji}

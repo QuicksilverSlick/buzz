@@ -452,6 +452,18 @@ export function benchRecordedLine(
     : line;
 }
 
+/** The keycaps the Bench seeds and reads as answers (item.rs OPTION_EMOJI). */
+const BENCH_OPTION_KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
+
+/**
+ * Whether a reaction is one of the card's answer keycaps: the pills phones
+ * tap, which the desktop card already shows as its option buttons.
+ */
+export function isBenchAnswerKeycap(card: BenchCard, emoji: string): boolean {
+  const index = BENCH_OPTION_KEYCAPS.indexOf(emoji);
+  return index !== -1 && index < card.options.length;
+}
+
 /** RFC 3339 deadline to unix seconds; null when it does not parse. */
 export function benchDeadlineSeconds(deadline: string | null): number | null {
   if (!deadline) return null;
