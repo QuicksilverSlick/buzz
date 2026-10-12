@@ -23,6 +23,7 @@ import type { UnreadCatchUpChannelResult } from "@/shared/api/tauriUnreadCatchUp
 import { relayClient } from "@/shared/api/relayClient";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
 import { resolveAgentParallelism } from "@/features/agents/lib/agentParallelism";
+import type { BenchCards } from "@/features/bench/lib/benchCards";
 import { awaitLiveSwitchOutcome } from "@/features/agents/lib/liveSwitchOutcome";
 import {
   _testRegisterKnownAgents,
@@ -535,6 +536,8 @@ type E2eConfig = {
     // snake_case wire shape the Rust backend returns so tests can drive the
     // LocalArchiveSettingsCard without a real SQLite database.
     agentMetricArchiveDefaultEnabled?: boolean;
+    // The `bench_cards` snapshot; absent means the Bench is not enabled.
+    benchCards?: BenchCards;
     saveSubscriptions?: Array<{
       scope_type: string;
       scope_value: string;
@@ -14972,6 +14975,14 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "agent_metric_archive_default_enabled":
         return activeConfig?.mock?.agentMetricArchiveDefaultEnabled ?? true;
+      // Message rows read the Bench snapshot to decide which of them are
+      // Bench cards; without a configured snapshot no row is one.
+      case "bench_cards":
+        return activeConfig?.mock?.benchCards ?? { enabled: false };
+      // The real command publishes the owner's keycap; the mock accepts it
+      // and leaves `recorded` to the configured snapshot.
+      case "bench_answer":
+        return null;
       case "set_prevent_sleep_active":
         return null;
       case "set_window_vibrancy":
