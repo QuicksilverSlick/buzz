@@ -1,7 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 
-import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 
@@ -471,7 +470,7 @@ test("code-entry phones advance without desktop confirmation", async ({
   await expect(card.getByTestId("confirm-sas")).toHaveCount(0);
   await expect(card.getByTestId("deny-sas")).toBeVisible();
   await expect(card.getByTestId("pairing-status")).toContainText(
-    `Enter this code in the ${PRODUCT_NAME} app on your phone.`,
+    "Enter this code in the Buzz app on your phone.",
   );
   await waitForAnimations(page);
   mkdirSync(SCREENSHOT_DIR, { recursive: true });

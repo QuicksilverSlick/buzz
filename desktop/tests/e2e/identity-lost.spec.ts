@@ -115,7 +115,7 @@ test("lost boot offers phone recovery with a single-use QR", async ({
   await expect(page.getByTestId("identity-recovery-qr")).toBeVisible();
   await expect(
     page.getByText(
-      `Scan this code with a device where you’re currently signed in to ${PRODUCT_NAME}.`,
+      "Scan this code with the Buzz app by Block (App Store or Google Play) on a phone where you’re already signed in.",
     ),
   ).toBeVisible();
   await expect(

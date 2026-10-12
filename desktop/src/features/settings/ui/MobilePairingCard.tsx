@@ -132,7 +132,8 @@ function PairingSteps({
             className="mt-1 text-sm text-muted-foreground/70"
             data-settings-subcopy
           >
-            Open Dreamforge on your mobile device and scan the code shown here.
+            Open the Buzz app by Block on your phone and scan the code shown
+            here.
           </p>
         </div>
       </li>
@@ -152,7 +153,7 @@ function PairingSteps({
             data-settings-subcopy
           >
             {codeEntry
-              ? "Type the six-digit code shown here into the Dreamforge mobile app."
+              ? "Type the six-digit code shown here into the Buzz app on your phone."
               : "Check that the six-digit code matches on both devices, then confirm it."}
           </p>
         </div>
@@ -424,9 +425,10 @@ export function MobilePairingCard({
         title="Mobile"
         description={
           <>
-            Connect the Dreamforge mobile app to this relay by scanning a QR
-            code. The connection is secured with end-to-end encryption and a
-            verification code.
+            Connect the Buzz app by Block on your phone to this relay by
+            scanning a QR code. Get it from the App Store or Google Play. The
+            connection is secured with end-to-end encryption and a verification
+            code.
           </>
         }
       />
@@ -444,7 +446,7 @@ export function MobilePairingCard({
             and is visually hidden, so it changes nothing on screen. */}
         <p aria-live="polite" className="sr-only" data-testid="pairing-status">
           {step === "sas" && sasCode
-            ? `Verification code ${sasCode.slice(0, 3)} ${sasCode.slice(3, 6)} ready. ${codeEntry ? "Enter this code in the Dreamforge app on your phone." : "Check that it matches on your mobile device, then confirm the codes match."}`
+            ? `Verification code ${sasCode.slice(0, 3)} ${sasCode.slice(3, 6)} ready. ${codeEntry ? "Enter this code in the Buzz app on your phone." : "Check that it matches on your mobile device, then confirm the codes match."}`
             : step === "transferring"
               ? "Codes confirmed. Pairing your mobile device."
               : step === "done"

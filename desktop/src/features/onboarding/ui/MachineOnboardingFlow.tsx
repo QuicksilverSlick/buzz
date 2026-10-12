@@ -467,7 +467,7 @@ export function MachineOnboardingFlow({
               </h1>
               <p className="mt-2 w-full text-base leading-6 text-foreground/80">
                 {phoneRecoveryStep === "loading" || phoneRecoveryStep === "qr"
-                  ? "Scan this code with a device where you’re currently signed in to Dreamforge."
+                  ? "Scan this code with the Buzz app by Block (App Store or Google Play) on a phone where you’re already signed in."
                   : "Confirm the code before sharing your identity."}
               </p>
               <div

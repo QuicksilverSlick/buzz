@@ -4529,7 +4529,7 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
   await page.getByLabel("I am 18 years of age or older.").check();
   await page
     .getByLabel(
-      `I agree to the ${PRODUCT_NAME} Terms of Service and Privacy Policy.`,
+      "I agree to this community’s Terms of Service and Privacy Policy.",
     )
     .check();
   await page.getByTestId("invite-redeem-submit").click();
