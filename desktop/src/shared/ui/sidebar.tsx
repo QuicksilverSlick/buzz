@@ -786,6 +786,8 @@ const SidebarMenuButton = React.forwardRef<
     asChild?: boolean;
     isActive?: boolean;
     tooltip?: string | React.ComponentProps<typeof TooltipContent>;
+    /** Also show the tooltip while the sidebar is expanded, not only collapsed. */
+    tooltipWhenExpanded?: boolean;
   } & VariantProps<typeof sidebarMenuButtonVariants>
 >(
   (
@@ -795,6 +797,7 @@ const SidebarMenuButton = React.forwardRef<
       variant = "default",
       size = "default",
       tooltip,
+      tooltipWhenExpanded = false,
       className,
       ...props
     },
@@ -830,7 +833,7 @@ const SidebarMenuButton = React.forwardRef<
         <TooltipContent
           side="right"
           align="center"
-          hidden={state !== "collapsed" || isMobile}
+          hidden={(state !== "collapsed" && !tooltipWhenExpanded) || isMobile}
           {...tooltip}
         />
       </Tooltip>

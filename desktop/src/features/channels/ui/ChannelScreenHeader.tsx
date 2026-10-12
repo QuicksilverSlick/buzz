@@ -4,17 +4,29 @@ import type * as React from "react";
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
 import type { EphemeralChannelDisplay } from "@/features/channels/lib/ephemeralChannel";
 import type { ActiveDmHeaderParticipant } from "@/features/channels/useActiveChannelHeader";
-import { getChannelDescription } from "@/features/channels/lib/channelDescription";
+import { useChannelMembersQuery } from "@/features/channels/hooks";
+import {
+  getChannelDescription,
+  getChannelDetail,
+  getChannelHeaderLine,
+} from "@/features/channels/lib/channelDescription";
 import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDisplay";
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
 import { ChannelHeaderStatusBadge } from "@/features/channels/ui/ChannelHeaderStatusBadge";
+import { useChannelModerationCapabilities } from "@/features/channels/ui/ChannelManagementModerationActions";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import {
   DEFAULT_HOVER_PROFILE_STATUS_GEOMETRY,
   ProfileAvatarWithStatus,
   scaleProfileAvatarStatusGeometry,
 } from "@/features/profile/ui/ProfileAvatarWithStatus";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
+import { ownsAnyAgent } from "@/features/agents/knownAgentPubkeys";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
+import { WELCOME_TEAM_ID } from "@/features/onboarding/welcomeGuide";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
 import { Button } from "@/shared/ui/button";
@@ -25,6 +37,7 @@ import {
   useTerminalPanel,
 } from "@/features/terminal/terminalPanelStore";
 import { TERMINAL_LABEL } from "@/shared/constants/brand";
+import { isMacPlatform } from "@/shared/lib/platform";
 
 const DM_HEADER_AVATAR_SIZE = 32;
 const DM_HEADER_AVATAR_STATUS_GEOMETRY = scaleProfileAvatarStatusGeometry(
@@ -48,6 +61,8 @@ type ChannelScreenHeaderProps = {
   showHeaderContent?: boolean;
   transparentChrome?: boolean;
   onAddBotOpenChange?: (open: boolean) => void;
+  /** Opens channel settings in edit mode for an undescribed channel. */
+  onAddDescription?: () => void;
   onJoinChannel?: () => Promise<void>;
   onManageChannel: () => void;
   onToggleMembers: () => void;
@@ -67,6 +82,7 @@ export function ChannelScreenHeader({
   isAddBotOpen,
   isJoining = false,
   onAddBotOpenChange,
+  onAddDescription,
   showHeaderContent = true,
   transparentChrome = false,
   onJoinChannel,
@@ -84,8 +100,60 @@ export function ChannelScreenHeader({
     !activeChannel.archivedAt &&
     onJoinChannel;
 
+  // Only an undescribed channel needs the roster, to decide whether this
+  // viewer gets "Add a description". The channel screen already loads it.
+  const needsManageCheck =
+    onAddDescription !== undefined &&
+    activeChannel !== null &&
+    activeChannel.channelType !== "dm" &&
+    !activeChannel.archivedAt &&
+    getChannelDetail(activeChannel) === null;
+  const membersQuery = useChannelMembersQuery(
+    activeChannel?.id ?? null,
+    needsManageCheck,
+  );
+  const { canManageChannel } = useChannelModerationCapabilities(
+    needsManageCheck ? membersQuery.data : undefined,
+    currentPubkey,
+    needsManageCheck,
+  );
+  const headerLine = getChannelHeaderLine(activeChannel, canManageChannel);
+  const subtitle =
+    headerLine.kind === "description" ? (
+      <p
+        className="min-w-0 truncate pl-5 text-xs leading-4 text-muted-foreground"
+        data-testid="chat-description"
+        title={headerLine.title}
+      >
+        {headerLine.text}
+      </p>
+    ) : headerLine.kind === "add-description" && onAddDescription ? (
+      <button
+        className="ml-5 min-w-0 truncate rounded-sm text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+        data-testid="chat-add-description"
+        onClick={onAddDescription}
+        type="button"
+      >
+        Add a description
+      </button>
+    ) : null;
+
   const terminalPanel = useTerminalPanel();
-  const terminalButton = activeChannel ? (
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const relayAgentsQuery = useRelayAgentsQuery();
+  // The terminal is agent tooling. Hide it from people who own no agents
+  // beyond the Welcome Team that onboarding gives every new member, unless
+  // it is already open, so the button can still close it.
+  const showTerminalButton =
+    activeChannel !== null &&
+    (terminalPanel.mode !== "closed" ||
+      ownsAnyAgent(
+        managedAgentsQuery.data,
+        relayAgentsQuery.data,
+        currentPubkey,
+        WELCOME_TEAM_ID,
+      ));
+  const terminalButton = showTerminalButton ? (
     <Button
       aria-label={
         terminalPanel.mode === "closed"
@@ -94,7 +162,7 @@ export function ChannelScreenHeader({
       }
       onClick={toggleTerminalPanel}
       size="icon"
-      title={`${TERMINAL_LABEL} (⌘J)`}
+      title={`${TERMINAL_LABEL} (${isMacPlatform() ? "⌘J" : "Ctrl+J"})`}
       type="button"
       variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
     >
@@ -211,6 +279,7 @@ export function ChannelScreenHeader({
           ) : null}
         </>
       }
+      subtitle={subtitle}
       title={activeChannelTitle}
       titleAdornment={
         activeChannel?.channelType === "dm" && !isGroupDm ? (
