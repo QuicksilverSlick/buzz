@@ -5,6 +5,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import {
   canBuildCommunity,
+  showsCreateActions,
   selectWelcomeChannelGuide,
 } from "@/features/channels/lib/welcomeChannelGuide";
 import {
@@ -98,7 +99,7 @@ export function useChannelIntro({
 
     const actions: ChannelIntroAction[] = [];
     if (isWelcomeExperienceChannel(activeChannel)) {
-      const showsCreateActions = !isStarterWelcome || canBuild;
+      const showsCreate = showsCreateActions(isStarterWelcome, canBuild);
       if (onBrowseChannels) {
         actions.push({
           icon: <HashSearch aria-hidden className="h-6 w-6" />,
@@ -108,7 +109,7 @@ export function useChannelIntro({
         });
       }
 
-      if (onCreateChannel && showsCreateActions) {
+      if (onCreateChannel && showsCreate) {
         actions.push({
           icon: <Plus aria-hidden className="h-6 w-6" />,
           label: "Create a channel",
@@ -117,7 +118,7 @@ export function useChannelIntro({
         });
       }
 
-      if (onWelcomeAddAgent && showsCreateActions) {
+      if (onWelcomeAddAgent && showsCreate) {
         actions.push({
           icon: <Bot aria-hidden className="h-6 w-6" />,
           label: "Create an agent",

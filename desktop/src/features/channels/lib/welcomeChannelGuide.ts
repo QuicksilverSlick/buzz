@@ -54,3 +54,12 @@ export function selectWelcomeChannelGuide(
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
+
+/** Who sees the "Create a channel" / "Create an agent" cards in a channel intro:
+ * everyone outside #welcome-everyone, and only owners and admins inside it. */
+export function showsCreateActions(
+  isStarterWelcome: boolean,
+  canBuild: boolean,
+): boolean {
+  return !isStarterWelcome || canBuild;
+}

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   canBuildCommunity,
   selectWelcomeChannelGuide,
+  showsCreateActions,
 } from "./welcomeChannelGuide.ts";
 
 function channel(overrides = {}) {
@@ -137,4 +138,11 @@ test("canBuildCommunity keeps the create cards for owners, admins and open relay
   for (const [name, lookup, expected] of cases) {
     assert.equal(canBuildCommunity(lookup), expected, name);
   }
+});
+
+test("showsCreateActions hides the create cards from guests only in #welcome-everyone", () => {
+  assert.equal(showsCreateActions(true, false), false);
+  assert.equal(showsCreateActions(true, true), true);
+  assert.equal(showsCreateActions(false, false), true);
+  assert.equal(showsCreateActions(false, true), true);
 });
