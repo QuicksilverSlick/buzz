@@ -70,6 +70,7 @@ fn test_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        session_policy: Default::default(),
         description: None,
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),

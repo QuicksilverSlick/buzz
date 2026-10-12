@@ -40,7 +40,8 @@ pub mod private_managed_agent;
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
-
+/// NIP-CW thread-mode normalized newest-first window contract.
+pub mod thread_window;
 /// Ticket state: the fold from status events to what is true now.
 pub mod ticket;
 /// Schnorr signature and event ID verification.
@@ -82,3 +83,6 @@ pub mod test_helpers {
         StoredEvent::with_received_at(make_event(kind), Utc::now(), channel_id, true)
     }
 }
+
+/// NIP-AR channel artifact envelope and limits.
+pub mod artifact;

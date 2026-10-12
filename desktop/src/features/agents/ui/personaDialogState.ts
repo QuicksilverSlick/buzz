@@ -46,6 +46,7 @@ export function createPersonaDialogState(): PersonaDialogState {
       displayName: "",
       avatarUrl: "",
       systemPrompt: "",
+      acpCommand: "buzz-acp",
       runtime: undefined,
       model: undefined,
     },
@@ -65,6 +66,7 @@ export function duplicatePersonaDialogState(
       avatarUrl: persona.avatarUrl ?? "",
       description: persona.description ?? undefined,
       systemPrompt: persona.systemPrompt,
+      acpCommand: persona.acpCommand || "buzz-acp",
       runtime: persona.runtime ?? undefined,
       model: persona.model ?? undefined,
       provider: persona.provider ?? undefined,
@@ -96,7 +98,8 @@ function behaviorEntry(
   if (
     persona.respondTo == null &&
     persona.parallelism == null &&
-    capabilities.length === 0
+    capabilities.length === 0 &&
+    (persona.sessionPolicy ?? "channel") === "channel"
   ) {
     return {};
   }
@@ -111,6 +114,7 @@ function behaviorEntry(
       // Absent rather than an empty array when nothing is granted, so a
       // persona that never had a grant still submits byte-identically.
       capabilities: capabilities.length > 0 ? [...capabilities] : undefined,
+      sessionPolicy: persona.sessionPolicy ?? "channel",
     },
   };
 }
@@ -136,6 +140,7 @@ export function editPersonaDialogState(
       avatarUrl: persona.avatarUrl ?? "",
       description: persona.description ?? undefined,
       systemPrompt: persona.systemPrompt,
+      acpCommand: persona.acpCommand || "buzz-acp",
       runtime: persona.runtime ?? undefined,
       model: persona.model ?? undefined,
       provider: persona.provider ?? undefined,

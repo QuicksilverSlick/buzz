@@ -76,10 +76,9 @@ pub(crate) struct SpawnConfigInputs<'a> {
     /// The stored record remains portable; only effective spawned access is stamped.
     pub enforced_owner_only: bool,
     /// The effective ACP session policy (`channel`/`thread`) the launch applies.
-    /// Resolved from the desktop experiment toggle at the shared launch
-    /// boundary; captured here so flipping the experiment while an agent runs
-    /// drives the existing restart-required path (the harness only reads
-    /// `BUZZ_ACP_SESSION_POLICY` at launch).
+    /// Resolved from the current linked definition at the shared launch
+    /// boundary; captured here so editing the definition while an agent runs
+    /// drives the existing restart-required path.
     pub session_policy: AcpSessionPolicy,
     /// The capability grants this launch resolved from the agent's definition
     /// — the same slice handed to `build_respond_to_env`, so the stamped
@@ -335,7 +334,6 @@ pub(crate) fn prospective_spawn_config_snapshot(
     workspace_relay: &str,
     global: &GlobalAgentConfig,
     enforced_owner_only: bool,
-    session_policy: AcpSessionPolicy,
 ) -> SpawnConfigSnapshot {
     // Prospective re-snapshot: apply the same `apply_persona_snapshot` the
     // start/restore paths run right before spawning, so this describes what a
@@ -386,7 +384,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         model: model.as_deref(),
         provider: provider.as_deref(),
         enforced_owner_only,
-        session_policy,
+        session_policy: record.session_policy,
         // Resolved through the SAME function the spawn path calls, against the
         // same `personas` slice, so the prospective and stamped sides cannot
         // disagree about what a restart would grant.

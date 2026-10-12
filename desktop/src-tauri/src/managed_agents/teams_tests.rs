@@ -169,6 +169,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        session_policy: Default::default(),
         description: None,
         pubkey: name.to_string(),
         name: name.to_string(),
@@ -457,11 +458,13 @@ const D_TAG: &str = "my-team";
 fn catalog_copy(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: id.to_string(),
         description: None,
         avatar_url: None,
         system_prompt: String::new(),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
@@ -698,11 +701,13 @@ fn test_ref_check_preserves_copy_used_by_a_standalone_managed_agent() {
 fn catalog_persona(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: id.to_string(),
         description: None,
         avatar_url: None,
         system_prompt: "Do the work.".to_string(),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,

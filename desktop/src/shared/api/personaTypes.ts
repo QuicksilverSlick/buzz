@@ -1,7 +1,7 @@
 // Persona (agent definition) wire types, split out of `types.ts` to keep that
 // file inside the repo-wide size ratchet. Consumers import these through
 // `@/shared/api/types`, which re-exports everything here.
-import type { RespondToMode } from "./types";
+import type { AcpSessionPolicy, RespondToMode } from "./types";
 
 export type AgentPersona = {
   id: string;
@@ -14,6 +14,7 @@ export type AgentPersona = {
    */
   description: string | null;
   systemPrompt: string;
+  acpCommand: string; // ACP transport selected before deployment.
   /** Preferred ACP runtime ID (e.g. "goose", "claude"). */
   runtime: string | null;
   /** Opaque, harness-specific model identifier string. Buzz stores and passes through without interpretation. */
@@ -45,6 +46,8 @@ export type AgentPersona = {
    * existed reads back as.
    */
   capabilities: AgentCapability[];
+  /** Whether ACP context is shared by the channel or isolated per thread. */
+  sessionPolicy?: AcpSessionPolicy;
   createdAt: string;
   updatedAt: string;
 };
@@ -77,6 +80,7 @@ export type PersonaBehaviorInput = {
   parallelism?: number;
   /** Absent and empty both mean no grants. */
   capabilities?: AgentCapability[];
+  sessionPolicy?: AcpSessionPolicy;
 };
 
 export type CreatePersonaInput = {
@@ -85,6 +89,7 @@ export type CreatePersonaInput = {
   /** Optional short, PUBLIC description (max 280 chars). Empty string clears. */
   description?: string | null;
   systemPrompt: string;
+  acpCommand?: string;
   runtime?: string;
   model?: string;
   provider?: string;
@@ -105,6 +110,7 @@ export type UpdatePersonaInput = {
   /** Optional short, PUBLIC description (max 280 chars). Empty string clears. */
   description?: string | null;
   systemPrompt: string;
+  acpCommand?: string;
   runtime?: string;
   model?: string;
   provider?: string;

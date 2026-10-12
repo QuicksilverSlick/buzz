@@ -7,6 +7,7 @@ fn agent(persona_id: &str, name: &str, display_name: Option<&str>) -> ManagedAge
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        session_policy: Default::default(),
         description: None,
         pubkey: format!("pubkey-{name}"),
         name: name.to_string(),
