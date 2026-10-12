@@ -295,6 +295,8 @@ type MockBridgeOptions = {
   canvasReadError?: string;
   /** Seed canvas revisions (oldest first); see e2eBridge mock config. */
   canvasRevisions?: Array<{
+    /** Defaults to the starter #general channel. */
+    channelId?: string;
     content: string;
     createdAt?: number;
     eventId?: string;

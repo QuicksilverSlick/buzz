@@ -421,14 +421,25 @@ test("persisted deep-link invite hands off to Joining after machine onboarding",
 
 // Guest mode: someone who joins a community through an invite skips
 // AI-provider setup, gets no private Welcome channel, Welcome Team or
-// kickoff, and lands in a channel the owner set up for them.
+// kickoff, joins the owner's #general and #welcome-everyone, and lands in a
+// channel the owner set up for them.
 
 const GUEST_STORAGE_KEY = `buzz-community-guest.v1:${encodeURIComponent(
+  COMMUNITY_RELAY_URL,
+)}:${DEFAULT_MOCK_PUBKEY}`;
+const GUEST_HINT_DONE_KEY = `buzz-guest-agent-hint-done.v1:${encodeURIComponent(
   COMMUNITY_RELAY_URL,
 )}:${DEFAULT_MOCK_PUBKEY}`;
 // The fixture's most recently active channel this member belongs to, other
 // than #general and #welcome-everyone.
 const GUEST_LANDING_CHANNEL_ID = "fa11bac0-0000-4000-8000-000000000012";
+const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+const WELCOME_EVERYONE_CHANNEL_ID = "5f0b1b3c-2a37-5366-9b8c-31a4b21d8e77";
+const RANDOM_CHANNEL_ID = "9dae0116-799b-5071-a0a8-fdd30a91a35d";
+// A key that belongs to no channel yet, like Craig's on a new Mac.
+const NEW_GUEST = TEST_IDENTITIES.outsider;
+const RESET_WORKER_PUBKEY = "ab".repeat(32);
+const GUEST_HINT = "Type @ and an agent's name to ask it for something.";
 
 async function commandCount(page: Page, command: string) {
   return page.evaluate(
@@ -439,9 +450,18 @@ async function commandCount(page: Page, command: string) {
   );
 }
 
+async function joinedChannelIds(page: Page) {
+  return page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((entry) => entry.command === "join_channel")
+      .map((entry) => (entry.payload as { channelId: string }).channelId),
+  );
+}
+
 async function seedInviteTransaction(
   page: Page,
   stage: "claiming" | "profile",
+  pubkey: string = DEFAULT_MOCK_PUBKEY,
 ) {
   await page.addInitScript(
     ({ pubkey, relayUrl, stage, storageKey }) => {
@@ -468,7 +488,7 @@ async function seedInviteTransaction(
       );
     },
     {
-      pubkey: DEFAULT_MOCK_PUBKEY,
+      pubkey,
       relayUrl: COMMUNITY_RELAY_URL,
       stage,
       storageKey: TRANSACTION_STORAGE_KEY,
@@ -476,12 +496,13 @@ async function seedInviteTransaction(
   );
 }
 
-async function expectGuestLanding(page: Page) {
+async function expectGuestLanding(
+  page: Page,
+  landing = { channelId: GUEST_LANDING_CHANNEL_ID, name: "all-replies" },
+) {
   await expect(page.getByTestId("community-onboarding-flow")).toHaveCount(0);
-  await expect(page).toHaveURL(
-    new RegExp(`#/channels/${GUEST_LANDING_CHANNEL_ID}$`),
-  );
-  await expect(page.getByTestId("chat-title")).toHaveText("all-replies");
+  await expect(page).toHaveURL(new RegExp(`#/channels/${landing.channelId}$`));
+  await expect(page.getByTestId("chat-title")).toHaveText(landing.name);
   await expect(page.getByTestId("channel-Welcome")).toHaveCount(0);
   // Guest mode is remembered for this community, whatever the identity.
   expect(
@@ -496,7 +517,8 @@ async function expectGuestLanding(page: Page) {
     ),
   ).toBe(1);
   // Nothing is created in the guest's name: no private Welcome channel, no
-  // starter channels, no Welcome Team, no kickoff.
+  // starter channels, no Welcome Team, no kickoff. Joining the owner's
+  // channels is fine.
   for (const command of [
     "create_channel",
     "ensure_starter_channels",
@@ -574,6 +596,140 @@ test("an invited guest skips the starter team and lands in their channel", async
   ).toHaveCount(0);
 });
 
+test("a guest with a new key joins #general and #welcome-everyone and lands there", async ({
+  page,
+}) => {
+  // Accepting an invite joins the community but none of its channels, and
+  // nobody could add this key to a channel before it existed.
+  await seedActiveIdentity(page, NEW_GUEST);
+  await seedInviteTransaction(page, "profile", NEW_GUEST.pubkey);
+  await installMockBridge(
+    page,
+    { profileHasEvent: false },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("community-profile-name-key").fill("Craig");
+  await page.getByTestId("community-profile-next").click();
+
+  await expectGuestLanding(page, {
+    channelId: WELCOME_EVERYONE_CHANNEL_ID,
+    name: "welcome-everyone",
+  });
+  await expect(page.getByTestId("channel-general")).toBeVisible();
+  await expect(page.getByTestId("channel-welcome-everyone")).toBeVisible();
+  // Joined once each, at entry; opening the app does not join them again.
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  expect((await joinedChannelIds(page)).sort()).toEqual(
+    [GENERAL_CHANNEL_ID, WELCOME_EVERYONE_CHANNEL_ID].sort(),
+  );
+});
+
+test("starter channels a guest could not join at entry are joined when the app opens", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, NEW_GUEST);
+  await seedInviteTransaction(page, "profile", NEW_GUEST.pubkey);
+  await installMockBridge(
+    page,
+    { joinChannelErrors: ["relay unavailable"], profileHasEvent: false },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("community-profile-name-key").fill("Craig");
+  await page.getByTestId("community-profile-next").click();
+
+  // #general's join failed at entry; #welcome-everyone's went through.
+  await expectGuestLanding(page, {
+    channelId: WELCOME_EVERYONE_CHANNEL_ID,
+    name: "welcome-everyone",
+  });
+  await expect(page.getByTestId("channel-general")).toBeVisible();
+  await expect
+    .poll(() => joinedChannelIds(page))
+    .toEqual([
+      GENERAL_CHANNEL_ID,
+      WELCOME_EVERYONE_CHANNEL_ID,
+      GENERAL_CHANNEL_ID,
+    ]);
+});
+
+test("Next on the profile step says the community is opening while guest entry waits", async ({
+  page,
+}) => {
+  await seedInviteTransaction(page, "profile");
+  await installMockBridge(
+    page,
+    { channelsReadDelayMs: 1_500, profileHasEvent: false },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("community-profile-name-key").fill("Craig");
+  await page.getByTestId("community-profile-next").click();
+
+  const next = page.getByTestId("community-profile-next");
+  await expect(next).toHaveAccessibleName("Opening your community");
+  await expect(next).toBeDisabled();
+  await expectGuestLanding(page);
+});
+
+test("an invited guest whose profile already exists waits on a locked form", async ({
+  page,
+}) => {
+  // The default mock identity already has a kind:0 profile, so the profile
+  // step enters by itself.
+  await seedInviteTransaction(page, "profile");
+  await installMockBridge(
+    page,
+    { channelsReadDelayMs: 1_500 },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await expect(page.getByTestId("community-profile-name-key")).toBeDisabled();
+  await expect(page.getByTestId("community-profile-next")).toHaveAccessibleName(
+    "Opening your community",
+  );
+  await expectGuestLanding(page);
+});
+
+test("an invite link opened on the AI-provider step skips the rest of it", async ({
+  page,
+}) => {
+  await fulfillInviteClaim(page);
+  await installMockBridge(
+    page,
+    { profileHasEvent: false },
+    { skipCommunitySeed: true, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Create a new identity key" }).click();
+  await page.getByRole("button", { name: "Create my private key" }).click();
+  await page.getByTestId("onboarding-next").click();
+  await expect(
+    page.getByRole("heading", { name: "Connect your AI provider" }),
+  ).toBeVisible();
+
+  await page.evaluate(async (link) => {
+    await window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+      "e2e_queue_pending_community_deep_link",
+      link,
+    );
+    await window.__BUZZ_E2E_EMIT_TAURI_EVENT__?.("deep-link-join", null);
+  }, PENDING_JOIN_LINK);
+
+  await expect(
+    page.getByRole("heading", { name: "Build your profile" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Connect your AI provider" }),
+  ).toHaveCount(0);
+});
+
 test("an invited guest with an existing profile still lands as a guest", async ({
   page,
 }) => {
@@ -620,6 +776,11 @@ test("a community admin who uses an invite keeps the starter team", async ({
   ).toBeNull();
 });
 
+async function openChannelAsGuest(page: Page, name: string) {
+  await page.getByTestId(`channel-${name}`).click();
+  await expect(page.getByTestId("chat-title")).toHaveText(name);
+}
+
 async function openWelcomeEveryoneAsGuest(
   page: Page,
   mock: Parameters<typeof installMockBridge>[1],
@@ -629,32 +790,191 @@ async function openWelcomeEveryoneAsGuest(
   }, GUEST_STORAGE_KEY);
   await installMockBridge(page, mock, { relayWsUrl: COMMUNITY_RELAY_URL });
   await page.goto("/");
-  await page.getByTestId("channel-welcome-everyone").click();
-  await expect(page.getByTestId("chat-title")).toHaveText("welcome-everyone");
+  await openChannelAsGuest(page, "welcome-everyone");
+}
+
+function guestHint(page: Page) {
+  return page
+    .getByTestId("welcome-composer-guide-banner")
+    .getByTestId("welcome-composer-guest-hint");
+}
+
+function resetWorker(
+  agent: Partial<{
+    channelNames: string[];
+    ownerPubkey: string;
+    respondTo: "anyone" | "owner-only";
+  }> = {},
+) {
+  return {
+    pubkey: RESET_WORKER_PUBKEY,
+    name: "Reset Worker",
+    respondTo: "anyone" as const,
+    channelNames: ["welcome-everyone"],
+    ...agent,
+  };
 }
 
 test("in #welcome-everyone a guest is told how to ask the community's agents", async ({
   page,
 }) => {
-  await openWelcomeEveryoneAsGuest(page, {
-    relayAgents: [
-      {
-        pubkey: "ab".repeat(32),
-        name: "Reset Worker",
-        respondTo: "anyone",
-      },
-    ],
-  });
+  await openWelcomeEveryoneAsGuest(page, { relayAgents: [resetWorker()] });
 
   const banner = page.getByTestId("welcome-composer-guide-banner");
-  await expect(banner.getByTestId("welcome-composer-guest-hint")).toHaveText(
-    "Type @ and an agent's name to ask it for something.",
-  );
+  await expect(guestHint(page)).toHaveText(GUEST_HINT);
   await expect(banner).not.toContainText("Fizz");
   await expect(
     page.getByTestId("welcome-composer-persona-mention"),
   ).toHaveCount(0);
+  // The @ list offers the agent the hint is about.
+  await page.getByTestId("message-input").fill("@Reset");
+  await expect(
+    page
+      .getByTestId("message-composer")
+      .getByTestId(`mention-suggestion-${RESET_WORKER_PUBKEY}`),
+  ).toBeVisible();
 });
+
+for (const { agent, title } of [
+  {
+    title: "answers anyone but is not in the channel",
+    agent: resetWorker({ channelNames: ["random"] }),
+  },
+  {
+    title: "answers only its owner",
+    agent: resetWorker({
+      ownerPubkey: TEST_IDENTITIES.charlie.pubkey,
+      respondTo: "owner-only",
+    }),
+  },
+]) {
+  test(`a guest gets no hint where the only agent ${title}`, async ({
+    page,
+  }) => {
+    await openWelcomeEveryoneAsGuest(page, { relayAgents: [agent] });
+
+    // #general's agents answer anyone, so the hint shows there once the
+    // agent lists have loaded...
+    await openChannelAsGuest(page, "general");
+    await expect(guestHint(page)).toHaveText(GUEST_HINT);
+    // ...and still not in #welcome-everyone, where the @ list has none.
+    await openChannelAsGuest(page, "welcome-everyone");
+    await expect(page.getByTestId("message-input")).toBeVisible();
+    await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+      0,
+    );
+  });
+}
+
+test("a guest is told how to ask agents in their own channel until they dismiss it", async ({
+  page,
+}) => {
+  await openWelcomeEveryoneAsGuest(page, {
+    relayAgents: [resetWorker({ channelNames: ["random"] })],
+  });
+  await openChannelAsGuest(page, "random");
+  await expect(guestHint(page)).toHaveText(GUEST_HINT);
+
+  await page.getByTestId("welcome-composer-dismiss-button").click();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+  expect(
+    await page.evaluate(
+      (key) => localStorage.getItem(key),
+      GUEST_HINT_DONE_KEY,
+    ),
+  ).toBe("true");
+
+  // Gone for good in this community: other channels, and after a restart.
+  await openChannelAsGuest(page, "general");
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+  await page.reload();
+  await openChannelAsGuest(page, "random");
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+});
+
+test("asking an agent finishes the guest hint for good", async ({ page }) => {
+  await openWelcomeEveryoneAsGuest(page, {
+    relayAgents: [resetWorker({ channelNames: ["random"] })],
+  });
+  // The owner added the agent to the guest's channel.
+  await page.evaluate(
+    async ({ channelId, pubkey }) => {
+      await window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.("add_channel_members", {
+        channelId,
+        pubkeys: [pubkey],
+        role: "bot",
+      });
+    },
+    { channelId: RANDOM_CHANNEL_ID, pubkey: RESET_WORKER_PUBKEY },
+  );
+  await openChannelAsGuest(page, "random");
+  await expect(guestHint(page)).toHaveText(GUEST_HINT);
+
+  await page.getByTestId("message-input").fill("@Reset");
+  await page
+    .getByTestId("message-composer")
+    .getByTestId(`mention-suggestion-${RESET_WORKER_PUBKEY}`)
+    .click();
+  await page.getByTestId("message-input").press("End");
+  await page.getByTestId("message-input").pressSequentially(" plan my week");
+  await page.getByTestId("message-input").press("Enter");
+
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toContainText(
+    "Nice work.",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate((key) => localStorage.getItem(key), GUEST_HINT_DONE_KEY),
+    )
+    .toBe("true");
+  await page.reload();
+  await openChannelAsGuest(page, "random");
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+});
+
+for (const { relayRole, staysGuest } of [
+  { relayRole: "owner" as const, staysGuest: false },
+  { relayRole: "admin" as const, staysGuest: false },
+  { relayRole: "member" as const, staysGuest: true },
+]) {
+  test(`a saved guest whom the relay lists as ${relayRole} ${
+    staysGuest ? "stays a guest" : "gets the normal experience back"
+  }`, async ({ page }) => {
+    // Guest entry decides on the invite alone when the role lookup doesn't
+    // answer; the relay's later answer corrects an owner or admin.
+    await openWelcomeEveryoneAsGuest(page, {
+      relayAgents: [resetWorker()],
+      relayRequiresMembership: true,
+      relayRole,
+    });
+
+    if (staysGuest) {
+      await expect(guestHint(page)).toHaveText(GUEST_HINT);
+    } else {
+      await expect(
+        page.getByTestId("welcome-composer-persona-mention"),
+      ).toBeVisible();
+      await expect(guestHint(page)).toHaveCount(0);
+    }
+    expect(
+      await page.evaluate(
+        (key) => localStorage.getItem(key),
+        GUEST_STORAGE_KEY,
+      ),
+    ).toBe(staysGuest ? "true" : null);
+  });
+}
 
 test("in #welcome-everyone a guest who can see no agents gets no hint", async ({
   page,

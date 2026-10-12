@@ -69,7 +69,8 @@ import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdi
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import { resolveWelcomeComposerHint } from "@/features/channels/lib/welcomeComposerHint";
-import { useIsCommunityGuest } from "@/features/onboarding/useIsCommunityGuest";
+import { useHasMentionableAgents } from "@/features/channels/ui/useHasMentionableAgents";
+import { useCommunityGuest } from "@/features/onboarding/useIsCommunityGuest";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
@@ -236,13 +237,22 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const huddleMemberPubkeysPending =
     agentPubkeysPending && hasOtherDmParticipant(activeChannel, currentPubkey);
-  const isActiveWelcomeChannel =
-    activeChannel !== null && isWelcomeExperience(activeChannel);
-  const isCommunityGuest = useIsCommunityGuest();
+  const communityGuest = useCommunityGuest();
+  const hasMentionableAgents = useHasMentionableAgents(
+    activeChannel,
+    currentPubkey,
+  );
   const welcomeComposerHint = resolveWelcomeComposerHint({
-    hasVisibleAgents: (agentPubkeys?.size ?? 0) > 0,
-    isGuest: isCommunityGuest,
+    channelType: activeChannel?.channelType ?? null,
+    guestHintDone: communityGuest.agentHintDone,
+    hasMentionableAgents,
+    isGuest: communityGuest.isGuest,
+    isWelcomeChannel:
+      activeChannel !== null && isWelcomeExperience(activeChannel),
   });
+  // This channel shows a composer hint: the Welcome Team's in the welcome
+  // channels, or a guest's wherever an agent answers them.
+  const isActiveWelcomeChannel = welcomeComposerHint !== null;
   useComposerHeightPadding(
     timelineScrollRef,
     composerWrapperRef,
@@ -252,13 +262,24 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const {
     bannerState: welcomeComposerBannerState,
-    completeBanner: completeWelcomeComposerBanner,
-    dismissBanner: handleDismissWelcomeBanner,
+    completeBanner,
+    dismissBanner,
   } = useWelcomeComposerBanner(
     activeChannelId,
     isActiveWelcomeChannel,
     currentPubkey ?? null,
   );
+  // A guest's hint, once used or dismissed, stays gone in this community.
+  const { markAgentHintDone } = communityGuest;
+  const isGuestAgentHint = welcomeComposerHint === "guest-agents";
+  const completeWelcomeComposerBanner = React.useCallback(() => {
+    completeBanner();
+    if (isGuestAgentHint) markAgentHintDone();
+  }, [completeBanner, isGuestAgentHint, markAgentHintDone]);
+  const handleDismissWelcomeBanner = React.useCallback(() => {
+    dismissBanner();
+    if (isGuestAgentHint) markAgentHintDone();
+  }, [dismissBanner, isGuestAgentHint, markAgentHintDone]);
   const isEditInThread = editTarget?.isThreadReply === true;
   const mainEditTarget = editTarget && !isEditInThread ? editTarget : null;
   const threadEditTarget = editTarget && isEditInThread ? editTarget : null;
@@ -747,9 +768,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     hasComposerBottomActivity && "composer-dock--with-activity",
                   )}
                 >
-                  {isActiveWelcomeChannel &&
-                  welcomeComposerHint &&
-                  !timeoutActive ? (
+                  {welcomeComposerHint && !timeoutActive ? (
                     <WelcomeComposerGuidanceLayer
                       hint={welcomeComposerHint}
                       onDismiss={handleDismissWelcomeBanner}

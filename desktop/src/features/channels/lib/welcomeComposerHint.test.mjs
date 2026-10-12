@@ -6,18 +6,49 @@ import {
   resolveWelcomeComposerHint,
 } from "./welcomeComposerHint.ts";
 
-test("resolveWelcomeComposerHint points guests at agents only when they can see some", () => {
+const BASE = {
+  channelType: "stream",
+  guestHintDone: false,
+  hasMentionableAgents: true,
+  isGuest: false,
+  isWelcomeChannel: true,
+};
+
+test("people with the Welcome Team are pointed at @Fizz in the welcome channels only", () => {
+  assert.equal(resolveWelcomeComposerHint(BASE), "welcome-team");
+  assert.equal(
+    resolveWelcomeComposerHint({ ...BASE, hasMentionableAgents: false }),
+    "welcome-team",
+  );
+  assert.equal(
+    resolveWelcomeComposerHint({ ...BASE, isWelcomeChannel: false }),
+    null,
+  );
+});
+
+test("a guest is told how to ask agents in any channel where one answers them", () => {
+  const guest = { ...BASE, isGuest: true };
+  assert.equal(resolveWelcomeComposerHint(guest), "guest-agents");
+  assert.equal(
+    resolveWelcomeComposerHint({ ...guest, isWelcomeChannel: false }),
+    "guest-agents",
+  );
+});
+
+test("a guest gets no hint where no agent answers, outside channels, or once done", () => {
+  const guest = { ...BASE, isGuest: true, isWelcomeChannel: false };
   const cases = [
-    { isGuest: false, hasVisibleAgents: false, expected: "welcome-team" },
-    { isGuest: false, hasVisibleAgents: true, expected: "welcome-team" },
-    { isGuest: true, hasVisibleAgents: true, expected: "guest-agents" },
-    { isGuest: true, hasVisibleAgents: false, expected: null },
+    { hasMentionableAgents: false },
+    { channelType: "dm" },
+    { channelType: "forum" },
+    { channelType: null },
+    { guestHintDone: true },
   ];
-  for (const { expected, ...input } of cases) {
+  for (const overrides of cases) {
     assert.equal(
-      resolveWelcomeComposerHint(input),
-      expected,
-      JSON.stringify(input),
+      resolveWelcomeComposerHint({ ...guest, ...overrides }),
+      null,
+      JSON.stringify(overrides),
     );
   }
 });

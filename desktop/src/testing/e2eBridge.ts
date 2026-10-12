@@ -3392,6 +3392,8 @@ let mockSaveSubscriptions: MockSaveSubscriptionRow[] = [];
 // command uses — so history/save-conflict/restore journeys run against real
 // state instead of a fixed stub.
 type MockCanvasRevisionSeed = {
+  /** Optional; defaults to the starter #general channel. */
+  channelId?: string;
   content: string;
   /** Optional; defaults to a monotonically increasing second per seed. */
   createdAt?: number;
@@ -3418,14 +3420,18 @@ function resetMockCanvasRevisions(config: E2eConfig | undefined) {
     return;
   }
   // Seeds are oldest-first; store newest-first so index 0 is always the head.
-  const revisions = seeds.map((seed, index) => ({
-    eventId: seed.eventId ?? mockEventId(),
-    content: seed.content,
-    createdAt: seed.createdAt ?? 1_700_000_000 + index,
-    author: seed.author ?? DEFAULT_MOCK_IDENTITY.pubkey,
-  }));
-  revisions.reverse();
-  mockCanvasRevisions.set(DEFAULT_STARTER_CANVAS_CHANNEL, revisions);
+  seeds.forEach((seed, index) => {
+    const channelId = seed.channelId ?? DEFAULT_STARTER_CANVAS_CHANNEL;
+    mockCanvasRevisions.set(channelId, [
+      {
+        eventId: seed.eventId ?? mockEventId(),
+        content: seed.content,
+        createdAt: seed.createdAt ?? 1_700_000_000 + index,
+        author: seed.author ?? DEFAULT_MOCK_IDENTITY.pubkey,
+      },
+      ...(mockCanvasRevisions.get(channelId) ?? []),
+    ]);
+  });
 }
 
 type MockObservedUnreadScope = {
@@ -13572,6 +13578,23 @@ export function maybeInstallE2eTauriMocks() {
           activeWorkspaceId: null,
           onboardingCompletions: [],
         };
+      // Test-only: a community link that arrives while the app is running.
+      // Specs queue it here, then emit the matching deep-link event.
+      case "e2e_queue_pending_community_deep_link": {
+        const pending = payload as {
+          id: string;
+          kind: string;
+          relayUrl: string;
+          code?: string | null;
+          name?: string | null;
+        };
+        mockPendingCommunityDeepLinks.push({
+          ...pending,
+          code: pending.code ?? null,
+          name: pending.name ?? null,
+        });
+        return null;
+      }
       case "take_pending_community_deep_link":
         // Mirrors the Rust queue: peek the head; acknowledge removes it.
         return mockPendingCommunityDeepLinks[0] ?? null;

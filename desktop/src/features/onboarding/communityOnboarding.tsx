@@ -154,15 +154,26 @@ export function startCommunityOnboarding(
   const relayUrl = canonicalRelayUrl(input.relayUrl);
   const existing = loadCommunityOnboardingTransaction(storage);
   if (existing?.relayUrl === relayUrl) {
-    const updated = {
+    const inviteCode = input.inviteCode?.trim();
+    // A new invite code is claimed before anything relies on it, wherever
+    // the onboarding had got to (the membership-denied screen redeems one at
+    // the profile step).
+    const claimsNewInvite = Boolean(
+      inviteCode && inviteCode !== existing.inviteCode,
+    );
+    const updated: CommunityOnboardingTransaction = {
       ...existing,
+      stage: claimsNewInvite ? "claiming" : existing.stage,
       firstCommunityPage:
         input.firstCommunityPage ?? existing.firstCommunityPage,
-      inviteCode: input.inviteCode?.trim() || existing.inviteCode,
+      inviteCode: inviteCode || existing.inviteCode,
       communityName: input.communityName?.trim() || existing.communityName,
       token: input.token?.trim() || existing.token,
       reposDir: input.reposDir ?? existing.reposDir,
-      policyReceipt: input.policyReceipt ?? existing.policyReceipt,
+      // A receipt is bound to the invite code it was minted for.
+      policyReceipt: claimsNewInvite
+        ? input.policyReceipt
+        : (input.policyReceipt ?? existing.policyReceipt),
       updatedAt: now.toISOString(),
       error: undefined,
       // A freshly opened link deserves fresh feedback — re-present the gate

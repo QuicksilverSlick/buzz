@@ -231,6 +231,16 @@ export function CommunityOnboardingFlow({
 
   useClaimInvite();
 
+  // An invite redeemed on the membership-denied screen sends onboarding back
+  // to claiming; close that screen so the claim and what follows show.
+  const inviteCode = transaction?.inviteCode;
+  const shownInviteCodeRef = React.useRef(inviteCode);
+  React.useEffect(() => {
+    if (shownInviteCodeRef.current === inviteCode) return;
+    shownInviteCodeRef.current = inviteCode;
+    setIsMembershipDenied(false);
+  }, [inviteCode]);
+
   React.useEffect(() => {
     if (transaction?.stage === "connecting") onConnect();
   }, [onConnect, transaction?.stage]);
@@ -356,11 +366,17 @@ export function CommunityOnboardingFlow({
 
     checkedProfileTransactionRef.current = transaction.id;
     void getProfile()
-      .then((profile) =>
-        profile.hasProfileEvent
-          ? continueAfterProfile(transaction.id)
-          : undefined,
-      )
+      .then(async (profile) => {
+        if (!profile.hasProfileEvent) return;
+        // Hold the form while guest entry asks the relay, so nobody starts
+        // typing into a screen that is about to close or presses Next twice.
+        setIsPending(true);
+        try {
+          await continueAfterProfile(transaction.id);
+        } finally {
+          setIsPending(false);
+        }
+      })
       .catch(() => {
         // Discovery is best-effort. Staying on the profile step preserves the
         // existing path when the relay cannot answer the lookup.
@@ -602,8 +618,8 @@ export function CommunityOnboardingFlow({
                       Build your profile
                     </h1>
                     <p className="mx-auto mt-3 max-w-[380px] text-sm leading-6 text-foreground/80">
-                      Add a name and avatar. They’ll show up on your messages,
-                      reactions, and agent handoffs.
+                      Add a name and avatar. They’ll show up on your messages
+                      and reactions.
                     </p>
                   </div>
                   <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-center pt-6">
@@ -618,10 +634,10 @@ export function CommunityOnboardingFlow({
                       htmlFor="community-display-name"
                     >
                       <span className="mb-2 block pl-4 text-sm text-foreground">
-                        Your username
+                        Your name
                       </span>
                       <OnboardingInput
-                        aria-label="Community username"
+                        aria-label="Your name"
                         autoCapitalize="none"
                         autoComplete="username"
                         autoCorrect="off"
@@ -629,7 +645,7 @@ export function CommunityOnboardingFlow({
                         disabled={isPending || isUploadingAvatar}
                         id="community-display-name"
                         onChange={(event) => setDisplayName(event.target.value)}
-                        placeholder="Enter your username here"
+                        placeholder="Enter your name here"
                         ref={nameInputRef}
                         spellCheck={false}
                         type="text"
@@ -659,7 +675,11 @@ export function CommunityOnboardingFlow({
                     onClick={() => void saveProfile()}
                     type="button"
                   >
-                    Next
+                    {isPending ? (
+                      <LoadingDots label="Opening your community" />
+                    ) : (
+                      "Next"
+                    )}
                   </Button>
                 </OnboardingFooter>
                 <Dialog

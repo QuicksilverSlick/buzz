@@ -8,6 +8,8 @@ import {
   shouldAutoOpenChannelAbout,
 } from "@/features/channels/lib/channelAbout";
 import { isWelcomeChannel } from "@/features/onboarding/welcome";
+import { useProjectsQuery } from "@/features/projects/hooks";
+import { isProjectHomeChannel } from "@/features/projects/lib/projectHomeChannel";
 import type { Channel } from "@/shared/api/types";
 import type { PanelSetterOptions } from "./useChannelPanelHistoryState";
 
@@ -55,12 +57,21 @@ export function useChannelAbout({
   // canvas stays one click away instead of opening over that.
   const canAutoOpen = channelId !== null && !isWelcomeChannel(activeChannel);
   const canvasLoaded = canvasQuery.isSuccess;
+  const projectsQuery = useProjectsQuery();
+  const isProjectHome = isProjectHomeChannel(
+    channelId,
+    projectsQuery.data ?? [],
+  );
+  // Wait for the project list too, so a project's home channel is known
+  // before deciding.
+  const projectsAnswered =
+    projectsQuery.data !== undefined || projectsQuery.isError;
 
   // Decide once per visit, when the canvas first answers. Opening or closing
   // other panels later in the same visit never brings About back by itself.
   const decidedChannelIdRef = React.useRef<string | null>(null);
   React.useEffect(() => {
-    if (channelId === null || !canvasLoaded) return;
+    if (channelId === null || !canvasLoaded || !projectsAnswered) return;
     if (decidedChannelIdRef.current === channelId) return;
     decidedChannelIdRef.current = channelId;
     if (channelAboutOpen) {
@@ -72,6 +83,7 @@ export function useChannelAbout({
       !canOpenBesideChannel ||
       !shouldAutoOpenChannelAbout({
         hasContent: hasChannelAbout,
+        isProjectHome,
         otherPanelOpen,
         seen: hasSeenChannelAbout(channelId),
       })
@@ -87,7 +99,9 @@ export function useChannelAbout({
     channelAboutOpen,
     channelId,
     hasChannelAbout,
+    isProjectHome,
     otherPanelOpen,
+    projectsAnswered,
     setChannelAboutOpen,
   ]);
 

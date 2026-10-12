@@ -49,15 +49,18 @@ test("only a canvas with visible text counts as content", () => {
   assert.equal(hasChannelCanvasContent({ content: "# Start here" }), true);
 });
 
-test("auto-open needs content, a first visit and a free side panel", () => {
+test("auto-open needs content, a first visit, a free side panel and no project home", () => {
   for (const hasContent of [false, true]) {
     for (const seen of [false, true]) {
       for (const otherPanelOpen of [false, true]) {
-        assert.equal(
-          shouldAutoOpenChannelAbout({ hasContent, otherPanelOpen, seen }),
-          hasContent && !seen && !otherPanelOpen,
-          JSON.stringify({ hasContent, otherPanelOpen, seen }),
-        );
+        for (const isProjectHome of [false, true]) {
+          const input = { hasContent, isProjectHome, otherPanelOpen, seen };
+          assert.equal(
+            shouldAutoOpenChannelAbout(input),
+            hasContent && !isProjectHome && !seen && !otherPanelOpen,
+            JSON.stringify(input),
+          );
+        }
       }
     }
   }

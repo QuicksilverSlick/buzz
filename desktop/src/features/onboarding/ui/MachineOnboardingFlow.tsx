@@ -156,6 +156,17 @@ export function MachineOnboardingFlow({
     },
     [complete, skipProviderSetup],
   );
+  // An invite link opened while the AI-provider step is showing skips it the
+  // same way. The config step is left alone so a save in progress finishes.
+  const skippedProviderSetupRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!skipProviderSetup || page !== "setup") return;
+    if (skippedProviderSetupRef.current) return;
+    skippedProviderSetupRef.current = true;
+    complete(selectedPubkey ?? undefined, {
+      continueToProfile: !identityWasImported,
+    });
+  }, [complete, identityWasImported, page, selectedPubkey, skipProviderSetup]);
   const returnToApiConfig = React.useCallback(() => {
     setIsChoosingDifferentHarness(false);
     setTransitionDirection("backward");

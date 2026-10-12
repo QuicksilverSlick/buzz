@@ -18,16 +18,20 @@ import type { Channel, RelayMemberRole } from "@/shared/api/types";
  */
 
 const COMMUNITY_GUEST_STORAGE_KEY = "buzz-community-guest.v1";
+/** Set once a guest belongs to the owner's #general and #welcome-everyone. */
+const GUEST_STARTERS_JOINED_STORAGE_KEY = "buzz-guest-starters-joined.v1";
+/** Set once a guest has used or dismissed the hint about asking agents. */
+const GUEST_AGENT_HINT_DONE_STORAGE_KEY = "buzz-guest-agent-hint-done.v1";
 
-type GuestStorage = Pick<Storage, "getItem" | "setItem">;
+type GuestStorage = Pick<Storage, "getItem" | "removeItem" | "setItem">;
 type InviteTransaction = Pick<CommunityOnboardingTransaction, "inviteCode">;
 
 /**
  * Whether this community onboarding joins through an invite. Every invite
  * entry point (an opened invite link, an invite pasted into Join a
- * community, Add a community, or the membership-denied screen) starts the
- * transaction with the invite code, and onboarding only moves past
- * "claiming" once the relay accepts that code.
+ * community, Add a community, or the membership-denied screen) puts the
+ * invite code on the transaction at the "claiming" stage, and onboarding only
+ * moves past "claiming" once the relay accepts that code.
  */
 export function isInviteJoin(
   transaction: InviteTransaction | null | undefined,
@@ -53,10 +57,48 @@ function normalizeCommunityScope(relayUrl: string) {
   return relayUrl.trim().replace(/\/+$/, "").toLowerCase();
 }
 
-function communityGuestStorageKey(pubkey: string, relayUrl: string) {
-  return `${COMMUNITY_GUEST_STORAGE_KEY}:${encodeURIComponent(
+/** A per-identity, per-community storage key. */
+function communityScopedKey(prefix: string, pubkey: string, relayUrl: string) {
+  return `${prefix}:${encodeURIComponent(
     normalizeCommunityScope(relayUrl),
   )}:${pubkey.trim().toLowerCase()}`;
+}
+
+function defaultStorage(): GuestStorage | null {
+  return typeof localStorage === "undefined" ? null : localStorage;
+}
+
+function readCommunityFlag(
+  prefix: string,
+  pubkey: string | null | undefined,
+  relayUrl: string | null | undefined,
+  storage: GuestStorage | null = defaultStorage(),
+): boolean {
+  if (!pubkey || !relayUrl) return false;
+  try {
+    return (
+      storage?.getItem(communityScopedKey(prefix, pubkey, relayUrl)) === "true"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Best-effort write of a flag whose loss only repeats harmless work: a refused
+ * write leaves the flag unset, so the work runs again next time.
+ */
+function writeCommunityFlag(
+  prefix: string,
+  pubkey: string,
+  relayUrl: string,
+  storage: GuestStorage | null = defaultStorage(),
+): void {
+  try {
+    storage?.setItem(communityScopedKey(prefix, pubkey, relayUrl), "true");
+  } catch (error) {
+    console.warn("Could not save a guest setting for this community.", error);
+  }
 }
 
 /**
@@ -70,7 +112,10 @@ export function markCommunityGuest(
   relayUrl: string,
   storage: GuestStorage = localStorage,
 ): void {
-  storage.setItem(communityGuestStorageKey(pubkey, relayUrl), "true");
+  storage.setItem(
+    communityScopedKey(COMMUNITY_GUEST_STORAGE_KEY, pubkey, relayUrl),
+    "true",
+  );
 }
 
 export function isCommunityGuest(
@@ -78,16 +123,86 @@ export function isCommunityGuest(
   relayUrl: string | null | undefined,
   storage?: GuestStorage,
 ): boolean {
-  if (!pubkey || !relayUrl) return false;
+  return readCommunityFlag(
+    COMMUNITY_GUEST_STORAGE_KEY,
+    pubkey,
+    relayUrl,
+    storage,
+  );
+}
+
+/**
+ * Forget guest mode for this identity and community: the relay lists them as
+ * its owner or admin, so the invite that classed them as a guest was only
+ * decided because the role lookup didn't answer. A refused removal keeps the
+ * record, and the next launch's role check clears it again.
+ */
+export function clearCommunityGuest(
+  pubkey: string,
+  relayUrl: string,
+  storage: GuestStorage | null = defaultStorage(),
+): void {
   try {
-    const store =
-      storage ?? (typeof localStorage === "undefined" ? null : localStorage);
-    return (
-      store?.getItem(communityGuestStorageKey(pubkey, relayUrl)) === "true"
+    storage?.removeItem(
+      communityScopedKey(COMMUNITY_GUEST_STORAGE_KEY, pubkey, relayUrl),
     );
-  } catch {
-    return false;
+  } catch (error) {
+    console.warn("Could not clear guest mode for this community.", error);
   }
+}
+
+/** Whether this guest already belongs to the owner's starter channels. */
+export function hasJoinedGuestStarterChannels(
+  pubkey: string | null | undefined,
+  relayUrl: string | null | undefined,
+  storage?: GuestStorage,
+): boolean {
+  return readCommunityFlag(
+    GUEST_STARTERS_JOINED_STORAGE_KEY,
+    pubkey,
+    relayUrl,
+    storage,
+  );
+}
+
+export function markGuestStarterChannelsJoined(
+  pubkey: string,
+  relayUrl: string,
+  storage?: GuestStorage,
+): void {
+  writeCommunityFlag(
+    GUEST_STARTERS_JOINED_STORAGE_KEY,
+    pubkey,
+    relayUrl,
+    storage,
+  );
+}
+
+/** Whether this guest has used or dismissed the hint about asking agents. */
+export function isGuestAgentHintDone(
+  pubkey: string | null | undefined,
+  relayUrl: string | null | undefined,
+  storage?: GuestStorage,
+): boolean {
+  return readCommunityFlag(
+    GUEST_AGENT_HINT_DONE_STORAGE_KEY,
+    pubkey,
+    relayUrl,
+    storage,
+  );
+}
+
+export function markGuestAgentHintDone(
+  pubkey: string,
+  relayUrl: string,
+  storage?: GuestStorage,
+): void {
+  writeCommunityFlag(
+    GUEST_AGENT_HINT_DONE_STORAGE_KEY,
+    pubkey,
+    relayUrl,
+    storage,
+  );
 }
 
 const STARTER_CHANNEL_NAMES = new Set([
@@ -97,6 +212,38 @@ const STARTER_CHANNEL_NAMES = new Set([
 
 function isStarterChannelName(channel: Channel) {
   return STARTER_CHANNEL_NAMES.has(channel.name.trim().toLowerCase());
+}
+
+/**
+ * The community's own #general or #welcome-everyone, the open channels every
+ * member is meant to be in. Accepting an invite joins the community, not its
+ * channels, so a guest joins these, and only these, once they are in.
+ */
+export function isGuestStarterChannel(channel: Channel): boolean {
+  return (
+    channel.channelType === "stream" &&
+    channel.visibility === "open" &&
+    channel.archivedAt === null &&
+    isStarterChannelName(channel)
+  );
+}
+
+/**
+ * The guest's channel list with the starter channels they just joined added.
+ * The relay's member list can trail a join that was just sent, so a joined
+ * starter may be missing from `channels` for a moment.
+ */
+export function withJoinedStarterChannels(
+  channels: readonly Channel[],
+  joinedStarters: readonly Channel[],
+): Channel[] {
+  const listed = new Set(channels.map((channel) => channel.id));
+  return [
+    ...channels,
+    ...joinedStarters
+      .filter((channel) => !listed.has(channel.id))
+      .map((channel) => ({ ...channel, isMember: true })),
+  ];
 }
 
 function lastActivity(channel: Channel) {
@@ -133,7 +280,6 @@ export function pickGuestLandingChannel(
     usable.find(
       (channel) => isStarterWelcomeChannel(channel) && channel.isMember,
     ) ??
-    usable.find(isStarterWelcomeChannel) ??
     null
   );
 }

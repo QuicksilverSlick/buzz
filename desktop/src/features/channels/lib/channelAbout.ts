@@ -58,16 +58,20 @@ export function markChannelAboutSeen(channelId: string) {
  * Whether to open the About panel on its own for this visit: the canvas has
  * content, this device has not shown it before, and nothing else (a thread,
  * a profile, channel settings, agent activity) already holds the side panel,
- * so a link that opened a thread is never covered.
+ * so a link that opened a thread is never covered. A project's home channel
+ * never opens it: its canvas starts as a table of command-line commands for
+ * agents, not an introduction for people.
  */
 export function shouldAutoOpenChannelAbout({
   hasContent,
+  isProjectHome,
   otherPanelOpen,
   seen,
 }: {
   hasContent: boolean;
+  isProjectHome: boolean;
   otherPanelOpen: boolean;
   seen: boolean;
 }) {
-  return hasContent && !seen && !otherPanelOpen;
+  return hasContent && !isProjectHome && !seen && !otherPanelOpen;
 }

@@ -6,6 +6,8 @@ import { installMockBridge } from "../helpers/bridge";
 const CANVAS = "# Start here\n\nAsk the Reset Worker when you need a hand.";
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const GENERAL_THREAD_ROOT_ID = "mock-general-welcome";
+// The mock's first project uses the "buzz" channel as its home.
+const PROJECT_HOME_CHANNEL_ID = "cf63feec-21bb-5bf0-a2f8-0e4c3de8ec73";
 
 async function openChannel(page: Page, name: string) {
   await page.getByTestId(`channel-${name}`).click();
@@ -114,6 +116,36 @@ test("a narrow window keeps the messages and leaves About to the button", async 
 
   await trigger.click();
   await expect(about).toContainText("Start here");
+});
+
+test("a project's home channel leaves its command list to the About button", async ({
+  page,
+}) => {
+  // Wide enough for About to fit beside the project overview and messages.
+  await page.setViewportSize({ height: 1080, width: 1920 });
+  await installMockBridge(page, {
+    canvasRevisions: [
+      {
+        channelId: PROJECT_HOME_CHANNEL_ID,
+        content: "# Project Channel: buzz\n\n| Action | Command |",
+      },
+    ],
+  });
+  await page.goto("/");
+  await openChannel(page, "buzz");
+
+  const about = page.getByTestId("channel-about-panel");
+  const trigger = page.getByTestId("channel-about-trigger");
+  // Known as a project home, and the canvas has loaded.
+  await expect(
+    page.getByTestId("chat-header").getByTestId("project-channel-icon"),
+  ).toBeVisible();
+  await expect(trigger).toBeVisible();
+  await expect(trigger).toHaveAttribute("aria-pressed", "false");
+  await expect(about).toHaveCount(0);
+
+  await trigger.click();
+  await expect(about).toContainText("Project Channel");
 });
 
 test("channels without a canvas show no About button and open nothing", async ({
