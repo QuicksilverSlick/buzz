@@ -11,18 +11,29 @@ export type ChannelIntroAction = {
   testId?: string;
 };
 
+/** A channel listed under "Channels in this community". */
+export type ChannelIntroChannel = {
+  description: string | null;
+  id: string;
+  name: string;
+  onOpen: () => void;
+};
+
 export type ChannelIntro = {
   actions?: ChannelIntroAction[];
   channelKindLabel: string;
   channelName: string;
+  /** Other channels to point people to, each with what it is for. */
+  channels?: ChannelIntroChannel[];
   description?: string | null;
   hideBeginning?: boolean;
   icon?: React.ReactNode;
 };
 
 /**
- * The empty-channel intro block: channel icon, heading, kind label, and
- * action cards. Rendered both as the virtualized timeline's leading row and
+ * The empty-channel intro block: channel icon, heading, kind label, action
+ * cards, and an optional list of other channels. Rendered both as the
+ * virtualized timeline's leading row and
  * as the non-virtualized empty state — one component so the two surfaces
  * cannot drift and the first message always lands below it without layout
  * shift.
@@ -122,6 +133,41 @@ export function ChannelIntroBlock({
             );
           })}
         </div>
+      ) : null}
+      {intro.channels?.length ? (
+        <section
+          aria-labelledby="channel-intro-channel-list-heading"
+          className="mt-6 w-full max-w-xl"
+          data-testid="channel-intro-channel-list"
+        >
+          <h2
+            className="text-sm font-medium leading-5 text-foreground"
+            id="channel-intro-channel-list-heading"
+          >
+            Channels in this community
+          </h2>
+          <ul className="mt-2 divide-y divide-border/60 overflow-hidden rounded-2xl border border-border/70 bg-background/70">
+            {intro.channels.map((channel) => (
+              <li key={channel.id}>
+                <button
+                  className="flex w-full min-w-0 flex-col px-3 py-2.5 text-left transition-colors hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-hidden"
+                  data-testid={`channel-intro-channel-${channel.name}`}
+                  onClick={channel.onOpen}
+                  type="button"
+                >
+                  <span className="truncate text-sm font-medium leading-5 text-foreground">
+                    #{channel.name}
+                  </span>
+                  {channel.description ? (
+                    <span className="mt-0.5 line-clamp-2 whitespace-normal break-words text-sm leading-5 text-muted-foreground">
+                      {channel.description}
+                    </span>
+                  ) : null}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
       ) : null}
     </div>
   );
