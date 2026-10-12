@@ -12,6 +12,7 @@ import { ChannelContextMenuItems } from "@/features/sidebar/ui/ChannelContextMen
 import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
+import { getChannelDetail } from "@/features/channels/lib/channelDescription";
 import { getEphemeralChannelDisplay } from "@/features/channels/lib/ephemeralChannel";
 import { EphemeralChannelBadge } from "@/features/channels/ui/EphemeralChannelBadge";
 import {
@@ -242,6 +243,42 @@ function SidebarChannelIcon({
   return <ChannelGlyph channel={channel} className={className} />;
 }
 
+/**
+ * The hover text for a sidebar channel row: its description, so people can
+ * tell what a channel is for before opening it. Direct messages have none.
+ * Rows with agent work or unread threads already open an activity preview
+ * on hover, so they skip this tooltip.
+ */
+export function getChannelRowTooltipDetail(
+  channel: Channel,
+  hasHoverPreview: boolean,
+): string | null {
+  if (channel.channelType === "dm" || hasHoverPreview) return null;
+  return getChannelDetail(channel);
+}
+
+function ChannelRowTooltip({
+  detail,
+  label,
+}: {
+  detail: string;
+  label: string;
+}) {
+  return (
+    <>
+      <span className="block font-medium [overflow-wrap:anywhere]">
+        {label}
+      </span>
+      <span
+        className="mt-1 line-clamp-3 block whitespace-normal [overflow-wrap:anywhere]"
+        data-testid="channel-row-tooltip-description"
+      >
+        {detail}
+      </span>
+    </>
+  );
+}
+
 export function ChannelMenuButton({
   channel,
   label,
@@ -299,6 +336,10 @@ export function ChannelMenuButton({
       !hasThreadUnread &&
       "sidebar-muted-content opacity-50 dark:opacity-45",
   );
+  const tooltipDetail = getChannelRowTooltipDetail(
+    channel,
+    Boolean(activeWorking) || hasThreadUnread,
+  );
 
   const button = (
     <SidebarMenuButton
@@ -314,7 +355,20 @@ export function ChannelMenuButton({
       data-testid={`channel-${channel.name}`}
       isActive={isActive}
       onClick={() => onSelectChannel(channel.id)}
-      tooltip={resolvedLabel}
+      tooltip={
+        tooltipDetail
+          ? {
+              children: (
+                <ChannelRowTooltip
+                  detail={tooltipDetail}
+                  label={resolvedLabel}
+                />
+              ),
+              className: "max-w-72 p-2 text-left",
+            }
+          : resolvedLabel
+      }
+      tooltipWhenExpanded={tooltipDetail !== null}
       type="button"
     >
       <SidebarChannelIcon
