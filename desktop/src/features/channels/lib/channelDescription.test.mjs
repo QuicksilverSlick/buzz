@@ -44,6 +44,28 @@ test("getChannelDetail provides one shared field order for every surface", () =>
   assert.equal(getChannelDescription(channel), getChannelDetail(channel));
 });
 
+test("getChannelDetail prefers description, then topic, then purpose", () => {
+  const cases = [
+    [{ description: "D", topic: "T", purpose: "P" }, "D"],
+    [{ description: "D", topic: "", purpose: "P" }, "D"],
+    [{ description: "D", topic: "T", purpose: "" }, "D"],
+    [{ description: "", topic: "T", purpose: "P" }, "T"],
+    [{ description: "  ", topic: "T", purpose: "P" }, "T"],
+    [{ description: "", topic: null, purpose: "P" }, "P"],
+    [{ description: "", topic: " ", purpose: "P" }, "P"],
+    [{ description: "", topic: null, purpose: null }, null],
+    [{ description: " D ", topic: "T", purpose: "P" }, "D"],
+  ];
+
+  for (const [fields, expected] of cases) {
+    assert.equal(
+      getChannelDetail(makeChannel(fields)),
+      expected,
+      JSON.stringify(fields),
+    );
+  }
+});
+
 test("getChannelDescription returns single-line detail unchanged", () => {
   assert.equal(
     getChannelDescription(makeChannel({ description: "Team updates." })),

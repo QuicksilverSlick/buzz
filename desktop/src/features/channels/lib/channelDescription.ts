@@ -1,9 +1,13 @@
 import type { Channel } from "@/shared/api/types";
 
-/** The authored channel detail shown consistently across channel surfaces. */
+/**
+ * The authored channel detail shown consistently across channel surfaces.
+ * Description comes first because the phone app shows only the description;
+ * topic and purpose are fallbacks for channels that never set one.
+ */
 export function getChannelDetail(channel: Channel): string | null {
   return (
-    [channel.topic, channel.description, channel.purpose]
+    [channel.description, channel.topic, channel.purpose]
       .find((value) => value && value.trim().length > 0)
       ?.trim() ?? null
   );
@@ -24,7 +28,7 @@ export function getChannelDescription(channel: Channel | null): string {
   ].filter((value) => value && value.trim().length > 0);
 
   // Show only the first non-empty field to avoid duplication when
-  // topic, description, and purpose contain overlapping text.
+  // description, topic, and purpose contain overlapping text.
   const detail = getChannelDetail(channel);
 
   // Join the status prefixes with spaces, but keep the detail text's own
