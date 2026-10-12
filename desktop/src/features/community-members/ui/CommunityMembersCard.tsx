@@ -223,7 +223,7 @@ export function CommunityMembersCard({
             </h2>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
-            Manage who has access to this relay.
+            Manage who has access to this community server.
           </p>
         </div>
 

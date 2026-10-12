@@ -4,6 +4,8 @@ import {
   toggleTerminalPanel,
   useTerminalPanel,
 } from "@/features/terminal/terminalPanelStore";
+import { terminalShortcutLabel } from "@/features/terminal/terminalShortcut";
+import { TERMINAL_LABEL } from "@/shared/constants/brand";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
@@ -88,7 +90,7 @@ export function ProjectRightPanelControls({
         disabled={!terminalAvailable}
         onClick={toggleTerminalPanel}
         size="icon"
-        title="Dreamforge Term (⌘J)"
+        title={`${TERMINAL_LABEL} (${terminalShortcutLabel()})`}
         type="button"
         variant="ghost"
       >

@@ -37,8 +37,8 @@ import {
   toggleTerminalPanel,
   useTerminalPanel,
 } from "@/features/terminal/terminalPanelStore";
+import { terminalShortcutLabel } from "@/features/terminal/terminalShortcut";
 import { TERMINAL_LABEL } from "@/shared/constants/brand";
-import { isMacPlatform } from "@/shared/lib/platform";
 import { CHANNEL_ABOUT_TITLE } from "./ChannelAboutPanel";
 
 const DM_HEADER_AVATAR_SIZE = 32;
@@ -172,7 +172,7 @@ export function ChannelScreenHeader({
       }
       onClick={toggleTerminalPanel}
       size="icon"
-      title={`${TERMINAL_LABEL} (${isMacPlatform() ? "⌘J" : "Ctrl+J"})`}
+      title={`${TERMINAL_LABEL} (${terminalShortcutLabel()})`}
       type="button"
       variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
     >

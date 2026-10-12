@@ -3843,7 +3843,7 @@ test("generic relay save failures use the generic reconnect card", async ({
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
   ).toContainText("Click to connect");
@@ -3871,7 +3871,7 @@ test("custom relay proxy sign-in failures use the generic reconnect card", async
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
 });
 
 test("community access failures use the generic reconnect card", async ({
@@ -3895,7 +3895,7 @@ test("community access failures use the generic reconnect card", async ({
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
 });
 
 test("dismissed relay save failures reappear on retry", async ({ page }) => {
@@ -4241,7 +4241,7 @@ test("onboarding relay reconnect — click shows Connected then auto-dismisses",
 
   const card = page.getByTestId("onboarding-relay-reconnect-card");
   await expect(card).toBeVisible();
-  await expect(card).toContainText("Can't reach the relay");
+  await expect(card).toContainText("Can't reach the community server");
 
   // Drive degraded before clicking so the card is in the expected error state.
   await setRelayConnectionState(page, "disconnected");
@@ -4257,7 +4257,7 @@ test("onboarding relay reconnect — click shows Connected then auto-dismisses",
   await setRelayConnectionState(page, "connected");
 
   await expect(card).toContainText("Connected", { timeout: 5_000 });
-  await expect(card).not.toContainText("Can't reach the relay");
+  await expect(card).not.toContainText("Can't reach the community server");
 
   // Auto-dismiss fires after ONBOARDING_CONNECTIVITY_SUCCESS_AUTO_DISMISS_MS
   // (2500ms). Allow generous headroom for CI.
@@ -4283,7 +4283,7 @@ test("onboarding relay reconnect — dismiss is clickable at minimum size", asyn
   const card = page.getByTestId("onboarding-relay-reconnect-card");
   await expect(card).toBeVisible();
   await page
-    .getByRole("button", { name: "Dismiss relay notification" })
+    .getByRole("button", { name: "Dismiss community server notification" })
     .click();
   await expect(card).toHaveCount(0);
 });
@@ -4322,7 +4322,7 @@ test("onboarding relay reconnect — connected without a prior click does not sh
   // card stayed in the error state.
   await page.waitForTimeout(500);
   await expect(card).toBeVisible();
-  await expect(card).toContainText("Can't reach the relay");
+  await expect(card).toContainText("Can't reach the community server");
   await expect(card).not.toContainText("Connected");
 });
 

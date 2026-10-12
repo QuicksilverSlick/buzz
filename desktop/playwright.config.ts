@@ -139,6 +139,7 @@ export default defineConfig({
         "**/project-commit-detail.spec.ts",
         "**/project-empty-state-alignment.spec.ts",
         "**/project-inbox.spec.ts",
+        "**/inbox-filter-projects.spec.ts",
         "**/projects-v3-screenshots.spec.ts",
         "**/project-issue-comments.spec.ts",
         "**/project-pr-review.spec.ts",

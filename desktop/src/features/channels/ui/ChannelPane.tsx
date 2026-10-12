@@ -661,7 +661,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               emptyDescription={
                 activeChannel?.channelType === "forum"
                   ? "Select a stream or DM to load real message history in this first integration pass."
-                  : "Messages and sub-replies will appear here once the relay has history for this channel."
+                  : "Messages and sub-replies will appear here once the community server has history for this channel."
               }
               emptyTitle={
                 activeChannel

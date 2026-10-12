@@ -103,7 +103,7 @@ test.describe("relay connectivity", () => {
     await expect(relayCard).toBeVisible({
       timeout: 5_000,
     });
-    await expect(relayCard).toContainText("Can't reach the relay");
+    await expect(relayCard).toContainText("Can't reach the community server");
     await expect(relayCard).toContainText("Click to connect");
     await expect(page.getByTestId("sidebar-reconnect")).toBeVisible();
     await settle(page);
@@ -124,7 +124,7 @@ test.describe("relay connectivity", () => {
     await expect(relayCard).toBeVisible({
       timeout: 5_000,
     });
-    await expect(relayCard).toContainText("Can't reach the relay");
+    await expect(relayCard).toContainText("Can't reach the community server");
     await expect(relayCard).toContainText("Click to connect");
     await expect(page.getByTestId("sidebar-reconnect")).toBeVisible();
     await settle(page);
@@ -147,7 +147,7 @@ test.describe("relay connectivity", () => {
     const canvasSection = page.getByTestId("channel-canvas-section");
     await canvasSection.scrollIntoViewIfNeeded();
     await expect(
-      canvasSection.getByText("Can't reach the relay."),
+      canvasSection.getByText("Can't reach the community server."),
     ).toBeVisible();
 
     // Await Radix sheet animations before measuring the settled state.
@@ -218,7 +218,7 @@ test.describe("relay connectivity", () => {
     await expect(relayCard).toBeVisible({
       timeout: 5_000,
     });
-    await expect(relayCard).toContainText("Can't reach the relay");
+    await expect(relayCard).toContainText("Can't reach the community server");
     await expect(relayCard).toContainText("Click to connect");
 
     await driveConnectionDegraded(page, "connected");

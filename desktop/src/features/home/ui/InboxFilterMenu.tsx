@@ -1,6 +1,11 @@
 import { ChevronDown } from "lucide-react";
 
 import type { InboxFilter } from "@/features/home/lib/inbox";
+import {
+  INBOX_FILTER_OPTIONS,
+  visibleInboxFilterOptions,
+} from "@/features/home/lib/inboxFilterOptions";
+import { useFeatureEnabled } from "@/shared/features";
 import { cn } from "@/shared/lib/cn";
 import {
   DropdownMenu,
@@ -10,20 +15,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
-
-const INBOX_FILTER_OPTIONS: Array<{
-  label: string;
-  value: InboxFilter;
-}> = [
-  { value: "all", label: "All" },
-  { value: "project", label: "Projects" },
-  { value: "mention", label: "Mentions" },
-  { value: "thread", label: "Threads" },
-  { value: "needs_action", label: "Needs action" },
-  { value: "agent_activity", label: "Agents" },
-  { value: "reminders", label: "Reminders" },
-  { value: "drafts", label: "Drafts" },
-];
 
 const TRIGGER_CLASS =
   "inline-flex h-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-muted/70 data-[state=open]:text-foreground disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 relative -ml-2 w-auto gap-1 px-2 text-sm font-medium text-foreground";
@@ -43,6 +34,8 @@ export function InboxFilterMenu({
   onFilterChange,
   reminderCount,
 }: InboxFilterMenuProps) {
+  const projectsEnabled = useFeatureEnabled("projects");
+  const filterOptions = visibleInboxFilterOptions(projectsEnabled);
   const activeFilter = INBOX_FILTER_OPTIONS.find(
     (option) => option.value === filter,
   );
@@ -71,7 +64,7 @@ export function InboxFilterMenu({
           onValueChange={(value) => onFilterChange(value as InboxFilter)}
           value={filter}
         >
-          {INBOX_FILTER_OPTIONS.map((option) => (
+          {filterOptions.map((option) => (
             <div key={option.value}>
               {option.value === "reminders" ? (
                 <DropdownMenuSeparator className="my-2 bg-border/60" />

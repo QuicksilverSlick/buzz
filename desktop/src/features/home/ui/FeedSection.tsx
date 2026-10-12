@@ -63,17 +63,17 @@ function feedHeadline(item: FeedItem) {
     case KIND_REMINDER:
       return "Reminder";
     case KIND_JOB_REQUEST:
-      return "Job requested";
+      return "Task requested";
     case KIND_JOB_ACCEPTED:
-      return "Job accepted";
+      return "Task accepted";
     case KIND_JOB_PROGRESS:
       return "Progress update";
     case KIND_JOB_RESULT:
-      return "Job result";
+      return "Task result";
     case KIND_JOB_CANCEL:
-      return "Job cancelled";
+      return "Task cancelled";
     case KIND_JOB_ERROR:
-      return "Job failed";
+      return "Task failed";
     case KIND_FORUM_POST:
       return "Forum post";
     case KIND_FORUM_COMMENT:
