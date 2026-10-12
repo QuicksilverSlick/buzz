@@ -166,6 +166,7 @@ mod tests {
         ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            session_policy: Default::default(),
             description: None,
             pubkey: "agentpubkeyhex".to_string(),
             name: "Test Agent".to_string(),

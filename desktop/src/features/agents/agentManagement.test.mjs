@@ -6,7 +6,12 @@ import {
   createInputFromRequest,
   requestTargetsEditablePersona,
   parseAgentManagementRequest,
+  updateInputFromRequest,
 } from "./agentManagement.ts";
+import {
+  behaviorForSubmit,
+  draftFromBehavior,
+} from "./ui/personaBehaviorDraft.ts";
 
 const CHANNEL_ID = "7c07e659-3610-42f4-9a5e-1e9973c09da9";
 
@@ -103,4 +108,84 @@ test("allows agents to update only personal, editable profiles", () => {
     requestTargetsEditablePersona({ isBuiltIn: false, sourceTeam: "team" }),
     false,
   );
+});
+
+test("agent-requested access edits preserve thread-scoped conversation context", () => {
+  const request = {
+    type: AGENT_MANAGEMENT_REQUEST,
+    action: "update",
+    requestId: "request-4",
+    request: {
+      channelId: CHANNEL_ID,
+      agentName: "Review helper",
+      respondTo: "anyone",
+    },
+  };
+  const updated = updateInputFromRequest(request, {
+    id: "review-helper",
+    displayName: "Review helper",
+    systemPrompt: "Review changes concisely.",
+    behavior: {
+      respondTo: "owner-only",
+      respondToAllowlist: [],
+      parallelism: 2,
+      sessionPolicy: "thread",
+    },
+  });
+
+  assert.equal(updated.behavior?.sessionPolicy, "thread");
+
+  const seed = draftFromBehavior(updated.behavior);
+  const edited = { ...seed, parallelism: "3" };
+  assert.deepEqual(behaviorForSubmit(edited, seed, true), {
+    respondTo: "anyone",
+    respondToAllowlist: undefined,
+    parallelism: 3,
+    capabilities: undefined,
+    sessionPolicy: "thread",
+  });
+});
+
+test("agent-requested access edits keep the owner's capability grants", () => {
+  const request = {
+    type: AGENT_MANAGEMENT_REQUEST,
+    action: "update",
+    requestId: "request-5",
+    request: {
+      channelId: CHANNEL_ID,
+      agentName: "Review helper",
+      respondTo: "anyone",
+    },
+  };
+  const updated = updateInputFromRequest(request, {
+    id: "review-helper",
+    displayName: "Review helper",
+    systemPrompt: "Review changes concisely.",
+    behavior: {
+      respondTo: "owner-only",
+      respondToAllowlist: [],
+      parallelism: 2,
+      capabilities: ["desktop-control", "cross-session-note"],
+      sessionPolicy: "channel",
+    },
+  });
+
+  // The review dialog is seeded from this overlay, so it must show the grants
+  // the agent already holds rather than every box unticked.
+  assert.deepEqual(updated.behavior?.capabilities, [
+    "desktop-control",
+    "cross-session-note",
+  ]);
+
+  // Behavior travels as a unit: an unrelated behavior edit must resubmit the
+  // grants, or the backend stores an empty list and silently revokes them.
+  const seed = draftFromBehavior(updated.behavior);
+  const edited = { ...seed, parallelism: "3" };
+  assert.deepEqual(behaviorForSubmit(edited, seed, true), {
+    respondTo: "anyone",
+    respondToAllowlist: undefined,
+    parallelism: 3,
+    capabilities: ["cross-session-note", "desktop-control"],
+    sessionPolicy: "channel",
+  });
 });

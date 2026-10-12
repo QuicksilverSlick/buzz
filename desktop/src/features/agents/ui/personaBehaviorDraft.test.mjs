@@ -65,14 +65,20 @@ test("flipping allowlist back to owner-only drops the list from the submit", () 
 
 // ── Absent-vs-present: unrelated edits must not touch the quad ───────────────
 
-test("create with an untouched empty quad submits nothing", () => {
-  assert.equal(
+test("create with an untouched draft submits the channel default", () => {
+  assert.deepEqual(
     behaviorForSubmit(
       emptyPersonaBehaviorDraft,
       emptyPersonaBehaviorDraft,
       false,
     ),
-    undefined,
+    {
+      respondTo: undefined,
+      respondToAllowlist: undefined,
+      parallelism: undefined,
+      capabilities: undefined,
+      sessionPolicy: "channel",
+    },
   );
 });
 
@@ -95,6 +101,7 @@ test("edit with a changed quad submits the full group", () => {
     // Absent rather than an empty array: an ungranted draft must not publish a
     // capabilities key at all, or every existing definition's bytes would move.
     capabilities: undefined,
+    sessionPolicy: "channel",
   });
 });
 
@@ -112,6 +119,7 @@ test("draftFromBehavior round-trips a full quad and copies the list", () => {
     respondTo: "allowlist",
     respondToAllowlist: [HEX],
     parallelism: 3,
+    sessionPolicy: "thread",
   };
   const draft = draftFromBehavior(behavior);
   assert.deepEqual(draft, {
@@ -119,6 +127,7 @@ test("draftFromBehavior round-trips a full quad and copies the list", () => {
     respondToAllowlist: [HEX],
     parallelism: "3",
     capabilities: [],
+    sessionPolicy: "thread",
   });
   draft.respondToAllowlist.push("mutated");
   assert.deepEqual(behavior.respondToAllowlist, [HEX], "list must be copied");
@@ -134,11 +143,21 @@ test("edit full-clear submits an explicit empty group, not nothing", () => {
     parallelism: "4",
   };
   const group = behaviorForSubmit(emptyPersonaBehaviorDraft, seed, true);
-  assert.deepEqual(group, {}, "full clear must submit a replace-with-empty");
+  assert.deepEqual(
+    group,
+    {
+      respondTo: undefined,
+      respondToAllowlist: undefined,
+      parallelism: undefined,
+      capabilities: undefined,
+      sessionPolicy: "channel",
+    },
+    "full clear must submit the channel default",
+  );
   // Partial clear keeps working: one field left set submits that field.
   const partial = behaviorForSubmit({ ...seed, parallelism: "8" }, seed, true);
   assert.equal(partial.parallelism, 8);
-  // Hash-quiet survives the fix: a no-op edit of an ALREADY-quad-less
+  // Hash-quiet survives the fix: a no-op edit of an already-default
   // definition still submits nothing — `{}` here would republish and flip
   // content hashes for exactly the definitions the hash-quiet row protects.
   const noop = behaviorForSubmit(
