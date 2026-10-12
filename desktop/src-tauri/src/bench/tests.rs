@@ -305,27 +305,6 @@ fn version_hash_ignores_key_order_id_and_updated_at() {
 }
 
 #[test]
-fn fence_outgrows_the_longest_backtick_run() {
-    for (text, len) in [
-        ("plain", 3),
-        ("a ``` b", 4),
-        ("a ````` b", 6),
-        ("``x`` ```` `", 5),
-    ] {
-        let out = fence(text);
-        let f = "`".repeat(len);
-        let inner = out
-            .strip_prefix(&format!("{f}text\n"))
-            .unwrap()
-            .strip_suffix(&format!("\n{f}"))
-            .unwrap();
-        assert_eq!(inner, text);
-        let longest = inner.split(|c| c != '`').map(str::len).max().unwrap();
-        assert!(longest < len, "{text:?}");
-    }
-}
-
-#[test]
 fn summary_cuts_on_a_char_boundary() {
     assert_eq!(summary("short"), "short");
     let exact = "é".repeat(400);
@@ -349,9 +328,9 @@ fn render_card_golden() {
         render_card(&item, "14:05"),
         "🔴 · dreamforge · orchestrator\n\
          **Relay choice**\n\
-         ```text\n\
+         \n\
          Stay or move?\n\
-         ```\n\
+         \n\
          1. Stay\n\
          2. Move\n\
          \n\
@@ -369,23 +348,23 @@ fn render_card_golden() {
     .unwrap();
     assert_eq!(
         render_card(&decision, "14:05"),
-        "🧭 · dreamforge · orchestrator\n**Relay choice**\n```text\nStay or move?\n```\nas of 14:05"
+        "🧭 · dreamforge · orchestrator\n**Relay choice**\n\nStay or move?\n\nas of 14:05"
     );
 }
 
 #[test]
-fn render_card_keeps_mentions_inside_the_fence() {
+fn render_card_keeps_mentions_inert() {
     // validate() refuses these strings; a card built from state must still
-    // keep them where neither app resolves them. The title is outside, so
-    // it loses its '@'; a bare nostr: is plain text on both apps.
+    // show them where neither app resolves them. The title loses its '@';
+    // the summary keeps it, a U+FEFF after it and after the ':'.
     let mut item = check(&[]).unwrap();
     item.title = "@Honey nostr:npub1abc".to_string();
     item.body = "ping @Honey nostr:npub1abc".to_string();
     let card = render_card(&item, "14:05");
-    let (head, rest) = card.split_once("```text\n").unwrap();
-    let (inner, tail) = rest.split_once("\n```").unwrap();
-    assert_eq!(inner, "ping @Honey nostr:npub1abc");
-    assert!(head.ends_with("\n**Honey nostr: npub1abc**\n"), "{head:?}");
+    let (head, rest) = card.split_once("\n\n").unwrap();
+    let (inner, tail) = rest.split_once("\n\n").unwrap();
+    assert_eq!(inner, "ping @\u{FEFF}Honey nostr:\u{FEFF}npub1abc");
+    assert!(head.ends_with("\n**Honey nostr: npub1abc**"), "{head:?}");
     for outside in [head, tail] {
         assert!(!outside.contains('@'), "{outside:?}");
     }

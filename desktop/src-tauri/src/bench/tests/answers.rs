@@ -139,10 +139,9 @@ fn render_card_recorded_trailer() {
             plain.replace(&format!("\n{HINT}"), "")
         )
     );
-    let tail = card.rsplit_once("\n```").unwrap().1;
     assert!(
-        !tail.contains("https://") && !tail.contains('['),
-        "{tail:?}"
+        !card.contains("https://") && !card.contains('['),
+        "{card:?}"
     );
     item.answer = None;
     assert_eq!(render_card(&item, "14:05"), plain);
@@ -620,8 +619,9 @@ fn answer_hint_only_on_unanswered_pending_cards() {
 
 #[tokio::test]
 async fn older_card_format_is_reposted_once_and_answers_survive() {
-    // Before CARD_FORMAT (the bare Drop hash), and format 2 (text in a fence).
-    for older in ["", ".2"] {
+    // Before CARD_FORMAT (the bare Drop hash), format 2 (text in a fence)
+    // and format 3 (the summary in a fence).
+    for older in ["", ".2", ".3"] {
         older_card_format_case(older).await;
     }
 }
@@ -711,7 +711,7 @@ async fn recorded_answer_on_older_format_card_survives_the_refresh() {
 // ── Card text the phone can read ────────────────────────────────────────
 
 #[test]
-fn render_card_text_outside_the_fence_is_inert() {
+fn render_card_title_and_options_are_inert() {
     // Everything either app gives meaning to, an entity, a dropped character
     // that would join "www.", a custom emoji shortcode and a trailing rule.
     let active = "[a](https://x.example) ![i](u) @Honey #general |a|b| *em* _em_ `c` \
@@ -724,8 +724,9 @@ fn render_card_text_outside_the_fence_is_inert() {
     for answer in [None, answered(2, 1)] {
         item.answer = answer;
         let card = render_card(&item, "14:05");
-        let (head, rest) = card.split_once("```text\n").unwrap();
-        let (_, tail) = rest.split_once("\n```\n").unwrap();
+        // Title, summary paragraph, then the options.
+        let (head, rest) = card.split_once("\n\n").unwrap();
+        let (_, tail) = rest.split_once("\n\n").unwrap();
         let lines: Vec<&str> = head.lines().chain(tail.lines()).skip(1).collect();
         assert!(
             lines[0].starts_with("**") && lines[0].ends_with("**"),
@@ -780,50 +781,86 @@ fn render_card_text_outside_the_fence_is_inert() {
 }
 
 #[test]
-fn render_card_summary_never_breaks_the_fence() {
-    // The phone ends a block at the first line of exactly three backticks,
-    // so a longer fence never shielded what came after an inner one.
+fn render_card_summary_is_its_own_inert_paragraph() {
+    // No code box: the summary is a paragraph between blank lines, with no
+    // backtick left to open one, so nothing in it reaches the options.
     for body in [
         "x\n```\n[a](https://e.example)\n```",
-        "Run this first:\n```bash\ncargo test\n```\nthen pick.",
-        "inline ```x``` and ````y````",
+        "Run this first:\n```bash\ncargo test\n```\nthen pick *one",
+        "inline ```x``` and ````y```` [z",
     ] {
         let card = render_card(&check(&[("body", json!(body))]).unwrap(), "14:05");
-        let lines: Vec<&str> = card.lines().collect();
-        let fences: Vec<usize> = (0..lines.len())
-            .filter(|&i| lines[i].starts_with("```"))
-            .collect();
-        assert_eq!(fences.len(), 2, "{card}");
-        assert_eq!((lines[fences[0]], lines[fences[1]]), ("```text", "```"));
-        assert_eq!(lines[fences[1] + 1], "1. Stay", "{card}");
-        assert!(lines[fences[0] + 1..fences[1]]
-            .iter()
-            .all(|l| !l.contains('`')));
+        assert!(!card.contains('`'), "{card}");
+        let paras: Vec<&str> = card.split("\n\n").collect();
+        assert_eq!(
+            paras[..3],
+            [
+                "🔴 · dreamforge · orchestrator\n**Relay choice**",
+                prose(body).as_str(),
+                "1. Stay\n2. Move"
+            ]
+        );
     }
 }
 
 #[test]
-fn render_card_wraps_the_summary_for_the_phone() {
-    let body = "Block's hosted relay rejects the new event kinds, so Bench-in-Buzz \
-                cannot ship there. Stay and wait for upstream, or move the community \
-                to our own relay?\n\nSee\tthe   plan: a_na\u{EF}ve_identifier_longer_than_one_row.";
-    let card = render_card(&check(&[("body", json!(body))]).unwrap(), "14:05");
-    let (_, rest) = card.split_once("```text\n").unwrap();
-    let (inner, _) = rest.split_once("\n```\n").unwrap();
+fn prose_keeps_plain_text_and_collapses_spaces() {
+    let plain = "Block's hosted relay rejects the new event kinds, so Bench-in-Buzz \
+                 cannot ship there. Stay and wait for upstream (a week, maybe 2), \
+                 or move the community to our own relay?\n\n\
+                 Either way - it's 3.5 hours of work!";
+    assert_eq!(prose(plain), plain);
+    let card = render_card(&check(&[("body", json!(plain))]).unwrap(), "14:05");
     assert!(
-        inner.lines().all(|l| l.chars().count() <= FENCE_WIDTH),
-        "{inner}"
+        card.contains(&format!("**\n\n{plain}\n\n1. Stay")),
+        "{card}"
     );
-    // Only the extra whitespace goes; the blank line stays.
-    let squash = |s: &str| s.split_whitespace().collect::<String>();
-    assert_eq!(squash(inner), squash(body));
-    assert!(inner.contains("\n\n"), "{inner}");
-    assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
-    assert_eq!(wrap("a  b\n\n\t c  ", 26), "a b\n\nc");
-    assert_eq!(
-        wrap(&"x".repeat(30), 26),
-        format!("{}\nxxxx", "x".repeat(26))
-    );
+    // No indent (a code block or nested item) and no trailing hard break.
+    assert_eq!(prose("\n  a \t b  \n\n\t c  \n"), "a b\n\nc");
+}
+
+#[test]
+fn prose_breaks_each_trigger() {
+    // gpt_markdown 1.1.6 honours no backslash escape, so each trigger either
+    // side gives meaning to is broken by an invisible U+FEFF instead.
+    let z = |s: &str| s.replace('°', "\u{FEFF}");
+    for (raw, want) in [
+        // Emphasis and strikethrough cannot close; `**`, `~~`, `~~~` split.
+        ("*em* and **b**", "°*em°* and °*°*b°*°*"),
+        ("_em_ and __b__", "°_em°_ and °_°_b°_°_"),
+        ("~s~ and ~~s~~", "°~s°~ and °~°~s°~°~"),
+        // Code: U+02CB, since a U+FEFF cannot split a code span.
+        ("`c` and ```f```", "ˋcˋ and ˋˋˋfˋˋˋ"),
+        // Heading, #channel, @mention, email, :emoji:, autolinks, entities.
+        ("# h #general", "#° h #°general"),
+        ("@Honey a@b.example", "@°Honey a@°b.example"),
+        (
+            ":party: https://github.com/x",
+            ":°party:° https:°//github.com/x",
+        ),
+        (
+            "&num;ch <u>u</u> <https://e.x>",
+            "&°num;ch <°u>u<°/u> <°https:°//e.x>",
+        ),
+        // Links, images, citations, footnotes, LaTeX and escapes.
+        ("[a](u) ![i](u) [1] [^n]", "[°a]°(u) ![°i]°(u) [°1]° [°^n]°"),
+        ("\\(x\\) \\[y\\] \\*", "\\°(x\\°) \\°[°y\\°]° \\°°*"),
+        // A line ending in --- is a rule on the phone; || a desktop spoiler.
+        ("wait --- or ||s||", "wait -°-°- or |°|s|°|"),
+        // Block marks at a line start.
+        (
+            "- a\n+ b\n> c\n1. d\n12) e",
+            "°- a\n°+ b\n°> c\n°1. d\n°12) e",
+        ),
+        ("(x) r\n===\n\u{2E3B} x", "°(x) r\n°===\n°\u{2E3B} x"),
+        ("| a | b |\n|---|---|", "°| a | b |\n°|-°-°-|-°-°-|"),
+    ] {
+        let out = prose(raw);
+        assert_eq!(out, z(want), "{raw:?}");
+        // Both apps show exactly the text that came in.
+        let shown = out.replace('\u{FEFF}', "").replace('\u{02CB}', "`");
+        assert_eq!(shown, raw);
+    }
 }
 
 #[test]
