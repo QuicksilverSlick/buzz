@@ -36,7 +36,8 @@ export function ConnectionMethodSection({
           Connect your AI provider
         </h1>
         <p className="mt-2 text-base leading-6 text-foreground/80">
-          Choose how your agents will access AI. You can change this later.
+          Only needed if you want to run your own AI agents on this computer.
+          Guests can skip this.
         </p>
       </div>
 

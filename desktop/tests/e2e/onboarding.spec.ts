@@ -946,6 +946,12 @@ test("fresh-key harness completion continues directly into profile onboarding", 
   await expect(
     page.getByRole("heading", { name: "Connect your AI provider" }),
   ).toBeVisible();
+  // Guests reach this step too; it has to say plainly that they can skip it.
+  await expect(
+    page.getByText(
+      "Only needed if you want to run your own AI agents on this computer. Guests can skip this.",
+    ),
+  ).toBeVisible();
 
   await page.evaluate(() => {
     const testWindow = window as Window & {
