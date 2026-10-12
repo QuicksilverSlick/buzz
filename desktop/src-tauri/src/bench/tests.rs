@@ -340,37 +340,46 @@ fn render_card_golden() {
     assert_eq!(
         render_card(&item, "14:05"),
         "🔴 · dreamforge · orchestrator\n\
+         **Relay choice**\n\
          ```text\n\
-         Relay choice\n\
-         \n\
          Stay or move?\n\
-         \n\
+         ```\n\
          1. Stay\n\
          2. Move\n\
-         ```\n\
+         \n\
          due 2026-09-20T00:00:00Z\n\
          plan: https://github.com/QuicksilverSlick/buzz\n\
          Tap one number below to answer.\n\
          as of 14:05"
+    );
+    let decision = check(&[
+        ("kind", json!("decision")),
+        ("decidedBy", json!("claude")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+    ])
+    .unwrap();
+    assert_eq!(
+        render_card(&decision, "14:05"),
+        "🧭 · dreamforge · orchestrator\n**Relay choice**\n```text\nStay or move?\n```\nas of 14:05"
     );
 }
 
 #[test]
 fn render_card_keeps_mentions_inside_the_fence() {
     // validate() refuses these strings; a card built from state must still
-    // keep them where neither app resolves them.
+    // keep them where neither app resolves them. The title is outside, so
+    // it loses its '@'; a bare nostr: is plain text on both apps.
     let mut item = check(&[]).unwrap();
     item.title = "@Honey nostr:npub1abc".to_string();
     item.body = "ping @Honey nostr:npub1abc".to_string();
     let card = render_card(&item, "14:05");
     let (head, rest) = card.split_once("```text\n").unwrap();
     let (inner, tail) = rest.split_once("\n```").unwrap();
-    assert!(inner.contains("@Honey nostr:npub1abc"));
+    assert_eq!(inner, "ping @Honey nostr:npub1abc");
+    assert!(head.ends_with("\n**Honey nostr:npub1abc**\n"), "{head:?}");
     for outside in [head, tail] {
-        assert!(
-            !outside.contains('@') && !outside.contains("nostr:"),
-            "{outside:?}"
-        );
+        assert!(!outside.contains('@'), "{outside:?}");
     }
 }
 
@@ -466,7 +475,7 @@ fn render_board_orders_links_and_folds() {
              - 🟠 Phone alerts (dreamforge) (no card yet)\n\
              \n\
              Decisions\n\
-             - 🧭 label(https:evil.example) Stay (dreamforge) (decided on claude.ai)\n\
+             - 🧭 label (https: evil.example) Stay (dreamforge) (decided on claude.ai)\n\
              - 🧭 Own relay later (dreamforge) (claude)\n\
              \n\
              Status\n\

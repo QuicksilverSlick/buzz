@@ -135,7 +135,7 @@ fn render_card_recorded_trailer() {
     assert_eq!(
         card,
         format!(
-            "{}\nRecorded: 2. Move x(https:evil.example) · 14:05",
+            "{}\nRecorded: 2. Move x (https: evil.example) · 14:05",
             plain.replace(&format!("\n{HINT}"), "")
         )
     );
@@ -192,7 +192,7 @@ fn render_board_answered_section() {
              \n\
              Answered, waiting for action (2)\n\
              - 🔴 Earlier tap (dreamforge) → 1. Stay · buzz://message?channel={UUID}&id={hex64}\n\
-             - 🔴 Relay choice (dreamforge) → 2. Move x(https:evil.example)"
+             - 🔴 Relay choice (dreamforge) → 2. Move x (https: evil.example)"
         )
     );
     assert!(!board.contains("https://") && !board.contains('['));
@@ -204,7 +204,7 @@ fn render_board_answered_section() {
     );
     let late = render_board(&all, UUID, "14:05", 100 + ANSWER_KEEP_SECS + 1);
     assert!(
-        late.ends_with("→ 2. Move x(https:evil.example) 🟠 24h"),
+        late.ends_with("→ 2. Move x (https: evil.example) 🟠 24h"),
         "{late:?}"
     );
     assert_ne!(board_hash(&board), board_hash(&late));
@@ -590,7 +590,7 @@ fn answer_hint_only_on_unanswered_pending_cards() {
     let mut pending = check(&[]).unwrap();
     let card = render_card(&pending, "14:05");
     assert!(
-        card.ends_with(&format!("```\n{HINT}\nas of 14:05")),
+        card.ends_with(&format!("2. Move\n\n{HINT}\nas of 14:05")),
         "{card}"
     );
     pending.answer = answered(0, 1);
@@ -620,6 +620,13 @@ fn answer_hint_only_on_unanswered_pending_cards() {
 
 #[tokio::test]
 async fn older_card_format_is_reposted_once_and_answers_survive() {
+    // Before CARD_FORMAT (the bare Drop hash), and format 2 (text in a fence).
+    for older in ["", ".2"] {
+        older_card_format_case(older).await;
+    }
+}
+
+async fn older_card_format_case(older: &str) {
     const OTHER: &str = "orchestrator/other";
     let mut b = seeded_bench(Gate::Open, &[]).await;
     b.drop_file(
@@ -628,10 +635,9 @@ async fn older_card_format_is_reposted_once_and_answers_survive() {
         &drop_json(&[("title", json!("Other"))]),
     );
     b.settle(3).await;
-    // Both cards as an older build tagged them (the bare Drop hash), one
-    // tapped before the upgrade.
+    // Both cards as an older build tagged them, one tapped before the upgrade.
     for i in b.s.items.values_mut() {
-        i.card.as_mut().unwrap().hash = i.hash.clone();
+        i.card.as_mut().unwrap().hash = format!("{}{older}", i.hash);
     }
     let (kept, old) = (b.card(ITEM).event_id, b.card(OTHER).event_id);
     let owner_tap = tap(&b.ctx.owner, &kept, OPTION_EMOJI[1], b.now);
@@ -651,7 +657,8 @@ async fn older_card_format_is_reposted_once_and_answers_survive() {
         tag_value(&posts[2].0, "client").unwrap(),
         format!("bench:card:{OTHER}@{}", card_hash(&b.s.items[OTHER]))
     );
-    assert!(text(&posts[2].0).contains(HINT));
+    assert!(text(&posts[0].0).contains("\n**Relay choice**\n"));
+    assert!(text(&posts[2].0).contains("\n**Other**\n") && text(&posts[2].0).contains(HINT));
     assert_eq!(tag_value(&posts[2].0, "p"), None);
     assert!(!b.s.items[OTHER].quiet_repost);
     // The answered card, its answer and its outbox file stay.
@@ -699,4 +706,58 @@ async fn recorded_answer_on_older_format_card_survives_the_refresh() {
     assert!(!b.kinds()[before..].iter().any(|k| *k == 5 || *k == 9));
     assert_eq!(b.card(ITEM).event_id, card.event_id);
     assert!(b.s.items[ITEM].answer.is_some() && outbox(&b).is_some());
+}
+
+// ── Card text the phone can read ────────────────────────────────────────
+
+#[test]
+fn render_card_text_outside_the_fence_is_inert() {
+    // Everything either app gives meaning to, an entity, a dropped character
+    // that would join "www.", and a trailing rule.
+    let active = "[a](https://x.example) ![i](u) @Honey #general |a|b| *em* _em_ `c` \
+                  ~~s~~ <u>u</u> \\(x\\) \\[y\\] $z$ &num;ch w[w]w.x.example ---";
+    let mut item = check(&[]).unwrap();
+    item.title = format!("# {active}");
+    item.options = ["- ", "> ", "1. ", "(x) "]
+        .map(|p| format!("{p}{active}"))
+        .to_vec();
+    for answer in [None, answered(2, 1)] {
+        item.answer = answer;
+        let card = render_card(&item, "14:05");
+        let (head, rest) = card.split_once("```text\n").unwrap();
+        let (_, tail) = rest.split_once("\n```\n").unwrap();
+        let lines: Vec<&str> = head.lines().chain(tail.lines()).skip(1).collect();
+        assert!(
+            lines[0].starts_with("**") && lines[0].ends_with("**"),
+            "{card}"
+        );
+        for (i, n) in ["1. ", "2. ", "3. ", "4. "].iter().enumerate() {
+            assert!(lines[i + 1].starts_with(n), "{card}");
+        }
+        for line in lines.iter().filter(|l| !l.is_empty()) {
+            let text = line
+                .strip_prefix("**")
+                .and_then(|l| l.strip_suffix("**"))
+                .or_else(|| {
+                    line.get(3..)
+                        .filter(|_| line.as_bytes().get(1) == Some(&b'.'))
+                })
+                .unwrap_or(line);
+            assert!(
+                !text.contains(|c: char| "[]@#|*_`~<>\\$;/".contains(c)),
+                "{text:?}"
+            );
+            assert!(!text.contains("www.") && !text.ends_with('-'), "{text:?}");
+            // No nested list, quote, heading or radio button either.
+            assert!(
+                text.starts_with(|c: char| c.is_ascii_alphanumeric()),
+                "{text:?}"
+            );
+            let lead = text.split(' ').next().unwrap();
+            let ordinal = lead
+                .strip_suffix(['.', ')'])
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
+            assert!(!ordinal, "{text:?}");
+        }
+    }
 }
