@@ -845,3 +845,18 @@ fn plain_text_folds_typography_and_spaces_colons() {
         assert_eq!(plain_text(raw, usize::MAX), plain, "{raw:?}");
     }
 }
+
+#[test]
+fn render_card_omits_a_title_that_sanitizes_to_nothing() {
+    // `****` is a thematic break on the desktop, so an all-symbol title must
+    // leave no bold line behind.
+    let mut item = check(&[]).unwrap();
+    item.title = "!!!".to_string();
+    let card = render_card(&item, "14:05");
+    assert!(
+        !card
+            .lines()
+            .any(|l| l.trim() == "****" || l.starts_with("**")),
+        "{card}"
+    );
+}
