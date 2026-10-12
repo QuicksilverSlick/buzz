@@ -169,6 +169,7 @@ export function updateInputFromRequest(
             respondTo: changes.respondTo,
             respondToAllowlist: [],
             parallelism: current.behavior?.parallelism,
+            capabilities: current.behavior?.capabilities,
             sessionPolicy: current.behavior?.sessionPolicy,
           },
         }

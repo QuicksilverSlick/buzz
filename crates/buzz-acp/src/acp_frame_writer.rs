@@ -130,7 +130,8 @@ mod tests {
         tokio::select! {
             biased;
             result = client.session_prompt_with_idle_timeout(
-                "sess-test", &prompt, Duration::from_secs(60), Duration::from_secs(60)
+                "sess-test", &prompt, Duration::from_secs(60), Duration::from_secs(60),
+                super::super::TurnAuthority::Owner, None
             ) => panic!("large write should remain blocked: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
@@ -176,7 +177,8 @@ mod tests {
         tokio::select! {
             biased;
             result = client.session_prompt_with_idle_timeout(
-                "sess-test", "hello", Duration::from_secs(60), Duration::from_secs(60)
+                "sess-test", "hello", Duration::from_secs(60), Duration::from_secs(60),
+                super::super::TurnAuthority::Owner, None
             ) => panic!("response should wait for cancel: {result:?}"),
             _ = wait_for(&ready) => {}
         }
@@ -214,7 +216,9 @@ sleep 10"#;
                     "sess-test",
                     "first",
                     Duration::from_secs(5),
-                    Duration::from_secs(5)
+                    Duration::from_secs(5),
+                    super::super::TurnAuthority::Owner,
+                    None,
                 )
                 .await,
             Err(AcpError::AgentError { .. })
@@ -224,7 +228,9 @@ sleep 10"#;
                 "sess-test",
                 "second",
                 Duration::from_secs(5),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                super::super::TurnAuthority::Owner,
+                None,
             )
             .await
             .is_ok());

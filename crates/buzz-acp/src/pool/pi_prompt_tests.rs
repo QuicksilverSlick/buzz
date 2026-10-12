@@ -325,6 +325,8 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
                 "/export",
                 Duration::from_secs(15),
                 Duration::from_secs(30),
+                crate::acp::TurnAuthority::Owner,
+                None,
             )
             .await
             .unwrap();
