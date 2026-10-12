@@ -60,9 +60,9 @@ const CONNECTION_STATE_LABEL: Record<ConnectionState, string> = {
   idle: "Not connected",
   connecting: "Connecting…",
   connected: "Connected",
-  reconnecting: "Reconnecting to relay…",
-  stalled: "Connection lost — relay is not responding",
-  disconnected: "Disconnected from relay",
+  reconnecting: "Reconnecting to the community server…",
+  stalled: "Connection lost — the community server is not responding",
+  disconnected: "Disconnected from the community server",
 };
 
 type CommunitySwitcherProps = {
@@ -516,7 +516,7 @@ export function CommunitySwitcher({
           <AlertDialogHeader>
             <AlertDialogTitle>Remove from this device</AlertDialogTitle>
             <AlertDialogDescription>
-              {`Remove "${removingCommunity?.name ?? ""}" from this device? Dreamforge won't contact the relay, so your membership isn't revoked. You can add the community again later.`}
+              {`Remove "${removingCommunity?.name ?? ""}" from this device? Dreamforge won't contact the community server, so your membership isn't revoked. You can add the community again later.`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

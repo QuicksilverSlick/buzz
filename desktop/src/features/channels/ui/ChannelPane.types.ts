@@ -35,6 +35,8 @@ export type ChannelPaneProps = {
    */
   onAutoSendComplete?: (() => void) | null;
   botTypingEntries: TypingIndicatorEntry[];
+  /** The channel side panel shows About this channel instead of settings. */
+  channelAboutOpen?: boolean;
   channelManagementOpen?: boolean;
   currentPubkey?: string;
   editTarget?: MessageComposerEditTarget | null;

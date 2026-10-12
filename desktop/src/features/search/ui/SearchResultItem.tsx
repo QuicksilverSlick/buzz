@@ -166,7 +166,7 @@ function describeSearchHit(hit: SearchHit) {
     case 45003:
       return "Forum reply";
     case 43001:
-      return "Agent job";
+      return "Agent task";
     case 43003:
       return "Agent update";
     case 46010:

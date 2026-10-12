@@ -39,10 +39,10 @@ export const SLOT_LABELS: Record<SoundSlot, string> = {
   mention: "@Mentions",
   thread_reply: "Thread replies",
   needs_action: "Needs action",
-  job_accepted: "Agent: job accepted",
+  job_accepted: "Agent: task accepted",
   job_progress: "Agent: progress update",
-  job_result: "Agent: job result",
-  job_error: "Agent: job error",
+  job_result: "Agent: task result",
+  job_error: "Agent: task error",
 };
 
 // The agent job protocol (kinds 43001-43006) is defined and queryable but
@@ -61,10 +61,10 @@ export const SLOT_DESCRIPTIONS: Record<SoundSlot, string> = {
   mention: "When someone tags you in a channel.",
   thread_reply: "When someone replies in a thread you follow or posted in.",
   needs_action: "When an approval or reminder is waiting on you.",
-  job_accepted: "When an agent picks up a job.",
-  job_progress: "While an agent works through a job.",
-  job_result: "When an agent finishes a job.",
-  job_error: "When an agent job fails.",
+  job_accepted: "When an agent picks up a task.",
+  job_progress: "While an agent works through a task.",
+  job_result: "When an agent finishes a task.",
+  job_error: "When an agent task fails.",
 };
 
 export const RECOMMENDED_SOUND_BY_SLOT: Record<SoundSlot, SoundName> = {

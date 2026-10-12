@@ -277,6 +277,125 @@ test("collision npubs sit inline with agent metadata", async () => {
   }
 });
 
+function describedByText(button) {
+  return (button.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter(Boolean)
+    .map((id) => document.getElementById(id)?.textContent ?? `missing:${id}`);
+}
+
+test("agent rows show their public description on one line", async () => {
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [
+        {
+          pubkey: "a".repeat(64),
+          displayName: "Reset Worker",
+          isAgent: true,
+          ownerLabel: "Russell",
+          description: "Builds your weekly plan. Ask for a check-in.",
+          audienceNote: null,
+        },
+      ],
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  const description = view.getByTestId("mention-agent-description");
+  assert.equal(
+    description.textContent,
+    "Builds your weekly plan. Ask for a check-in.",
+  );
+  assert.match(description.className, /(?:^|\s)truncate(?:\s|$)/);
+  assert.equal(
+    description.getAttribute("title"),
+    "Builds your weekly plan. Ask for a check-in.",
+  );
+  assert.ok(view.getByText("managed by Russell"));
+  assert.equal(view.queryByTestId("mention-agent-audience-note"), null);
+  const button = view.getByRole("button", { name: "Mention Reset Worker" });
+  assert.deepEqual(describedByText(button), [
+    "Builds your weekly plan. Ask for a check-in.",
+  ]);
+});
+
+test("an agent that will not answer the person typing names who it answers", async () => {
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [
+        {
+          pubkey: "a".repeat(64),
+          displayName: "Reset Worker",
+          isAgent: true,
+          ownerLabel: "Russell",
+          notInChannel: true,
+          description: "Builds your weekly plan.",
+          audienceNote: "Answers only Russell",
+        },
+        {
+          pubkey: "b".repeat(64),
+          displayName: "Helper",
+          isAgent: true,
+          audienceNote: "Answers only Russell",
+        },
+      ],
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  const notes = view.getAllByTestId("mention-agent-audience-note");
+  assert.deepEqual(
+    notes.map((note) => note.textContent),
+    ["Answers only Russell · not in channel", "Answers only Russell"],
+  );
+  assert.equal(view.queryByText(/managed by/), null);
+  assert.deepEqual(
+    describedByText(view.getByRole("button", { name: "Mention Reset Worker" })),
+    ["Answers only Russell · not in channel", "Builds your weekly plan."],
+  );
+  assert.deepEqual(
+    describedByText(view.getByRole("button", { name: "Mention Helper" })),
+    ["Answers only Russell"],
+  );
+});
+
+test("people rows never carry agent details", async () => {
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [
+        {
+          pubkey: "a".repeat(64),
+          displayName: "Craig",
+          description: "Not an agent.",
+          audienceNote: "Answers only Russell",
+        },
+      ],
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  assert.equal(view.queryByTestId("mention-agent-description"), null);
+  assert.equal(view.queryByTestId("mention-agent-audience-note"), null);
+  assert.equal(
+    view
+      .getByRole("button", { name: "Mention Craig" })
+      .getAttribute("aria-describedby"),
+    null,
+  );
+});
+
 test("does not intercept Tab from the editor", async () => {
   const React = await import("react");
   const { fireEvent, render } = await import("@testing-library/react");

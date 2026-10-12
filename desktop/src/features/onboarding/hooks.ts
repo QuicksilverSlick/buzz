@@ -16,6 +16,14 @@ import {
   rememberPendingWelcomeChannel,
 } from "@/features/onboarding/welcome";
 import { forceFreshOnboarding } from "@/features/onboarding/devFreshOnboarding";
+import { joinGuestStarterChannels } from "@/features/onboarding/guestEntry";
+import {
+  hasJoinedGuestStarterChannels,
+  isCommunityGuest,
+  markGuestStarterChannelsJoined,
+  withJoinedStarterChannels,
+} from "@/features/onboarding/guestMode";
+import { useCommunityGuestStatus } from "@/features/onboarding/useIsCommunityGuest";
 import { ensureWelcomeCanvas } from "@/features/onboarding/welcomeCanvas";
 import { ensureWelcomeTeam } from "@/features/onboarding/welcomeGuide";
 import { useProfileQuery } from "@/features/profile/hooks";
@@ -71,6 +79,31 @@ function seedWelcomeExperience(
   return promise;
 }
 
+/**
+ * Join the owner's #general and #welcome-everyone for a guest whose entry
+ * could not. The missing "joined" record is the retry: a failure here is
+ * tried again the next time the app opens this community.
+ */
+async function joinGuestStarterChannelsOnce(
+  queryClient: ReturnType<typeof useQueryClient>,
+  pubkey: string,
+  communityScope: string,
+) {
+  if (hasJoinedGuestStarterChannels(pubkey, communityScope)) return;
+  try {
+    const starters = await joinGuestStarterChannels();
+    markGuestStarterChannelsJoined(pubkey, communityScope);
+    await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
+    // The relay's member list can trail the join; keep the joined channels
+    // in the sidebar until it catches up.
+    queryClient.setQueryData<Channel[]>(channelsQueryKey, (channels) =>
+      channels ? withJoinedStarterChannels(channels, starters) : channels,
+    );
+  } catch (error) {
+    console.warn("Failed to join the community's starter channels.", error);
+  }
+}
+
 export async function initializeStarterChannels(
   queryClient: ReturnType<typeof useQueryClient>,
   {
@@ -83,6 +116,13 @@ export async function initializeStarterChannels(
     communityScope: string | null;
   },
 ): Promise<ChannelInitResult> {
+  if (pubkey && communityScope && isCommunityGuest(pubkey, communityScope)) {
+    // Guests use the community its owner set up: no private Welcome channel,
+    // no Welcome Team, and no starter channels created in their name. They
+    // only join the owner's own, here when guest entry could not.
+    await joinGuestStarterChannelsOnce(queryClient, pubkey, communityScope);
+    return { ok: true };
+  }
   try {
     let starterChannels: Awaited<
       ReturnType<typeof ensureStarterChannels>
@@ -571,11 +611,19 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
     [currentPubkey, queryClient, starterChannelsCommunityScope],
   );
 
+  // A saved guest flag waits for the relay's word on this person's role: an
+  // owner or admin wrongly saved as a guest is cleared first and gets the
+  // normal setup here.
+  const guestStatus = useCommunityGuestStatus(
+    currentPubkey,
+    starterChannelsCommunityScope,
+  );
   React.useEffect(() => {
     if (
       onboardingGate.stage !== "ready" ||
       !currentPubkey ||
       !starterChannelsCommunityScope ||
+      !guestStatus.isSettled ||
       !readOnboardingCompletion(currentPubkey) ||
       hasEnsuredWelcomeChannel(currentPubkey, starterChannelsCommunityScope)
     ) {
@@ -585,6 +633,7 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
     void requestStarterChannels(false);
   }, [
     currentPubkey,
+    guestStatus.isSettled,
     onboardingGate.stage,
     requestStarterChannels,
     starterChannelsCommunityScope,

@@ -61,6 +61,7 @@ export function MachineOnboardingFlow({
   identityLost,
   initialPage,
   queryClient,
+  skipProviderSetup = false,
 }: {
   complete: (
     pubkey?: string,
@@ -71,6 +72,12 @@ export function MachineOnboardingFlow({
   identityLost: boolean;
   initialPage?: MachineOnboardingPage;
   queryClient: QueryClient;
+  /**
+   * Go straight from the identity steps to the community, as "Set up later"
+   * would. Set for people arriving through an invite; AI-provider setup stays
+   * available in Settings.
+   */
+  skipProviderSetup?: boolean;
 }) {
   const [page, setPage] = React.useState<MachineOnboardingPage>(
     identityLost ? "key-import" : (initialPage ?? "identity"),
@@ -137,6 +144,29 @@ export function MachineOnboardingFlow({
       ),
     [],
   );
+  /** Leave the identity steps: on to AI-provider setup, or past it. */
+  const continuePastIdentity = React.useCallback(
+    (pubkey: string | null, imported: boolean) => {
+      if (skipProviderSetup) {
+        complete(pubkey ?? undefined, { continueToProfile: !imported });
+        return;
+      }
+      setTransitionDirection("forward");
+      setPage("setup");
+    },
+    [complete, skipProviderSetup],
+  );
+  // An invite link opened while the AI-provider step is showing skips it the
+  // same way. The config step is left alone so a save in progress finishes.
+  const skippedProviderSetupRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!skipProviderSetup || page !== "setup") return;
+    if (skippedProviderSetupRef.current) return;
+    skippedProviderSetupRef.current = true;
+    complete(selectedPubkey ?? undefined, {
+      continueToProfile: !identityWasImported,
+    });
+  }, [complete, identityWasImported, page, selectedPubkey, skipProviderSetup]);
   const returnToApiConfig = React.useCallback(() => {
     setIsChoosingDifferentHarness(false);
     setTransitionDirection("backward");
@@ -175,8 +205,7 @@ export function MachineOnboardingFlow({
       setIdentityWasImported(true);
       setSelectedPubkey(identity.pubkey);
       setIdentityStorage(identity.storage);
-      setTransitionDirection("forward");
-      setPage("setup");
+      continuePastIdentity(identity.pubkey, true);
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : "Failed to load identity",
@@ -184,7 +213,7 @@ export function MachineOnboardingFlow({
     } finally {
       setIsPending(false);
     }
-  }, [continueWithRecoveredIdentity, queryClient]);
+  }, [continuePastIdentity, continueWithRecoveredIdentity, queryClient]);
 
   const replaceLostIdentity = React.useCallback(async () => {
     const confirmed = window.confirm(
@@ -220,10 +249,9 @@ export function MachineOnboardingFlow({
       queryClient.setQueryData(["identity"], identity);
       setIdentityWasImported(true);
       setSelectedPubkey(identity.pubkey);
-      setTransitionDirection("forward");
-      setPage("setup");
+      continuePastIdentity(identity.pubkey, true);
     },
-    [continueWithIdentity, queryClient],
+    [continuePastIdentity, continueWithIdentity, queryClient],
   );
 
   const backFromKeyImport = React.useCallback(() => {
@@ -573,10 +601,9 @@ export function MachineOnboardingFlow({
           <BackupStep
             direction={backupDirection}
             identityStorage={identityStorage}
-            onNext={() => {
-              setTransitionDirection("forward");
-              setPage("setup");
-            }}
+            onNext={() =>
+              continuePastIdentity(selectedPubkey, identityWasImported)
+            }
             onOpenPasswordBackup={() => {
               resetEncryptedBackupSession(backupSession);
               setBackupDirection("forward");

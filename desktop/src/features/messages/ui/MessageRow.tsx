@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertTriangle } from "lucide-react";
+import { Globe } from "lucide-react";
 import {
   depthGuideActionsEqual,
   numberArrayEqual,
@@ -524,9 +524,10 @@ export const MessageRow = React.memo(
             }
           >
             {message.respondTo === "anyone" ? (
-              <AlertTriangle
+              <Globe
                 aria-hidden="true"
-                className="h-2.5 w-2.5 fill-background text-amber-500"
+                className="h-2.5 w-2.5 text-muted-foreground"
+                data-testid="message-respond-to-anyone-icon"
               />
             ) : (
               <span className="h-2 w-2 rounded-full bg-blue-500" />
