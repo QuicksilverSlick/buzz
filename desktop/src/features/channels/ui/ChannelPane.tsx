@@ -27,6 +27,7 @@ import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { ChannelAboutPanel } from "@/features/channels/ui/ChannelAboutPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -86,6 +87,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   autoSendDraftKey = null,
   onAutoSendComplete = null,
   botTypingEntries,
+  channelAboutOpen = false,
   channelManagementOpen = false,
   currentPubkey,
   editTarget = null,
@@ -824,7 +826,21 @@ export const ChannelPane = React.memo(function ChannelPane({
       ) : null}
       {/* Serialize replacements so focus drawers keep one travel direction. */}
       <AnimatePresence mode="wait" onExitComplete={markExitComplete}>
-        {channelManagementOpen && activeChannel ? (
+        {channelManagementOpen && activeChannel && channelAboutOpen ? (
+          wrapAux(
+            <ChannelAboutPanel
+              channel={activeChannel}
+              isSinglePanelView={
+                useSplitAuxiliaryPane ? false : isSinglePanelView
+              }
+              layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+              onClose={() => onCloseChannelManagement?.()}
+              transparentChrome={useSplitAuxiliaryPane}
+              widthPx={threadPanelWidthPx}
+            />,
+            "channel-about-auxiliary-pane",
+          )
+        ) : channelManagementOpen && activeChannel ? (
           <ChannelManagementAuxiliaryPanel
             activeChannel={activeChannel}
             canResetThreadPanelWidth={canResetThreadPanelWidth}

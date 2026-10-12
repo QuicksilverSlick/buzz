@@ -76,6 +76,7 @@ import { useElementWidth } from "@/shared/hooks/use-mobile";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
 import { AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX } from "@/shared/layout/AuxiliaryPanel";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { useChannelAbout } from "./useChannelAbout";
 import { useChannelActivityTyping } from "./useChannelActivityTyping";
 import { useChannelAgentSessions } from "./useChannelAgentSessions";
 import { useMessageProfiles } from "./useMessageProfiles";
@@ -124,6 +125,7 @@ export function ChannelScreen({
     readStateVersion,
   } = useAppShell();
   const {
+    channelAboutOpen,
     channelManagementOpen,
     clearAutoSend,
     clearMessageRouteTarget,
@@ -134,6 +136,7 @@ export function ChannelScreen({
     profilePanelPubkey,
     profilePanelTab,
     profilePanelView,
+    setChannelAboutOpen,
     setChannelManagementOpen,
     setOpenAgentSessionChannelId,
     setOpenAgentSessionPubkey,
@@ -707,39 +710,56 @@ export function ChannelScreen({
     resetKey: activeChannelId,
     enabled: !isSinglePanelView,
   });
+  // Settings and About share the channel side panel; settings is open only
+  // when that panel is not showing About.
+  const channelSettingsOpen = channelManagementOpen && !channelAboutOpen;
+  const openChannelSidePanel = React.useCallback(
+    (open: () => void) => {
+      setOpenThreadHeadId(null);
+      setExpandedThreadReplyIds(new Set());
+      setThreadScrollTargetId(null);
+      setThreadReplyTargetId(null);
+      handleCloseAgentSession();
+      setProfilePanelPubkey(null);
+      open();
+    },
+    [handleCloseAgentSession, setOpenThreadHeadId, setProfilePanelPubkey],
+  );
   const handleManageChannel = React.useCallback(() => {
     if (!requireThreadEditResolution()) return;
     if (activeChannel?.channelType === "forum") {
       openGlobalChannelManagement();
       return;
     }
-    if (channelManagementOpen) {
+    if (channelSettingsOpen) {
       setChannelManagementOpen(false);
       return;
     }
-    setOpenThreadHeadId(null);
-    setExpandedThreadReplyIds(new Set());
-    setThreadScrollTargetId(null);
-    setThreadReplyTargetId(null);
-    handleCloseAgentSession();
-    setProfilePanelPubkey(null);
-    setChannelManagementOpen(true);
+    openChannelSidePanel(() => setChannelManagementOpen(true));
   }, [
     activeChannel?.channelType,
-    channelManagementOpen,
+    channelSettingsOpen,
+    openChannelSidePanel,
     openGlobalChannelManagement,
     requireThreadEditResolution,
     setChannelManagementOpen,
-    setOpenThreadHeadId,
-    handleCloseAgentSession,
-    setProfilePanelPubkey,
   ]);
   const handleAddChannelDescription = React.useCallback(() => {
     if (!activeChannelId) return;
     requestChannelEdit(activeChannelId);
     // An open settings panel takes the request itself; toggling would close it.
-    if (activeChannel?.channelType === "forum" || !channelManagementOpen) handleManageChannel();
-  }, [activeChannel?.channelType, activeChannelId, channelManagementOpen, handleManageChannel]);
+    if (activeChannel?.channelType === "forum" || !channelSettingsOpen) handleManageChannel();
+  }, [activeChannel?.channelType, activeChannelId, channelSettingsOpen, handleManageChannel]);
+  const { hasChannelAbout, toggleChannelAbout } = useChannelAbout({
+    activeChannel,
+    canOpenBesideChannel: !isNarrowPanelViewport,
+    channelAboutOpen,
+    enabled: !isHuddleTranscript,
+    openSidePanel: openChannelSidePanel,
+    otherPanelOpen: hasAuxiliaryPanel || Boolean(idleAuxiliaryPanel),
+    requireThreadEditResolution,
+    setChannelAboutOpen,
+  });
   const handleToggleMembers = React.useCallback(
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
@@ -754,14 +774,16 @@ export function ChannelScreen({
         activeDmAvatarUrl={activeDmAvatarUrl}
         activeDmHeaderParticipants={activeDmHeaderParticipants}
         activeDmPresenceStatus={activeDmPresenceStatus}
+        channelAboutOpen={channelAboutOpen}
         chromeWrapperRef={channelHeaderChromeRef}
-        {...{ currentPubkey, headerEndActions }}
+        {...{ currentPubkey, hasChannelAbout, headerEndActions }}
         isAddBotOpen={isAddBotOpen}
         isJoining={joinChannelMutation.isPending}
         onAddBotOpenChange={setIsAddBotOpen}
         onAddDescription={handleAddChannelDescription}
         onJoinChannel={joinChannelMutation.mutateAsync}
         onManageChannel={handleManageChannel}
+        onToggleChannelAbout={toggleChannelAbout}
         onToggleMembers={handleToggleMembers}
         showHeaderContent={!isSinglePanelView && !isHuddleTranscript}
         transparentChrome={activeChannel?.channelType !== "forum"}
@@ -769,7 +791,10 @@ export function ChannelScreen({
     ),
     [
       activeChannel,
+      channelAboutOpen,
       handleAddChannelDescription,
+      hasChannelAbout,
+      toggleChannelAbout,
       activeChannelEphemeralDisplay,
       activeChannelTitle,
       shouldCompactHeaderActions,
@@ -855,6 +880,7 @@ export function ChannelScreen({
                   autoSendDraftKey={autoSendDraftKey}
                   onAutoSendComplete={clearAutoSend}
                   botTypingEntries={botTypingEntries}
+                  channelAboutOpen={channelAboutOpen}
                   channelManagementOpen={channelManagementOpen}
                   currentPubkey={currentPubkey}
                   canResetThreadPanelWidth={canResetThreadPanelWidth}

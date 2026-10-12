@@ -1,4 +1,4 @@
-import { LogIn, SquareTerminal } from "lucide-react";
+import { BookOpenText, LogIn, SquareTerminal } from "lucide-react";
 import type * as React from "react";
 
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
@@ -30,6 +30,7 @@ import { WELCOME_TEAM_ID } from "@/features/onboarding/welcomeGuide";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
 import { Button } from "@/shared/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
@@ -38,6 +39,7 @@ import {
 } from "@/features/terminal/terminalPanelStore";
 import { TERMINAL_LABEL } from "@/shared/constants/brand";
 import { isMacPlatform } from "@/shared/lib/platform";
+import { CHANNEL_ABOUT_TITLE } from "./ChannelAboutPanel";
 
 const DM_HEADER_AVATAR_SIZE = 32;
 const DM_HEADER_AVATAR_STATUS_GEOMETRY = scaleProfileAvatarStatusGeometry(
@@ -53,8 +55,12 @@ type ChannelScreenHeaderProps = {
   activeDmAvatarUrl: string | null;
   activeDmHeaderParticipants: ActiveDmHeaderParticipant[];
   activeDmPresenceStatus: PresenceStatus | null;
+  /** The side panel is showing About this channel. */
+  channelAboutOpen?: boolean;
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   currentPubkey?: string;
+  /** The channel's canvas has content to show in About this channel. */
+  hasChannelAbout?: boolean;
   headerEndActions?: React.ReactNode;
   isAddBotOpen?: boolean;
   isJoining?: boolean;
@@ -65,6 +71,7 @@ type ChannelScreenHeaderProps = {
   onAddDescription?: () => void;
   onJoinChannel?: () => Promise<void>;
   onManageChannel: () => void;
+  onToggleChannelAbout?: () => void;
   onToggleMembers: () => void;
 };
 
@@ -76,8 +83,10 @@ export function ChannelScreenHeader({
   activeDmAvatarUrl,
   activeDmHeaderParticipants,
   activeDmPresenceStatus,
+  channelAboutOpen = false,
   chromeWrapperRef,
   currentPubkey,
+  hasChannelAbout = false,
   headerEndActions,
   isAddBotOpen,
   isJoining = false,
@@ -87,6 +96,7 @@ export function ChannelScreenHeader({
   transparentChrome = false,
   onJoinChannel,
   onManageChannel,
+  onToggleChannelAbout,
   onToggleMembers,
 }: ChannelScreenHeaderProps) {
   const isGroupDm =
@@ -169,6 +179,29 @@ export function ChannelScreenHeader({
       <SquareTerminal />
     </Button>
   ) : null;
+  // Shown only when the canvas has something to read; it stays visible while
+  // the panel is open so the same button can close it.
+  const aboutButton =
+    activeChannel !== null &&
+    onToggleChannelAbout &&
+    (hasChannelAbout || channelAboutOpen) ? (
+      <Tooltip disableHoverableContent>
+        <TooltipTrigger asChild>
+          <Button
+            aria-label={CHANNEL_ABOUT_TITLE}
+            aria-pressed={channelAboutOpen}
+            data-testid="channel-about-trigger"
+            onClick={onToggleChannelAbout}
+            size="icon"
+            type="button"
+            variant={channelAboutOpen ? "secondary" : "outline"}
+          >
+            <BookOpenText />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{CHANNEL_ABOUT_TITLE}</TooltipContent>
+      </Tooltip>
+    ) : null;
   const channelActions = activeChannel ? (
     showJoinButton ? (
       <div className="flex items-center gap-1">
@@ -199,8 +232,9 @@ export function ChannelScreenHeader({
     headerEndActions
   );
   const actions =
-    terminalButton || channelActions ? (
+    aboutButton || terminalButton || channelActions ? (
       <div className="flex items-center gap-1">
+        {aboutButton}
         {terminalButton}
         {channelActions}
       </div>
