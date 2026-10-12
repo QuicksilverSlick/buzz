@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { PRODUCT_NAME } from "@/shared/constants/brand";
+
 import {
   DEFAULT_ACP_COMMAND_VALUE,
   acpCommandPickerState,
@@ -15,7 +17,7 @@ test("stock and discovered commands select discovered options", () => {
   const defaultState = acpCommandPickerState("buzz-acp", [candidate]);
   assert.equal(defaultState.selectValue, "buzz-acp");
   assert.deepEqual(defaultState.options, [
-    { label: "Buzz ACP (default)", value: "buzz-acp" },
+    { label: `${PRODUCT_NAME} ACP (default)`, value: "buzz-acp" },
     { label: "buzz-janet-acp", value: "buzz-janet-acp" },
   ]);
 
