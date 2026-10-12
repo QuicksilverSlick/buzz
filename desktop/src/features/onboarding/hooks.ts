@@ -16,6 +16,7 @@ import {
   rememberPendingWelcomeChannel,
 } from "@/features/onboarding/welcome";
 import { forceFreshOnboarding } from "@/features/onboarding/devFreshOnboarding";
+import { isCommunityGuest } from "@/features/onboarding/guestMode";
 import { ensureWelcomeCanvas } from "@/features/onboarding/welcomeCanvas";
 import { ensureWelcomeTeam } from "@/features/onboarding/welcomeGuide";
 import { useProfileQuery } from "@/features/profile/hooks";
@@ -83,6 +84,11 @@ export async function initializeStarterChannels(
     communityScope: string | null;
   },
 ): Promise<ChannelInitResult> {
+  if (isCommunityGuest(pubkey, communityScope)) {
+    // Guests use the community its owner set up: no private Welcome channel,
+    // no Welcome Team, and no starter channels created in their name.
+    return { ok: true };
+  }
   try {
     let starterChannels: Awaited<
       ReturnType<typeof ensureStarterChannels>

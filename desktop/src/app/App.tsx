@@ -33,6 +33,10 @@ import {
   resolveProfileCheckAction,
   isTransactionStillConnecting,
 } from "@/features/onboarding/communityOnboarding";
+import {
+  commitGuestEntry,
+  prepareGuestEntry,
+} from "@/features/onboarding/guestEntry";
 import { CommunityOnboardingFlow } from "@/features/onboarding/ui/CommunityOnboardingFlow";
 import {
   MachineOnboardingFlow,
@@ -555,23 +559,45 @@ function CommunityApp({
 
     // resolveProfileCheckAction resolves exactly once (Promise.race + timer
     // cleared on settle), so no settled flag is needed here.
-    void resolveProfileCheckAction(getProfile, 10_000).then((result) => {
+    void resolveProfileCheckAction(getProfile, 10_000).then(async (result) => {
       // Atomic staleness guard via isTransactionStillConnecting: the
       // transaction must still be the same one that launched this request
       // AND still be in connecting. Covers cancel+replacement (B's ID !== A's)
       // and cancel-without-replacement (transactionRef.current is null).
-      if (!isTransactionStillConnecting(transactionRef.current, transactionId))
-        return;
+      const isStale = () =>
+        !isTransactionStillConnecting(transactionRef.current, transactionId);
+      if (isStale()) return;
 
-      if (result.action === "skip") {
-        markCommunityOnboardingComplete(result.profile.pubkey, relayUrl);
-        communityOnboarding.clear();
-      } else {
+      if (result.action !== "skip") {
         communityOnboarding.update(
           { stage: "profile", error: undefined },
           transactionId,
         );
+        return;
       }
+      // An invite join by someone who already has a profile skips the
+      // profile step too, but still enters as a guest: no Welcome channel,
+      // landing in a channel the owner set up.
+      const guestEntry = await prepareGuestEntry(transactionRef.current);
+      if (isStale()) return;
+      if (guestEntry) {
+        try {
+          commitGuestEntry(guestEntry, result.profile.pubkey, relayUrl);
+        } catch (error) {
+          // The profile step retries guest entry and shows what went wrong.
+          console.warn(
+            "Could not record guest mode for this community.",
+            error,
+          );
+          communityOnboarding.update(
+            { stage: "profile", error: undefined },
+            transactionId,
+          );
+          return;
+        }
+      }
+      markCommunityOnboardingComplete(result.profile.pubkey, relayUrl);
+      communityOnboarding.clear();
     });
   }, [
     communityOnboarding,

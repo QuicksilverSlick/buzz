@@ -6,6 +6,10 @@ import {
   markCommunityOnboardingComplete,
   useCommunityOnboarding,
 } from "@/features/onboarding/communityOnboarding";
+import {
+  commitGuestEntry,
+  prepareGuestEntry,
+} from "@/features/onboarding/guestEntry";
 import { initializeStarterChannels } from "@/features/onboarding/hooks";
 import { useClaimInvite } from "@/features/onboarding/useClaimInvite";
 import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
@@ -306,6 +310,38 @@ export function CommunityOnboardingFlow({
     }
   }, [finish, isPending, queryClient, relayUrl, update]);
 
+  // Async steps re-check the live transaction so a cancelled or replaced
+  // onboarding is never advanced or finished.
+  const transactionRef = React.useRef(transaction);
+  transactionRef.current = transaction;
+  /**
+   * After the profile step, someone who joined by invite enters as a guest
+   * straight away: no starter team, no Welcome channel, landing in a channel
+   * the owner set up. Everyone else meets the starter team.
+   */
+  const continueAfterProfile = React.useCallback(
+    async (transactionId: string) => {
+      const isLive = () =>
+        transactionRef.current?.id === transactionId &&
+        transactionRef.current.stage === "profile";
+      if (!isLive()) return;
+      const guestEntry = await prepareGuestEntry(transactionRef.current);
+      if (!isLive()) return;
+      if (!guestEntry) {
+        setTransitionDirection("forward");
+        update({ stage: "team-intro", error: undefined }, transactionId);
+        return;
+      }
+      const identity = await getIdentity();
+      const live = transactionRef.current;
+      if (!live || !isLive()) return;
+      commitGuestEntry(guestEntry, identity.pubkey, live.relayUrl);
+      markCommunityOnboardingComplete(identity.pubkey, live.relayUrl);
+      clear();
+    },
+    [clear, update],
+  );
+
   const backToProfile = React.useCallback(() => {
     if (isPending) return;
     setStarterChannelFailureCount(0);
@@ -320,17 +356,16 @@ export function CommunityOnboardingFlow({
 
     checkedProfileTransactionRef.current = transaction.id;
     void getProfile()
-      .then((profile) => {
-        if (profile.hasProfileEvent) {
-          setTransitionDirection("forward");
-          update({ stage: "team-intro", error: undefined }, transaction.id);
-        }
-      })
+      .then((profile) =>
+        profile.hasProfileEvent
+          ? continueAfterProfile(transaction.id)
+          : undefined,
+      )
       .catch(() => {
         // Discovery is best-effort. Staying on the profile step preserves the
         // existing path when the relay cannot answer the lookup.
       });
-  }, [isProfileStage, transaction, update]);
+  }, [continueAfterProfile, isProfileStage, transaction]);
   const isTeamStage =
     transaction?.stage === "team-intro" ||
     transaction?.stage === "finalizing" ||
@@ -458,8 +493,7 @@ export function CommunityOnboardingFlow({
         deferredAvatar?.cancel();
         throw error;
       }
-      setTransitionDirection("forward");
-      update({ stage: "team-intro", error: undefined });
+      await continueAfterProfile(transaction.id);
     } catch (error) {
       if (isRelayMembershipDeniedError(error)) {
         try {

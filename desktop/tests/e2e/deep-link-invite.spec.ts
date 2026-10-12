@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 import { PRODUCT_NAME } from "../../src/shared/constants/brand";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
@@ -417,4 +417,176 @@ test("persisted deep-link invite hands off to Joining after machine onboarding",
 
   // The claim was attempted and its failure surfaced with a Retry.
   await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+});
+
+// Guest mode: someone who joins a community through an invite gets no
+// private Welcome channel, Welcome Team or kickoff, and lands in a channel
+// the owner set up for them.
+
+const GUEST_STORAGE_KEY = `buzz-community-guest.v1:${encodeURIComponent(
+  COMMUNITY_RELAY_URL,
+)}:${DEFAULT_MOCK_PUBKEY}`;
+// The fixture's most recently active channel this member belongs to, other
+// than #general and #welcome-everyone.
+const GUEST_LANDING_CHANNEL_ID = "fa11bac0-0000-4000-8000-000000000012";
+
+async function commandCount(page: Page, command: string) {
+  return page.evaluate(
+    (target) =>
+      window.__BUZZ_E2E_COMMANDS__?.filter((entry) => entry === target)
+        .length ?? 0,
+    command,
+  );
+}
+
+async function seedInviteTransaction(
+  page: Page,
+  stage: "claiming" | "profile",
+) {
+  await page.addInitScript(
+    ({ pubkey, relayUrl, stage, storageKey }) => {
+      window.localStorage.setItem(
+        `buzz-machine-onboarding-complete.v2:${pubkey}`,
+        "true",
+      );
+      const timestamp = new Date().toISOString();
+      window.localStorage.setItem(
+        storageKey,
+        JSON.stringify({
+          id: `txn-guest-${stage}`,
+          source: "deep-link-join",
+          stage,
+          relayUrl,
+          inviteCode: "abc.def",
+          communityName: "hive",
+          ...(stage === "profile"
+            ? { communityId: "e2e-default-community" }
+            : {}),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    },
+    {
+      pubkey: DEFAULT_MOCK_PUBKEY,
+      relayUrl: COMMUNITY_RELAY_URL,
+      stage,
+      storageKey: TRANSACTION_STORAGE_KEY,
+    },
+  );
+}
+
+async function expectGuestLanding(page: Page) {
+  await expect(page.getByTestId("community-onboarding-flow")).toHaveCount(0);
+  await expect(page).toHaveURL(
+    new RegExp(`#/channels/${GUEST_LANDING_CHANNEL_ID}$`),
+  );
+  await expect(page.getByTestId("chat-title")).toHaveText("all-replies");
+  await expect(page.getByTestId("channel-Welcome")).toHaveCount(0);
+  // Guest mode is remembered for this community, whatever the identity.
+  expect(
+    await page.evaluate(
+      (prefix) =>
+        Object.keys(window.localStorage).filter(
+          (key) =>
+            key.startsWith(prefix) &&
+            window.localStorage.getItem(key) === "true",
+        ).length,
+      GUEST_STORAGE_KEY.slice(0, GUEST_STORAGE_KEY.lastIndexOf(":") + 1),
+    ),
+  ).toBe(1);
+  // Nothing is created in the guest's name: no private Welcome channel, no
+  // starter channels, no Welcome Team, no kickoff.
+  for (const command of [
+    "create_channel",
+    "ensure_starter_channels",
+    "create_managed_agent",
+    "send_managed_agent_channel_message",
+  ]) {
+    expect(await commandCount(page, command), command).toBe(0);
+  }
+}
+
+function fulfillInviteClaim(page: Page) {
+  return page.route("**/api/invites/claim", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "joined",
+        community_id: "mock-community",
+        host: "hive.example.com",
+        role: "member",
+      }),
+    }),
+  );
+}
+
+test("an invited guest skips the starter team and lands in their channel", async ({
+  page,
+}) => {
+  await seedInviteTransaction(page, "profile");
+  await installMockBridge(
+    page,
+    { profileHasEvent: false },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await expect(
+    page.getByRole("heading", { name: "Build your profile" }),
+  ).toBeVisible();
+  await page.getByTestId("community-profile-name-key").fill("Craig");
+  await page.getByTestId("community-profile-next").click();
+
+  await expectGuestLanding(page);
+  await expect(
+    page.getByRole("heading", { name: "Meet your starter team" }),
+  ).toHaveCount(0);
+});
+
+test("an invited guest with an existing profile still lands as a guest", async ({
+  page,
+}) => {
+  // The default mock identity already has a kind:0 profile, so the claim
+  // skips the profile step and finishes onboarding right after connecting.
+  await fulfillInviteClaim(page);
+  await seedInviteTransaction(page, "claiming");
+  await installMockBridge(page, undefined, {
+    relayWsUrl: COMMUNITY_RELAY_URL,
+    skipCommunitySeed: true,
+    skipOnboardingSeed: true,
+  });
+  await page.goto("/");
+
+  await expectGuestLanding(page);
+});
+
+test("a community admin who uses an invite keeps the starter team", async ({
+  page,
+}) => {
+  await seedInviteTransaction(page, "profile");
+  await installMockBridge(
+    page,
+    {
+      profileHasEvent: false,
+      relayRequiresMembership: true,
+      relayRole: "admin",
+    },
+    { relayWsUrl: COMMUNITY_RELAY_URL, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("community-profile-name-key").fill("Riley");
+  await page.getByTestId("community-profile-next").click();
+
+  await expect(
+    page.getByRole("heading", { name: "Meet your starter team" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      (key) => window.localStorage.getItem(key),
+      GUEST_STORAGE_KEY,
+    ),
+  ).toBeNull();
 });
