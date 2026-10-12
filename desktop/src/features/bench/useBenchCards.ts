@@ -17,6 +17,7 @@ import {
   indexBenchCards,
   isBenchCandidate,
 } from "@/features/bench/lib/benchCards";
+import { benchNeedsYouCount } from "@/features/bench/lib/benchScreen";
 import { invokeTauri } from "@/shared/api/tauri";
 import { isDocumentVisible } from "@/shared/lib/useDocumentVisible";
 
@@ -25,6 +26,8 @@ export const BENCH_CARDS_QUERY_KEY = ["bench-cards"] as const;
 export const BENCH_POLL_INTERVAL_MS = 3_000;
 /** Off #bench the snapshot only gates rendering, so a mount reuses it. */
 const BENCH_IDLE_STALE_MS = 60_000;
+/** The sidebar badge's own cadence, everywhere else in the app. */
+const BENCH_SIDEBAR_POLL_MS = 15_000;
 
 export type BenchAnswerInput = {
   itemId: string;
@@ -101,6 +104,21 @@ export function useBenchAnswer() {
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: BENCH_CARDS_QUERY_KEY }),
   });
+}
+
+/**
+ * The sidebar's Bench badge: null while the Bench is not enabled (the entry
+ * hides), else how many items need the owner. The sidebar is always mounted,
+ * so it refreshes on its own slow timer; the Bench screen's 3 s poll and the
+ * answer mutation refresh the same snapshot faster.
+ */
+export function useBenchNeedsYouCount(): number | null {
+  const { data } = useQuery({
+    ...benchCardsQueryOptions,
+    select: benchNeedsYouCount,
+    refetchInterval: BENCH_SIDEBAR_POLL_MS,
+  });
+  return data ?? null;
 }
 
 /**

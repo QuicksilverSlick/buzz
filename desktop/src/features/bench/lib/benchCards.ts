@@ -183,7 +183,15 @@ export function benchCardMode(
     interactive: false,
     readOnlyReason,
   });
-  if (!card.cardEventId) return readOnly("This card is no longer live.");
+  // Only the Bench screen shows an item without a live card: an answered one
+  // whose card was retired, or one the Bench has yet to (re)post.
+  if (!card.cardEventId) {
+    return readOnly(
+      card.answer
+        ? "This card is no longer live."
+        : "Waiting for the Bench to post this card in #bench.",
+    );
+  }
   if (card.validity === "superseded") {
     return readOnly("Superseded: this card is being retired.");
   }

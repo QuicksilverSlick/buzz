@@ -192,7 +192,13 @@ test("mode: read-only for another viewer, no owner, stale or superseded", () => 
     [card(), null, OWNER, /no owner/],
     [card({ validity: "superseded" }), OWNER, OWNER, /Superseded/],
     [card({ validity: "suspected-stale" }), OWNER, OWNER, /May be stale/],
-    [card({ cardEventId: null }), OWNER, OWNER, /no longer live/],
+    [
+      card({ cardEventId: null, answer: { option: 0, answeredAt: 1 } }),
+      OWNER,
+      OWNER,
+      /no longer live/,
+    ],
+    [card({ cardEventId: null }), OWNER, OWNER, /Waiting for the Bench/],
   ];
   for (const [c, owner, viewer, reason] of cases) {
     const mode = benchCardMode(c, owner, viewer);

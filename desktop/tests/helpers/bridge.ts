@@ -1,5 +1,6 @@
 import type { Page } from "@playwright/test";
 import type { ChannelTemplate, RelayEvent } from "../../src/shared/api/types";
+import type { BenchCards } from "../../src/features/bench/lib/benchCards";
 import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
 import { FEATURE_OVERRIDES_STORAGE_KEY, PREVIEW_FEATURE_IDS } from "./features";
 
@@ -467,6 +468,12 @@ type MockBridgeOptions = {
     scope_value: string;
     kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
   }>;
+  /**
+   * The `bench_cards` snapshot; omitted means the Bench is not enabled. A
+   * spec can replace `window.__BUZZ_E2E__.mock.benchCards` mid-test to play
+   * the Bench's tick recording an answer.
+   */
+  benchCards?: BenchCards;
   /**
    * Event IDs that `get_event` should report as definitively not found.
    * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs
