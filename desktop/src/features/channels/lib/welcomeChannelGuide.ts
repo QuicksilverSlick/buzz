@@ -1,4 +1,5 @@
 import { getChannelDetail } from "@/features/channels/lib/channelDescription";
+import { isEphemeralChannel } from "@/features/channels/lib/ephemeralChannel";
 import {
   canManageCommunityMembers,
   type RelayMembershipLookup,
@@ -29,8 +30,9 @@ export function canBuildCommunity(
 /**
  * The channels listed in #welcome-everyone: every channel the viewer can
  * open (open channels, and private ones they belong to), with its
- * description. Direct messages, archived channels and the welcome channel
- * itself are left out. Sorted by name.
+ * description. Direct messages, archived channels, temporary channels
+ * (huddle rooms among them) and the welcome channel itself are left out.
+ * Sorted by name.
  */
 export function selectWelcomeChannelGuide(
   channels: readonly Channel[],
@@ -42,6 +44,7 @@ export function selectWelcomeChannelGuide(
         channel.id !== welcomeChannelId &&
         channel.channelType !== "dm" &&
         channel.archivedAt === null &&
+        !isEphemeralChannel(channel) &&
         (channel.visibility === "open" || channel.isMember),
     )
     .map((channel) => ({

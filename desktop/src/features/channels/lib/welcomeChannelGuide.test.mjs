@@ -16,6 +16,8 @@ function channel(overrides = {}) {
     name: "chan",
     purpose: null,
     topic: null,
+    ttlDeadline: null,
+    ttlSeconds: null,
     visibility: "open",
     ...overrides,
   };
@@ -40,6 +42,20 @@ test("selectWelcomeChannelGuide keeps only channels the viewer can open", () => 
     { description: "Long posts.", id: "ideas", name: "ideas" },
     { description: null, id: "lounge", name: "lounge" },
   ]);
+});
+
+test("selectWelcomeChannelGuide leaves out temporary channels such as huddle rooms", () => {
+  const channels = [
+    channel({ name: "general" }),
+    // A huddle room: private, temporary, and the viewer is in it.
+    channel({ name: "huddle-1a2b", visibility: "private", ttlSeconds: 3600 }),
+    channel({ name: "launch-week", ttlDeadline: "2026-01-08T00:00:00Z" }),
+  ];
+
+  assert.deepEqual(
+    selectWelcomeChannelGuide(channels, "welcome").map((entry) => entry.name),
+    ["general"],
+  );
 });
 
 test("selectWelcomeChannelGuide uses the description before topic and purpose", () => {

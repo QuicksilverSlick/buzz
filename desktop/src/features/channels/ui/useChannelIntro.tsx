@@ -9,7 +9,7 @@ import {
 } from "@/features/channels/lib/welcomeChannelGuide";
 import {
   mergeOpenChannelDirectory,
-  useOpenChannelDirectoryQuery,
+  useWarmOpenChannelDirectory,
 } from "@/features/channels/openChannelDirectory";
 import {
   getChannelIntroDescription,
@@ -67,9 +67,10 @@ export function useChannelIntro({
   const isStarterWelcome = isStarterWelcomeChannel(activeChannel);
   const canBuild = canBuildCommunity(useMyRelayMembershipLookupQuery().data);
   const memberChannels = useChannelsQuery().data ?? NO_CHANNELS;
-  const directoryChannels = useOpenChannelDirectoryQuery({
-    enabled: isStarterWelcome,
-  }).data;
+  // Cache only: open channels the viewer hasn't joined appear once Browse
+  // channels or search has loaded the directory. Opening #welcome-everyone
+  // never starts the all-open relay scan itself.
+  const directoryChannels = useWarmOpenChannelDirectory();
   const guideChannels = React.useMemo<ChannelIntroChannel[]>(() => {
     if (!isStarterWelcome || !activeChannel) {
       return [];

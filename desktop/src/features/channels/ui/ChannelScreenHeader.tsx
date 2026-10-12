@@ -26,6 +26,7 @@ import {
 } from "@/features/agents/hooks";
 import { ownsAnyAgent } from "@/features/agents/knownAgentPubkeys";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
+import { WELCOME_TEAM_ID } from "@/features/onboarding/welcomeGuide";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
 import { Button } from "@/shared/ui/button";
@@ -140,8 +141,9 @@ export function ChannelScreenHeader({
   const terminalPanel = useTerminalPanel();
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
-  // The terminal is agent tooling. Hide it from people who own no agents,
-  // unless it is already open, so the button can still close it.
+  // The terminal is agent tooling. Hide it from people who own no agents
+  // beyond the Welcome Team that onboarding gives every new member, unless
+  // it is already open, so the button can still close it.
   const showTerminalButton =
     activeChannel !== null &&
     (terminalPanel.mode !== "closed" ||
@@ -149,6 +151,7 @@ export function ChannelScreenHeader({
         managedAgentsQuery.data,
         relayAgentsQuery.data,
         currentPubkey,
+        WELCOME_TEAM_ID,
       ));
   const terminalButton = showTerminalButton ? (
     <Button
