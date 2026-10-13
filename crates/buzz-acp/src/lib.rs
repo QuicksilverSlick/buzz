@@ -6093,7 +6093,7 @@ mod agent_draft_prompt_tests {
     fn shared_base_prompt_teaches_portable_agent_drafts() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.starts_with(
-            "You are an agent operating inside Buzz — a Nostr-based messaging platform for human-agent collaboration.\nBuzz is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
+            "You are an agent operating inside Dreamforge — a Nostr-based messaging platform for human-agent collaboration.\nDreamforge is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
         ));
         assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
@@ -6152,7 +6152,7 @@ mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
+        assert!(prompt.contains("use the person's **exact display name as shown in Dreamforge**"));
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
         assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
         assert!(prompt.contains("--mention <hex-or-npub>"));
