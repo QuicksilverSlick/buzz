@@ -4,14 +4,24 @@ use std::path::Path;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
+const DIR_PREFIX: &str = "buzz-acp-git-";
+/// Held locked for the harness's whole life. The OS drops the lock when the
+/// process exits or is killed, which is how a later harness knows the folder
+/// (and the key inside it) is no longer in use.
+const LOCK_FILE: &str = ".lock";
+
 /// Keep this guard alive until the adapter pool has shut down.
 pub(crate) struct GitEnvironment {
+    // Declared first so it closes before the directory is removed.
+    _lock: std::fs::File,
     _dir: TempDir,
     pub(crate) env: Vec<(String, String)>,
 }
 
 impl GitEnvironment {
     pub(crate) fn for_config(config: &mut crate::config::Config) -> anyhow::Result<Self> {
+        // A killed harness never runs TempDir's Drop, so its key stays behind.
+        remove_stale_dirs(&std::env::temp_dir(), std::time::Duration::from_secs(60));
         let environment =
             Self::install(&config.keys, &config.relay_url, &std::env::current_exe()?)?;
         config
@@ -30,8 +40,10 @@ impl GitEnvironment {
     ) -> anyhow::Result<Self> {
         let agent = GitIdentityMode::from_value(std::env::var_os(GIT_IDENTITY_ENV).as_deref())?
             == GitIdentityMode::Agent;
-        let dir = tempfile::Builder::new().prefix("buzz-acp-git-").tempdir()?;
+        let dir = tempfile::Builder::new().prefix(DIR_PREFIX).tempdir()?;
         set_owner_only(dir.path())?;
+        let lock = std::fs::File::create(dir.path().join(LOCK_FILE))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
         symlink(executable, &dir.path().join("git-credential-nostr"))?;
         if agent {
             symlink(executable, &dir.path().join("git-sign-nostr"))?;
@@ -104,8 +116,75 @@ impl GitEnvironment {
             GIT_IDENTITY_ENV.into(),
             if agent { "agent" } else { "user" }.into(),
         ));
-        Ok(Self { _dir: dir, env })
+        Ok(Self {
+            _lock: lock,
+            _dir: dir,
+            env,
+        })
     }
+}
+
+/// Remove `buzz-acp-git-*` folders whose harness is gone.
+///
+/// A folder goes only when its lock is free (no live owner) and it is older
+/// than `min_age`, which is far longer than an owner takes to lock a folder it
+/// has just created. Folders without a lock file predate it; a live owner of
+/// one cannot be told apart from a dead one, so they are left alone.
+fn remove_stale_dirs(parent: &Path, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(DIR_PREFIX) || !is_own_key_dir(&entry) {
+            continue;
+        }
+        let Ok(lock) = std::fs::File::open(path.join(LOCK_FILE)) else {
+            continue;
+        };
+        let old_enough = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !old_enough || fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            continue;
+        }
+        drop(lock);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(path = %path.display(), "removed a stale Git key folder"),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not remove a stale Git key folder")
+            }
+        }
+    }
+}
+
+/// The temp dir can be shared (Linux /tmp), so only judge a real directory (not a
+/// symlink) that only we can write, holding a regular `.lock` file: a planted
+/// symlink or FIFO could otherwise redirect the sweep or block harness start.
+fn is_own_key_dir(entry: &std::fs::DirEntry) -> bool {
+    // DirEntry::file_type does not follow symlinks (or Windows junctions).
+    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        return false;
+    }
+    let lock_is_file = std::fs::symlink_metadata(entry.path().join(LOCK_FILE))
+        .is_ok_and(|meta| meta.file_type().is_file());
+    lock_is_file && owned_by_us_only(&entry.path())
+}
+
+#[cfg(unix)]
+fn owned_by_us_only(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.uid() == nix::unistd::getuid().as_raw() && meta.mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn owned_by_us_only(_: &Path) -> bool {
+    // %TEMP% is per-user on Windows.
+    true
 }
 
 struct KeyInfo {
@@ -779,5 +858,89 @@ mod git_identity_mode_tests {
                 "{err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_dir_tests {
+    use super::{remove_stale_dirs, set_owner_only, DIR_PREFIX, LOCK_FILE};
+    use std::{fs::File, path::Path, time::Duration};
+
+    fn key_dir(parent: &Path, name: &str, with_lock: bool) -> std::path::PathBuf {
+        let dir = parent.join(format!("{DIR_PREFIX}{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        set_owner_only(&dir).unwrap();
+        std::fs::write(dir.join(".nostr-key"), "secret").unwrap();
+        if with_lock {
+            File::create(dir.join(LOCK_FILE)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn only_folders_whose_owner_is_gone_are_removed() {
+        let parent = tempfile::tempdir().unwrap();
+        let running = key_dir(parent.path(), "running", true);
+        let killed = key_dir(parent.path(), "killed", true);
+        let legacy = key_dir(parent.path(), "legacy", false);
+        let unrelated = parent.path().join("other-killed");
+        std::fs::create_dir(&unrelated).unwrap();
+        File::create(unrelated.join(LOCK_FILE)).unwrap();
+        // Stands in for a live harness: it holds its lock until it exits.
+        let held = File::open(running.join(LOCK_FILE)).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        // Too young: an owner may not have taken its lock yet.
+        remove_stale_dirs(parent.path(), Duration::from_secs(3600));
+        assert!(killed.exists(), "a folder younger than min_age must stay");
+
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(!killed.exists(), "a dead harness's folder must be removed");
+        assert!(
+            running.join(".nostr-key").exists(),
+            "a running harness keeps its key"
+        );
+        assert!(
+            legacy.exists(),
+            "a folder without a lock cannot be judged and must stay"
+        );
+        assert!(
+            unrelated.exists(),
+            "only buzz-acp-git-* folders are touched"
+        );
+
+        // Once the owner exits, its folder is fair game.
+        drop(held);
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(!running.exists());
+    }
+
+    #[test]
+    fn a_lock_that_is_not_a_regular_file_is_left_alone() {
+        let parent = tempfile::tempdir().unwrap();
+        let odd = key_dir(parent.path(), "odd", false);
+        std::fs::create_dir(odd.join(LOCK_FILE)).unwrap();
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(odd.join(".nostr-key").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_or_shared_folders_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = key_dir(elsewhere.path(), "target", true);
+        std::os::unix::fs::symlink(&target, parent.path().join(format!("{DIR_PREFIX}link")))
+            .unwrap();
+        let shared = key_dir(parent.path(), "shared", true);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(
+            target.join(".nostr-key").exists(),
+            "a symlink is never followed"
+        );
+        assert!(shared.exists(), "a folder others can write is not judged");
     }
 }

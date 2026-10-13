@@ -382,30 +382,33 @@ enum SiblingVerdict {
 /// current event and arms a bounded retry deadline, so a transient relay
 /// outage cannot poison a sibling for the process lifetime and a persistent
 /// one cannot turn every sibling event into an inline relay round-trip.
-async fn is_owner_or_sibling(
+///
+/// `None` means the author could not be checked (the lookup failed or is
+/// throttled after one). Callers fail closed on it, but it is not a verdict.
+async fn owner_or_sibling(
     author: &str,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
-) -> bool {
+) -> Option<bool> {
     let my_owner = match owner_cache.get() {
         Some(o) => o,
-        None => return false, // no owner configured — fail closed
+        None => return Some(false), // no owner configured — fail closed
     };
 
     // Direct owner check.
     if author == my_owner {
-        return true;
+        return Some(true);
     }
 
     // Check sibling cache.
     match owner_cache.sibling_state(author) {
-        SiblingCacheState::Proven(is_sibling) => return is_sibling,
+        SiblingCacheState::Proven(is_sibling) => return Some(is_sibling),
         SiblingCacheState::Throttled => {
             tracing::debug!(
                 author,
                 "sibling check throttled after an indeterminate lookup — denying without a relay query"
             );
-            return false;
+            return None;
         }
         SiblingCacheState::Unknown => {}
     }
@@ -414,11 +417,11 @@ async fn is_owner_or_sibling(
     match check_sibling_via_profile(author, my_owner, rest_client).await {
         SiblingVerdict::Sibling => {
             owner_cache.cache_sibling(author.to_string(), true);
-            true
+            Some(true)
         }
         SiblingVerdict::NotSibling => {
             owner_cache.cache_sibling(author.to_string(), false);
-            false
+            Some(false)
         }
         SiblingVerdict::Indeterminate => {
             let backoff = owner_cache.note_indeterminate(author);
@@ -428,9 +431,21 @@ async fn is_owner_or_sibling(
                 "sibling check indeterminate — relay profile query failed; \
                  dropping this event without a proven verdict, retrying after backoff"
             );
-            false
+            None
         }
     }
+}
+
+/// [`owner_or_sibling`] failing closed, as the tests below pin it.
+#[cfg(test)]
+async fn is_owner_or_sibling(
+    author: &str,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> bool {
+    owner_or_sibling(author, owner_cache, rest_client)
+        .await
+        .unwrap_or(false)
 }
 
 /// Return the workflow owner attributed by a relay-signed workflow message.
@@ -535,15 +550,27 @@ fn effective_prompt_author(
 /// dropping the load inside it fails the construction regressions.
 mod inbound_author_gate {
     use super::{
-        effective_prompt_author, is_dm_channel, is_owner_or_sibling, pool, refresh_relay_self,
-        relay, OwnerCache, RespondTo,
+        effective_prompt_author, is_dm_channel, owner_or_sibling, pool, refresh_relay_self, relay,
+        OwnerCache, RespondTo,
     };
     use std::collections::HashSet;
 
     pub(crate) struct InboundAuthorGateDecision {
         pub(crate) effective_author: String,
         pub(crate) allowed: bool,
+        /// Denied only because the author could not be checked, not by policy.
+        pub(crate) unverified: bool,
         pub(crate) is_dm: bool,
+    }
+
+    /// Why the gate turned an event away.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum GateRefusal {
+        /// The configured policy does not accept this author.
+        Policy,
+        /// The author could not be checked (a relay lookup failed). Fails
+        /// closed, but says nothing about whether the author is accepted.
+        Unverified,
     }
 
     /// An event that passed the complete listener author boundary.
@@ -568,6 +595,7 @@ mod inbound_author_gate {
     ///
     /// This stays private to the gate module so neither listener can bypass
     /// workflow attribution by calling the raw-signer policy directly.
+    /// `None` means the author could not be checked.
     async fn author_allowed(
         respond_to: &RespondTo,
         allowlist: &HashSet<String>,
@@ -575,21 +603,19 @@ mod inbound_author_gate {
         is_dm: bool,
         owner_cache: &OwnerCache,
         rest_client: &relay::RestClient,
-    ) -> bool {
+    ) -> Option<bool> {
         if is_dm {
             return match respond_to {
-                RespondTo::Nobody => false,
-                _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
+                RespondTo::Nobody => Some(false),
+                _ => owner_or_sibling(author, owner_cache, rest_client).await,
             };
         }
         match respond_to {
-            RespondTo::Anyone => true,
-            RespondTo::Nobody => false,
-            RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
-            RespondTo::Allowlist => {
-                allowlist.contains(author)
-                    || is_owner_or_sibling(author, owner_cache, rest_client).await
-            }
+            RespondTo::Anyone => Some(true),
+            RespondTo::Nobody => Some(false),
+            RespondTo::OwnerOnly => owner_or_sibling(author, owner_cache, rest_client).await,
+            RespondTo::Allowlist if allowlist.contains(author) => Some(true),
+            RespondTo::Allowlist => owner_or_sibling(author, owner_cache, rest_client).await,
         }
     }
 
@@ -611,6 +637,7 @@ mod inbound_author_gate {
             rest_client,
         )
         .await
+        .unwrap_or(false)
     }
 
     pub(crate) struct InboundAuthorGate {
@@ -704,7 +731,7 @@ mod inbound_author_gate {
         ) -> InboundAuthorGateDecision {
             let effective_author =
                 effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex);
-            let allowed = author_allowed(
+            let verdict = author_allowed(
                 respond_to,
                 allowlist,
                 &effective_author,
@@ -715,7 +742,8 @@ mod inbound_author_gate {
             .await;
             InboundAuthorGateDecision {
                 effective_author,
-                allowed,
+                allowed: verdict == Some(true),
+                unverified: verdict.is_none(),
                 is_dm,
             }
         }
@@ -728,7 +756,7 @@ mod inbound_author_gate {
             owner_cache: &OwnerCache,
             channel_info: &pool::ChannelInfoResolver,
             rest_client: &relay::RestClient,
-        ) -> Option<AuthorizedListenerEvent> {
+        ) -> Result<AuthorizedListenerEvent, GateRefusal> {
             let decision = self
                 .evaluate_listener_event(
                     &buzz_event,
@@ -749,11 +777,16 @@ mod inbound_author_gate {
                     effective_author = %decision.effective_author,
                     mode = %respond_to,
                     is_dm = decision.is_dm,
+                    unverified = decision.unverified,
                     "inbound author gate — dropping event"
                 );
-                return None;
+                return Err(if decision.unverified {
+                    GateRefusal::Unverified
+                } else {
+                    GateRefusal::Policy
+                });
             }
-            Some(AuthorizedListenerEvent {
+            Ok(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
             })
@@ -782,7 +815,7 @@ mod inbound_author_gate {
     }
 }
 
-use inbound_author_gate::{AuthorizedListenerEvent, InboundAuthorGate};
+use inbound_author_gate::{AuthorizedListenerEvent, GateRefusal, InboundAuthorGate};
 
 struct AuthorizedNormalListenerEvent(AuthorizedListenerEvent);
 
@@ -964,7 +997,7 @@ async fn authorize_normal_listener_event(
     owner_cache: &OwnerCache,
     channel_info: &pool::ChannelInfoResolver,
     rest_client: &relay::RestClient,
-) -> Option<AuthorizedListenerEvent> {
+) -> Result<AuthorizedListenerEvent, GateRefusal> {
     author_gate
         .authorize_listener_event(
             buzz_event,
@@ -3740,7 +3773,7 @@ async fn run_harness(
                             let inbound_kind = buzz_event.event.kind.as_u16();
                             let inbound_author = buzz_event.event.pubkey.to_hex();
                             let inbound_thread_tags = queue::parse_thread_tags(&buzz_event.event);
-                            let Some(authorized_event) = authorize_normal_listener_event(
+                            let authorized = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
                                 &config.respond_to,
@@ -3749,18 +3782,23 @@ async fn run_harness(
                                 &ctx.channel_info,
                                 &ctx.rest_client,
                             )
-                            .await
-                            else {
+                            .await;
+                            let refusal = authorized.as_ref().err().copied();
+                            let Ok(authorized_event) = authorized else {
                                 // The gate logs the drop at debug, which leaves
                                 // the sender waiting on an answer that will never
                                 // come and the owner unaware anyone tried. One
                                 // notice per (channel, author) says so out loud
                                 // without letting a noisy author turn the agent
-                                // into a flooder.
-                                if remember_gate_notice(
-                                    &mut gate_notified,
-                                    (inbound_channel_id, inbound_author),
-                                ) {
+                                // into a flooder. A failed lookup is not a
+                                // refusal, so it gets no notice: "not set up to
+                                // take requests from you" would be false.
+                                if gate_notice_due(refusal)
+                                    && remember_gate_notice(
+                                        &mut gate_notified,
+                                        (inbound_channel_id, inbound_author),
+                                    )
+                                {
                                     let is_dm =
                                         is_dm_channel(inbound_channel_id, &ctx.channel_info).await;
                                     // Never mention the owner in a DM: that would
@@ -4064,6 +4102,7 @@ async fn run_harness(
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    &mut last_activity,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -5299,6 +5338,11 @@ fn remember_gate_notice(seen: &mut HashSet<(Uuid, String)>, key: (Uuid, String))
     true
 }
 
+/// Whether a gate refusal earns the "not set up to take requests" notice.
+fn gate_notice_due(refusal: Option<GateRefusal>) -> bool {
+    refusal == Some(GateRefusal::Policy)
+}
+
 /// What someone outside the author gate is told.
 ///
 /// Says what happened, what it means for them, and what happens next — without
@@ -5406,7 +5450,14 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    last_activity: &mut tokio::time::Instant,
 ) -> LoopAction {
+    // Start a full idle interval when channel work settles, before releasing
+    // its in-flight guard. Heartbeats must not keep an otherwise idle pool alive.
+    match &result.source {
+        PromptSource::Channel(_) => *last_activity = tokio::time::Instant::now(),
+        PromptSource::Heartbeat => {}
+    }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -6042,7 +6093,7 @@ mod agent_draft_prompt_tests {
     fn shared_base_prompt_teaches_portable_agent_drafts() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.starts_with(
-            "You are an agent operating inside Buzz — a Nostr-based messaging platform for human-agent collaboration.\nBuzz is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
+            "You are an agent operating inside Dreamforge — a Nostr-based messaging platform for human-agent collaboration.\nDreamforge is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
         ));
         assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
@@ -6101,7 +6152,7 @@ mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
+        assert!(prompt.contains("use the person's **exact display name as shown in Dreamforge**"));
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
         assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
         assert!(prompt.contains("--mention <hex-or-npub>"));
@@ -7730,7 +7781,7 @@ mod author_gate_tests {
                 .await
             }
         };
-        let result = authorized.map(|event| event.into_parts().1);
+        let result = authorized.ok().map(|event| event.into_parts().1);
         server.abort();
         let allowed = result.is_some();
         (result, allowed)
@@ -8678,6 +8729,70 @@ mod author_gate_tests {
             channel.contains("owner"),
             "channel notice should say the owner was flagged: {channel}"
         );
+    }
+
+    /// "I'm not set up to take requests from you" is a policy statement. When
+    /// the author could not be checked (the relay lookup failed), saying it
+    /// would be false — the sender may well be a same-owner agent.
+    #[tokio::test]
+    async fn test_gate_notice_only_for_a_checked_refusal() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let (profile_rest, server) =
+            sibling_query_server(serde_json::json!([{ "tags": [] }])).await;
+        // A fetched profile without the owner's attestation is a real refusal;
+        // an unreachable relay is not, on the lookup and while throttled after it.
+        let cases = [
+            (profile_rest, GateRefusal::Policy, 1),
+            (dummy_rest_client(), GateRefusal::Unverified, 2),
+        ];
+        for (rest, expected, events) in cases {
+            let mut gate = InboundAuthorGate::connect(&rest, &agent, "test").await;
+            let owner_cache = OwnerCache::new(Some(owner.clone()));
+            let channel_info = pool::ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "project".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )]),
+                rest.clone(),
+            );
+            let author = nostr::Keys::generate();
+            for _ in 0..events {
+                let event = relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event: nostr::EventBuilder::new(
+                        nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                        "please review",
+                    )
+                    .sign_with_keys(&author)
+                    .unwrap(),
+                };
+                let refusal = authorize_normal_listener_event(
+                    &mut gate,
+                    event,
+                    &RespondTo::OwnerOnly,
+                    &HashSet::new(),
+                    &owner_cache,
+                    &channel_info,
+                    &rest,
+                )
+                .await
+                .err();
+                assert_eq!(refusal, Some(expected));
+                assert_eq!(
+                    gate_notice_due(refusal),
+                    expected == GateRefusal::Policy,
+                    "{expected:?}"
+                );
+            }
+        }
+        server.abort();
     }
 
     #[test]
@@ -10539,6 +10654,30 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn git_key_folder_stays_locked_while_its_harness_runs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let git = install_git_with_env(&test_config(), &[]).unwrap();
+        let keyfile = &git
+            .env
+            .windows(2)
+            .find(|pair| pair[0].1 == "nostr.keyfile")
+            .unwrap()[1]
+            .1;
+        let dir = std::path::Path::new(keyfile)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let lock = std::fs::File::open(dir.join(".lock")).unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&lock).is_err(),
+            "a running harness must hold its folder's lock, or a sweep would delete its key"
+        );
+        drop(lock);
+        drop(git);
+        assert!(!dir.exists(), "a clean exit still removes the folder");
+    }
+
+    #[test]
     fn invalid_git_identity_mode_fails_install() {
         let _guard = ENV_LOCK.lock().unwrap();
         let err = install_git_with_env(
@@ -11637,6 +11776,114 @@ mod error_outcome_emission_tests {
         agent.state.set_scope_owner_generation(scope, generation);
     }
 
+    // Exercise result handling and both production idle decisions with a fake clock.
+    // No relay or provider is used; cat supplies only an owned process handle.
+    async fn assert_completion_idle_window(channel_turn: bool) {
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        if channel_turn {
+            bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        }
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: channel_turn.then_some(channel_id),
+                scope: channel_turn.then_some(scope.clone()),
+                turn_id: "idle-window".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = !channel_turn;
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let bound = Duration::from_secs(30);
+        let mut last_activity = tokio::time::Instant::now();
+        tokio::time::advance(bound * 2).await;
+        let completed_at = tokio::time::Instant::now();
+        let result = PromptResult {
+            agent,
+            source: if channel_turn {
+                PromptSource::Channel(scope)
+            } else {
+                PromptSource::Heartbeat
+            },
+            turn_id: "idle-window".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut last_activity,
+        );
+        // Match the main loop: consume finished prompt tasks before the idle check.
+        while pool.join_set.join_next().await.is_some() {}
+        assert!(pool.task_map().is_empty());
+        assert!(!heartbeat_in_flight);
+        assert!(!queue.has_undispatched_work());
+        let sleep_due = |now| {
+            idle_pool_sleep_due(
+                true,
+                last_activity,
+                now,
+                bound,
+                heartbeat_in_flight,
+                !pool.join_set.is_empty(),
+                queue.has_undispatched_work(),
+                any_respawn_in_flight(&crash_history),
+            )
+        };
+        assert_eq!(sleep_due(completed_at), !channel_turn);
+        assert_eq!(
+            inactivity_expired(last_activity, completed_at, bound, false),
+            !channel_turn
+        );
+        if channel_turn {
+            assert_eq!(last_activity, completed_at);
+            assert!(!sleep_due(completed_at + bound - Duration::from_millis(1)));
+        }
+        assert!(sleep_due(completed_at + bound));
+        assert!(inactivity_expired(
+            last_activity,
+            completed_at + bound,
+            bound,
+            false
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_channel_turn_gets_a_full_bounded_idle_window() {
+        assert_completion_idle_window(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_heartbeat_does_not_extend_the_idle_window() {
+        assert_completion_idle_window(false).await;
+    }
+
     #[tokio::test]
     async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
         let channel_id = Uuid::new_v4();
@@ -11708,6 +11955,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11788,6 +12036,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11909,6 +12158,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
@@ -11978,6 +12228,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let turn_errors: Vec<_> = observer
@@ -12247,6 +12498,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 Some(observer.clone()),
                 None,
+                &mut tokio::time::Instant::now(),
             );
             let events = observer.snapshot();
             let turn_error = events.iter().find(|e| e.kind == "turn_error").unwrap();
@@ -12342,6 +12594,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             );
             (
                 queue.pending_channels(),
@@ -12451,6 +12704,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             );
             (
                 queue.pending_channels(),
@@ -12546,6 +12800,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let events = observer.snapshot();
@@ -12643,6 +12898,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         let events = observer.snapshot();
@@ -12764,6 +13020,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // Batch preserved as a cancelled merge, not dead-lettered — same
@@ -12900,6 +13157,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // No batch to merge — the queue has nothing pending for any channel.
@@ -13031,6 +13289,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                &mut tokio::time::Instant::now(),
             ),
             LoopAction::Continue
         ));
@@ -13183,6 +13442,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // The batch must not be requeued: pending_channels returns 0.
@@ -13291,6 +13551,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             Some(&rest),
+            &mut tokio::time::Instant::now(),
         );
 
         // The batch must not be requeued: pending_channels returns 0.
@@ -13562,6 +13823,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            &mut tokio::time::Instant::now(),
         );
 
         // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
