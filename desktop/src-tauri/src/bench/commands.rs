@@ -285,6 +285,7 @@ pub(crate) async fn bench_answer(
         owner: state.signing_keys()?,
         writer: super::writer_keys()?,
         root,
+        agents: Vec::new(),
     };
     let now = nostr::Timestamp::now().as_secs();
     answer_card(&ctx, &s, &item_id, option, now).await

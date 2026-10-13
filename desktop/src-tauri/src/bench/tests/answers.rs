@@ -214,11 +214,13 @@ fn m1_state_loads() {
     let mut item = check(&[]).unwrap();
     let mut v = serde_json::to_value(&item).unwrap();
     let o = v.as_object_mut().unwrap();
-    for field in ["answer", "recorded", "quietRepost"] {
+    for field in ["answer", "recorded", "quietRepost", "routed", "changedAt"] {
         assert!(o.remove(field).is_some(), "{field}");
     }
     let loaded: Item = serde_json::from_value(v).unwrap();
     assert!(loaded.answer.is_none() && loaded.recorded.is_none() && !loaded.quiet_repost);
+    // An item answered before routing existed is due at once (changedAt 0).
+    assert!(loaded.routed.is_none() && loaded.changed_at == 0);
     // And the M2 fields round-trip in camelCase.
     item.answer = answered(1, 7);
     item.recorded = Some(1);
