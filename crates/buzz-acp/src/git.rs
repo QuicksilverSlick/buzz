@@ -136,7 +136,7 @@ fn remove_stale_dirs(parent: &Path, min_age: std::time::Duration) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !entry.file_name().to_string_lossy().starts_with(DIR_PREFIX) || !path.is_dir() {
+        if !entry.file_name().to_string_lossy().starts_with(DIR_PREFIX) || !is_own_key_dir(&entry) {
             continue;
         }
         let Ok(lock) = std::fs::File::open(path.join(LOCK_FILE)) else {
@@ -159,6 +159,32 @@ fn remove_stale_dirs(parent: &Path, min_age: std::time::Duration) {
             }
         }
     }
+}
+
+/// The temp dir can be shared (Linux /tmp), so only judge a real directory (not a
+/// symlink) that only we can write, holding a regular `.lock` file: a planted
+/// symlink or FIFO could otherwise redirect the sweep or block harness start.
+fn is_own_key_dir(entry: &std::fs::DirEntry) -> bool {
+    // DirEntry::file_type does not follow symlinks (or Windows junctions).
+    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        return false;
+    }
+    let lock_is_file = std::fs::symlink_metadata(entry.path().join(LOCK_FILE))
+        .is_ok_and(|meta| meta.file_type().is_file());
+    lock_is_file && owned_by_us_only(&entry.path())
+}
+
+#[cfg(unix)]
+fn owned_by_us_only(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.uid() == nix::unistd::getuid().as_raw() && meta.mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn owned_by_us_only(_: &Path) -> bool {
+    // %TEMP% is per-user on Windows.
+    true
 }
 
 struct KeyInfo {
@@ -837,12 +863,13 @@ mod git_identity_mode_tests {
 
 #[cfg(test)]
 mod stale_dir_tests {
-    use super::{remove_stale_dirs, DIR_PREFIX, LOCK_FILE};
+    use super::{remove_stale_dirs, set_owner_only, DIR_PREFIX, LOCK_FILE};
     use std::{fs::File, path::Path, time::Duration};
 
     fn key_dir(parent: &Path, name: &str, with_lock: bool) -> std::path::PathBuf {
         let dir = parent.join(format!("{DIR_PREFIX}{name}"));
         std::fs::create_dir(&dir).unwrap();
+        set_owner_only(&dir).unwrap();
         std::fs::write(dir.join(".nostr-key"), "secret").unwrap();
         if with_lock {
             File::create(dir.join(LOCK_FILE)).unwrap();
@@ -886,5 +913,34 @@ mod stale_dir_tests {
         drop(held);
         remove_stale_dirs(parent.path(), Duration::ZERO);
         assert!(!running.exists());
+    }
+
+    #[test]
+    fn a_lock_that_is_not_a_regular_file_is_left_alone() {
+        let parent = tempfile::tempdir().unwrap();
+        let odd = key_dir(parent.path(), "odd", false);
+        std::fs::create_dir(odd.join(LOCK_FILE)).unwrap();
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(odd.join(".nostr-key").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_or_shared_folders_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = key_dir(elsewhere.path(), "target", true);
+        std::os::unix::fs::symlink(&target, parent.path().join(format!("{DIR_PREFIX}link")))
+            .unwrap();
+        let shared = key_dir(parent.path(), "shared", true);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        remove_stale_dirs(parent.path(), Duration::ZERO);
+        assert!(
+            target.join(".nostr-key").exists(),
+            "a symlink is never followed"
+        );
+        assert!(shared.exists(), "a folder others can write is not judged");
     }
 }
