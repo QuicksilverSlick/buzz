@@ -130,6 +130,9 @@ pub(crate) struct BenchState {
     strays: Vec<String>,
     /// routes.json entries refused this tick, as `<writer>: <reason>`.
     unroutable: Vec<String>,
+    /// No notice before this: an agent never sees events from before it
+    /// subscribes, so a launch (rebuild) or a join holds them one settle.
+    routes_held_until: u64,
     last_tick: String,
     last_error: Option<String>,
 }
@@ -638,6 +641,7 @@ async fn bootstrap(
         }
         post_as_owner(ctx, events::build_add_member(ch, &hex, None)?).await?;
         s.members_added.push(hex);
+        s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
         // The relay stamps a member_joined row after the 9000: repost the
         // board so it stays newest.
         s.board_dirty = true;
@@ -672,6 +676,7 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     s.board = r.board;
     s.strays = r.stray_ids;
     s.needs_rebuild = false;
+    s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
     // The partial map is kept; the Err is how state.json learns of the cut.
     if events.len() as u32 >= RECOVER_LIMIT {
         return Err(format!(
@@ -952,7 +957,7 @@ async fn publish(
         else {
             continue;
         };
-        if !item::route_due(&item, now) {
+        if now < s.routes_held_until || !item::route_due(&item, now) {
             continue;
         }
         if !spend(budget, 1) {

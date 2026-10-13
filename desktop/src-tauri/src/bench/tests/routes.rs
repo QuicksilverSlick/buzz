@@ -397,3 +397,43 @@ async fn notice_for_a_deleted_card_goes_top_level() {
     assert!(b.s.items[ITEM].routed.is_some());
     assert!(settle_past(&mut b, 2).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_join_or_a_launch_holds_notices_one_settle() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    let mv = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&mv]);
+    b.tick().await.unwrap();
+    // Settled before the route existed: the agent only sees #bench from its
+    // join on, so the notice waits a settle after the join.
+    b.now += ROUTE_SETTLE_SECS;
+    route(&mut b);
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert_eq!(b.kinds()[before], 9000);
+    b.now += ROUTE_SETTLE_SECS - 4;
+    b.tick().await.unwrap();
+    assert!(notices(&b, before).is_empty());
+    b.tick().await.unwrap();
+    assert_eq!(notices(&b, before).len(), 1);
+
+    // A change that settled while the app was closed waits a settle after
+    // the launch (every launch rebuilds), when the agent is listening again.
+    reply(&b, &[]);
+    b.tick().await.unwrap();
+    let stay = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now + 1);
+    reply(&b, &[&stay]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.s.needs_rebuild = true;
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS - 4;
+    b.tick().await.unwrap();
+    assert!(notices(&b, before).is_empty());
+    b.tick().await.unwrap();
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).starts_with("Bench answer changed"));
+}
