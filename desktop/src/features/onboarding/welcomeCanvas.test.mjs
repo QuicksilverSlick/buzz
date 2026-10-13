@@ -13,7 +13,12 @@ test("welcome canvas covers purpose, agent use, a first challenge, and help", ()
   assert.match(WELCOME_CANVAS_CONTENT, /quick challenge/i);
   assert.match(
     WELCOME_CANVAS_CONTENT,
-    new RegExp(`${PRODUCT_NAME} user guide`, "i"),
+    new RegExp(`${PRODUCT_NAME} guest guide`, "i"),
+  );
+  assert.ok(
+    WELCOME_CANVAS_CONTENT.includes(
+      "(https://github.com/QuicksilverSlick/buzz/blob/main/docs/guest-guide.md)",
+    ),
   );
 });
 

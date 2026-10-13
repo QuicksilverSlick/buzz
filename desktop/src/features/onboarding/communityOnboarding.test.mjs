@@ -78,9 +78,57 @@ test("same-relay ingress resumes rather than replacing progress", () => {
     new Date("2026-07-16T00:02:00Z"),
   );
   assert.equal(resumed.id, progressed.id);
-  assert.equal(resumed.stage, "profile");
   assert.equal(resumed.communityId, "community-id");
   assert.equal(resumed.inviteCode, "new-code");
+  // The new code is claimed before guest entry relies on it.
+  assert.equal(resumed.stage, "claiming");
+});
+
+test("a same-relay invite keeps progress unless its code is new", () => {
+  const storage = createMemoryStorage();
+  const first = startCommunityOnboarding(
+    {
+      source: "deep-link-join",
+      relayUrl: "wss://relay.example",
+      inviteCode: "first-code",
+      policyReceipt: "receipt-for-first-code",
+    },
+    storage,
+  );
+  updateCommunityOnboardingTransaction(
+    first,
+    { stage: "profile", error: "Not a member yet" },
+    storage,
+  );
+
+  // Opening the same link again resumes where it was.
+  const reopened = startCommunityOnboarding(
+    {
+      source: "deep-link-join",
+      relayUrl: "wss://relay.example",
+      inviteCode: " first-code ",
+    },
+    storage,
+  );
+  assert.equal(reopened.stage, "profile");
+  assert.equal(reopened.policyReceipt, "receipt-for-first-code");
+  assert.equal(reopened.error, undefined);
+
+  // A different code, such as one redeemed on the membership-denied screen,
+  // is claimed, and never with the receipt minted for the old code.
+  const redeemed = startCommunityOnboarding(
+    {
+      source: "membership-recovery",
+      relayUrl: "wss://relay.example",
+      inviteCode: "second-code",
+    },
+    storage,
+  );
+  assert.equal(redeemed.id, first.id);
+  assert.equal(redeemed.stage, "claiming");
+  assert.equal(redeemed.inviteCode, "second-code");
+  assert.equal(redeemed.policyReceipt, undefined);
+  assert.equal(loadCommunityOnboardingTransaction(storage)?.stage, "claiming");
 });
 
 test("stale asynchronous updates cannot mutate a replacement transaction", () => {

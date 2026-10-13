@@ -454,7 +454,7 @@ fn collect_missing_requirements(
             "complete Claude Code authentication by running the Claude CLI",
             rt,
         ),
-        "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
+        "codex" => cli_login::codex_requirements(rt, &effective.env),
         _ => vec![],
     }
 }
@@ -1013,7 +1013,7 @@ mod tests {
         // Use a not-installed runtime so the requirement is always emitted
         // regardless of whether codex is on the test machine's PATH.
         let rt = make_cli_runtime(&["__buzz_nonexistent_adapter_xyz789__"], None);
-        let reqs = cli_login::requirements(&["codex", "login", "status"], "run `codex login`", &rt);
+        let reqs = cli_login::codex_requirements(&rt, &BTreeMap::new());
         // Whether codex is installed or not, the copy (if any) must not mention OPENAI_API_KEY.
         for req in &reqs {
             if let Requirement::CliLogin { setup_copy, .. } = req {

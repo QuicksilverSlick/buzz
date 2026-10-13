@@ -27,6 +27,7 @@ import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { ChannelAboutPanel } from "@/features/channels/ui/ChannelAboutPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -67,6 +68,9 @@ import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMes
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
+import { resolveWelcomeComposerHint } from "@/features/channels/lib/welcomeComposerHint";
+import { useHasMentionableAgents } from "@/features/channels/ui/useHasMentionableAgents";
+import { useCommunityGuest } from "@/features/onboarding/useIsCommunityGuest";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
@@ -84,6 +88,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   autoSendDraftKey = null,
   onAutoSendComplete = null,
   botTypingEntries,
+  channelAboutOpen = false,
   channelManagementOpen = false,
   currentPubkey,
   editTarget = null,
@@ -232,8 +237,22 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const huddleMemberPubkeysPending =
     agentPubkeysPending && hasOtherDmParticipant(activeChannel, currentPubkey);
-  const isActiveWelcomeChannel =
-    activeChannel !== null && isWelcomeExperience(activeChannel);
+  const communityGuest = useCommunityGuest();
+  const hasMentionableAgents = useHasMentionableAgents(
+    activeChannel,
+    currentPubkey,
+  );
+  const welcomeComposerHint = resolveWelcomeComposerHint({
+    channelType: activeChannel?.channelType ?? null,
+    guestHintDone: communityGuest.agentHintDone,
+    hasMentionableAgents,
+    isGuest: communityGuest.isGuest,
+    isWelcomeChannel:
+      activeChannel !== null && isWelcomeExperience(activeChannel),
+  });
+  // This channel shows a composer hint: the Welcome Team's in the welcome
+  // channels, or a guest's wherever an agent answers them.
+  const isActiveWelcomeChannel = welcomeComposerHint !== null;
   useComposerHeightPadding(
     timelineScrollRef,
     composerWrapperRef,
@@ -243,13 +262,24 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const {
     bannerState: welcomeComposerBannerState,
-    completeBanner: completeWelcomeComposerBanner,
-    dismissBanner: handleDismissWelcomeBanner,
+    completeBanner,
+    dismissBanner,
   } = useWelcomeComposerBanner(
     activeChannelId,
     isActiveWelcomeChannel,
     currentPubkey ?? null,
   );
+  // A guest's hint, once used or dismissed, stays gone in this community.
+  const { markAgentHintDone } = communityGuest;
+  const isGuestAgentHint = welcomeComposerHint === "guest-agents";
+  const completeWelcomeComposerBanner = React.useCallback(() => {
+    completeBanner();
+    if (isGuestAgentHint) markAgentHintDone();
+  }, [completeBanner, isGuestAgentHint, markAgentHintDone]);
+  const handleDismissWelcomeBanner = React.useCallback(() => {
+    dismissBanner();
+    if (isGuestAgentHint) markAgentHintDone();
+  }, [dismissBanner, isGuestAgentHint, markAgentHintDone]);
   const isEditInThread = editTarget?.isThreadReply === true;
   const mainEditTarget = editTarget && !isEditInThread ? editTarget : null;
   const threadEditTarget = editTarget && isEditInThread ? editTarget : null;
@@ -652,7 +682,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               emptyDescription={
                 activeChannel?.channelType === "forum"
                   ? "Select a stream or DM to load real message history in this first integration pass."
-                  : "Messages and sub-replies will appear here once the relay has history for this channel."
+                  : "Messages and sub-replies will appear here once the community server has history for this channel."
               }
               emptyTitle={
                 activeChannel
@@ -738,8 +768,9 @@ export const ChannelPane = React.memo(function ChannelPane({
                     hasComposerBottomActivity && "composer-dock--with-activity",
                   )}
                 >
-                  {isActiveWelcomeChannel && !timeoutActive ? (
+                  {welcomeComposerHint && !timeoutActive ? (
                     <WelcomeComposerGuidanceLayer
+                      hint={welcomeComposerHint}
                       onDismiss={handleDismissWelcomeBanner}
                       settingUp={welcomeKickoffSettingUp}
                       state={welcomeComposerBannerState}
@@ -814,7 +845,21 @@ export const ChannelPane = React.memo(function ChannelPane({
       ) : null}
       {/* Serialize replacements so focus drawers keep one travel direction. */}
       <AnimatePresence mode="wait" onExitComplete={markExitComplete}>
-        {channelManagementOpen && activeChannel ? (
+        {channelManagementOpen && activeChannel && channelAboutOpen ? (
+          wrapAux(
+            <ChannelAboutPanel
+              channel={activeChannel}
+              isSinglePanelView={
+                useSplitAuxiliaryPane ? false : isSinglePanelView
+              }
+              layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+              onClose={() => onCloseChannelManagement?.()}
+              transparentChrome={useSplitAuxiliaryPane}
+              widthPx={threadPanelWidthPx}
+            />,
+            "channel-about-auxiliary-pane",
+          )
+        ) : channelManagementOpen && activeChannel ? (
           <ChannelManagementAuxiliaryPanel
             activeChannel={activeChannel}
             canResetThreadPanelWidth={canResetThreadPanelWidth}

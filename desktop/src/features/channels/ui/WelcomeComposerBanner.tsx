@@ -2,6 +2,10 @@ import * as React from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Bot, Check, X } from "lucide-react";
 
+import {
+  GUEST_AGENT_MENTION_HINT,
+  type WelcomeComposerHint,
+} from "@/features/channels/lib/welcomeComposerHint";
 import { ComposerDockGlassBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { cn } from "@/shared/lib/cn";
 
@@ -283,6 +287,8 @@ function WelcomeComposerPersonaMention() {
 }
 
 type WelcomeComposerBannerProps = {
+  /** Which prompt copy to show; see `resolveWelcomeComposerHint`. */
+  hint?: WelcomeComposerHint;
   state: WelcomeComposerBannerState;
   /**
    * While the Welcome kickoff is still setting up the team, the banner's
@@ -299,6 +305,7 @@ type WelcomeComposerBannerProps = {
 };
 
 export function WelcomeComposerBanner({
+  hint = "welcome-team",
   onDismiss,
   settingUp = false,
   state,
@@ -402,6 +409,18 @@ export function WelcomeComposerBanner({
               >
                 Setting up your welcome team…
               </motion.span>
+            ) : hint === "guest-agents" ? (
+              <motion.span
+                animate="animate"
+                className="min-w-0 flex-1"
+                data-testid="welcome-composer-guest-hint"
+                exit="exit"
+                initial="initial"
+                key="guest-prompt-copy"
+                variants={welcomeComposerBannerContentVariants}
+              >
+                {GUEST_AGENT_MENTION_HINT}
+              </motion.span>
             ) : (
               <motion.span
                 animate="animate"
@@ -439,6 +458,7 @@ type WelcomeComposerGuidanceLayerProps = WelcomeComposerBannerProps & {
 
 export function WelcomeComposerGuidanceLayer({
   children,
+  hint,
   onDismiss,
   settingUp,
   state,
@@ -455,6 +475,7 @@ export function WelcomeComposerGuidanceLayer({
       />
       {children}
       <WelcomeComposerBanner
+        hint={hint}
         onDismiss={onDismiss}
         settingUp={settingUp}
         state={state}

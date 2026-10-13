@@ -1,7 +1,9 @@
 import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 
+import { BenchSidebarEntry } from "@/features/bench/ui/BenchSidebarEntry";
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
+import { SIDEBAR_COUNT_BADGE_CLASS } from "@/features/sidebar/ui/sidebarSectionStyles";
 import { FeatureGate } from "@/shared/features";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
@@ -21,7 +23,8 @@ type SidebarSelectedView =
   | "agents"
   | "workflows"
   | "pulse"
-  | "projects";
+  | "projects"
+  | "bench";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -42,6 +45,7 @@ type AppSidebarPinnedHeaderProps = {
 type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
+  onSelectBench: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
@@ -92,6 +96,7 @@ export function AppSidebarPinnedHeader({
 export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
+  onSelectBench,
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
@@ -120,13 +125,17 @@ export function AppSidebarPrimaryMenu({
             </SidebarMenuButton>
             {homeBadgeCount > 0 ? (
               <SidebarMenuBadge
-                className="right-2 rounded-full bg-primary/15 px-1.5 text-2xs text-primary peer-data-[active=true]/menu-button:bg-sidebar-active-foreground/20 peer-data-[active=true]/menu-button:text-sidebar-active-foreground"
+                className={SIDEBAR_COUNT_BADGE_CLASS}
                 data-testid="sidebar-home-count"
               >
                 {Math.min(homeBadgeCount, 99)}
               </SidebarMenuBadge>
             ) : null}
           </SidebarMenuItem>
+          <BenchSidebarEntry
+            isActive={selectedView === "bench"}
+            onSelect={onSelectBench}
+          />
           <FeatureGate feature="pulse">
             <SidebarMenuItem>
               <SidebarMenuButton

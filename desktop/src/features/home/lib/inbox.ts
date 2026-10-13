@@ -147,17 +147,17 @@ function feedHeadline(item: FeedItem, groupItems: readonly FeedItem[] = []) {
     case 40007:
       return "Reminder";
     case 43001:
-      return "Job requested";
+      return "Task requested";
     case 43002:
-      return "Job accepted";
+      return "Task accepted";
     case 43003:
       return "Progress update";
     case 43004:
-      return "Job result";
+      return "Task result";
     case 43005:
-      return "Job cancelled";
+      return "Task cancelled";
     case 43006:
-      return "Job failed";
+      return "Task failed";
     case 45001:
       return "Forum post";
     case 45003:

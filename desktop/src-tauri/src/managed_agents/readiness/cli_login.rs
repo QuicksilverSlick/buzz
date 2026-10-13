@@ -1,20 +1,44 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::managed_agents::{
-    discovery::{
-        classify_runtime, codex_adapter_availability, find_command, resolve_command,
-        KnownAcpRuntime,
-    },
+    discovery::{classify_runtime, codex_adapter_availability, find_command, KnownAcpRuntime},
     AcpAvailabilityStatus,
 };
 
 use super::{cli_probe, Requirement};
 
-/// Requirements for CLI-login runtimes (claude, codex).
+/// Codex requirements, probed with the engine this agent's codex-acp will run
+/// (`CODEX_PATH` from `agent_env` or the app env, else the bundled engine).
+pub(super) fn codex_requirements(
+    runtime: &KnownAcpRuntime,
+    agent_env: &BTreeMap<String, String>,
+) -> Vec<Requirement> {
+    let codex_path = cli_probe::codex_path_env(Some(agent_env));
+    probe_requirements(
+        &["codex", "login", "status"],
+        // A global Codex CLI is optional, so lead with the in-app connect flow.
+        "connect your Codex account in Agent runtimes, or run `codex login` if the Codex CLI is installed",
+        runtime,
+        codex_path.as_deref(),
+    )
+}
+
+/// Requirements for a CLI-login runtime probed with `probe_args` as given
+/// (claude; codex goes through [`codex_requirements`]).
 pub(super) fn requirements(
     probe_args: &[&str],
     setup_copy: &str,
     runtime: &KnownAcpRuntime,
+) -> Vec<Requirement> {
+    probe_requirements(probe_args, setup_copy, runtime, None)
+}
+
+fn probe_requirements(
+    probe_args: &[&str],
+    setup_copy: &str,
+    runtime: &KnownAcpRuntime,
+    codex_path: Option<&str>,
 ) -> Vec<Requirement> {
     let adapter_result = runtime
         .commands
@@ -39,15 +63,27 @@ pub(super) fn requirements(
 
     match availability {
         AcpAvailabilityStatus::Available => {
-            let Some(binary_path) = resolve_command(probe_args[0]) else {
-                return vec![missing_requirement(
-                    probe_args,
-                    setup_copy,
-                    AcpAvailabilityStatus::Available,
-                )];
+            let adapter_path = adapter_path.as_deref().map(Path::new);
+            let Some((program, argv)) =
+                cli_probe::probe_command(probe_args, adapter_path, codex_path)
+            else {
+                // With `codex_path` set, only a CODEX_PATH that does not
+                // resolve lands here: codex-acp would fail to spawn it, so
+                // name that setting rather than asking for a login.
+                return vec![match codex_path {
+                    Some(path) => Requirement::MissingBinary {
+                        command: format!("CODEX_PATH={path}"),
+                    },
+                    None => missing_requirement(
+                        probe_args,
+                        setup_copy,
+                        AcpAvailabilityStatus::Available,
+                    ),
+                }];
             };
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             let augmented_path = cli_probe::augmented_path();
-            match cli_probe::login_probe(&binary_path, probe_args, augmented_path.as_deref()) {
+            match cli_probe::login_probe(&program, &argv, augmented_path.as_deref()) {
                 cli_probe::ProbeOutcome::LoggedIn => vec![],
                 cli_probe::ProbeOutcome::LoggedOut => vec![missing_requirement(
                     probe_args,

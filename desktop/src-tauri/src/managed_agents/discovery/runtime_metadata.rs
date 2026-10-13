@@ -218,4 +218,20 @@ mod tests {
         assert!(codex.adapter_install_instructions_url.contains("codex-acp"));
         assert!(codex.cli_install_hint.contains("Codex CLI"));
     }
+
+    /// codex-acp runs the Codex engine it bundles (or `CODEX_PATH`), so an
+    /// installed adapter with no `codex` on PATH is Available, not CliMissing.
+    #[test]
+    fn codex_adapter_without_global_cli_is_available() {
+        let codex = known_acp_runtime_exact("codex").unwrap();
+        let (availability, ..) = super::super::classify_runtime(
+            Some(("codex-acp", std::path::PathBuf::from("codex-acp"))),
+            codex.underlying_cli,
+            false,
+        );
+        assert_eq!(
+            availability,
+            crate::managed_agents::AcpAvailabilityStatus::Available
+        );
+    }
 }

@@ -6,6 +6,10 @@ import {
   markCommunityOnboardingComplete,
   useCommunityOnboarding,
 } from "@/features/onboarding/communityOnboarding";
+import {
+  commitGuestEntry,
+  prepareGuestEntry,
+} from "@/features/onboarding/guestEntry";
 import { initializeStarterChannels } from "@/features/onboarding/hooks";
 import { useClaimInvite } from "@/features/onboarding/useClaimInvite";
 import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
@@ -227,6 +231,16 @@ export function CommunityOnboardingFlow({
 
   useClaimInvite();
 
+  // An invite redeemed on the membership-denied screen sends onboarding back
+  // to claiming; close that screen so the claim and what follows show.
+  const inviteCode = transaction?.inviteCode;
+  const shownInviteCodeRef = React.useRef(inviteCode);
+  React.useEffect(() => {
+    if (shownInviteCodeRef.current === inviteCode) return;
+    shownInviteCodeRef.current = inviteCode;
+    setIsMembershipDenied(false);
+  }, [inviteCode]);
+
   React.useEffect(() => {
     if (transaction?.stage === "connecting") onConnect();
   }, [onConnect, transaction?.stage]);
@@ -306,6 +320,38 @@ export function CommunityOnboardingFlow({
     }
   }, [finish, isPending, queryClient, relayUrl, update]);
 
+  // Async steps re-check the live transaction so a cancelled or replaced
+  // onboarding is never advanced or finished.
+  const transactionRef = React.useRef(transaction);
+  transactionRef.current = transaction;
+  /**
+   * After the profile step, someone who joined by invite enters as a guest
+   * straight away: no starter team, no Welcome channel, landing in a channel
+   * the owner set up. Everyone else meets the starter team.
+   */
+  const continueAfterProfile = React.useCallback(
+    async (transactionId: string) => {
+      const isLive = () =>
+        transactionRef.current?.id === transactionId &&
+        transactionRef.current.stage === "profile";
+      if (!isLive()) return;
+      const guestEntry = await prepareGuestEntry(transactionRef.current);
+      if (!isLive()) return;
+      if (!guestEntry) {
+        setTransitionDirection("forward");
+        update({ stage: "team-intro", error: undefined }, transactionId);
+        return;
+      }
+      const identity = await getIdentity();
+      const live = transactionRef.current;
+      if (!live || !isLive()) return;
+      commitGuestEntry(guestEntry, identity.pubkey, live.relayUrl);
+      markCommunityOnboardingComplete(identity.pubkey, live.relayUrl);
+      clear();
+    },
+    [clear, update],
+  );
+
   const backToProfile = React.useCallback(() => {
     if (isPending) return;
     setStarterChannelFailureCount(0);
@@ -320,17 +366,22 @@ export function CommunityOnboardingFlow({
 
     checkedProfileTransactionRef.current = transaction.id;
     void getProfile()
-      .then((profile) => {
-        if (profile.hasProfileEvent) {
-          setTransitionDirection("forward");
-          update({ stage: "team-intro", error: undefined }, transaction.id);
+      .then(async (profile) => {
+        if (!profile.hasProfileEvent) return;
+        // Hold the form while guest entry asks the relay, so nobody starts
+        // typing into a screen that is about to close or presses Next twice.
+        setIsPending(true);
+        try {
+          await continueAfterProfile(transaction.id);
+        } finally {
+          setIsPending(false);
         }
       })
       .catch(() => {
         // Discovery is best-effort. Staying on the profile step preserves the
         // existing path when the relay cannot answer the lookup.
       });
-  }, [isProfileStage, transaction, update]);
+  }, [continueAfterProfile, isProfileStage, transaction]);
   const isTeamStage =
     transaction?.stage === "team-intro" ||
     transaction?.stage === "finalizing" ||
@@ -458,8 +509,7 @@ export function CommunityOnboardingFlow({
         deferredAvatar?.cancel();
         throw error;
       }
-      setTransitionDirection("forward");
-      update({ stage: "team-intro", error: undefined });
+      await continueAfterProfile(transaction.id);
     } catch (error) {
       if (isRelayMembershipDeniedError(error)) {
         try {
@@ -568,8 +618,8 @@ export function CommunityOnboardingFlow({
                       Build your profile
                     </h1>
                     <p className="mx-auto mt-3 max-w-[380px] text-sm leading-6 text-foreground/80">
-                      Add a name and avatar. They’ll show up on your messages,
-                      reactions, and agent handoffs.
+                      Add a name and avatar. They’ll show up on your messages
+                      and reactions.
                     </p>
                   </div>
                   <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-center pt-6">
@@ -584,10 +634,10 @@ export function CommunityOnboardingFlow({
                       htmlFor="community-display-name"
                     >
                       <span className="mb-2 block pl-4 text-sm text-foreground">
-                        Your username
+                        Your name
                       </span>
                       <OnboardingInput
-                        aria-label="Community username"
+                        aria-label="Your name"
                         autoCapitalize="none"
                         autoComplete="username"
                         autoCorrect="off"
@@ -595,7 +645,7 @@ export function CommunityOnboardingFlow({
                         disabled={isPending || isUploadingAvatar}
                         id="community-display-name"
                         onChange={(event) => setDisplayName(event.target.value)}
-                        placeholder="Enter your username here"
+                        placeholder="Enter your name here"
                         ref={nameInputRef}
                         spellCheck={false}
                         type="text"
@@ -625,7 +675,11 @@ export function CommunityOnboardingFlow({
                     onClick={() => void saveProfile()}
                     type="button"
                   >
-                    Next
+                    {isPending ? (
+                      <LoadingDots label="Opening your community" />
+                    ) : (
+                      "Next"
+                    )}
                   </Button>
                 </OnboardingFooter>
                 <Dialog

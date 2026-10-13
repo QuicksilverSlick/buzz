@@ -8,6 +8,7 @@
 //! forced discovery calls before re-probing).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::managed_agents::AuthStatus;
@@ -52,9 +53,11 @@ pub(crate) fn len() -> usize {
 /// default path spawns nothing — it reuses the last cached status, falling back
 /// to `Unknown` for a runtime never probed this session.
 pub(super) fn resolve_auth_statuses(partials: &mut [super::PartialEntry], force: bool) {
-    use crate::managed_agents::AcpAvailabilityStatus;
+    use crate::managed_agents::{readiness::cli_probe, AcpAvailabilityStatus};
 
     if force {
+        // No agent env here, so only the app env's `CODEX_PATH` applies.
+        let codex_path = cli_probe::codex_path_env(None);
         let probe_handles: Vec<(usize, std::thread::JoinHandle<AuthStatus>)> = partials
             .iter()
             .enumerate()
@@ -63,14 +66,15 @@ pub(super) fn resolve_auth_statuses(partials: &mut [super::PartialEntry], force:
                     return None;
                 }
                 let probe_args = partial.runtime.auth_probe_args?;
-                // Need the resolved binary path for the CLI (e.g. the actual `claude` binary).
-                let binary_path = super::resolve_command(probe_args[0])?;
-                let probe_args_owned: Vec<String> =
-                    probe_args.iter().map(|s| s.to_string()).collect();
+                // Probe the CLI the runtime will actually run (for codex, the
+                // engine bundled with the resolved adapter).
+                let adapter_path = partial.entry.binary_path.as_deref().map(Path::new);
+                let (program, argv) =
+                    cli_probe::probe_command(probe_args, adapter_path, codex_path.as_deref())?;
 
                 let handle = std::thread::spawn(move || {
-                    let refs: Vec<&str> = probe_args_owned.iter().map(String::as_str).collect();
-                    super::probe_auth_status(&binary_path, &refs)
+                    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                    super::probe_auth_status(&program, &refs)
                 });
                 Some((idx, handle))
             })

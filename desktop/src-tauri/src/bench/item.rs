@@ -32,6 +32,10 @@ const LABEL_MAX: usize = 40;
 const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
 const BOARD_TITLE_MAX: usize = 60;
+/// U+FEFF, zero-width no-break space: invisible on both apps, and whitespace
+/// to the phone's regexes (Dart `\s`) and the desktop's emphasis rules
+/// (micromark's `/\s/`).
+const ZWNBSP: char = '\u{FEFF}';
 
 /// A drop file exactly as a writer may author it. `deny_unknown_fields` is
 /// the whole "a drop never carries answer/verdict/source/version/card/
@@ -166,8 +170,8 @@ pub(crate) struct Item {
     pub quiet_repost: bool,
 }
 
-/// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area are
-/// the only untrusted strings printed outside the fence on a card.
+/// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
+/// like a validated link url, print on the card as they are.
 pub(crate) fn valid_name(s: &str, max: usize) -> bool {
     let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     !s.is_empty()
@@ -181,7 +185,7 @@ fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
         return Err(format!("{field}: longer than {max_chars} chars"));
     }
     // Cc except newline and tab, plus the zero-width and bidi format
-    // characters both apps honour inside a fence: an option list reordered
+    // characters both apps honour in card text: an option list reordered
     // on screen steers the one tap the board exists for.
     let bad = |c: char| {
         (c.is_control() && c != '\n' && c != '\t')
@@ -248,8 +252,8 @@ fn valid_link(l: &Link) -> Result<(), String> {
             l.label
         ));
     }
-    // The card prints the raw url outside the fence, but the parser below
-    // drops tabs and newlines and encodes spaces: bound the raw bytes first.
+    // The card prints the raw url, but the parser below drops tabs and
+    // newlines and encodes spaces: bound the raw bytes first.
     if !l.url.chars().all(|c| c.is_ascii_graphic() && c != '@') {
         return Err(format!(
             "link url {:?}: printable ascii without spaces or '@' only",
@@ -309,6 +313,14 @@ pub(crate) fn validate(
     valid_text(&d.body, BODY_MAX, "body")?;
     for o in &d.options {
         valid_text(o, OPTION_MAX, "option")?;
+        // Printed through plain_text: an emoji-only option would leave the
+        // owner a bare "1." beside its keycap.
+        if !plain_text(o, usize::MAX)
+            .bytes()
+            .any(|b| b.is_ascii_alphanumeric())
+        {
+            return Err("option: no plain letters or digits".to_string());
+        }
     }
     match d.kind {
         ItemKind::Pending => {
@@ -339,7 +351,7 @@ pub(crate) fn validate(
         return Err("private items ship in Phase 3".to_string());
     }
     // Kept in canonical form: chrono also takes a space separator and any
-    // number of fractional digits, and the card prints it outside the fence.
+    // number of fractional digits, and the card prints it as it is.
     let deadline = d
         .deadline
         .as_deref()
@@ -412,14 +424,6 @@ fn short_hash(bytes: &[u8]) -> String {
     h
 }
 
-/// Wrap text in a code fence longer than any backtick run inside it. Both
-/// apps render fenced code inertly: no links, mentions or markdown.
-pub(crate) fn fence(text: &str) -> String {
-    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let f = "`".repeat((longest + 1).max(3));
-    format!("{f}text\n{text}\n{f}")
-}
-
 pub(crate) fn summary(body: &str) -> String {
     match body.char_indices().nth(SUMMARY_MAX) {
         Some((cut, _)) => format!("{}\u{2026}", &body[..cut]),
@@ -427,19 +431,94 @@ pub(crate) fn summary(body: &str) -> String {
     }
 }
 
-/// Board lines sit outside any fence, where both apps linkify bare URLs and
-/// `[x](url)`: keep only characters that can form neither.
+/// Agent text as plain paragraphs both apps show character for character:
+/// gpt_markdown 1.1.6 (the phone) honours no backslash escape, so a ZWNBSP
+/// breaks each trigger instead. Before `*`, `_` and `~` it makes them unable
+/// to close emphasis or strikethrough and splits `**`, `~~` and `~~~`. After
+/// `#`, `@`, `:`, `&`, `<`, `[`, `]` and `\` there is no heading, #channel,
+/// @mention, :emoji:, autolink, entity, HTML, link, citation, LaTeX or escape.
+/// Inside `--` and `||` there is no line-end rule (phone) or spoiler
+/// (desktop), and before a line opening with a list, quote, table, setext,
+/// radio or rule mark, no block. A ZWNBSP cannot split a code span, so a
+/// backtick becomes U+02CB, which looks the same. Spaces and tabs collapse,
+/// so no line is indented and none ends in a hard break.
+pub(crate) fn prose(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.trim().split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.starts_with(['-', '+', '=', '>', '(', '|', '\u{2E3B}'])
+            || list_mark(&line).is_some()
+        {
+            out.push(ZWNBSP);
+        }
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '`' => out.push('\u{02CB}'),
+                '*' | '_' | '~' => out.extend([ZWNBSP, c]),
+                '#' | '@' | ':' | '&' | '<' | '[' | ']' | '\\' => out.extend([c, ZWNBSP]),
+                '-' | '|' if chars.peek() == Some(&c) => out.extend([c, ZWNBSP]),
+                c => out.push(c),
+            }
+        }
+    }
+    out
+}
+
+/// Digits of a leading `1.` or `1)` list mark: an ordered list item on the
+/// desktop, and on the phone too when it is `1.`.
+fn list_mark(s: &str) -> Option<usize> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let b = s.as_bytes();
+    (digits > 0
+        && matches!(b.get(digits), Some(b'.' | b')'))
+        && matches!(b.get(digits + 1), None | Some(b' ')))
+    .then_some(digits)
+}
+
+/// Board lines and a card's title, options and link labels: words only.
+/// Both apps render markdown there and the phone has no backslash
+/// escape, so anything outside a plainly inert set becomes a space: `_`
+/// pairs into emphasis on the desktop, `;` closes an entity (`&num;`) the
+/// desktop decodes into a live `#channel` or `buzz://` link, and a space
+/// rather than nothing so a dropped character never joins `w[w]w.` into an
+/// autolink. It also never opens a block after a card's `1. ` (both apps
+/// nest blocks in a list item): it starts at a letter, digit or quote, a
+/// leading `1.` or `1)` loses its mark, and trailing dashes go (the phone
+/// draws any line ending in `---` as a rule). Curly quotes, en and em dashes
+/// and the ellipsis fold to ASCII first, so "Don’t" never reads "Don t".
+/// Nothing but a space follows a `:`: the phone draws `:name:` as the image
+/// any community member published under that shortcode.
+pub(crate) fn plain_text(t: &str, max: usize) -> String {
+    let inert = |c: char| c.is_ascii_alphanumeric() || " ,.!?'\"()&+-".contains(c);
+    let mut spaced = String::with_capacity(t.len());
+    for c in t.chars() {
+        match c {
+            '\u{2018}' | '\u{2019}' | '\u{02BC}' => spaced.push('\''),
+            '\u{201C}' | '\u{201D}' => spaced.push('"'),
+            '\u{2013}' | '\u{2014}' => spaced.push('-'),
+            '\u{2026}' => spaced.push_str("..."),
+            ':' => spaced.push_str(": "),
+            c if inert(c) => spaced.push(c),
+            _ => spaced.push(' '),
+        }
+    }
+    let words = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s = words
+        .trim_start_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '"' || c == '\''))
+        .to_string();
+    if let Some(digits) = list_mark(&s) {
+        s.remove(digits);
+    }
+    let s: String = s.chars().take(max).collect();
+    s.trim_end_matches(['-', ' ']).to_string()
+}
+
 pub(crate) fn plain_title(t: &str) -> String {
-    let kept: String = t
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || " ,.;:!?'\"()&+_-".contains(*c))
-        .collect();
-    kept.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(BOARD_TITLE_MAX)
-        .collect()
+    plain_text(t, BOARD_TITLE_MAX)
 }
 
 pub(crate) fn severity_rank(s: Option<Severity>) -> u8 {
@@ -478,8 +557,11 @@ fn state_name(s: StatusState) -> &'static str {
 /// Bump when render_card's text changes: every live unanswered card is then
 /// reposted once, without a ping, with the new text (publish (b) retires it
 /// as stale). An answered card gets the new text through its Recorded edit
-/// and keeps its answer and its 24 h keep.
-pub(crate) const CARD_FORMAT: u32 = 2;
+/// and keeps its answer and its 24 h keep. 3: title and options moved out of
+/// the fence, which the phone draws as unwrapped monospace, and the summary
+/// left in it is hard-wrapped. 4: the summary leaves the fence, a grey code
+/// box on the phone, for its own paragraph of prose().
+pub(crate) const CARD_FORMAT: u32 = 4;
 
 /// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
 /// Cards posted before CARD_FORMAT existed carry the bare Drop hash.
@@ -487,35 +569,52 @@ pub(crate) fn card_hash(item: &Item) -> String {
     format!("{}.{CARD_FORMAT}", item.hash)
 }
 
-/// Card text: marker line, one fence holding title/summary/options, then the
-/// validated deadline and links outside the fence so the phone can open them,
+/// Card text: marker line, the title in bold, the summary as its own
+/// paragraph of prose() (agent text stays inert), the options as a numbered
+/// list, then the validated deadline and links so the phone can open them,
 /// and on an unanswered pending card the line that says how to answer.
+/// Everything but the summary and the url goes through plain_text.
 pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
-    let mut inner = format!("{}\n\n{}", item.title, summary(&item.body));
-    if item.kind == ItemKind::Pending {
-        inner.push('\n');
-        for (i, o) in item.options.iter().enumerate() {
-            inner.push_str(&format!("\n{}. {o}", i + 1));
-        }
-    }
     let mut out = format!(
-        "{} \u{b7} {} \u{b7} {}\n{}",
+        "{} \u{b7} {} \u{b7} {}",
         marker(item),
         item.area,
-        item.writer,
-        fence(&inner)
+        item.writer
     );
+    let title = plain_text(&item.title, usize::MAX);
+    // An empty one would print `****`, a rule on both apps.
+    if !title.is_empty() {
+        out.push_str(&format!("\n**{title}**"));
+    }
+    if !item.body.trim().is_empty() {
+        // Blank lines make it a paragraph of its own on both apps, so nothing
+        // in it pairs with a `*` or `](` on the card's other lines: the phone
+        // matches links and italics across lines, and rewrites each link
+        // line's url to `[url](url)` first.
+        out.push_str("\n\n");
+        out.push_str(&prose(&summary(&item.body)));
+        out.push('\n');
+    }
+    if item.kind == ItemKind::Pending {
+        for (i, o) in item.options.iter().enumerate() {
+            out.push_str(&format!("\n{}. {}", i + 1, plain_text(o, usize::MAX)));
+        }
+        // A blank line ends the list, or the desktop folds the lines below
+        // into the last option.
+        out.push('\n');
+    }
     if let Some(d) = &item.deadline {
         out.push_str(&format!("\ndue {d}"));
     }
     for l in &item.links {
-        out.push_str(&format!("\n{}: {}", l.label, l.url));
+        let label = plain_text(&l.label, usize::MAX);
+        out.push_str(&format!("\n{label}: {}", l.url));
     }
     if item.kind == ItemKind::Pending && item.answer.is_none() {
         out.push_str("\nTap one number below to answer.");
     }
     out.push_str(&format!("\nas of {hhmm}"));
-    // Outside the fence, so through plain_title like every board line.
+    // Through plain_title like every board line.
     if let Some(a) = &item.answer {
         if let Some(o) = item.options.get(a.option) {
             out.push_str(&format!(
@@ -537,9 +636,21 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.writer != MIGRATION_WRITER
 }
 
+/// The event a reaction is aimed at: its last `e` tag, how the relay scopes
+/// a reaction.
+pub(crate) fn reaction_target(e: &nostr::Event) -> Option<&str> {
+    e.tags
+        .iter()
+        .filter_map(|t| match t.as_slice() {
+            [k, v, ..] if k == "e" => Some(v.as_str()),
+            _ => None,
+        })
+        .last()
+}
+
 /// The answer on `item`'s live card: the NEWEST valid kind 7 by an approver
-/// other than the writer, aimed at the card by its last `e` tag (how the
-/// relay scopes a reaction) and echoing one seeded keycap byte-for-byte.
+/// other than the writer, aimed at the card by its `reaction_target` and
+/// echoing one seeded keycap byte-for-byte.
 /// Latest wins so a second tap changes the answer; a retraction is the
 /// reaction no longer coming back from the relay, which hands the answer to
 /// the next newest.
@@ -555,18 +666,10 @@ pub(crate) fn pick_answer<'e>(
         .iter()
         .filter_map(|e| {
             let pk = e.pubkey.to_hex();
-            let target = e
-                .tags
-                .iter()
-                .filter_map(|t| match t.as_slice() {
-                    [k, v, ..] if k == "e" => Some(v.as_str()),
-                    _ => None,
-                })
-                .last();
             let ok = e.kind.as_u16() == 7
                 && pk != writer_hex
                 && approvers.contains(&pk)
-                && target == Some(card.event_id.as_str())
+                && reaction_target(e) == Some(card.event_id.as_str())
                 && e.verify().is_ok();
             let i = OPTION_EMOJI[..n].iter().position(|o| *o == e.content)?;
             ok.then_some((i, e))

@@ -26,8 +26,9 @@ export type { ChannelSearchKey } from "./channelSearchKeys";
  * `profileView` (profile panel focused view), `profileTab` (profile summary
  * tab), `agentSession` (agent session panel pubkey), `agentSessionChannel`
  * (optional channel scope for the agent session panel), `channelManagement`
- * (presence flag for the channel-management panel — open/closed only, so it
- * carries a sentinel `"1"` rather than an id), `autoSend` (draft auto-submit
+ * (the channel side panel: `"1"` for channel settings, `"about"` for the
+ * read-only About this channel view; both share one slot, so anything that
+ * closes channel settings closes About too), `autoSend` (draft auto-submit
  * trigger — cleared surgically after the auto-submit fires so `thread` and
  * all other panel state are preserved).
  */
@@ -40,6 +41,7 @@ export type PanelValueSetter = (
 ) => void;
 
 const CHANNEL_MANAGEMENT_OPEN_VALUE = "1";
+const CHANNEL_ABOUT_OPEN_VALUE = "about";
 
 export function useChannelPanelHistoryState() {
   const { applyPatch, values } = useHistorySearchState(CHANNEL_SEARCH_KEYS);
@@ -105,6 +107,15 @@ export function useChannelPanelHistoryState() {
     [applyPatch],
   );
 
+  const setChannelAboutOpen = React.useCallback(
+    (open: boolean, options?: PanelSetterOptions) =>
+      applyPatch(
+        { channelManagement: open ? CHANNEL_ABOUT_OPEN_VALUE : null },
+        options,
+      ),
+    [applyPatch],
+  );
+
   const clearMessageRouteTarget = React.useCallback(
     (options?: PanelSetterOptions) =>
       applyPatch({ messageId: null, threadRootId: null }, options),
@@ -122,6 +133,8 @@ export function useChannelPanelHistoryState() {
   );
 
   return {
+    channelAboutOpen: values.channelManagement === CHANNEL_ABOUT_OPEN_VALUE,
+    /** True while the channel side panel shows settings or About. */
     channelManagementOpen: values.channelManagement != null,
     clearAutoSend,
     clearMessageRouteTarget,
@@ -132,6 +145,7 @@ export function useChannelPanelHistoryState() {
     profilePanelPubkey: values.profile,
     profilePanelTab: profilePanelTabFromSearch(values.profileTab),
     profilePanelView: profilePanelViewFromSearch(values.profileView),
+    setChannelAboutOpen,
     setChannelManagementOpen,
     setOpenAgentSessionChannelId,
     setOpenAgentSessionPubkey,

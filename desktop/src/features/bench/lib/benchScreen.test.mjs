@@ -1,0 +1,152 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  benchLastTickSeconds,
+  benchNeedsYouCount,
+  benchSections,
+  benchSeverityRank,
+} from "./benchScreen.ts";
+
+function card(id, overrides = {}) {
+  return {
+    id,
+    writer: "dreamforge",
+    kind: "pending",
+    title: id,
+    body: "",
+    area: "release",
+    severity: "attention",
+    options: ["Ship it", "Hold"],
+    state: null,
+    decidedBy: null,
+    deadline: null,
+    links: [],
+    order: 0,
+    validity: "current",
+    cardEventId: "e".repeat(64),
+    answer: null,
+    recorded: null,
+    ...overrides,
+  };
+}
+
+function snapshot(items) {
+  return {
+    enabled: true,
+    channelId: "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
+    writerPubkey: "a".repeat(64),
+    ownerPubkey: "b".repeat(64),
+    lastError: null,
+    lastTick: "2026-10-12T10:00:00Z",
+    items,
+  };
+}
+
+const ids = (cards) => cards.map((c) => c.id);
+
+test("sections: each item lands in exactly one section, like the board", () => {
+  const sections = benchSections(
+    snapshot([
+      card("w/open"),
+      card("w/answered", { answer: { option: 1, answeredAt: 50 } }),
+      card("w/decided", { kind: "decision", options: [], decidedBy: "claude" }),
+      card("w/status", { kind: "status", options: [], state: "done" }),
+      card("w/stale", { validity: "suspected-stale" }),
+      card("w/gone", { kind: "status", validity: "superseded" }),
+    ]),
+  );
+  assert.deepEqual(ids(sections.needsYou), ["w/open"]);
+  assert.deepEqual(ids(sections.answered), ["w/answered"]);
+  assert.deepEqual(ids(sections.decided), ["w/decided"]);
+  assert.deepEqual(ids(sections.status), ["w/status"]);
+  assert.equal(sections.retiring, 2, "stale and superseded are folded");
+});
+
+test("sections: needs you sorts by severity, then order, then id", () => {
+  const sections = benchSections(
+    snapshot([
+      card("w/none", { severity: null }),
+      card("w/info", { severity: "info" }),
+      card("w/attention-late", { severity: "attention", order: 2 }),
+      card("w/critical", { severity: "critical", order: 9 }),
+      card("w/attention-b", { severity: "attention", order: 1 }),
+      card("w/attention-a", { severity: "attention", order: 1 }),
+      card("w/good", { severity: "good" }),
+    ]),
+  );
+  assert.deepEqual(ids(sections.needsYou), [
+    "w/critical",
+    "w/attention-a",
+    "w/attention-b",
+    "w/attention-late",
+    "w/info",
+    "w/good",
+    "w/none",
+  ]);
+});
+
+test("sections: answered is oldest answer first; decided and status by area", () => {
+  const sections = benchSections(
+    snapshot([
+      card("w/later", { answer: { option: 0, answeredAt: 200 } }),
+      card("w/earlier", { answer: { option: 1, answeredAt: 100 } }),
+      card("w/d-ops", { kind: "decision", area: "ops", options: [] }),
+      card("w/d-app-2", { kind: "decision", area: "app", order: 2 }),
+      card("w/d-app-1", { kind: "decision", area: "app", order: 1 }),
+      card("w/s-web", { kind: "status", area: "web", options: [] }),
+      card("w/s-api", { kind: "status", area: "api", options: [] }),
+    ]),
+  );
+  assert.deepEqual(ids(sections.answered), ["w/earlier", "w/later"]);
+  assert.deepEqual(ids(sections.decided), [
+    "w/d-app-1",
+    "w/d-app-2",
+    "w/d-ops",
+  ]);
+  assert.deepEqual(ids(sections.status), ["w/s-api", "w/s-web"]);
+});
+
+test("sections: no snapshot is four empty sections", () => {
+  for (const value of [null, undefined]) {
+    const sections = benchSections(value);
+    assert.deepEqual(
+      [sections.needsYou, sections.answered, sections.decided, sections.status],
+      [[], [], [], []],
+    );
+    assert.equal(sections.retiring, 0);
+  }
+});
+
+test("severity rank: unknown and missing severities sort last", () => {
+  assert.deepEqual(
+    ["critical", "attention", "info", "good", null, "toString"].map(
+      benchSeverityRank,
+    ),
+    [0, 1, 2, 3, 4, 4],
+  );
+});
+
+test("badge: null while disabled, else the Needs you count", () => {
+  assert.equal(benchNeedsYouCount({ enabled: false }), null);
+  assert.equal(benchNeedsYouCount(undefined), null);
+  assert.equal(benchNeedsYouCount(snapshot([])), 0);
+  assert.equal(
+    benchNeedsYouCount(
+      snapshot([
+        card("w/a"),
+        card("w/b", { severity: "critical" }),
+        card("w/answered", { answer: { option: 0, answeredAt: 1 } }),
+        card("w/stale", { validity: "superseded" }),
+        card("w/status", { kind: "status", options: [] }),
+      ]),
+    ),
+    2,
+  );
+});
+
+test("last tick: RFC 3339 to unix seconds; empty or garbage is null", () => {
+  assert.equal(benchLastTickSeconds("2026-10-12T10:00:00Z"), 1_791_799_200);
+  assert.equal(benchLastTickSeconds(""), null);
+  assert.equal(benchLastTickSeconds("not a time"), null);
+});

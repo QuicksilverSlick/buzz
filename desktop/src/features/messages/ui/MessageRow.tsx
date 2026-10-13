@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertTriangle } from "lucide-react";
+import { Globe } from "lucide-react";
 import {
   depthGuideActionsEqual,
   numberArrayEqual,
@@ -12,6 +12,9 @@ import {
 } from "@/features/messages/lib/canSendToChannel";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
+import { BenchCard } from "@/features/bench/ui/BenchCard";
+import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAuthorWithIndicators";
@@ -380,6 +383,26 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
+    // Non-null only for a live Bench card in #bench signed by the Bench
+    // writer key (see benchRowState); every other row renders as before.
+    const benchCard = useBenchCardForMessage({
+      channelId,
+      id: message.id,
+      kind: message.kind,
+      pending: message.pending,
+      signerPubkey: message.signerPubkey,
+    });
+    // A live card's option buttons already show its answer keycaps.
+    const shownReactions = React.useMemo(
+      () =>
+        benchCard
+          ? reactions.filter(
+              (reaction) =>
+                !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
+            )
+          : reactions,
+      [benchCard, reactions],
+    );
 
     const renderBody = () => {
       switch (message.kind) {
@@ -415,6 +438,15 @@ export const MessageRow = React.memo(
             />
           );
         default: {
+          if (benchCard) {
+            return (
+              <BenchCard
+                card={benchCard.card}
+                ownerPubkey={benchCard.ownerPubkey}
+                viewerPubkey={currentPubkey}
+              />
+            );
+          }
           const waveMessage = parseWaveMessageContent(message.body);
           if (waveMessage) {
             return (
@@ -504,9 +536,10 @@ export const MessageRow = React.memo(
             }
           >
             {message.respondTo === "anyone" ? (
-              <AlertTriangle
+              <Globe
                 aria-hidden="true"
-                className="h-2.5 w-2.5 fill-background text-amber-500"
+                className="h-2.5 w-2.5 text-muted-foreground"
+                data-testid="message-respond-to-anyone-icon"
               />
             ) : (
               <span className="h-2 w-2 rounded-full bg-blue-500" />
@@ -690,7 +723,7 @@ export const MessageRow = React.memo(
         {continuationMetadataNode}
         <MessageReactions
           messageId={message.id}
-          reactions={reactions}
+          reactions={shownReactions}
           canToggle={canToggleReactions}
           pending={reactionPending}
           burstEmojiOnRender={badgeBurstEmoji}
@@ -942,6 +975,8 @@ export const MessageRow = React.memo(
   (prev, next) =>
     prev.message.id === next.message.id &&
     prev.message.pubkey === next.message.pubkey &&
+    // The Bench card guard checks the raw signer.
+    prev.message.signerPubkey === next.message.signerPubkey &&
     prev.message.body === next.message.body &&
     prev.message.author === next.message.author &&
     prev.message.isAgent === next.message.isAgent &&

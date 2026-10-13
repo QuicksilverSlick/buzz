@@ -2408,7 +2408,7 @@ test("connected first-community profile keeps navigation inside the card and bal
     borderRadius: "12px",
     fontSize: "14px",
   });
-  await expect(page.getByText("Your username", { exact: true })).toBeVisible();
+  await expect(page.getByText("Your name", { exact: true })).toBeVisible();
   await expect(page.getByTestId("community-onboarding-flow")).toHaveAttribute(
     "data-system-color-scheme",
     /^(light|dark)$/,
@@ -3251,6 +3251,84 @@ test("membership denial on community profile save offers recovery", async ({
     .toContain("wss://invited.example.com");
 });
 
+test("an invite redeemed on the membership-denied screen is claimed", async ({
+  page,
+}) => {
+  const claimedCodes: string[] = [];
+  await page.route("**/api/join-policy", (route) =>
+    route.fulfill({ status: 404, body: "" }),
+  );
+  await page.route("**/api/invites/claim", async (route) => {
+    claimedCodes.push(
+      (route.request().postDataJSON() as { code: string }).code,
+    );
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "joined",
+        community_id: "mock-community",
+        host: "denied.example.com",
+        role: "member",
+      }),
+    });
+  });
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await page.addInitScript(
+    ({ pubkey, transactionStorageKey }) => {
+      window.localStorage.setItem(
+        `buzz-machine-onboarding-complete.v2:${pubkey}`,
+        "true",
+      );
+      const timestamp = new Date().toISOString();
+      window.localStorage.setItem(
+        transactionStorageKey,
+        JSON.stringify({
+          id: "txn-membership-denied-invite",
+          source: "first-community",
+          stage: "profile",
+          relayUrl: "wss://denied.example.com",
+          communityName: "Denied",
+          communityId: "e2e-default-community",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    },
+    {
+      pubkey: BLANK_TYLER_IDENTITY.pubkey,
+      transactionStorageKey: COMMUNITY_ONBOARDING_TRANSACTION_STORAGE_KEY,
+    },
+  );
+  await installMockBridge(
+    page,
+    {
+      profileUpdateError:
+        "relay returned 403 Forbidden: You must be a relay member to access this relay",
+    },
+    {
+      relayWsUrl: "wss://denied.example.com",
+      skipOnboardingSeed: true,
+    },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("community-profile-name-key").fill("Kalvin");
+  await page.getByTestId("community-profile-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+
+  await page.getByTestId("membership-denied-redeem-invite").click();
+  await page.getByTestId("invite-redeem-input").fill("fresh.code");
+  await page.getByTestId("invite-redeem-submit").click();
+
+  // The denied screen closes, the new code is claimed, and onboarding goes on.
+  await expect(page.getByTestId("membership-denied")).toHaveCount(0);
+  await expect.poll(() => claimedCodes).toEqual(["fresh.code"]);
+  await expect(
+    page.getByRole("heading", { name: "Build your profile" }),
+  ).toBeVisible();
+});
+
 test("identity fallback text does not count as a real onboarding name", async ({
   page,
 }) => {
@@ -3843,7 +3921,7 @@ test("generic relay save failures use the generic reconnect card", async ({
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
   ).toContainText("Click to connect");
@@ -3871,7 +3949,7 @@ test("custom relay proxy sign-in failures use the generic reconnect card", async
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
 });
 
 test("community access failures use the generic reconnect card", async ({
@@ -3895,7 +3973,7 @@ test("community access failures use the generic reconnect card", async ({
   ).toBeVisible();
   await expect(
     page.getByTestId("onboarding-relay-reconnect-card"),
-  ).toContainText("Can't reach the relay");
+  ).toContainText("Can't reach the community server");
 });
 
 test("dismissed relay save failures reappear on retry", async ({ page }) => {
@@ -4241,7 +4319,7 @@ test("onboarding relay reconnect — click shows Connected then auto-dismisses",
 
   const card = page.getByTestId("onboarding-relay-reconnect-card");
   await expect(card).toBeVisible();
-  await expect(card).toContainText("Can't reach the relay");
+  await expect(card).toContainText("Can't reach the community server");
 
   // Drive degraded before clicking so the card is in the expected error state.
   await setRelayConnectionState(page, "disconnected");
@@ -4257,7 +4335,7 @@ test("onboarding relay reconnect — click shows Connected then auto-dismisses",
   await setRelayConnectionState(page, "connected");
 
   await expect(card).toContainText("Connected", { timeout: 5_000 });
-  await expect(card).not.toContainText("Can't reach the relay");
+  await expect(card).not.toContainText("Can't reach the community server");
 
   // Auto-dismiss fires after ONBOARDING_CONNECTIVITY_SUCCESS_AUTO_DISMISS_MS
   // (2500ms). Allow generous headroom for CI.
@@ -4283,7 +4361,7 @@ test("onboarding relay reconnect — dismiss is clickable at minimum size", asyn
   const card = page.getByTestId("onboarding-relay-reconnect-card");
   await expect(card).toBeVisible();
   await page
-    .getByRole("button", { name: "Dismiss relay notification" })
+    .getByRole("button", { name: "Dismiss community server notification" })
     .click();
   await expect(card).toHaveCount(0);
 });
@@ -4322,7 +4400,7 @@ test("onboarding relay reconnect — connected without a prior click does not sh
   // card stayed in the error state.
   await page.waitForTimeout(500);
   await expect(card).toBeVisible();
-  await expect(card).toContainText("Can't reach the relay");
+  await expect(card).toContainText("Can't reach the community server");
   await expect(card).not.toContainText("Connected");
 });
 

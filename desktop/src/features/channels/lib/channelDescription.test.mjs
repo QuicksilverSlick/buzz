@@ -22,7 +22,7 @@ function makeChannel(overrides = {}) {
 test("getChannelDescription falls back when channel is null", () => {
   assert.equal(
     getChannelDescription(null),
-    "Connect to the relay to browse channels and read messages.",
+    "Connect to the community server to browse channels and read messages.",
   );
 });
 

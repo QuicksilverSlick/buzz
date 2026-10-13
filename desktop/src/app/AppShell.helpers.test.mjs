@@ -5,8 +5,17 @@ import {
   markAllReadSources,
   activateDesktopNotificationTarget,
   createDesktopNotificationActivationQueue,
+  deriveShellRoute,
   shouldBounceForChannelNotification,
 } from "./AppShell.helpers.ts";
+
+test("deriveShellRoute_givesTheBenchItsOwnSidebarView", () => {
+  assert.deepEqual(deriveShellRoute("/bench"), {
+    selectedChannelId: null,
+    selectedView: "bench",
+  });
+  assert.equal(deriveShellRoute("/bench/extra").selectedView, "home");
+});
 
 test("shouldBounceForChannelNotification_allowsTopLevelChannelMessages", () => {
   assert.equal(shouldBounceForChannelNotification([["h", "channel"]]), true);

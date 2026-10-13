@@ -18,6 +18,7 @@ import {
   type WelcomeTeamStarterDefinition,
   welcomeTeammateHasExpectedAccess,
 } from "@/features/onboarding/welcomeGuide";
+import { useIsCommunityGuest } from "@/features/onboarding/useIsCommunityGuest";
 import { isWelcomeChannel } from "@/features/onboarding/welcome";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { useThreadReplies } from "@/features/messages/useThreadReplies";
@@ -504,7 +505,10 @@ export function useWelcomeKickoff(
   const agentAccessOwnerOnly = agentAccessOwnerOnlyQuery.data;
   const { globalConfig, isLoading: configLoading } = useGlobalAgentConfig();
   const channelId = activeChannel?.id ?? null;
-  const isActiveWelcome = isWelcomeChannel(activeChannel);
+  // Guests never get the Welcome Team, so a private Welcome channel they
+  // happen to belong to must not provision one or post the kickoff.
+  const isGuest = useIsCommunityGuest();
+  const isActiveWelcome = isWelcomeChannel(activeChannel) && !isGuest;
   const focusedWelcomeChannelRef = React.useRef<string | null>(null);
   focusedWelcomeChannelRef.current = isActiveWelcome ? channelId : null;
   // Watch the opener's thread subtree directly so teammate intro replies are

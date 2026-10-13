@@ -113,8 +113,8 @@ export function MembershipDenied({
             </h1>
           </div>
           <p className="text-sm leading-6 text-muted-foreground">
-            This relay requires an invitation. Ask a relay admin to add you as a
-            member, then come back and try again.
+            This community server requires an invitation. Ask a community admin
+            to add you as a member, then come back and try again.
           </p>
         </div>
 
@@ -147,8 +147,8 @@ export function MembershipDenied({
             </div>
           </div>
           <p className="text-xs leading-5 text-muted-foreground">
-            This is your public identity — it&apos;s safe to share. Send it to
-            the relay admin so they can invite you.
+            This is your public identity — it&apos;s safe to share. Send it to a
+            community admin so they can invite you.
           </p>
         </div>
 

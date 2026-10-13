@@ -3,3 +3,7 @@ export const SECTION_ICON_BUTTON_CLASS =
 
 export const SECTION_ACTION_VISIBILITY_CLASS =
   "opacity-0 transition-opacity group-hover/sidebar-section:opacity-100 group-focus-within/sidebar-section:opacity-100 group-data-[section-actions-open=true]/sidebar-section:opacity-100";
+
+/** The primary menu's count pill (Inbox, Bench) on a SidebarMenuBadge. */
+export const SIDEBAR_COUNT_BADGE_CLASS =
+  "right-2 rounded-full bg-primary/15 px-1.5 text-2xs text-primary peer-data-[active=true]/menu-button:bg-sidebar-active-foreground/20 peer-data-[active=true]/menu-button:text-sidebar-active-foreground";
