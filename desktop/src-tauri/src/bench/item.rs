@@ -135,6 +135,21 @@ pub(crate) struct Answer {
     pub answered_at: u64,
 }
 
+/// An answer change waits this long before it is routed, so an untap and a
+/// new tap (how the owner changes an answer) reach the agent as one notice.
+pub(crate) const ROUTE_SETTLE_SECS: u64 = 120;
+
+/// The last answer notice sent to the writer's route target.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Routed {
+    /// 0-based option the notice announced; None: a withdrawal.
+    pub option: Option<usize>,
+    pub to: String,
+    pub event_id: String,
+    pub at: u64,
+}
+
 /// A validated drop, namespaced by writer, as kept in state.json.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +183,11 @@ pub(crate) struct Item {
     /// next one posts without the p tag. A new Drop starts false.
     #[serde(default)]
     pub quiet_repost: bool,
+    #[serde(default)]
+    pub routed: Option<Routed>,
+    /// Bench clock of the last answer change: a new reaction or a clear.
+    #[serde(default)]
+    pub changed_at: u64,
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
@@ -391,6 +411,8 @@ pub(crate) fn validate(
         answer: None,
         recorded: None,
         quiet_repost: false,
+        routed: None,
+        changed_at: 0,
     })
 }
 
@@ -634,6 +656,53 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.needs == Needs::You
         && item.validity == Validity::Current
         && item.writer != MIGRATION_WRITER
+}
+
+/// Whether the route target is owed a notice: the answer has settled and is
+/// not the one it was last told. A clear that was never routed owes nothing;
+/// a re-tap of the told option is no change.
+pub(crate) fn route_due(item: &Item, now: u64) -> bool {
+    let want = item.answer.as_ref().map(|a| a.option);
+    let told = item.routed.as_ref().map(|r| r.option);
+    told.map_or(want.is_some(), |t| t != want)
+        && now.saturating_sub(item.changed_at) >= ROUTE_SETTLE_SECS
+}
+
+/// The notice for the item's current answer; `prev` is the option the target
+/// was last told (None: never, or a withdrawal). Card text goes through
+/// plain_text as on the card: it is drop text, so the agent is pointed at the
+/// outbox file, which carries the owner's signed reaction.
+pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> String {
+    let id = &item.id;
+    let opt = |i: usize| {
+        let text = item.options.get(i).map(|o| plain_text(o, usize::MAX));
+        format!("{}. {}", i + 1, text.unwrap_or_default())
+    };
+    let head = format!("{id}\nCard: {}", plain_text(&item.title, usize::MAX));
+    let details =
+        format!("Answered {hhmm} by the owner. Details: outbox/{id}.json in the Bench folder.");
+    let clear = format!(
+        "reply in this thread, then clear the card by re-dropping {id} as a decision or status."
+    );
+    match (item.answer.as_ref().map(|a| a.option), prev) {
+        (Some(n), None) => format!(
+            "Bench answer \u{b7} {head}\nChosen: {}\n{details}\nAct on it, {clear}",
+            opt(n)
+        ),
+        (Some(n), Some(p)) => format!(
+            "Bench answer changed \u{b7} {head}\nChosen: {}\nWas: {}\n{details}\n\
+             Undo what you did for the old choice if it conflicts, {clear}",
+            opt(n),
+            opt(p)
+        ),
+        (None, Some(p)) => format!(
+            "Bench answer withdrawn \u{b7} {head}\nWas: {}\nThe owner cleared the answer at \
+             {hhmm}. Stop if you have not acted; if you have, say in this thread what to \
+             undo. Do not clear the card.",
+            opt(p)
+        ),
+        (None, None) => String::new(),
+    }
 }
 
 /// The event a reaction is aimed at: its last `e` tag, how the relay scopes

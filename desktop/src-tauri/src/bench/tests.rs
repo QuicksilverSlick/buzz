@@ -609,8 +609,10 @@ fn rebuild_map_keeps_the_newest_per_marker_and_lists_the_rest() {
     let board_new = kind9(&w, 104, Some("bench:board@eeee"));
     let untagged = kind9(&w, 105, None);
     let foreign = kind9(&Keys::generate(), 106, Some("bench:board@ffff"));
+    // An answer notice is neither a card nor a stray.
+    let route = kind9(&w, 107, Some("bench:route:orchestrator/x@2"));
     let events = [
-        &board_new, &card_old, &untagged, &card_y, &board_old, &card_new, &foreign,
+        &board_new, &card_old, &untagged, &card_y, &board_old, &card_new, &foreign, &route,
     ]
     .map(|e| e.clone());
 
@@ -788,7 +790,8 @@ struct Relay {
     query_reply: Mutex<Vec<Value>>,
     /// Every /query body in order.
     queries: Mutex<Vec<Value>>,
-    /// Event ids the relay no longer has: a kind 5 or 40003 on them is refused.
+    /// Event ids the relay no longer has: a kind 5, 40003 or reply on them is
+    /// refused.
     gone: Mutex<HashSet<String>>,
 }
 
@@ -826,11 +829,11 @@ async fn fake_events(
     }
     let kind = ev["kind"].as_u64().unwrap();
     let target = tag_value(&ev, "e").unwrap_or_default();
-    if matches!(kind, 5 | 40003) && r.gone.lock().unwrap().contains(&target) {
-        let message = if kind == 5 {
-            "target event not found"
-        } else {
-            "invalid: edit target event not found"
+    if matches!(kind, 5 | 9 | 40003) && r.gone.lock().unwrap().contains(&target) {
+        let message = match kind {
+            5 => "target event not found",
+            9 => "invalid: reply parent not found",
+            _ => "invalid: edit target event not found",
         };
         let reply = json!({ "event_id": ev["id"], "accepted": false, "message": message });
         return (StatusCode::OK, Json(reply));
@@ -910,6 +913,7 @@ impl Bench {
             owner,
             writer,
             root: root.clone(),
+            agents: Vec::new(),
         };
         let (s, fresh) = load_state(&root);
         assert!(fresh);
@@ -1427,3 +1431,4 @@ fn exported_board_drops_all_validate() {
 
 mod answers;
 mod desktop_cards;
+mod routes;

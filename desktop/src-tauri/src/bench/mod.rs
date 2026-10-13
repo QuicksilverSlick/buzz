@@ -128,6 +128,11 @@ pub(crate) struct BenchState {
     items: BTreeMap<String, item::Item>,
     orphan_cards: BTreeMap<String, Posted>,
     strays: Vec<String>,
+    /// routes.json entries refused this tick, as `<writer>: <reason>`.
+    unroutable: Vec<String>,
+    /// No notice before this: an agent never sees events from before it
+    /// subscribes, so a launch (rebuild) or a join holds them one settle.
+    routes_held_until: u64,
     last_tick: String,
     last_error: Option<String>,
 }
@@ -271,6 +276,8 @@ pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt 
                     r.cards.insert(id.to_string(), p);
                 }
             }
+            // Answer notices: thread replies the Bench never edits or retires.
+            Some((target, _)) if target.starts_with("route:") => {}
             _ => r.stray_ids.push(e.id.to_hex()),
         }
     }
@@ -364,6 +371,9 @@ pub(crate) struct Ctx<'a> {
     pub owner: nostr::Keys,
     pub writer: nostr::Keys,
     pub root: PathBuf,
+    /// Managed agents on this desktop that admit the writer: the only
+    /// possible route targets.
+    pub agents: Vec<String>,
 }
 
 enum Outcome {
@@ -503,6 +513,80 @@ fn read_members(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// routes.json: `{"<writer folder>": "<agent hex>"}`, the agent that acts on
+/// that writer's answers. The owner's file, not the drop's: a drop could aim
+/// writer-signed mentions anywhere, and every target joins private #bench.
+/// A target must be a managed agent here that admits the writer, and never
+/// the writer, the owner or an approver (an agent must not answer cards).
+/// Refused entries come back as `<writer>: <reason>`; no file, no routes.
+fn read_routes(
+    root: &Path,
+    agents: &[String],
+    approvers: &[String],
+    writer_hex: &str,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut routes = BTreeMap::new();
+    let mut unroutable = Vec::new();
+    let map = match std::fs::read_to_string(root.join("routes.json")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (routes, unroutable),
+        Err(e) => Err(e.to_string()),
+        Ok(text) => {
+            serde_json::from_str::<BTreeMap<String, String>>(&text).map_err(|e| e.to_string())
+        }
+    };
+    let map = match map {
+        Ok(map) => map,
+        Err(e) => return (routes, vec![format!("routes.json: {e}")]),
+    };
+    for (writer, to) in map {
+        let to = to.trim().to_ascii_lowercase();
+        let reason = if !item::valid_name(&writer, item::NAME_MAX) {
+            "not a writer folder name"
+        } else if to.len() != 64 || !to.bytes().all(|b| b.is_ascii_hexdigit()) {
+            "not a 64-hex pubkey"
+        } else if to == writer_hex || approvers.contains(&to) {
+            "the writer, the owner or an approver"
+        } else if !agents.contains(&to) {
+            "not a managed agent here that admits the Bench writer"
+        } else {
+            routes.insert(writer, to);
+            continue;
+        };
+        unroutable.push(format!("{writer}: {reason}"));
+    }
+    (routes, unroutable)
+}
+
+/// Agents whose access, as this build enforces it, lets the writer's
+/// mentions in: anyone, or an allowlist naming the writer.
+fn admitting_agents(
+    records: &[crate::managed_agents::ManagedAgentRecord],
+    writer_hex: &str,
+    owner_only_build: bool,
+) -> Vec<String> {
+    use crate::managed_agents::{access_policy, RespondTo};
+    records
+        .iter()
+        .filter(
+            |r| match access_policy::projected_access_with_policy(r, owner_only_build) {
+                (RespondTo::Anyone, _) => true,
+                (RespondTo::Allowlist, list) => list
+                    .iter()
+                    .any(|k| k.trim().eq_ignore_ascii_case(writer_hex)),
+                (RespondTo::OwnerOnly, _) => false,
+            },
+        )
+        .map(|r| r.pubkey.to_ascii_lowercase())
+        .collect()
+}
+
+/// Local `HH:MM` of a Bench clock reading.
+fn local_hhmm(ts: u64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// Take `n` posts from the tick's budget, or say no.
 fn spend(budget: &mut usize, n: usize) -> bool {
     match budget.checked_sub(n) {
@@ -514,14 +598,17 @@ fn spend(budget: &mut usize, n: usize) -> bool {
     }
 }
 
-/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member (owner). Each
-/// step is retried every tick until its flag is set. The tag-free kind 0 goes
-/// first so a refused writer leaves no half-built channel behind.
+/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member and route
+/// target (owner). Each step is retried every tick until its flag is set. The
+/// tag-free kind 0 goes first so a refused writer leaves no half-built
+/// channel behind. Route targets join to read their notices; they never go
+/// into members.txt, so they never answer.
 async fn bootstrap(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     budget: &mut usize,
     now: u64,
+    routes: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
     let ch = channel_id(&s.owner_pubkey);
     let writer_hex = ctx.writer.public_key().to_hex();
@@ -542,7 +629,10 @@ async fn bootstrap(
         post_as_owner(ctx, create).await?;
         s.channel_created = true;
     }
-    for hex in std::iter::once(writer_hex.clone()).chain(read_members(&ctx.root)) {
+    let joining = std::iter::once(writer_hex.clone())
+        .chain(read_members(&ctx.root))
+        .chain(routes.values().cloned());
+    for hex in joining {
         if s.members_added.contains(&hex) {
             continue;
         }
@@ -551,6 +641,7 @@ async fn bootstrap(
         }
         post_as_owner(ctx, events::build_add_member(ch, &hex, None)?).await?;
         s.members_added.push(hex);
+        s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
         // The relay stamps a member_joined row after the 9000: repost the
         // board so it stays newest.
         s.board_dirty = true;
@@ -585,6 +676,7 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     s.board = r.board;
     s.strays = r.stray_ids;
     s.needs_rebuild = false;
+    s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
     // The partial map is kept; the Err is how state.json learns of the cut.
     if events.len() as u32 >= RECOVER_LIMIT {
         return Err(format!(
@@ -681,6 +773,7 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
                     &path,
                     body.to_string().as_bytes(),
                 )?;
+                item.changed_at = now;
                 Some(item::Answer {
                     reaction_id,
                     option: i,
@@ -693,6 +786,9 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
             // disk for the writer to act on.
             None => {
                 let _ = std::fs::remove_file(&path);
+                if item.answer.is_some() {
+                    item.changed_at = now;
+                }
                 None
             }
         };
@@ -720,24 +816,22 @@ fn expire(s: &mut BenchState, now: u64) {
     }
 }
 
-/// A kind 9 in #bench carrying its `client` marker; the p tag only when the
-/// card pings the owner.
+/// A kind 9 in #bench carrying its `client` marker; the p tag only for whom
+/// it pings (the owner for a card, the route target for a notice).
 async fn post_message(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     text: &str,
-    ping: bool,
+    ping: Option<&str>,
+    thread: Option<&events::ThreadRef>,
     marker: String,
     now: u64,
 ) -> Result<Outcome, String> {
-    let owner_hex = s.owner_pubkey.clone();
-    let owner_p = [owner_hex.as_str()];
-    let mentions: &[&str] = if ping { &owner_p } else { &[] };
     let builder = events::build_message_with_client_tags(
-        channel_id(&owner_hex),
+        channel_id(&s.owner_pubkey),
         text,
-        None,
-        mentions,
+        thread,
+        ping.as_slice(),
         &[],
         &[],
         &[],
@@ -795,6 +889,7 @@ async fn publish(
     budget: &mut usize,
     now: u64,
     hhmm: &str,
+    routes: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     // (a) The live cards: pending + current + unanswered by severity; kept
     // answered cards count against MAX_CARDS (the phone's pill window).
@@ -851,6 +946,73 @@ async fn publish(
         }
     }
 
+    // (a3) Tell the writer's route target of a settled answer change, in the
+    // card's thread so the board stays newest. `routed` lands only once the
+    // relay took the notice, so a failed post is retried next tick.
+    for id in s.items.keys().cloned().collect::<Vec<_>>() {
+        let item = s.items[&id].clone();
+        let Some(to) = routes
+            .get(&item.writer)
+            .filter(|to| s.members_added.contains(to))
+        else {
+            continue;
+        };
+        if now < s.routes_held_until || !item::route_due(&item, now) {
+            continue;
+        }
+        if !spend(budget, 1) {
+            return Ok(());
+        }
+        let want = item.answer.as_ref().map(|a| a.option);
+        let prev = item.routed.as_ref().and_then(|r| r.option);
+        let at = item
+            .answer
+            .as_ref()
+            .map_or(item.changed_at, |a| a.answered_at);
+        let text = item::render_route(&item, prev, &local_hhmm(at));
+        let n = want.map_or("withdrawn".to_string(), |i| (i + 1).to_string());
+        let thread = live_card(&item)
+            .map(|c| nostr::EventId::from_hex(&c.event_id))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .map(|e| events::ThreadRef {
+                root_event_id: e,
+                parent_event_id: e,
+            });
+        let marker = format!("bench:route:{id}@{n}");
+        let outcome = match post_message(
+            ctx,
+            s,
+            &text,
+            Some(to.as_str()),
+            thread.as_ref(),
+            marker,
+            now,
+        )
+        .await
+        {
+            // The card was deleted by hand: the notice goes top-level next tick.
+            Err(e) if thread.is_some() && e.contains("not found") => {
+                forget_card(s, &id);
+                continue;
+            }
+            r => r?,
+        };
+        // A top-level notice is now newer than the board.
+        s.board_dirty |= thread.is_none();
+        let event_id = match outcome {
+            Outcome::Accepted { event_id } => event_id,
+            // Already on the relay: told all the same.
+            Outcome::Duplicate => String::new(),
+        };
+        s.items.get_mut(&id).expect("routed id").routed = Some(item::Routed {
+            option: want,
+            to: to.clone(),
+            event_id,
+            at: now,
+        });
+    }
+
     // (b) Delete cards that are stale (another Drop or card format) or no
     // longer wanted. An answered card is exempt for ANSWER_KEEP_SECS so late
     // pills land, then retired here; it is never refreshed for format alone.
@@ -899,8 +1061,9 @@ async fn publish(
         let hash = item::card_hash(&item);
         let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
-        let ping = item::ping_owner(&item) && !item.quiet_repost;
-        match post_message(ctx, s, &text, ping, marker, now).await? {
+        let owner = s.owner_pubkey.clone();
+        let ping = (item::ping_owner(&item) && !item.quiet_repost).then_some(owner.as_str());
+        match post_message(ctx, s, &text, ping, None, marker, now).await? {
             Outcome::Accepted { event_id } => {
                 let created_at = s.last_created_at;
                 let i = s.items.get_mut(id).expect("wanted id");
@@ -960,7 +1123,8 @@ async fn publish(
         if !spend(budget, 2) {
             return Ok(());
         }
-        match post_message(ctx, s, &text, false, format!("bench:board@{hash}"), now).await? {
+        let marker = format!("bench:board@{hash}");
+        match post_message(ctx, s, &text, None, None, marker, now).await? {
             Outcome::Accepted { event_id } => {
                 let old = s.board.replace(Posted {
                     event_id,
@@ -1020,8 +1184,14 @@ pub(crate) async fn tick(
         );
     }
     s.last_tick = now_iso.to_string();
+    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+        .chain(read_members(&ctx.root))
+        .collect();
+    let writer_hex = ctx.writer.public_key().to_hex();
+    let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &approvers, &writer_hex);
+    s.unroutable = unroutable;
     let mut budget = MAX_POSTS_PER_TICK;
-    if !bootstrap(ctx, s, &mut budget, now).await? {
+    if !bootstrap(ctx, s, &mut budget, now, &routes).await? {
         return Ok(());
     }
     if s.needs_rebuild {
@@ -1030,7 +1200,7 @@ pub(crate) async fn tick(
     poll_answers(ctx, s, now).await?;
     intake(s, &ctx.root, now_iso);
     expire(s, now);
-    publish(ctx, s, &mut budget, now, hhmm).await
+    publish(ctx, s, &mut budget, now, hhmm, &routes).await
 }
 
 /// The service loop. state.json (lastTick / lastError / admission) is the
@@ -1080,7 +1250,7 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
     // would otherwise leave an unlisted card behind for good.
     s.needs_rebuild = true;
     s.relay = relay.clone();
-    s.writer_pubkey = writer_hex;
+    s.writer_pubkey = writer_hex.clone();
     s.version = 1;
     let base = crate::relay::relay_http_base_url(&relay);
     let mut last_written = String::new();
@@ -1090,12 +1260,24 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
         let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let result = match state.signing_keys() {
             Ok(owner) => {
+                // Re-read every tick: an allowlist edit takes effect without a
+                // relaunch. A broken store routes nothing (state.json says so).
+                let agents = crate::managed_agents::load_agent_store(&app)
+                    .map(|r| {
+                        admitting_agents(
+                            &r,
+                            &writer_hex,
+                            crate::managed_agents::access_policy::owner_only(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let ctx = Ctx {
                     state: &state,
                     base: base.clone(),
                     owner,
                     writer: writer.clone(),
                     root: root.clone(),
+                    agents,
                 };
                 let now = nostr::Timestamp::now().as_secs();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();
