@@ -25,6 +25,9 @@ buzz-persona = { path = "../buzz-persona" }
 git-credential-nostr = { path = "../git-credential-nostr" }
 git-sign-nostr = { path = "../git-sign-nostr" }
 tempfile = "3"
+# Holds the key folder's .lock (flock / LockFileEx). std's File::lock is 1.89+, past the
+# 1.88 MSRV; buzz-agent uses fs2 for the same reason.
+fs2 = "0.4"
 zeroize = { workspace = true }
 
 # Nostr

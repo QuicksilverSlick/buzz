@@ -43,7 +43,7 @@ impl GitEnvironment {
         let dir = tempfile::Builder::new().prefix(DIR_PREFIX).tempdir()?;
         set_owner_only(dir.path())?;
         let lock = std::fs::File::create(dir.path().join(LOCK_FILE))?;
-        lock.lock()?;
+        fs2::FileExt::lock_exclusive(&lock)?;
         symlink(executable, &dir.path().join("git-credential-nostr"))?;
         if agent {
             symlink(executable, &dir.path().join("git-sign-nostr"))?;
@@ -148,7 +148,7 @@ fn remove_stale_dirs(parent: &Path, min_age: std::time::Duration) {
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age >= min_age);
-        if !old_enough || lock.try_lock().is_err() {
+        if !old_enough || fs2::FileExt::try_lock_exclusive(&lock).is_err() {
             continue;
         }
         drop(lock);
@@ -861,7 +861,7 @@ mod stale_dir_tests {
         File::create(unrelated.join(LOCK_FILE)).unwrap();
         // Stands in for a live harness: it holds its lock until it exits.
         let held = File::open(running.join(LOCK_FILE)).unwrap();
-        held.lock().unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
 
         // Too young: an owner may not have taken its lock yet.
         remove_stale_dirs(parent.path(), Duration::from_secs(3600));

@@ -10669,7 +10669,7 @@ mod build_mcp_servers_tests {
             .to_path_buf();
         let lock = std::fs::File::open(dir.join(".lock")).unwrap();
         assert!(
-            lock.try_lock().is_err(),
+            fs2::FileExt::try_lock_exclusive(&lock).is_err(),
             "a running harness must hold its folder's lock, or a sweep would delete its key"
         );
         drop(lock);
