@@ -18,10 +18,6 @@ ignore = [
     # Desktop workspace (desktop/src-tauri) — unmaintained crates with no safe upgrade.
     # audiopus_sys: via `opus` 0.3 (huddle Opus decoder); fix is switching Opus bindings.
     { id = "RUSTSEC-2026-0150", reason = "desktop: audiopus_sys via opus; no maintained replacement adopted yet" },
-    # ringbuf 0.3.3: via `neteq` 0.8 (huddle jitter buffer). neteq declares ringbuf but its source never
-    # calls it, so Consumer::skip/clear (the affected functions) are unreachable; every neteq release,
-    # 0.9.1 included, still requires ringbuf ^0.3. Drop this when neteq moves to ringbuf >= 0.5.2.
-    { id = "RUSTSEC-2026-0293", reason = "desktop: ringbuf 0.3 via neteq, which never calls it; no neteq release allows >= 0.5.2" },
     # mach 0.1.2 / 0.3.2: via `user-idle` 0.6 (macOS idle detection).
     { id = "RUSTSEC-2020-0168", reason = "desktop: mach via user-idle; no upstream fix available" },
     # proc-macro-error: via tauri → tray-icon → gtk 0.18 → glib-macros (Linux only).
@@ -32,9 +28,17 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "desktop: unic-char-property via tauri-utils → urlpattern; waits on tauri" },
     { id = "RUSTSEC-2025-0098", reason = "desktop: unic-ucd-version via tauri-utils → urlpattern; waits on tauri" },
     { id = "RUSTSEC-2025-0100", reason = "desktop: unic-ucd-ident via tauri-utils → urlpattern; waits on tauri" },
-    # unsafe-libyaml 0.2.11: unmaintained (no vulnerability), via serde_yaml. No maintained
-    # drop-in is adopted upstream yet; owner chose to ignore it on 2026-10-12.
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade; via serde_yaml" },
+    # unsafe-libyaml 0.2.11 — unmaintained (repository archived 2024-03-25), not a
+    # vulnerability report. Transitive dep: serde_yaml → unsafe-libyaml. The serde_yaml_ng
+    # fork uses the same crate, so removing it means migrating YAML parsing in
+    # buzz-agent, buzz-persona, buzz-relay, buzz-workflow and desktop.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via serde_yaml; unmaintained, not vulnerable; removal needs a YAML parser migration" },
+    # NetEQ =0.8.3 declares ringbuf but its published Rust sources never use it,
+    # so Consumer::skip/clear and their panic-unsafe Drop path are unreachable.
+    # NetEQ 0.9.1 still declares ringbuf 0.3; ringbuf itself is fixed in 0.5.2.
+    # Keep the exact NetEQ pin and the wrapper ban below together. Re-audit or
+    # remove this exception when NetEQ removes/updates the unused dependency.
+    { id = "RUSTSEC-2026-0293", reason = "unused dependency of audited, exactly pinned neteq 0.8.3; no Rust references to ringbuf; other consumers forbidden by bans.deny" },
 ]
 
 [licenses]
@@ -110,3 +114,6 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+deny = [
+    { name = "ringbuf", version = "<0.5.2", wrappers = ["neteq"], reason = "only audited NetEQ may declare this unused vulnerable dependency; all other consumers must use a patched release" },
+]
