@@ -10547,6 +10547,30 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn git_key_folder_stays_locked_while_its_harness_runs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let git = install_git_with_env(&test_config(), &[]).unwrap();
+        let keyfile = &git
+            .env
+            .windows(2)
+            .find(|pair| pair[0].1 == "nostr.keyfile")
+            .unwrap()[1]
+            .1;
+        let dir = std::path::Path::new(keyfile)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let lock = std::fs::File::open(dir.join(".lock")).unwrap();
+        assert!(
+            lock.try_lock().is_err(),
+            "a running harness must hold its folder's lock, or a sweep would delete its key"
+        );
+        drop(lock);
+        drop(git);
+        assert!(!dir.exists(), "a clean exit still removes the folder");
+    }
+
+    #[test]
     fn invalid_git_identity_mode_fails_install() {
         let _guard = ENV_LOCK.lock().unwrap();
         let err = install_git_with_env(
