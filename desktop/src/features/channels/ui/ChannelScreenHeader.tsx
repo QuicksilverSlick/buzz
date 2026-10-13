@@ -27,7 +27,6 @@ import {
 import { ownsAnyAgent } from "@/features/agents/knownAgentPubkeys";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { WELCOME_TEAM_ID } from "@/features/onboarding/welcomeGuide";
-import { useIsProjectHomeChannel } from "@/features/projects/lib/projectHomeChannel";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators";
 import { Button } from "@/shared/ui/button";
@@ -111,13 +110,9 @@ export function ChannelScreenHeader({
     !activeChannel.archivedAt &&
     onJoinChannel;
 
-  // A project home shows its own context beside the header, aligned with a
-  // one-line title, so it gets no description line.
-  const isProjectHome = useIsProjectHomeChannel(activeChannel?.id);
   // Only an undescribed channel needs the roster, to decide whether this
   // viewer gets "Add a description". The channel screen already loads it.
   const needsManageCheck =
-    !isProjectHome &&
     onAddDescription !== undefined &&
     activeChannel !== null &&
     activeChannel.channelType !== "dm" &&
@@ -133,24 +128,25 @@ export function ChannelScreenHeader({
     needsManageCheck,
   );
   const headerLine = getChannelHeaderLine(activeChannel, canManageChannel);
-  const subtitle = isProjectHome ? null : headerLine.kind === "description" ? (
-    <p
-      className="min-w-0 truncate pl-5 text-xs leading-4 text-muted-foreground"
-      data-testid="chat-description"
-      title={headerLine.title}
-    >
-      {headerLine.text}
-    </p>
-  ) : headerLine.kind === "add-description" && onAddDescription ? (
-    <button
-      className="ml-5 min-w-0 truncate rounded-sm text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-      data-testid="chat-add-description"
-      onClick={onAddDescription}
-      type="button"
-    >
-      Add a description
-    </button>
-  ) : null;
+  const subtitle =
+    headerLine.kind === "description" ? (
+      <p
+        className="min-w-0 truncate pl-1 text-xs leading-4 text-muted-foreground"
+        data-testid="chat-description"
+        title={headerLine.title}
+      >
+        {headerLine.text}
+      </p>
+    ) : headerLine.kind === "add-description" && onAddDescription ? (
+      <button
+        className="ml-1 min-w-0 truncate rounded-sm text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+        data-testid="chat-add-description"
+        onClick={onAddDescription}
+        type="button"
+      >
+        Add a description
+      </button>
+    ) : null;
 
   const terminalPanel = useTerminalPanel();
   const managedAgentsQuery = useManagedAgentsQuery();

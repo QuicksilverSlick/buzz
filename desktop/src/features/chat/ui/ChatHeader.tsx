@@ -33,7 +33,7 @@ type ChatHeaderProps = {
   mode?: "home" | "channel" | "agents" | "workflows" | "pulse" | "projects";
   overlaysContent?: boolean;
   statusBadge?: React.ReactNode;
-  /** One line under the title, such as the channel description. */
+  /** One muted line beside the title, such as the channel description. */
   subtitle?: React.ReactNode;
   /** Identity adornment rendered exactly 4px after a DM title. */
   titleAdornment?: React.ReactNode;
@@ -129,14 +129,7 @@ export function ChatHeader({
     >
       <div className="flex h-9 min-w-0 items-center gap-2.5">
         <div className="min-w-0 flex-1">
-          {/* With a subtitle, the title and subtitle rows (h-5 + h-4) share
-              the same h-9 row, so the header height does not change. */}
-          <div
-            className={cn(
-              "group/title flex min-w-0 items-center gap-[4px] overflow-hidden",
-              subtitle && "h-5",
-            )}
-          >
+          <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
             <div className="flex shrink-0 items-center">
               {leadingContent ?? (
                 <ChannelIcon
@@ -148,8 +141,7 @@ export function ChatHeader({
             </div>
             <h1
               className={cn(
-                "min-w-0 truncate text-base font-semibold tracking-tight",
-                subtitle ? "leading-5" : "leading-6",
+                "min-w-0 truncate text-base font-semibold leading-6 tracking-tight",
                 channelType !== "dm" && "translate-y-px",
               )}
               data-testid="chat-title"
@@ -161,8 +153,7 @@ export function ChatHeader({
             <Button
               aria-label={`Copy channel name: ${title}`}
               className={cn(
-                "shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100",
-                subtitle ? "h-5 w-5" : "h-6 w-6",
+                "h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100",
               )}
               onClick={() => void handleCopyTitle()}
               size="icon-xs"
@@ -177,10 +168,12 @@ export function ChatHeader({
                 {statusBadge}
               </div>
             ) : null}
+            {/* Beside the title, not under it, so the title keeps its
+                vertical position (sidebar search and project home align to it). */}
+            {subtitle ? (
+              <div className="flex min-w-0 flex-1 items-center">{subtitle}</div>
+            ) : null}
           </div>
-          {subtitle ? (
-            <div className="flex h-4 min-w-0 items-center">{subtitle}</div>
-          ) : null}
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
