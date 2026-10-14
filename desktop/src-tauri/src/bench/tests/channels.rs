@@ -7,18 +7,18 @@ use super::super::roles::AgentAccess;
 use super::answers::{last_query, reply, tap, ITEM};
 use super::*;
 
-const X: &str = "105f15cc-1d5a-431a-9826-9402fba1a12b";
-const ASK: &str = "reset-worker/welcome";
+pub(super) const X: &str = "105f15cc-1d5a-431a-9826-9402fba1a12b";
+pub(super) const ASK: &str = "reset-worker/welcome";
 
-struct People {
-    craig: Keys,
+pub(super) struct People {
+    pub(super) craig: Keys,
     /// Reset Worker: writes the folder and is its route target.
     agent: Keys,
     /// An agent decider: never an answerer on a needs-you card.
     orch: Keys,
 }
 
-fn hex(k: &Keys) -> String {
+pub(super) fn hex(k: &Keys) -> String {
     k.public_key().to_hex()
 }
 
@@ -77,7 +77,7 @@ fn ask(overrides: &[(&str, Value)]) -> String {
 }
 
 /// The #bench bench with its legacy card, plus the scoped card in X.
-async fn bound_bench() -> (Bench, People, nostr::Event) {
+pub(super) async fn bound_bench() -> (Bench, People, nostr::Event) {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let p = bind(&mut b);
     let list = admins(&b, &b.relay.keys.clone(), &[]);

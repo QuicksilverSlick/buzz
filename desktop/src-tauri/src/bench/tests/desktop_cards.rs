@@ -2,8 +2,9 @@
 //! through the fake relay and Bench harness in tests.rs.
 
 use super::answers::{last_query, outbox, reply, tap, ITEM};
+use super::channels::{bound_bench, hex, ASK, X};
 use super::*;
-use crate::bench::commands::{answer_card, cards, plan_answer, AnswerPlan, ANSWERED_ELSEWHERE};
+use crate::bench::commands::{answer_card, cards, plan_answer, AnswerPlan};
 
 fn plan(add: Option<&'static str>, delete: &[&str]) -> AnswerPlan {
     AnswerPlan {
@@ -14,10 +15,12 @@ fn plan(add: Option<&'static str>, delete: &[&str]) -> AnswerPlan {
 
 /// One bench_answer: the posts it made, as events the relay now holds.
 async fn answer(b: &Bench, option: Option<u8>) -> Vec<nostr::Event> {
+    answer_on(b, ITEM, option).await
+}
+
+async fn answer_on(b: &Bench, id: &str, option: Option<u8>) -> Vec<nostr::Event> {
     let before = b.posts().len();
-    answer_card(&b.ctx, &b.s, ITEM, option, b.now)
-        .await
-        .unwrap();
+    answer_card(&b.ctx, &b.s, id, option, b.now).await.unwrap();
     b.posts()[before..]
         .iter()
         .map(|(e, tag)| {
@@ -88,11 +91,11 @@ async fn bench_answer_posts_owner_keycaps_and_the_tick_records_them() {
         tap(&b.ctx.owner, &card, OPTION_EMOJI[1], 0).tags,
         "tags exactly like events::build_reaction"
     );
-    // The poll's own filter and approvers, narrowed to this card.
+    // The owner's own keycaps on this card, in its channel.
     assert_eq!(
         last_query(&b),
         json!([{
-            "kinds": [7], "authors": [owner, "cd".repeat(32)], "#h": [b.channel()],
+            "kinds": [7], "authors": [owner], "#h": [b.channel()],
             "#e": [card], "limit": 500,
         }])
     );
@@ -146,89 +149,46 @@ async fn bench_answer_posts_owner_keycaps_and_the_tick_records_them() {
 }
 
 #[tokio::test]
-async fn bench_answer_follows_latest_wins_across_approver_keys() {
-    let mut b = seeded_bench(Gate::Open, &[]).await;
-    let card = b.card(ITEM).event_id;
-    // The phone's own key, which answers through members.txt.
-    let phone = Keys::generate();
-    std::fs::write(b.root.join("members.txt"), phone.public_key().to_hex()).unwrap();
-    let mut relay: Vec<nostr::Event> = Vec::new();
+async fn bench_answer_in_a_project_channel_overrides_craig() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let owner = b.owner_hex();
+    let craig_tap = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    let mut relay = vec![list, craig_tap];
     async fn tick_with(b: &mut Bench, relay: &[nostr::Event]) -> Option<(usize, String)> {
         reply(b, &relay.iter().collect::<Vec<_>>());
         b.tick().await.unwrap();
-        let a = b.s.items[ITEM].answer.as_ref()?;
-        Some((a.option, a.reaction_id.clone()))
+        let a = b.s.items[ASK].answer.as_ref()?;
+        Some((a.option, a.by.clone()))
     }
-    async fn refused(b: &Bench, option: Option<u8>) -> String {
-        let before = b.posts().len();
-        let err = answer_card(&b.ctx, &b.s, ITEM, option, b.now)
-            .await
-            .unwrap_err();
-        assert_eq!(b.posts().len(), before, "a refusal publishes nothing");
-        err
-    }
+    assert_eq!(tick_with(&mut b, &relay).await, Some((0, hex(&p.craig))));
 
-    // The phone answers 2; undo on the desktop cannot delete its tap.
-    let phone_2 = tap(&phone, &card, OPTION_EMOJI[1], b.now);
-    relay.push(phone_2.clone());
-    assert_eq!(
-        tick_with(&mut b, &relay).await,
-        Some((1, phone_2.id.to_hex()))
-    );
-    assert_eq!(refused(&b, None).await, ANSWERED_ELSEWHERE);
-    assert_eq!(
-        last_query(&b)[0]["authors"],
-        json!([b.owner_hex(), phone.public_key().to_hex()])
-    );
-
-    // Choosing 1 on the desktop outranks it.
-    let posted = answer(&b, Some(0)).await;
+    // Answering as owner: one owner keycap, planned in X against the
+    // owner's own taps only; Craig's tap is never outranked or touched.
+    let posted = answer_on(&b, ASK, Some(1)).await;
     assert_eq!(kinds(&posted), [7]);
-    let desk_1 = posted[0].clone();
-    relay.push(desk_1.clone());
+    assert_eq!(posted[0].created_at.as_secs(), b.now);
     assert_eq!(
-        tick_with(&mut b, &relay).await,
-        Some((0, desk_1.id.to_hex()))
+        last_query(&b),
+        json!([{
+            "kinds": [7], "authors": [owner], "#h": [X], "#e": [card], "limit": 500,
+        }])
     );
-    // Undo here would hand the answer back to the phone's older 2.
-    assert_eq!(refused(&b, None).await, ANSWERED_ELSEWHERE);
+    relay.push(posted[0].clone());
+    assert_eq!(tick_with(&mut b, &relay).await, Some((1, owner.clone())));
 
-    // The phone taps 2 again after the owner, its clock 100 s ahead.
-    relay.retain(|e| e.id != phone_2.id);
-    let phone_2b = tap(&phone, &card, OPTION_EMOJI[1], b.now + 100);
-    relay.push(phone_2b.clone());
-    assert_eq!(
-        tick_with(&mut b, &relay).await,
-        Some((1, phone_2b.id.to_hex()))
-    );
-    // Choosing 1 again: the owner's 1 is there but outranked, so it is
-    // deleted first (the relay refuses an active duplicate) and posted anew,
-    // stamped past the phone's tap.
-    let posted = answer(&b, Some(0)).await;
-    assert_eq!(kinds(&posted), [5, 7]);
+    // The same option by Craig and the owner: the owner's still stands.
+    let owner_1 = posted[0].clone();
+    relay.push(tap(&p.craig, &card, OPTION_EMOJI[1], b.now + 5));
+    assert_eq!(tick_with(&mut b, &relay).await, Some((1, owner.clone())));
+
+    // Clearing deletes only the owner's keycap; Craig's newest answer stands.
+    let posted = answer_on(&b, ASK, None).await;
+    assert_eq!(kinds(&posted), [5]);
     let del = serde_json::to_value(&posted[0]).unwrap();
-    assert_eq!(del["tags"], json!([["e", desk_1.id.to_hex()]]));
-    let desk_1b = posted[1].clone();
-    assert_eq!(desk_1b.content, OPTION_EMOJI[0]);
-    assert_eq!(
-        desk_1b.created_at.as_secs(),
-        phone_2b.created_at.as_secs() + 1
-    );
-    relay.retain(|e| e.id != desk_1.id);
-    relay.push(desk_1b.clone());
-    assert_eq!(
-        tick_with(&mut b, &relay).await,
-        Some((0, desk_1b.id.to_hex()))
-    );
-    assert!(answer(&b, Some(0)).await.is_empty());
-
-    // A tap dated past the clock lead cannot be outranked from here, and the
-    // owner's keycap is not deleted trying.
-    relay.retain(|e| e.id != phone_2b.id);
-    let far = tap(&phone, &card, OPTION_EMOJI[1], b.now + 10_000);
-    relay.push(far.clone());
-    assert_eq!(tick_with(&mut b, &relay).await, Some((1, far.id.to_hex())));
-    assert!(refused(&b, Some(0)).await.contains("dated in the future"));
+    assert_eq!(del["tags"], json!([["e", owner_1.id.to_hex()]]));
+    relay.retain(|e| e.id != owner_1.id);
+    assert_eq!(tick_with(&mut b, &relay).await, Some((1, hex(&p.craig))));
 }
 
 #[tokio::test]
