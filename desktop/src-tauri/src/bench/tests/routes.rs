@@ -12,6 +12,7 @@ fn answered(option: usize, changed_at: u64) -> Item {
         reaction_id: "ab".repeat(32),
         option,
         answered_at: changed_at,
+        ..Default::default()
     });
     item.changed_at = changed_at;
     item

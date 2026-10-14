@@ -781,6 +781,7 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
                     reaction_id,
                     option: i,
                     answered_at: now,
+                    ..Default::default()
                 })
             }
             // Retried every tick with every error ignored (Windows sharing

@@ -1,0 +1,256 @@
+{
+  "about": "Who may answer a Bench card and which answer stands. Read by the Rust bench tests (tests/scoped.rs) and the desktop TypeScript tests. Each alias is a fresh key; 'writer' is the Bench writer S, which supplies the seed taps. ownerSet is the owner plus members.txt. 'to' is the card's resolved answerers (scoped cards only). Kind 7 content is the 1-based keycap number or 'heart'; kind 9 content is a thread reply. 'target': 'other' aims the event at another card. Options in 'answer' are 1-based. No case relies on a tie in time.",
+  "ownerSet": ["owner", "phone"],
+  "cases": [
+    {
+      "name": "a legacy card: the owner counts and Craig is refused",
+      "scoped": false,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "1", "at": 10 },
+        { "who": "craig", "kind": 7, "content": "2", "at": 20 }
+      ],
+      "answer": { "who": "owner", "option": 1 },
+      "reply": null,
+      "refused": ["craig"],
+      "eligible": {
+        "owner": true,
+        "phone": true,
+        "craig": false,
+        "stranger": false,
+        "writer": false
+      }
+    },
+    {
+      "name": "Craig as decider counts",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [{ "who": "craig", "kind": 7, "content": "2", "at": 20 }],
+      "answer": { "who": "craig", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": {
+        "owner": true,
+        "phone": true,
+        "craig": true,
+        "agent": false,
+        "stranger": false
+      }
+    },
+    {
+      "name": "the owner beats a newer Craig tap",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "1", "at": 10 },
+        { "who": "craig", "kind": 7, "content": "2", "at": 20 }
+      ],
+      "answer": { "who": "owner", "option": 1 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "with no owner tap, Craig's tap stands",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "craig", "kind": 7, "content": "2", "at": 20 },
+        { "who": "stranger", "kind": 7, "content": "1", "at": 30 }
+      ],
+      "answer": { "who": "craig", "option": 2 },
+      "reply": null,
+      "refused": ["stranger"],
+      "eligible": { "craig": true, "stranger": false }
+    },
+    {
+      "name": "an agent decider on a needs-you card is refused",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Merge PR 731", "Hold"],
+      "to": [{ "who": "agent", "role": "decider", "agent": true }],
+      "events": [{ "who": "agent", "kind": 7, "content": "1", "at": 10 }],
+      "answer": null,
+      "reply": null,
+      "refused": ["agent"],
+      "eligible": { "owner": true, "agent": false }
+    },
+    {
+      "name": "an agent decider on a delegable card counts",
+      "scoped": true,
+      "needs": "delegable",
+      "options": ["Merge PR 731", "Hold"],
+      "to": [{ "who": "agent", "role": "decider", "agent": true }],
+      "events": [{ "who": "agent", "kind": 7, "content": "1", "at": 10 }],
+      "answer": { "who": "agent", "option": 1 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "agent": true, "craig": false }
+    },
+    {
+      "name": "a newer phone tap beats the owner's tap, and both beat Craig",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "owner", "agent": false }],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "1", "at": 10 },
+        { "who": "phone", "kind": 7, "content": "2", "at": 20 },
+        { "who": "craig", "kind": 7, "content": "1", "at": 30 }
+      ],
+      "answer": { "who": "phone", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "phone": true, "craig": true }
+    },
+    {
+      "name": "the writer's seed taps never count",
+      "scoped": false,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "2", "at": 10 },
+        { "who": "writer", "kind": 7, "content": "1", "at": 50 },
+        { "who": "writer", "kind": 7, "content": "2", "at": 51 }
+      ],
+      "answer": { "who": "owner", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "writer": false }
+    },
+    {
+      "name": "a reply of 2 counts as option 2",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [{ "who": "craig", "kind": 9, "content": " 2 ", "at": 20 }],
+      "answer": { "who": "craig", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "craig": true }
+    },
+    {
+      "name": "a reply matching one label in another case counts",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Send the new email", "Keep the old one"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "craig", "kind": 9, "content": "keep the OLD one", "at": 20 }
+      ],
+      "answer": { "who": "craig", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "craig": true }
+    },
+    {
+      "name": "a free-text reply becomes the reply, newest first",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "owner", "kind": 9, "content": "Let me think", "at": 10 },
+        {
+          "who": "craig",
+          "kind": 9,
+          "content": "Can we wait until Monday?",
+          "at": 20
+        }
+      ],
+      "answer": null,
+      "reply": { "who": "craig" },
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "replies from someone who may not answer are ignored",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "stranger", "kind": 9, "content": "Merge it", "at": 20 },
+        { "who": "stranger", "kind": 9, "content": "1", "at": 30 }
+      ],
+      "answer": null,
+      "reply": null,
+      "refused": ["stranger"],
+      "eligible": { "craig": true, "stranger": false }
+    },
+    {
+      "name": "a keycap beyond the options or another emoji is ignored",
+      "scoped": false,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "3", "at": 20 },
+        { "who": "owner", "kind": 7, "content": "heart", "at": 30 }
+      ],
+      "answer": null,
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true }
+    },
+    {
+      "name": "taps and replies aimed at another card are ignored",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        {
+          "who": "owner",
+          "kind": 7,
+          "content": "1",
+          "at": 10,
+          "target": "other"
+        },
+        {
+          "who": "craig",
+          "kind": 9,
+          "content": "2",
+          "at": 20,
+          "target": "other"
+        },
+        {
+          "who": "craig",
+          "kind": 9,
+          "content": "Why?",
+          "at": 30,
+          "target": "other"
+        }
+      ],
+      "answer": null,
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "a reply on a legacy card is neither an answer nor a reply",
+      "scoped": false,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "owner", "kind": 9, "content": "1", "at": 10 },
+        { "who": "owner", "kind": 9, "content": "Hold on", "at": 20 }
+      ],
+      "answer": null,
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "phone": true }
+    }
+  ]
+}

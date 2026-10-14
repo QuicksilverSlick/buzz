@@ -159,16 +159,52 @@ pub(crate) enum Needs {
     Delegable,
 }
 
-/// The approver's answer on a pending item, derived from a kind-7 reaction.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// The answer on a pending item, derived from a keycap tap (or, on a scoped
+/// card, a thread reply naming an option).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Answer {
-    /// The approver's kind-7 id: the change key.
+    /// The answering event's id: the change key.
     pub reaction_id: String,
     /// 0-based index into `options`.
     pub option: usize,
     /// Bench clock when first seen.
     pub answered_at: u64,
+    /// The answerer's hex; "" on answers recorded before step 1.
+    #[serde(default)]
+    pub by: String,
+    /// A stamped answerer's roster name; None: the owner's own keys.
+    #[serde(default)]
+    pub by_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<AnswerRole>,
+    #[serde(default)]
+    pub source: AnswerSource,
+    /// Local HH:MM when recorded; "" before step 1.
+    #[serde(default)]
+    pub hhmm: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AnswerSource {
+    #[default]
+    Tap,
+    Reply,
+}
+
+/// The newest free-text reply on a scoped card from someone who may answer
+/// it: their "Other", routed to the writer like an answer.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Reply {
+    pub event_id: String,
+    pub by: String,
+    /// None: the owner's own keys.
+    pub by_name: Option<String>,
+    pub role: Option<AnswerRole>,
+    pub at: u64,
+    pub hhmm: String,
 }
 
 /// Who may answer a scoped card, resolved by the service (`roles::stamp`)
@@ -268,6 +304,11 @@ pub(crate) struct Item {
     /// Some iff scoped; set by the service, never by a drop.
     #[serde(default)]
     pub stamp: Option<Stamp>,
+    #[serde(default)]
+    pub reply: Option<Reply>,
+    /// Scoped: the hex already p-tagged for this Drop.
+    #[serde(default)]
+    pub pinged: Vec<String>,
 }
 
 impl Item {
@@ -519,6 +560,8 @@ pub(crate) fn validate(
         routed: None,
         changed_at: 0,
         stamp: None,
+        reply: None,
+        pinged: Vec::new(),
     })
 }
 
@@ -841,6 +884,25 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.writer != MIGRATION_WRITER
 }
 
+/// Who to p-tag on a new card. Owner-only cards keep today's rule; a card
+/// with answerers pings its humans, and its agents only when it is
+/// delegable, each once per Drop.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn card_pings(item: &Item, owner_hex: &str) -> Vec<String> {
+    let answerers = item.stamp.as_ref().map_or(&[][..], |s| &s.answerers);
+    if answerers.is_empty() {
+        return (ping_owner(item) && !item.quiet_repost)
+            .then(|| owner_hex.to_string())
+            .into_iter()
+            .collect();
+    }
+    answerers
+        .iter()
+        .filter(|a| (!a.agent || item.needs == Needs::Delegable) && !item.pinged.contains(&a.pk))
+        .map(|a| a.pk.clone())
+        .collect()
+}
+
 /// Whether the route target is owed a notice: the answer has settled and is
 /// not the one it was last told. A clear that was never routed owes nothing;
 /// a re-tap of the told option is no change.
@@ -900,33 +962,122 @@ pub(crate) fn reaction_target(e: &nostr::Event) -> Option<&str> {
         .last()
 }
 
-/// The answer on `item`'s live card: the NEWEST valid kind 7 by an approver
-/// other than the writer, aimed at the card by its `reaction_target` and
-/// echoing one seeded keycap byte-for-byte.
-/// Latest wins so a second tap changes the answer; a retraction is the
-/// reaction no longer coming back from the relay, which hands the answer to
-/// the next newest.
+/// Whether `pk` may answer this card: the owner's keys (`owner_set`: the
+/// owner plus members.txt) always, a stamped answerer if it is a human or
+/// the card is delegable. The second half repeats `roles::stamp`'s rule.
+pub(crate) fn eligible(item: &Item, pk: &str, owner_set: &[String]) -> bool {
+    owner_set.iter().any(|o| o == pk)
+        || item.stamp.as_ref().is_some_and(|s| {
+            s.answerers
+                .iter()
+                .any(|a| a.pk == pk && (!a.agent || item.needs == Needs::Delegable))
+        })
+}
+
+fn refers_to(e: &nostr::Event, card_id: &str) -> bool {
+    e.tags
+        .iter()
+        .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "e" && v == card_id))
+}
+
+/// The 0-based option an event answers on the card `card_id`: a kind 7
+/// aimed at it by its `reaction_target` and echoing one seeded keycap
+/// byte for byte, or, on a scoped card only, a kind 9 in its thread whose
+/// whole text is "1" to "n" or exactly one option's label.
+pub(crate) fn answer_option(item: &Item, card_id: &str, e: &nostr::Event) -> Option<usize> {
+    let n = item.options.len().min(OPTION_EMOJI.len());
+    match e.kind.as_u16() {
+        7 if reaction_target(e) == Some(card_id) => {
+            OPTION_EMOJI[..n].iter().position(|o| *o == e.content)
+        }
+        9 if item.scoped() && refers_to(e, card_id) => {
+            let t = e.content.trim();
+            (1..=n).position(|k| t == k.to_string()).or_else(|| {
+                let mut hits = item.options[..n]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, o)| plain_text(o, usize::MAX).eq_ignore_ascii_case(t));
+                match (hits.next(), hits.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The answer on `item`'s live card: the newest valid answer from the
+/// owner's keys, else the newest from a stamped answerer, never the
+/// writer's own seeds. The owner always wins, so a later tap by anyone
+/// else never outranks theirs; newest within each so a second tap changes
+/// the answer. A retraction is the event no longer coming back from the
+/// relay, which hands the answer to the next.
 pub(crate) fn pick_answer<'e>(
     item: &Item,
     events: &'e [nostr::Event],
-    approvers: &[String],
+    owner_set: &[String],
     writer_hex: &str,
 ) -> Option<(usize, &'e nostr::Event)> {
     let card = item.card.as_ref()?;
-    let n = item.options.len().min(OPTION_EMOJI.len());
     events
         .iter()
         .filter_map(|e| {
+            let i = answer_option(item, &card.event_id, e)?;
             let pk = e.pubkey.to_hex();
-            let ok = e.kind.as_u16() == 7
-                && pk != writer_hex
-                && approvers.contains(&pk)
-                && reaction_target(e) == Some(card.event_id.as_str())
-                && e.verify().is_ok();
-            let i = OPTION_EMOJI[..n].iter().position(|o| *o == e.content)?;
-            ok.then_some((i, e))
+            let ok = pk != writer_hex && eligible(item, &pk, owner_set) && e.verify().is_ok();
+            ok.then(|| (i, e, owner_set.contains(&pk)))
         })
-        .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
+        .max_by_key(|(_, e, owner)| (*owner, e.created_at.as_secs(), e.id.to_hex()))
+        .map(|(i, e, _)| (i, e))
+}
+
+/// The newest free-text reply in a scoped card's thread from someone who
+/// may answer it: a kind 9 that names no option.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pick_reply<'e>(
+    item: &Item,
+    events: &'e [nostr::Event],
+    owner_set: &[String],
+    writer_hex: &str,
+) -> Option<&'e nostr::Event> {
+    let card = item.card.as_ref().filter(|_| item.scoped())?;
+    events
+        .iter()
+        .filter(|e| {
+            let pk = e.pubkey.to_hex();
+            e.kind.as_u16() == 9
+                && pk != writer_hex
+                && refers_to(e, &card.event_id)
+                && answer_option(item, &card.event_id, e).is_none()
+                && eligible(item, &pk, owner_set)
+                && e.verify().is_ok()
+        })
+        .max_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
+}
+
+/// Valid answers on the live card from keys that may not answer it, for
+/// the refusedTaps log.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn refused_taps<'e>(
+    item: &Item,
+    events: &'e [nostr::Event],
+    owner_set: &[String],
+    writer_hex: &str,
+) -> Vec<&'e nostr::Event> {
+    let Some(card) = &item.card else {
+        return Vec::new();
+    };
+    events
+        .iter()
+        .filter(|e| {
+            let pk = e.pubkey.to_hex();
+            pk != writer_hex
+                && answer_option(item, &card.event_id, e).is_some()
+                && !eligible(item, &pk, owner_set)
+                && e.verify().is_ok()
+        })
+        .collect()
 }
 
 /// Board text. Stale and superseded items are folded (not rendered).

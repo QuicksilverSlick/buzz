@@ -432,3 +432,144 @@ fn card_hash_carries_the_stamp_only_when_set() {
     assert_ne!(card_hash(&item), stamped);
     assert!(card_hash(&item).starts_with(&format!("{}.", item.hash)));
 }
+
+// ── answers: owner wins, over the vectors the desktop shares ────────────
+
+use super::answers::tap;
+use std::collections::HashMap;
+
+const ALIASES: [&str; 6] = ["owner", "phone", "craig", "agent", "stranger", "writer"];
+
+#[test]
+fn answer_vectors() {
+    let v: Value = serde_json::from_str(include_str!("../answer_vectors.json")).unwrap();
+    let keys: HashMap<&str, Keys> = ALIASES.iter().map(|a| (*a, Keys::generate())).collect();
+    let hex_of = |who: &Value| keys[who.as_str().unwrap()].public_key().to_hex();
+    let alias = |e: &nostr::Event| {
+        let pk = e.pubkey;
+        *ALIASES
+            .iter()
+            .find(|a| keys[*a].public_key() == pk)
+            .unwrap()
+    };
+    let owner_set: Vec<String> = v["ownerSet"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(hex_of)
+        .collect();
+    let writer_hex = keys["writer"].public_key().to_hex();
+    let (card, other) = (hex('c'), hex('d'));
+    for case in v["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let mut overrides = vec![
+            ("options", case["options"].clone()),
+            ("needs", case["needs"].clone()),
+        ];
+        if case["scoped"] == json!(true) {
+            overrides.push(("project", json!("p")));
+        }
+        let mut item = check(&overrides).unwrap();
+        assert_eq!(item.scoped(), case["scoped"] == json!(true), "{name}");
+        item.card = Some(Posted {
+            event_id: card.clone(),
+            created_at: 1,
+            hash: item.hash.clone(),
+            seeded: 2,
+        });
+        if item.scoped() {
+            let answerers = case["to"].as_array().unwrap().iter().map(|t| Answerer {
+                pk: hex_of(&t["who"]),
+                name: t["who"].as_str().unwrap().to_string(),
+                role: serde_json::from_value(t["role"].clone()).unwrap(),
+                agent: t["agent"].as_bool().unwrap(),
+            });
+            item.stamp = Some(Stamp {
+                answerers: answerers.collect(),
+                ..Default::default()
+            });
+        }
+        let events: Vec<nostr::Event> = case["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let k = &keys[e["who"].as_str().unwrap()];
+                let target = if e["target"] == json!("other") {
+                    &other
+                } else {
+                    &card
+                };
+                let at = e["at"].as_u64().unwrap();
+                let content = e["content"].as_str().unwrap();
+                if e["kind"] == json!(7) {
+                    let emoji = match content {
+                        "heart" => "\u{2764}\u{FE0F}".to_string(),
+                        n => format!("{n}\u{FE0F}\u{20E3}"),
+                    };
+                    return tap(k, target, &emoji, at);
+                }
+                let root = nostr::Tag::parse(["e", target.as_str(), "", "root"]).unwrap();
+                nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
+                    .tags([root])
+                    .custom_created_at(nostr::Timestamp::from(at))
+                    .sign_with_keys(k)
+                    .unwrap()
+            })
+            .collect();
+
+        let answer = pick_answer(&item, &events, &owner_set, &writer_hex)
+            .map(|(i, e)| json!({"who": alias(e), "option": i + 1}));
+        assert_eq!(
+            answer.unwrap_or(Value::Null),
+            case["answer"],
+            "{name}: answer"
+        );
+        let reply =
+            pick_reply(&item, &events, &owner_set, &writer_hex).map(|e| json!({"who": alias(e)}));
+        assert_eq!(reply.unwrap_or(Value::Null), case["reply"], "{name}: reply");
+        let refused: Vec<&str> = refused_taps(&item, &events, &owner_set, &writer_hex)
+            .into_iter()
+            .map(alias)
+            .collect();
+        assert_eq!(json!(refused), case["refused"], "{name}: refused");
+        for (who, want) in case["eligible"].as_object().unwrap() {
+            let pk = keys[who.as_str()].public_key().to_hex();
+            let got = eligible(&item, &pk, &owner_set);
+            assert_eq!(json!(got), *want, "{name}: eligible {who}");
+        }
+    }
+}
+
+#[test]
+fn card_pings_follow_the_answerers() {
+    let owner = hex('f');
+    let pings = |item: &Item| card_pings(item, &owner);
+    // Owner-only cards keep today's rule, scoped or not.
+    let legacy = check(&[]).unwrap();
+    assert_eq!(pings(&legacy), std::slice::from_ref(&owner));
+    let mut quiet = legacy.clone();
+    quiet.quiet_repost = true;
+    assert!(pings(&quiet).is_empty());
+    assert!(pings(&check(&[("needs", json!("delegable"))]).unwrap()).is_empty());
+    let mut scoped = check(&[("project", json!("p"))]).unwrap();
+    scoped.stamp = Some(Stamp::default());
+    assert_eq!(pings(&scoped), std::slice::from_ref(&owner));
+    // With answerers: the humans, and agents only on a delegable card, each
+    // once per Drop; the owner is not pinged.
+    let person = |c: char, agent: bool| Answerer {
+        pk: hex(c),
+        name: c.to_string(),
+        role: AnswerRole::Decider,
+        agent,
+    };
+    scoped.stamp = Some(Stamp {
+        answerers: vec![person('1', false), person('2', true)],
+        ..Default::default()
+    });
+    assert_eq!(pings(&scoped), [hex('1')]);
+    scoped.needs = Needs::Delegable;
+    assert_eq!(pings(&scoped), [hex('1'), hex('2')]);
+    scoped.pinged = vec![hex('1')];
+    assert_eq!(pings(&scoped), [hex('2')]);
+}

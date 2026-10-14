@@ -16,6 +16,7 @@ fn answered(option: usize, answered_at: u64) -> Option<Answer> {
         reaction_id: "ab".repeat(32),
         option,
         answered_at,
+        ..Default::default()
     })
 }
 
@@ -246,6 +247,7 @@ async fn owner_tap_records_answer_and_writes_outbox() {
             reaction_id: owner_tap.id.to_hex(),
             option: 1,
             answered_at: b.now,
+            ..Default::default()
         })
     );
     assert_eq!(b.s.items[ITEM].recorded, Some(1));
