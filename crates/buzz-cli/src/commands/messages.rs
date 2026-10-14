@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::client::{normalize_events, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::{
-    infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
+    infer_language, parse_event_id, parse_uuid, read_content_or_file, read_or_stdin, truncate_diff,
     validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
 };
 use buzz_sdk::mentions::{
@@ -608,15 +608,7 @@ pub struct SendMessageParams {
     pub mentions: Vec<String>,
 }
 
-pub async fn cmd_send_message(
-    client: &BuzzClient,
-    mut p: SendMessageParams,
-) -> Result<(), CliError> {
-    // Allow '-' to read content from stdin. This keeps callers from having to
-    // jam shell-metacharacter-heavy text (backticks, $vars, etc.) through argv
-    // quoting — the source of countless self-inflicted command-substitution
-    // bugs for agent and human users alike.
-    p.content = read_or_stdin(&p.content)?;
+pub async fn cmd_send_message(client: &BuzzClient, p: SendMessageParams) -> Result<(), CliError> {
     validate_content_size(&p.content)?;
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
@@ -940,6 +932,7 @@ pub async fn dispatch(
         MessagesCmd::Send {
             channel,
             content,
+            content_file,
             kind,
             reply_to,
             broadcast,
@@ -950,7 +943,12 @@ pub async fn dispatch(
                 client,
                 SendMessageParams {
                     channel_id: channel,
-                    content,
+                    // Allow '-' (stdin) or --content-file. This keeps callers from
+                    // having to jam shell-metacharacter-heavy text (backticks,
+                    // $vars, etc.) through argv quoting — the source of countless
+                    // self-inflicted command-substitution bugs for agent and human
+                    // users alike.
+                    content: read_content_or_file(content.as_deref(), content_file.as_deref())?,
                     kind,
                     reply_to,
                     broadcast,
@@ -1813,6 +1811,40 @@ mod tests {
             emoji_tags.is_empty(),
             "no-colon content must produce no emoji tags, got: {emoji_tags:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_content_file_preserves_non_ascii_through_cli_dispatch() {
+        use clap::Parser;
+        // Windows PowerShell pipes turn these into `?`; --content-file must not.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.txt");
+        std::fs::write(&path, "\u{feff}Ship it \u{2014} now \u{1f680}\n").unwrap();
+
+        let cli = crate::Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "send",
+            "--channel",
+            SEND_TEST_CHANNEL,
+            "--content-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let crate::Cmd::Messages(cmd) = cli.command else {
+            panic!("expected a messages command");
+        };
+
+        let (url, _, captured_event) = fake_send_relay(send_palette_response()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        super::dispatch(cmd, &client, &crate::OutputFormat::Json)
+            .await
+            .unwrap();
+
+        let raw = captured_event.lock().unwrap();
+        let raw = raw.as_ref().expect("event must have been submitted");
+        let event: serde_json::Value = serde_json::from_str(&raw.body).unwrap();
+        assert_eq!(event["content"], "Ship it \u{2014} now \u{1f680}\n");
     }
 
     #[tokio::test]

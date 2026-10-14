@@ -15,7 +15,7 @@ use crate::commands::agents::fetch_archived_snapshot;
 use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAgentRoster};
 use crate::commands::users::presence_subject;
 use crate::error::CliError;
-use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
+use crate::validate::{parse_uuid, read_content_or_file, validate_hex64, validate_uuid};
 
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -1825,7 +1825,6 @@ pub async fn cmd_set_canvas(
     channel_id: &str,
     content: &str,
 ) -> Result<(), CliError> {
-    let content = read_or_stdin(content)?;
     let channel_uuid = parse_uuid(channel_id)?;
 
     // `set` is an unconditional replace — no `expected-revision` tag, so the
@@ -1846,11 +1845,11 @@ pub async fn cmd_set_canvas(
             let head_created_at = head.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
             buzz_sdk::build_set_canvas_unconditional_after_head(
                 channel_uuid,
-                &content,
+                content,
                 head_created_at,
             )
         }
-        None => buzz_sdk::build_set_canvas(channel_uuid, &content, None),
+        None => buzz_sdk::build_set_canvas(channel_uuid, content, None),
     }
     .map_err(|e| CliError::Other(format!("build_set_canvas failed: {e}")))?;
 
@@ -1971,7 +1970,14 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
         CanvasCmd::Get { channel, revision } => {
             cmd_get_canvas(client, &channel, revision.as_deref()).await
         }
-        CanvasCmd::Set { channel, content } => cmd_set_canvas(client, &channel, &content).await,
+        CanvasCmd::Set {
+            channel,
+            content,
+            content_file,
+        } => {
+            let content = read_content_or_file(content.as_deref(), content_file.as_deref())?;
+            cmd_set_canvas(client, &channel, &content).await
+        }
         CanvasCmd::History { channel, limit } => cmd_canvas_history(client, &channel, limit).await,
         CanvasCmd::Restore { channel, revision } => {
             cmd_restore_canvas(client, &channel, &revision, &mut std::io::stdout()).await

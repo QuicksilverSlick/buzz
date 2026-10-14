@@ -6134,6 +6134,13 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_teaches_content_file_for_non_ascii_on_windows() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("buzz messages send ... --content-file msg.md"));
+        assert!(prompt.contains("On Windows always use `--content-file`"));
+    }
+
+    #[test]
     fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("read its root `AGENTS.md`"));
