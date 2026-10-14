@@ -309,6 +309,16 @@ pub(crate) struct Item {
     /// Scoped: the hex already p-tagged for this Drop.
     #[serde(default)]
     pub pinged: Vec<String>,
+    /// The name the live card's Recorded line shows; None: the legacy line.
+    #[serde(default)]
+    pub recorded_by: Option<String>,
+    /// The reply event id last routed to the writer's route target.
+    #[serde(default)]
+    pub routed_reply: Option<String>,
+    /// A receipt: the pending item as this close-out found it. Its card
+    /// stays, edited to show the answer and this item as the outcome.
+    #[serde(default)]
+    pub request: Option<Box<Item>>,
 }
 
 impl Item {
@@ -562,6 +572,9 @@ pub(crate) fn validate(
         stamp: None,
         reply: None,
         pinged: Vec::new(),
+        recorded_by: None,
+        routed_reply: None,
+        request: None,
     })
 }
 
@@ -799,7 +812,8 @@ fn state_name(s: StatusState) -> &'static str {
 /// and keeps its answer and its 24 h keep. 3: title and options moved out of
 /// the fence, which the phone draws as unwrapped monospace, and the summary
 /// left in it is hard-wrapped. 4: the summary leaves the fence, a grey code
-/// box on the phone, for its own paragraph of prose().
+/// box on the phone, for its own paragraph of prose(). Scoped cards and
+/// receipts came without a bump: no unscoped card's text changed.
 pub(crate) const CARD_FORMAT: u32 = 4;
 
 /// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`,
@@ -817,12 +831,168 @@ pub(crate) fn card_hash(item: &Item) -> String {
     }
 }
 
-/// Card text: marker line, the title in bold, the summary as its own
-/// paragraph of prose() (agent text stays inert), the options as a numbered
-/// list, then the validated deadline and links so the phone can open them,
-/// and on an unanswered pending card the line that says how to answer.
-/// Everything but the summary and the url goes through plain_text.
+/// Card text: the request (`card_head`), then on an unanswered pending card
+/// the line that says how to answer, `as of`, and the Recorded trailer.
+/// A scoped card says who it is for instead, adds the recommendation, names
+/// who answered and ends with the Other line. A receipt is
+/// `render_receipt`. Names go through plain_title like every board line.
 pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
+    if let Some(request) = &item.request {
+        return render_receipt(request, item, hhmm);
+    }
+    let mut out = card_head(item);
+    let pending = item.kind == ItemKind::Pending;
+    let scoped = pending && item.scoped();
+    let tap = "Tap one number below to answer.";
+    if scoped {
+        out.push_str(&format!("\n{}", for_line(item)));
+        if item.answer.is_none() {
+            out.push_str(&format!(" {tap}"));
+        }
+        out.push_str(&recommended(item));
+    } else if pending && item.answer.is_none() {
+        out.push_str(&format!("\n{tap}"));
+    }
+    out.push_str(&format!("\nas of {hhmm}"));
+    if let Some(a) = &item.answer {
+        if let Some(o) = item.options.get(a.option) {
+            let tail = if scoped {
+                let at = if a.hhmm.is_empty() { hhmm } else { &a.hhmm };
+                format!("{} \u{b7} {at}", shown_name(item, a.by_name.as_deref()))
+            } else {
+                hhmm.to_string()
+            };
+            out.push_str(&format!(
+                "\nRecorded: {}. {} \u{b7} {tail}",
+                a.option + 1,
+                plain_title(o)
+            ));
+        }
+    }
+    // The phone has no Other button: a reply in the thread is the answer.
+    if scoped {
+        out.push_str("\nOr reply in this thread.");
+    }
+    out
+}
+
+/// A closed card: the request as it was asked, what was answered, then the
+/// close-out drop as its Outcome, appended so the question is never lost.
+fn render_receipt(request: &Item, outcome: &Item, hhmm: &str) -> String {
+    let mut out = card_head(request);
+    out.push_str(&recommended(request));
+    // An answer recorded before step 1 has no time of its own.
+    let by = |name: Option<&str>, at: &str| {
+        let mut s = String::new();
+        if request.scoped() {
+            s.push_str(&format!(" \u{b7} {}", shown_name(request, name)));
+        }
+        if !at.is_empty() {
+            s.push_str(&format!(" \u{b7} {at}"));
+        }
+        s
+    };
+    let answered = match (&request.answer, &request.reply) {
+        (Some(a), _) => request.options.get(a.option).map(|o| {
+            let by = by(a.by_name.as_deref(), &a.hhmm);
+            format!("{}. {}{by}", a.option + 1, plain_title(o))
+        }),
+        (None, Some(r)) => Some(format!(
+            "Other, in this thread{}",
+            by(r.by_name.as_deref(), &r.hhmm)
+        )),
+        (None, None) => None,
+    };
+    let answered = answered.unwrap_or_else(|| "no answer recorded".to_string());
+    out.push_str(&format!("\nAnswered: {answered}"));
+    let state = outcome
+        .state
+        .map(|s| format!("{} \u{b7} ", state_name(s)))
+        .unwrap_or_default();
+    out.push_str(&format!("\n\nOutcome \u{b7} {state}{hhmm}"));
+    let title = plain_text(&outcome.title, usize::MAX);
+    if !title.is_empty() {
+        out.push_str(&format!("\n**{title}**"));
+    }
+    if !outcome.body.trim().is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&prose(&summary(&outcome.body)));
+        out.push('\n');
+    }
+    for l in &outcome.links {
+        let label = plain_text(&l.label, usize::MAX);
+        out.push_str(&format!("\n{label}: {}", l.url));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// "For: Craig or Quicksilver (owner)."
+fn for_line(item: &Item) -> String {
+    let names: Vec<String> = item
+        .stamp
+        .iter()
+        .flat_map(|s| &s.answerers)
+        .map(|a| plain_title(&a.name))
+        .collect();
+    let owner = owner_text(item);
+    if names.is_empty() {
+        return format!("For: {owner}.");
+    }
+    format!("For: {} or {owner}.", names.join(", "))
+}
+
+fn recommended(item: &Item) -> String {
+    let Some(n) = item.recommend else {
+        return String::new();
+    };
+    let who = item
+        .stamp
+        .as_ref()
+        .and_then(|s| s.recommender.as_deref())
+        .map_or(item.writer.clone(), plain_title);
+    format!("\nRecommended: {n} ({who})")
+}
+
+/// The owner's name from roles.json, if it named one.
+fn owner_name(item: &Item) -> Option<String> {
+    let s = item.stamp.as_ref()?;
+    Some(plain_title(&s.owner_name)).filter(|n| !n.is_empty())
+}
+
+/// "Quicksilver (owner)", or "the owner".
+fn owner_text(item: &Item) -> String {
+    owner_name(item).map_or("the owner".to_string(), |n| format!("{n} (owner)"))
+}
+
+/// Who answered, as a card names them: the stamped answerer's name, else
+/// (the owner's own keys) the owner's.
+fn shown_name(item: &Item, by_name: Option<&str>) -> String {
+    by_name
+        .map(plain_title)
+        .or_else(|| owner_name(item))
+        .unwrap_or_else(|| "the owner".to_string())
+}
+
+/// Who answered, with their role, as a notice names them.
+fn answerer_text(item: &Item, by_name: Option<&str>, role: Option<AnswerRole>) -> String {
+    let role = role.map(|r| match r {
+        AnswerRole::Owner => "owner",
+        AnswerRole::Decider => "decider",
+    });
+    match (by_name, role) {
+        (Some(n), Some(r)) => format!("{} ({r})", plain_title(n)),
+        (Some(n), None) => plain_title(n),
+        (None, _) => owner_text(item),
+    }
+}
+
+/// The request as a card shows it: marker line, the title in bold, the
+/// summary as its own paragraph of prose() (agent text stays inert), the
+/// options as a numbered list, then the validated deadline and links so the
+/// phone can open them. Everything but the summary and the url goes through
+/// plain_text.
+fn card_head(item: &Item) -> String {
     let mut out = format!(
         "{} \u{b7} {} \u{b7} {}",
         marker(item),
@@ -857,20 +1027,6 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     for l in &item.links {
         let label = plain_text(&l.label, usize::MAX);
         out.push_str(&format!("\n{label}: {}", l.url));
-    }
-    if item.kind == ItemKind::Pending && item.answer.is_none() {
-        out.push_str("\nTap one number below to answer.");
-    }
-    out.push_str(&format!("\nas of {hhmm}"));
-    // Through plain_title like every board line.
-    if let Some(a) = &item.answer {
-        if let Some(o) = item.options.get(a.option) {
-            out.push_str(&format!(
-                "\nRecorded: {}. {} \u{b7} {hhmm}",
-                a.option + 1,
-                plain_title(o)
-            ));
-        }
     }
     out
 }
@@ -924,8 +1080,12 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
         format!("{}. {}", i + 1, text.unwrap_or_default())
     };
     let head = format!("{id}\nCard: {}", plain_text(&item.title, usize::MAX));
+    let by = match &item.answer {
+        Some(a) if item.scoped() => answerer_text(item, a.by_name.as_deref(), a.role),
+        _ => "the owner".to_string(),
+    };
     let details =
-        format!("Answered {hhmm} by the owner. Details: outbox/{id}.json in the Bench folder.");
+        format!("Answered {hhmm} by {by}. Details: outbox/{id}.json in the Bench folder.");
     let clear = format!(
         "reply in this thread, then clear the card by re-dropping {id} as a decision or status."
     );
@@ -940,14 +1100,41 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
             opt(n),
             opt(p)
         ),
-        (None, Some(p)) => format!(
-            "Bench answer withdrawn \u{b7} {head}\nWas: {}\nThe owner cleared the answer at \
-             {hhmm}. Stop if you have not acted; if you have, say in this thread what to \
-             undo. Do not clear the card.",
-            opt(p)
-        ),
+        (None, Some(p)) => {
+            // On a scoped card someone other than the owner may have cleared it.
+            let cleared = if item.scoped() {
+                format!("The answer was cleared at {hhmm}.")
+            } else {
+                format!("The owner cleared the answer at {hhmm}.")
+            };
+            format!(
+                "Bench answer withdrawn \u{b7} {head}\nWas: {}\n{cleared} Stop if you have not \
+                 acted; if you have, say in this thread what to undo. Do not clear the card.",
+                opt(p)
+            )
+        }
         (None, None) => String::new(),
     }
+}
+
+/// The notice for a free-text reply on a scoped card (its Other). Like an
+/// answer notice it carries no reply text: the agent reads the reply itself
+/// in the thread, with the trust it gives that person.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
+    let Some(r) = &item.reply else {
+        return String::new();
+    };
+    let id = &item.id;
+    format!(
+        "Bench reply \u{b7} {id}\nCard: {}\n{} replied in this thread at {hhmm} instead of \
+         choosing an option. Read their reply (event {}) in this thread, answer them there, \
+         and when it is settled close the card by re-dropping {id} as a decision or status \
+         with the outcome.",
+        plain_text(&item.title, usize::MAX),
+        answerer_text(item, r.by_name.as_deref(), r.role),
+        r.event_id
+    )
 }
 
 /// The event a reaction is aimed at: its last `e` tag, how the relay scopes

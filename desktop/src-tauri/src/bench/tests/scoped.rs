@@ -573,3 +573,245 @@ fn card_pings_follow_the_answerers() {
     scoped.pinged = vec![hex('1')];
     assert_eq!(pings(&scoped), [hex('2')]);
 }
+
+// ── card and notice text ────────────────────────────────────────────────
+
+const ASK: &str = "🟠 · dreamforge · reset-worker\n\
+                   **Welcome email**\n\
+                   \n\
+                   Craig asked for a shorter welcome email.\n\
+                   \n\
+                   1. Send the new email\n\
+                   2. Keep the old one\n";
+
+fn craig() -> Answerer {
+    Answerer {
+        pk: hex('1'),
+        name: "Craig".to_string(),
+        role: AnswerRole::Decider,
+        agent: false,
+    }
+}
+
+/// Reset Worker asks Craig, recommending option 2, stamped as the service
+/// would from the test roster.
+fn ask() -> Item {
+    let mut item = drop_as(
+        "reset-worker",
+        &[
+            ("project", json!("reset")),
+            ("to", json!({"role": "decider"})),
+            ("recommend", json!(2)),
+            ("severity", json!("attention")),
+            ("title", json!("Welcome email")),
+            ("body", json!("Craig asked for a shorter welcome email.")),
+            ("options", json!(["Send the new email", "Keep the old one"])),
+        ],
+    );
+    item.stamp = Some(Stamp {
+        owner_name: "Quicksilver".to_string(),
+        recommender: Some("Reset Worker".to_string()),
+        answerers: vec![craig()],
+    });
+    item
+}
+
+fn answer_by(option: usize, by_name: Option<&str>, hhmm: &str) -> Option<Answer> {
+    Some(Answer {
+        reaction_id: hex('9'),
+        option,
+        answered_at: 1,
+        by: hex('1'),
+        by_name: by_name.map(str::to_string),
+        role: Some(AnswerRole::Decider).filter(|_| by_name.is_some()),
+        source: AnswerSource::Tap,
+        hhmm: hhmm.to_string(),
+    })
+}
+
+#[test]
+fn scoped_card_says_who_it_is_for() {
+    let mut item = ask();
+    assert_eq!(
+        render_card(&item, "14:05"),
+        format!(
+            "{ASK}\n\
+             For: Craig or Quicksilver (owner). Tap one number below to answer.\n\
+             Recommended: 2 (Reset Worker)\n\
+             as of 14:05\n\
+             Or reply in this thread."
+        )
+    );
+    item.answer = answer_by(1, Some("Craig"), "14:02");
+    assert_eq!(
+        render_card(&item, "14:05"),
+        format!(
+            "{ASK}\n\
+             For: Craig or Quicksilver (owner).\n\
+             Recommended: 2 (Reset Worker)\n\
+             as of 14:05\n\
+             Recorded: 2. Keep the old one · Craig · 14:02\n\
+             Or reply in this thread."
+        )
+    );
+    // The owner's own keys: named from roles.json, timed by the edit.
+    item.answer = answer_by(0, None, "");
+    assert!(render_card(&item, "14:05").ends_with(
+        "\nRecorded: 1. Send the new email · Quicksilver · 14:05\nOr reply in this thread."
+    ));
+
+    // Owner-only, and no owner name or recommender in roles.json.
+    item.answer = None;
+    let st = item.stamp.as_mut().unwrap();
+    st.answerers.clear();
+    assert!(render_card(&item, "14:05")
+        .contains("\nFor: Quicksilver (owner). Tap one number below to answer.\n"));
+    let dana = Answerer {
+        pk: hex('4'),
+        name: "Dana [x]".to_string(),
+        role: AnswerRole::Owner,
+        agent: false,
+    };
+    let st = item.stamp.as_mut().unwrap();
+    *st = Stamp {
+        owner_name: String::new(),
+        recommender: None,
+        answerers: vec![craig(), dana],
+    };
+    let card = render_card(&item, "14:05");
+    assert!(card.contains("\nFor: Craig, Dana x or the owner. Tap one number below to answer.\nRecommended: 2 (reset-worker)\n"), "{card}");
+    // Before the service stamps it, a scoped card is owner-only.
+    item.stamp = None;
+    assert!(render_card(&item, "14:05").contains("\nFor: the owner. Tap"));
+}
+
+#[test]
+fn receipt_keeps_the_request_and_adds_the_outcome() {
+    let mut request = ask();
+    request.answer = answer_by(1, Some("Craig"), "14:02");
+    let mut outcome = drop_as(
+        "reset-worker",
+        &[
+            ("project", json!("reset")),
+            ("kind", json!("status")),
+            ("state", json!("done")),
+            ("severity", Value::Null),
+            ("options", Value::Null),
+            ("title", json!("Kept the old email")),
+            ("body", json!("No change was sent.")),
+            (
+                "links",
+                json!([{"label": "PR", "url": "https://github.com/QuicksilverSlick/buzz/pull/1"}]),
+            ),
+        ],
+    );
+    outcome.request = Some(Box::new(request.clone()));
+    assert_eq!(
+        render_card(&outcome, "15:10"),
+        format!(
+            "{ASK}\n\
+             Recommended: 2 (Reset Worker)\n\
+             Answered: 2. Keep the old one · Craig · 14:02\n\
+             \n\
+             Outcome · done · 15:10\n\
+             **Kept the old email**\n\
+             \n\
+             No change was sent.\n\
+             \n\
+             PR: https://github.com/QuicksilverSlick/buzz/pull/1"
+        )
+    );
+    // Answered by a reply in the thread instead, or not at all.
+    request.answer = None;
+    request.reply = Some(Reply {
+        event_id: hex('8'),
+        by: hex('1'),
+        by_name: Some("Craig".to_string()),
+        role: Some(AnswerRole::Decider),
+        at: 1,
+        hhmm: "14:03".to_string(),
+    });
+    outcome.request = Some(Box::new(request.clone()));
+    let card = render_card(&outcome, "15:10");
+    assert!(
+        card.contains("\nAnswered: Other, in this thread · Craig · 14:03\n\nOutcome"),
+        "{card}"
+    );
+    request.reply = None;
+    outcome.request = Some(Box::new(request));
+    assert!(render_card(&outcome, "15:10").contains("\nAnswered: no answer recorded\n\nOutcome"));
+
+    // A legacy card names nobody, and an answer from before step 1 has no
+    // time of its own.
+    let mut legacy = check(&[]).unwrap();
+    legacy.answer = answer_by(1, None, "");
+    let mut decision = check(&[
+        ("kind", json!("decision")),
+        ("decidedBy", json!("claude")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+        ("title", json!("Moved the relay")),
+        ("body", json!("")),
+    ])
+    .unwrap();
+    decision.request = Some(Box::new(legacy));
+    assert_eq!(
+        render_card(&decision, "15:10"),
+        "🔴 · dreamforge · orchestrator\n\
+         **Relay choice**\n\
+         \n\
+         Stay or move?\n\
+         \n\
+         1. Stay\n\
+         2. Move\n\
+         \n\
+         Answered: 2. Move\n\
+         \n\
+         Outcome · 15:10\n\
+         **Moved the relay**"
+    );
+}
+
+#[test]
+fn notices_name_who_answered_on_scoped_cards() {
+    let details = |item: &Item| {
+        render_route(item, None, "14:05")
+            .lines()
+            .find(|l| l.starts_with("Answered "))
+            .unwrap()
+            .to_string()
+    };
+    let mut item = ask();
+    item.answer = answer_by(1, Some("Craig"), "14:02");
+    assert_eq!(
+        details(&item),
+        "Answered 14:05 by Craig (decider). Details: outbox/reset-worker/q.json in the Bench folder."
+    );
+    item.answer = answer_by(1, None, "");
+    assert!(details(&item).starts_with("Answered 14:05 by Quicksilver (owner). "));
+    item.answer = None;
+    assert!(
+        render_route(&item, Some(1), "14:07").contains("\nThe answer was cleared at 14:07. Stop")
+    );
+
+    item.reply = Some(Reply {
+        event_id: hex('8'),
+        by: hex('1'),
+        by_name: Some("Craig".to_string()),
+        role: Some(AnswerRole::Decider),
+        at: 1,
+        hhmm: "14:03".to_string(),
+    });
+    assert_eq!(
+        render_route_reply(&item, "14:03"),
+        format!(
+            "Bench reply · reset-worker/q\n\
+             Card: Welcome email\n\
+             Craig (decider) replied in this thread at 14:03 instead of choosing an option. \
+             Read their reply (event {}) in this thread, answer them there, and when it is \
+             settled close the card by re-dropping reset-worker/q as a decision or status with \
+             the outcome.",
+            hex('8')
+        )
+    );
+}
