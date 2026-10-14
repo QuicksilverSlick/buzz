@@ -45,9 +45,10 @@ for (const gate of gates) {
     const expression = condition
       .replace(/always\(\)/g, "true")
       .replace(
-        /github\.event_name|needs\.[\w-]+\.(?:result|outputs\.[\w-]+)/g,
+        /github\.(?:event_name|repository)|needs\.[\w-]+\.(?:result|outputs\.[\w-]+)/g,
         (key) => {
           if (key === "github.event_name") return JSON.stringify(event);
+          if (key === "github.repository") return JSON.stringify("block/buzz");
           if (key === "needs.changes.result") return JSON.stringify(selection);
           if (key === "needs.relay-artifacts-domain.result")
             return JSON.stringify(artifacts);

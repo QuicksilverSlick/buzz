@@ -245,7 +245,8 @@ jobs:
   mobile-swift-domain:
     name: Mobile Swift Domain
     needs: [changes]
-    if: needs.changes.outputs.mobile == 'true'
+    # The Dreamforge fork does not build or ship the phone app (owners use Block's store build).
+    if: github.repository == 'block/buzz' && needs.changes.outputs.mobile == 'true'
     uses: ./.github/workflows/_ci-clients.yml
     with:
       web: ${{ needs.changes.outputs.web == 'true' }}
@@ -416,7 +417,8 @@ jobs:
 
   mobile:
     name: Mobile
-    if: always() && (needs.changes.result != 'success' || ((github.event_name == 'push' || needs.changes.outputs.mobile == 'true')))
+    # The Dreamforge fork does not build or ship the phone app (owners use Block's store build).
+    if: always() && github.repository == 'block/buzz' && (needs.changes.result != 'success' || ((github.event_name == 'push' || needs.changes.outputs.mobile == 'true')))
     needs: [changes, clients]
     runs-on: ubuntu-latest
     timeout-minutes: 5

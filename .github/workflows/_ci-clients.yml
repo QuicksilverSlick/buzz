@@ -61,7 +61,8 @@ jobs:
     name: Mobile
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.mobile)
+    # The Dreamforge fork does not build or ship the phone app (owners use Block's store build).
+    if: inputs.lane == 'required' && github.repository == 'block/buzz' && (github.event_name == 'push' || inputs.mobile)
     permissions:
       contents: read
     steps:
