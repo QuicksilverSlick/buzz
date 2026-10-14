@@ -798,6 +798,8 @@ struct Relay {
     gone: Mutex<HashSet<String>>,
     /// The relay's own key: NIP-11 `self`, and the signer of its 39001s.
     keys: Keys,
+    /// A /query for the admin lists (kind 39001) fails with a 500.
+    admins_down: Mutex<bool>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -864,13 +866,23 @@ async fn fake_events(
     (StatusCode::OK, Json(reply))
 }
 
-/// The reply is filter-agnostic: rebuild_map skips kind != 9 and pick_answer
-/// skips kind != 7, so one list serves recover and the poll. Only `until`
-/// and, past it, `limit` (newest first) apply, so recover can page.
-async fn fake_query(State(r): State<Arc<Relay>>, body: String) -> Json<Vec<Value>> {
+/// Only `authors`, `until` and, past it, `limit` (newest first) apply, so
+/// recover can page and the poll's two pages split as the relay's do. Kinds
+/// and tags do not: rebuild_map skips kind != 9 and pick_answer kind != 7, so
+/// one list serves recover and the poll.
+async fn fake_query(
+    State(r): State<Arc<Relay>>,
+    body: String,
+) -> Result<Json<Vec<Value>>, StatusCode> {
     let q: Value = serde_json::from_str(&body).unwrap();
     r.queries.lock().unwrap().push(q.clone());
+    if q[0]["kinds"] == json!([39001]) && *r.admins_down.lock().unwrap() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut evs = r.query_reply.lock().unwrap().clone();
+    if let Some(authors) = q[0]["authors"].as_array() {
+        evs.retain(|e| authors.contains(&e["pubkey"]));
+    }
     if let Some(until) = q[0]["until"].as_u64() {
         evs.retain(|e| e["created_at"].as_u64().unwrap() <= until);
     }
@@ -879,7 +891,7 @@ async fn fake_query(State(r): State<Arc<Relay>>, body: String) -> Json<Vec<Value
         evs.sort_by_key(|e| std::cmp::Reverse(e["created_at"].as_u64()));
         evs.truncate(limit);
     }
-    Json(evs)
+    Ok(Json(evs))
 }
 
 async fn fake_nip11(State(r): State<Arc<Relay>>) -> Json<Value> {
@@ -929,6 +941,7 @@ impl Bench {
             queries: Mutex::new(Vec::new()),
             gone: Mutex::new(HashSet::new()),
             keys: Keys::generate(),
+            admins_down: Mutex::new(false),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));

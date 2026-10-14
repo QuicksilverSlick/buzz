@@ -4,7 +4,7 @@
 //! harness are in scope.
 
 use super::super::roles::AgentAccess;
-use super::answers::{last_query, reply, tap, ITEM};
+use super::answers::{reply, tap, ITEM};
 use super::*;
 
 pub(super) const X: &str = "105f15cc-1d5a-431a-9826-9402fba1a12b";
@@ -214,15 +214,20 @@ async fn craig_answers_and_the_owner_overrides() {
     b.tick().await.unwrap();
     let mut chans = vec![b.channel(), X.to_string()];
     chans.sort();
-    assert_eq!(
-        last_query(&b),
+    // The owner's keys, then the cards' answerers, each a page of its own.
+    let page = |authors: Value| {
         json!([{
-            "kinds": [7, 9],
-            "authors": [b.owner_hex(), "cd".repeat(32), craig],
-            "#h": chans,
-            "#e": [legacy, card],
+            "kinds": [7, 9], "authors": authors, "#h": chans, "#e": [legacy, card],
             "limit": 500,
         }])
+    };
+    let sent = b.relay.queries.lock().unwrap().clone();
+    assert_eq!(
+        sent[sent.len() - 2..],
+        [
+            page(json!([b.owner_hex(), "cd".repeat(32)])),
+            page(json!([craig]))
+        ]
     );
     let a = b.s.items[ASK].answer.clone().unwrap();
     assert_eq!(
@@ -300,8 +305,13 @@ async fn taps_that_do_not_count_are_logged_once() {
     b.ctx.access = vec![AgentAccess {
         pubkey: hex(&p.orch),
         anyone: false,
-        allowlist: vec![hex(&p.craig)],
+        allowlist: Vec::new(),
     }];
+    // Only answerers' taps are fetched: a delegable card makes the agent
+    // decider one, so its tap on the needs-you card comes back to refuse.
+    let later = ask(&[("needs", json!("delegable")), ("title", json!("Later"))]);
+    b.drop_file("reset-worker", "later", &later);
+    b.settle(6).await;
     let (legacy, card) = (b.card(ITEM).event_id, b.card(ASK).event_id);
     let orch = tap(&p.orch, &card, OPTION_EMOJI[0], b.now);
     let stranger = tap(&Keys::generate(), &card, OPTION_EMOJI[1], b.now);
@@ -331,9 +341,14 @@ async fn taps_that_do_not_count_are_logged_once() {
                 "not an answerer on this card"
             ),
             (ASK, orch.id.to_hex(), 1, "agent on a needs-you card"),
-            (ASK, stranger.id.to_hex(), 2, "not an answerer on this card"),
         ]
     );
+    // A stranger's tap is never even fetched.
+    assert!(!b
+        .s
+        .refused_taps
+        .iter()
+        .any(|t| t.event_id == stranger.id.to_hex()));
 }
 
 #[tokio::test]
@@ -564,9 +579,7 @@ async fn recover_pages_through_every_channel() {
     b.s.items.get_mut(ASK).unwrap().card = None;
     b.s.needs_rebuild = true;
     let queries = b.relay.queries.lock().unwrap().len();
-    // The fake relay serves the same events to the poll that follows.
-    let err = b.tick().await.unwrap_err();
-    assert!(err.contains("answers truncated"), "{err}");
+    b.tick().await.unwrap();
     let sent: Vec<Value> = b.relay.queries.lock().unwrap()[queries..]
         .iter()
         .filter(|q| q[0]["kinds"] == json!([9]))
@@ -583,4 +596,158 @@ async fn recover_pages_through_every_channel() {
     assert_eq!(sent[1]["until"], json!(ts[499] - 1));
     assert_eq!(b.card(ASK).event_id, card.event_id);
     assert_eq!(b.s.strays.len(), 600);
+}
+
+#[tokio::test]
+async fn the_owners_word_stands_across_taps_and_other() {
+    // The owner holds, then Craig replies: his reply is not the card's Other
+    // and is never routed as one.
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    let ship = thread_reply(&p.craig, &card, "Just ship it", b.now + 1, &[]);
+    reply(&b, &[&list, &hold, &ship]);
+    b.tick().await.unwrap();
+    let a = b.s.items[ASK].answer.clone().unwrap();
+    assert_eq!((a.option, a.by_name), (1, None));
+    assert!(b.s.items[ASK].reply.is_none());
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert!(
+        content(&n[0]).starts_with(&format!("Bench answer · {ASK}\n")),
+        "{}",
+        content(&n[0])
+    );
+
+    // Craig merges, then the owner replies inside the settle: Craig's answer
+    // is held back, never routed, and the card stops saying it.
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let merge = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].answer.is_some());
+    let wait = thread_reply(&b.ctx.owner, &card, "Wait, don't merge", b.now, &[]);
+    reply(&b, &[&list, &merge, &wait]);
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    let item = &b.s.items[ASK];
+    assert!(item.answer.is_none());
+    let r = item.reply.clone().unwrap();
+    assert_eq!((r.event_id, r.by_name), (wait.id.to_hex(), None));
+    assert!(!b.root.join(format!("outbox/{ASK}.json")).exists());
+    let edit = &b.posts()[before].0;
+    assert_eq!(edit["kind"], 40003);
+    assert!(!content(edit).contains("Recorded:"), "{}", content(edit));
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert!(
+        content(&n[0]).starts_with(&format!("Bench reply · {ASK}\n"))
+            && content(&n[0]).contains("\nQuicksilver (owner) replied in this thread"),
+        "{}",
+        content(&n[0])
+    );
+}
+
+#[tokio::test]
+async fn an_answerer_flooding_a_thread_never_stalls_the_bench() {
+    let (mut b, p, list) = bound_bench().await;
+    let (legacy, card) = (b.card(ITEM).event_id, b.card(ASK).event_id);
+    let merge = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    b.tick().await.unwrap();
+    // Craig's newer replies fill his page, and cut his tap out of it.
+    let flood: Vec<nostr::Event> = (0..RECOVER_LIMIT as u64)
+        .map(|i| thread_reply(&p.craig, &card, "spam", b.now + 1 + i, &[]))
+        .collect();
+    let on_bench = tap(&b.ctx.owner, &legacy, OPTION_EMOJI[1], b.now);
+    let mut evs = vec![&list, &merge, &on_bench];
+    evs.extend(&flood);
+    reply(&b, &evs);
+    b.drop_file(
+        "orchestrator",
+        "later",
+        &drop_json(&[("title", json!("Later"))]),
+    );
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("their answers stand"), "{err}");
+    // The owner's page is whole; Craig's hidden tap is no retraction.
+    assert_eq!(b.s.items[ITEM].answer.as_ref().map(|a| a.option), Some(1));
+    let craig = b.s.items[ASK].answer.clone().unwrap();
+    assert_eq!(craig.reaction_id, merge.id.to_hex());
+    assert!(b.s.items[ASK].reply.is_none());
+    // Intake and publish go on.
+    for _ in 0..4 {
+        let _ = b.tick().await;
+    }
+    assert!(b.s.items["orchestrator/later"].card.is_some());
+    // The owner still decides that card, and still withdraws.
+    let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    let mut with_hold = evs.clone();
+    with_hold.push(&hold);
+    reply(&b, &with_hold);
+    let _ = b.tick().await;
+    let a = b.s.items[ASK].answer.clone().unwrap();
+    assert_eq!((a.option, a.by_name), (1, None));
+    reply(&b, &evs);
+    let _ = b.tick().await;
+    assert!(b.s.items[ASK].answer.is_none());
+}
+
+#[tokio::test]
+async fn an_unreadable_admin_list_refuses_only_a_first_check() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let p = bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let down = |b: &Bench, on: bool| *b.relay.admins_down.lock().unwrap() = on;
+    let refused = |b: &Bench| b.s.channels[X].refused.clone();
+    down(&b, true);
+    b.drop_file("reset-worker", "welcome", &ask(&[]));
+    b.settle(4).await;
+    assert_eq!(
+        refused(&b).as_deref(),
+        Some("the admin list could not be read")
+    );
+    assert!(b.s.items[ASK].card.is_none());
+    down(&b, false);
+    b.now += 60;
+    b.settle(4).await;
+    assert_eq!(refused(&b), None);
+    let card = b.card(ASK).event_id;
+    // A recheck the relay cannot serve (at boot, say) keeps the last verdict.
+    down(&b, true);
+    b.now += 600;
+    b.settle(2).await;
+    assert_eq!(refused(&b), None);
+    down(&b, false);
+    // A list naming an outsider takes the channel off: its card waits,
+    // unread, and is not deleted.
+    let craig_tap = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    let shared = admins(&b, &b.relay.keys.clone(), &[&hex(&p.craig)]);
+    reply(&b, &[&shared, &craig_tap]);
+    b.now += 600;
+    b.settle(2).await;
+    assert_eq!(
+        refused(&b).as_deref(),
+        Some("an owner or admin outside your keys")
+    );
+    assert!(b.s.items[ASK].answer.is_none());
+    // The owner alone again: the same card, with the tap made meanwhile.
+    reply(&b, &[&list, &craig_tap]);
+    b.now += 60;
+    b.settle(2).await;
+    assert_eq!(refused(&b), None);
+    assert_eq!(b.card(ASK).event_id, card);
+    assert_eq!(b.s.items[ASK].answer.as_ref().map(|a| a.option), Some(0));
+    assert!(!b
+        .posts()
+        .iter()
+        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
 }

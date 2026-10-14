@@ -139,7 +139,9 @@ pub(super) async fn join_bound(
 /// One channel per tick, once the writer is in it. A channel owner or admin
 /// can delete any event, the owner's winning tap included, so a channel with
 /// one outside the owner's keys gets no cards. Only the relay's own signed
-/// list counts, and an unreadable one refuses.
+/// list counts. One that cannot be read refuses a first check and otherwise
+/// keeps the last verdict, so a relay hiccup never takes a channel's cards
+/// off the board.
 pub(super) async fn check_admins(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -165,29 +167,39 @@ pub(super) async fn check_admins(
         })
         .cloned();
     let Some(ch) = due else { return };
-    let refused = admin_refusal(ctx, s, &ch, owner_set, now).await;
+    let refused = match admin_refusal(ctx, s, &ch, owner_set, now).await {
+        Ok(verdict) => verdict.map(str::to_string),
+        Err(why) => {
+            eprintln!("bench: {ch}: {why}");
+            match s.channels.get(&ch) {
+                Some(c) => c.refused.clone(),
+                None => Some(why.to_string()),
+            }
+        }
+    };
     s.channels.insert(
         ch,
         ChannelCheck {
             checked_at: now,
-            refused: refused.map(str::to_string),
+            refused,
         },
     );
 }
 
+/// The verdict on a channel's admin list; Err: it could not be read.
 async fn admin_refusal(
     ctx: &Ctx<'_>,
     s: &BenchState,
     ch: &str,
     owner_set: &[String],
     now: u64,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, &'static str> {
     let filter = serde_json::json!({ "kinds": [39001], "#d": [ch], "limit": 10 });
     let Ok(lists) = query(ctx, s, filter, now).await else {
-        return Some("the admin list could not be read");
+        return Err("the admin list could not be read");
     };
     let Ok(Some(relay)) = crate::commands::fetch_relay_self_at(ctx.state, &ctx.base).await else {
-        return Some("the relay's key is unknown");
+        return Err("the relay's key is unknown");
     };
     let names_ch = |e: &&nostr::Event| {
         e.tags
@@ -200,11 +212,11 @@ async fn admin_refusal(
         .filter(names_ch)
         .max_by_key(|e| e.created_at)
     else {
-        return Some("no admin list from the relay");
+        return Ok(Some("no admin list from the relay"));
     };
     // The list holds only owners and admins.
     let outside = list.tags.iter().any(|t| {
         matches!(t.as_slice(), [k, pk, ..] if k == "p" && !owner_set.contains(&pk.to_ascii_lowercase()))
     });
-    outside.then_some("an owner or admin outside your keys")
+    Ok(outside.then_some("an owner or admin outside your keys"))
 }

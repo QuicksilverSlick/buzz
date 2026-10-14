@@ -1204,51 +1204,76 @@ pub(crate) fn answer_option(item: &Item, card_id: &str, e: &nostr::Event) -> Opt
     }
 }
 
-/// The answer on `item`'s live card: the newest valid answer from the
-/// owner's keys, else the newest from a stamped answerer, never the
-/// writer's own seeds. The owner always wins, so a later tap by anyone
-/// else never outranks theirs; newest within each so a second tap changes
-/// the answer. A retraction is the event no longer coming back from the
-/// relay, which hands the answer to the next.
+/// A scoped card's Other: a kind 9 in its thread that names no option.
+fn free_text(item: &Item, card_id: &str, e: &nostr::Event) -> bool {
+    item.scoped()
+        && e.kind.as_u16() == 9
+        && refers_to(e, card_id)
+        && answer_option(item, card_id, e).is_none()
+}
+
+/// Whether the owner's keys answered or replied on the live card `card_id`.
+pub(crate) fn owner_spoke(
+    item: &Item,
+    card_id: &str,
+    events: &[nostr::Event],
+    owner_set: &[String],
+) -> bool {
+    events.iter().any(|e| {
+        owner_set.contains(&e.pubkey.to_hex())
+            && (answer_option(item, card_id, e).is_some() || free_text(item, card_id, e))
+            && e.verify().is_ok()
+    })
+}
+
+/// Whether `e` counts on the live card: from a key that may answer it,
+/// never the writer's own seeds, and once the owner's keys answered or
+/// replied there (`only_owner`), from theirs alone. Taps and Other alike,
+/// so nobody else's tap or reply ever outranks the owner's.
+fn counts(
+    item: &Item,
+    e: &nostr::Event,
+    owner_set: &[String],
+    writer_hex: &str,
+    only_owner: bool,
+) -> bool {
+    let pk = e.pubkey.to_hex();
+    pk != writer_hex
+        && eligible(item, &pk, owner_set)
+        && (!only_owner || owner_set.contains(&pk))
+        && e.verify().is_ok()
+}
+
+/// The answer on `item`'s live card: the newest answer that `counts`, so
+/// a second tap changes it. A retraction is the event no longer coming back
+/// from the relay, which hands the answer to the next.
 pub(crate) fn pick_answer<'e>(
     item: &Item,
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
 ) -> Option<(usize, &'e nostr::Event)> {
-    let card = item.card.as_ref()?;
+    let card = &item.card.as_ref()?.event_id;
+    let only_owner = owner_spoke(item, card, events, owner_set);
     events
         .iter()
-        .filter_map(|e| {
-            let i = answer_option(item, &card.event_id, e)?;
-            let pk = e.pubkey.to_hex();
-            let ok = pk != writer_hex && eligible(item, &pk, owner_set) && e.verify().is_ok();
-            ok.then(|| (i, e, owner_set.contains(&pk)))
-        })
-        .max_by_key(|(_, e, owner)| (*owner, e.created_at.as_secs(), e.id.to_hex()))
-        .map(|(i, e, _)| (i, e))
+        .filter(|e| counts(item, e, owner_set, writer_hex, only_owner))
+        .filter_map(|e| Some((answer_option(item, card, e)?, e)))
+        .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
 }
 
-/// The newest free-text reply in a scoped card's thread from someone who
-/// may answer it: a kind 9 that names no option.
+/// The newest free-text reply in a scoped card's thread that `counts`.
 pub(crate) fn pick_reply<'e>(
     item: &Item,
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
 ) -> Option<&'e nostr::Event> {
-    let card = item.card.as_ref().filter(|_| item.scoped())?;
+    let card = &item.card.as_ref().filter(|_| item.scoped())?.event_id;
+    let only_owner = owner_spoke(item, card, events, owner_set);
     events
         .iter()
-        .filter(|e| {
-            let pk = e.pubkey.to_hex();
-            e.kind.as_u16() == 9
-                && pk != writer_hex
-                && refers_to(e, &card.event_id)
-                && answer_option(item, &card.event_id, e).is_none()
-                && eligible(item, &pk, owner_set)
-                && e.verify().is_ok()
-        })
+        .filter(|e| free_text(item, card, e) && counts(item, e, owner_set, writer_hex, only_owner))
         .max_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
 }
 

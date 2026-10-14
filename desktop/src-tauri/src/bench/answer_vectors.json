@@ -160,7 +160,7 @@
       "options": ["Stay", "Move"],
       "to": [{ "who": "craig", "role": "decider", "agent": false }],
       "events": [
-        { "who": "owner", "kind": 9, "content": "Let me think", "at": 10 },
+        { "who": "craig", "kind": 9, "content": "Let me think", "at": 10 },
         {
           "who": "craig",
           "kind": 9,
@@ -170,6 +170,67 @@
       ],
       "answer": null,
       "reply": { "who": "craig" },
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "the owner's reply beats a newer Craig reply",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "owner", "kind": 9, "content": "Let me think", "at": 10 },
+        { "who": "craig", "kind": 9, "content": "Just ship it", "at": 20 }
+      ],
+      "answer": null,
+      "reply": { "who": "owner" },
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "the owner's tap holds back a newer Craig reply",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Merge PR", "Hold"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "owner", "kind": 7, "content": "2", "at": 10 },
+        { "who": "craig", "kind": 9, "content": "Just ship it", "at": 20 }
+      ],
+      "answer": { "who": "owner", "option": 2 },
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "the owner's reply holds back Craig's tap",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Merge PR", "Hold"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "craig", "kind": 7, "content": "1", "at": 10 },
+        { "who": "owner", "kind": 9, "content": "Wait, don't merge", "at": 20 }
+      ],
+      "answer": null,
+      "reply": { "who": "owner" },
+      "refused": [],
+      "eligible": { "owner": true, "craig": true }
+    },
+    {
+      "name": "the owner's tap and the owner's reply both stand",
+      "scoped": true,
+      "needs": "you",
+      "options": ["Merge PR", "Hold"],
+      "to": [{ "who": "craig", "role": "decider", "agent": false }],
+      "events": [
+        { "who": "craig", "kind": 7, "content": "2", "at": 5 },
+        { "who": "owner", "kind": 7, "content": "1", "at": 10 },
+        { "who": "owner", "kind": 9, "content": "After lunch", "at": 20 }
+      ],
+      "answer": { "who": "owner", "option": 1 },
+      "reply": { "who": "owner" },
       "refused": [],
       "eligible": { "owner": true, "craig": true }
     },

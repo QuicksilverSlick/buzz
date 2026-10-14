@@ -325,14 +325,15 @@ pub(super) async fn publish(
 
     // (b) Delete cards that are stale (another Drop, card format or stamp) or
     // no longer wanted, unless someone answered or replied on them or they
-    // are a receipt: those stay on the relay for good.
+    // are a receipt: those stay on the relay for good. A card in a channel
+    // that is not ready waits: its taps are read once it is again.
     let stale: Vec<(String, String, String)> = s
         .items
         .values()
         .filter_map(|i| {
             let c = i.card.as_ref()?;
             let stale = c.hash != item::card_hash(i) || !wanted.contains(&i.id);
-            let retire = !i.engaged() && i.request.is_none() && stale;
+            let retire = !i.engaged() && i.request.is_none() && stale && channel_ready(s, i);
             retire.then(|| (i.id.clone(), card_channel(s, i), c.event_id.clone()))
         })
         .collect();
