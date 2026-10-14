@@ -6136,7 +6136,11 @@ mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_content_file_for_non_ascii_on_windows() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("buzz messages send ... --content-file msg.md"));
+        assert!(prompt.contains(
+            "buzz messages send ... --content-file <temp-dir>/buzz-<channel-uuid>-<suffix>.md"
+        ));
+        assert!(prompt
+            .contains("Never reuse a fixed file name or write the file inside a git checkout"));
         assert!(prompt.contains("On Windows always use `--content-file`"));
     }
 
