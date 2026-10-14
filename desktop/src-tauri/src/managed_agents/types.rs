@@ -143,7 +143,7 @@ impl AgentDefinition {
             agent_command_override: None,
             agent_args: Vec::new(),
             mcp_command: String::new(),
-            turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+            turn_timeout_seconds: 0,
             idle_timeout_seconds: None,
             max_turn_duration_seconds: None,
             parallelism: default_agent_parallelism(),
@@ -303,9 +303,12 @@ pub struct ManagedAgentRecord {
     /// serde compatibility with existing stores.
     pub mcp_command: String,
     /// Deprecated: `BUZZ_ACP_TURN_TIMEOUT` is ignored by the harness and the
-    /// desktop no longer emits or edits it. Kept for serde compatibility with
-    /// existing stores; use `idle_timeout_seconds` or
-    /// `max_turn_duration_seconds` for turn-length control.
+    /// desktop no longer emits or edits it; use `idle_timeout_seconds` or
+    /// `max_turn_duration_seconds` for turn-length control. Any stored value
+    /// is dropped on load (a stale 320 read like a live limit) and the field
+    /// is written as 0 only because older builds require the key to parse
+    /// the store.
+    #[serde(skip_deserializing)]
     pub turn_timeout_seconds: u64,
     /// Idle timeout in seconds (`BUZZ_ACP_IDLE_TIMEOUT`): how long the agent
     /// may stay silent on its ACP channel mid-turn before the harness times
@@ -850,8 +853,6 @@ pub struct AgentModelInfo {
 }
 
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
-/// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
-pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
 pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
 
 fn default_agent_parallelism() -> u32 {
