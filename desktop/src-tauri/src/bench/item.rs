@@ -327,6 +327,11 @@ impl Item {
     pub(crate) fn scoped(&self) -> bool {
         self.project.is_some() || self.decision.is_some() || self.recommend.is_some()
     }
+
+    /// Someone answered or replied: its card is a record now, never deleted.
+    pub(crate) fn engaged(&self) -> bool {
+        self.answer.is_some() || self.reply.is_some()
+    }
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
@@ -1043,11 +1048,17 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
 /// Who to p-tag on a new card. Owner-only cards keep today's rule; a card
 /// with answerers pings its humans, and its agents only when it is
 /// delegable, each once per Drop.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn card_pings(item: &Item, owner_hex: &str) -> Vec<String> {
     let answerers = item.stamp.as_ref().map_or(&[][..], |s| &s.answerers);
     if answerers.is_empty() {
-        return (ping_owner(item) && !item.quiet_repost)
+        // A scoped Drop's `pinged` says whether the owner was pinged yet, so
+        // a card that loses its answerers still reaches him once.
+        let told = if item.scoped() {
+            item.pinged.iter().any(|p| p == owner_hex)
+        } else {
+            item.quiet_repost
+        };
+        return (ping_owner(item) && !told)
             .then(|| owner_hex.to_string())
             .into_iter()
             .collect();
@@ -1120,7 +1131,6 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
 /// The notice for a free-text reply on a scoped card (its Other). Like an
 /// answer notice it carries no reply text: the agent reads the reply itself
 /// in the thread, with the trust it gives that person.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
     let Some(r) = &item.reply else {
         return String::new();
@@ -1221,7 +1231,6 @@ pub(crate) fn pick_answer<'e>(
 
 /// The newest free-text reply in a scoped card's thread from someone who
 /// may answer it: a kind 9 that names no option.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pick_reply<'e>(
     item: &Item,
     events: &'e [nostr::Event],
@@ -1245,7 +1254,6 @@ pub(crate) fn pick_reply<'e>(
 
 /// Valid answers on the live card from keys that may not answer it, for
 /// the refusedTaps log.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn refused_taps<'e>(
     item: &Item,
     events: &'e [nostr::Event],
@@ -1277,10 +1285,15 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
             .collect()
     };
     let by_area = |i: &&Item| (i.area.clone(), i.order, i.id.clone());
-    let (mut answered, mut pending): (Vec<&Item>, Vec<&Item>) = current(ItemKind::Pending)
+    let (mut answered, open): (Vec<&Item>, Vec<&Item>) = current(ItemKind::Pending)
         .into_iter()
         .partition(|i| i.answer.is_some());
+    // A card someone else may answer is not the owner's to-do.
+    let (mut waiting, mut pending): (Vec<&Item>, Vec<&Item>) = open
+        .into_iter()
+        .partition(|i| i.stamp.as_ref().is_some_and(|s| !s.answerers.is_empty()));
     pending.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
+    waiting.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
     answered.sort_by_key(|i| (i.answer.as_ref().map(|a| a.answered_at), i.id.clone()));
     let mut decisions = current(ItemKind::Decision);
     decisions.sort_by_key(by_area);
@@ -1291,6 +1304,9 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
         "Bench \u{b7} as of {hhmm} \u{b7} needs you: {}",
         pending.len()
     );
+    if !waiting.is_empty() {
+        out.push_str(&format!(" \u{b7} waiting on others: {}", waiting.len()));
+    }
     if !answered.is_empty() {
         out.push_str(&format!(" \u{b7} answered: {}", answered.len()));
     }
@@ -1300,22 +1316,54 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     out.push_str(
         "\nTo answer: tap one number under a card. To undo or change it, tap that number again first.",
     );
+    // A card lives in its item's channel; a receipt's in its request's.
     let link = |i: &Item| {
+        let ch = i.request.as_deref().unwrap_or(i).channel.as_deref();
+        let ch = ch.unwrap_or(channel);
         i.card
             .as_ref()
-            .map(|c| format!("buzz://message?channel={channel}&id={}", c.event_id))
+            .map(|c| format!("buzz://message?channel={ch}&id={}", c.event_id))
+    };
+    let target =
+        |i: &Item| link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
+    // A closed item's card: its question, answer and outcome.
+    let receipt = |i: &Item| {
+        link(i)
+            .filter(|_| i.request.is_some())
+            .map(|l| format!(" \u{b7} {l}"))
+            .unwrap_or_default()
     };
     // Bullets, not ordinals: a numbered line reads like an option keycap.
     section(
         &mut out,
         "Needs you",
         pending.iter().map(|i| {
-            let target = link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
             format!(
-                "- {} {} ({}) {target}",
+                "- {} {} ({}) {}",
                 marker(i),
                 plain_title(&i.title),
-                i.area
+                i.area,
+                target(i)
+            )
+        }),
+    );
+    section(
+        &mut out,
+        "Waiting on others",
+        waiting.iter().map(|i| {
+            let names: Vec<String> = i
+                .stamp
+                .iter()
+                .flat_map(|s| &s.answerers)
+                .map(|a| plain_title(&a.name))
+                .collect();
+            format!(
+                "- {} {} ({}) for {} {}",
+                marker(i),
+                plain_title(&i.title),
+                i.area,
+                names.join(", "),
+                target(i)
             )
         }),
     );
@@ -1355,10 +1403,11 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
                 "(claude)"
             };
             format!(
-                "- {} {} ({}) {by}",
+                "- {} {} ({}) {by}{}",
                 marker(i),
                 plain_title(&i.title),
-                i.area
+                i.area,
+                receipt(i)
             )
         }),
     );
@@ -1368,17 +1417,18 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
         status.iter().map(|i| {
             let state = i.state.map_or("?", state_name);
             format!(
-                "- {} {}: {} \u{2014} {state}",
+                "- {} {}: {} \u{2014} {state}{}",
                 marker(i),
                 i.area,
-                plain_title(&i.title)
+                plain_title(&i.title),
+                receipt(i)
             )
         }),
     );
     out
 }
 
-fn section(out: &mut String, name: &str, lines: impl Iterator<Item = String>) {
+pub(crate) fn section(out: &mut String, name: &str, lines: impl Iterator<Item = String>) {
     let mut lines = lines.peekable();
     if lines.peek().is_none() {
         return;

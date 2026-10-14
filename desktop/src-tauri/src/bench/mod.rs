@@ -4,7 +4,7 @@
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
 //! the writer's own events, the reaction poll and the outbox, inbox intake,
 //! the pinned relay helpers and the 2 s loop. `publish` posts a tick's cards
-//! and board.
+//! and board; `channels` covers project channels bound in roles.json.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,11 +18,10 @@ use crate::app_state::AppState;
 use crate::events;
 use crate::secret_store::SecretStore;
 
+mod channels;
 pub(crate) mod commands;
 mod item;
 mod publish;
-// The tick calls these once the service half of scoped cards lands.
-#[cfg_attr(not(test), allow(dead_code))]
 mod roles;
 
 pub(crate) const RELAY_WS: &str = "wss://greymatterllc.communities.buzz.xyz";
@@ -46,6 +45,9 @@ const MAX_POSTS_PER_TICK: usize = 4;
 const MAX_CLOCK_LEAD_SECS: u64 = 600;
 const MAX_DROP_BYTES: u64 = 64 * 1024;
 const RECOVER_LIMIT: u32 = 500;
+/// Receipts are never deleted, so the writer's kind 9s only grow.
+const RECOVER_PAGES: usize = 10;
+const REFUSED_TAPS_MAX: usize = 50;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMED_OUT: &str = "submit timed out";
 
@@ -125,6 +127,13 @@ pub(crate) struct BenchState {
     profile_published: bool,
     channel_created: bool,
     members_added: Vec<String>,
+    /// Who the owner added to each bound project channel.
+    joined: BTreeMap<String, Vec<String>>,
+    /// Each bound channel's join or admin check: cards go only where it passed.
+    channels: BTreeMap<String, channels::ChannelCheck>,
+    /// Engaged cards a new question left behind: on the relay for good, never
+    /// adopted again by recover (which would retire them as stale).
+    kept: Vec<String>,
     /// Floor of the monotonic clock for writer events.
     last_created_at: u64,
     board: Option<Posted>,
@@ -135,11 +144,26 @@ pub(crate) struct BenchState {
     strays: Vec<String>,
     /// routes.json entries refused this tick, as `<writer>: <reason>`.
     unroutable: Vec<String>,
+    /// The last answers that did not count, newest last.
+    refused_taps: Vec<RefusedTap>,
     /// No notice before this: an agent never sees events from before it
     /// subscribes, so a launch (rebuild) or a join holds them one settle.
     routes_held_until: u64,
     last_tick: String,
     last_error: Option<String>,
+}
+
+/// A valid answer on a live card from a key that may not answer it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RefusedTap {
+    pub item: String,
+    pub by: String,
+    pub event_id: String,
+    /// 1-based.
+    pub option: usize,
+    pub at: u64,
+    pub why: String,
 }
 
 /// state.json, else the previous snapshot, else fresh (which forces a rebuild
@@ -326,30 +350,69 @@ fn scan_inbox(
     out
 }
 
+/// What a new Drop keeps of the item it replaces. A close-out (a decision or
+/// status) of a carded request keeps the card, which becomes its receipt; a
+/// new question after an answer or a reply leaves the old card on the relay
+/// as it is and gets a card of its own; anything else keeps the card for
+/// publish to refresh.
+fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<String>) -> item::Item {
+    let Some(o) = old else { return new };
+    let asking = new.kind == item::ItemKind::Pending;
+    if !asking && o.card.is_some() && (o.kind == item::ItemKind::Pending || o.request.is_some()) {
+        let asked = item::Item {
+            card: None,
+            routed: None,
+            ..o.clone()
+        };
+        new.request = o.request.clone().or(Some(Box::new(asked)));
+        new.card = o.card.clone();
+    } else if asking && (o.engaged() || o.request.is_some()) {
+        kept.extend(o.card.as_ref().map(|c| c.event_id.clone()));
+    } else {
+        new.card = o.card.clone();
+    }
+    new
+}
+
 /// Take every readable drop into state (keeping the card of the item it
-/// replaces) or reject it in place as `<stem>.rejected.json`; the writer
-/// cleans up its own rejections. Returns whether state changed.
-fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
+/// replaces, see `carry_card`) or reject it in place as
+/// `<stem>.rejected.json`; the writer cleans up its own rejections. A scoped
+/// drop waits while roles.json is unreadable. Returns whether state changed.
+fn intake(
+    s: &mut BenchState,
+    root: &Path,
+    now_iso: &str,
+    roles: Option<&roles::Roles>,
+    roles_bad: bool,
+) -> bool {
     let mut changed = false;
     for (path, writer, stem, raw) in scan_inbox(root, SystemTime::now()) {
-        let (reason, raw) = match raw {
-            Ok(raw) => match item::validate(&writer, &stem, &raw, now_iso) {
-                Ok(item) => {
-                    let old = s.items.get(&item.id);
-                    if old.is_none_or(|o| o.hash != item.hash) {
-                        // The hash-change re-drop is the writer's ack: the
-                        // rebuilt item carries no answer, so the file goes too,
-                        // whether or not state still remembers the answer.
-                        let _ = std::fs::remove_file(outbox_path(root, &item.id));
-                        let card = old.and_then(|o| o.card.clone());
-                        s.items.insert(item.id.clone(), item::Item { card, ..item });
-                        changed = true;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+        let checked = raw.map(|raw| {
+            let item = item::validate(&writer, &stem, &raw, now_iso);
+            // Who may scope cards is unknown: the drop waits for roles.json.
+            if roles_bad && item.as_ref().is_ok_and(item::Item::scoped) {
+                return None;
+            }
+            let item = item.and_then(|mut i| roles::bind(&mut i, roles).map(|()| i));
+            Some((item, raw))
+        });
+        let (reason, raw) = match checked {
+            Ok(None) => continue,
+            Ok(Some((Ok(item), _))) => {
+                let old = s.items.get(&item.id);
+                if old.is_none_or(|o| o.hash != item.hash) {
+                    // The hash-change re-drop is the writer's ack: the
+                    // rebuilt item carries no answer, so the file goes too,
+                    // whether or not state still remembers the answer.
+                    let _ = std::fs::remove_file(outbox_path(root, &item.id));
+                    let item = carry_card(old, item, &mut s.kept);
+                    s.items.insert(item.id.clone(), item);
+                    changed = true;
                 }
-                Err(reason) => (reason, Some(raw)),
-            },
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            Ok(Some((Err(reason), raw))) => (reason, Some(raw)),
             Err(reason) => (reason, None),
         };
         let rejected = path.with_file_name(format!("{stem}.rejected.json"));
@@ -379,6 +442,9 @@ pub(crate) struct Ctx<'a> {
     /// Managed agents on this desktop that admit the writer: the only
     /// possible route targets.
     pub agents: Vec<String>,
+    /// Who every managed agent here takes instructions from: an agent a
+    /// human on a card can instruct never answers that card.
+    pub access: Vec<roles::AgentAccess>,
 }
 
 enum Outcome {
@@ -603,17 +669,17 @@ fn spend(budget: &mut usize, n: usize) -> bool {
     }
 }
 
-/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member and route
-/// target (owner). Each step is retried every tick until its flag is set. The
-/// tag-free kind 0 goes first so a refused writer leaves no half-built
-/// channel behind. Route targets join to read their notices; they never go
-/// into members.txt, so they never answer.
+/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member and #bench
+/// route target (owner). Each step is retried every tick until its flag is
+/// set. The tag-free kind 0 goes first so a refused writer leaves no
+/// half-built channel behind. Route targets join to read their notices; they
+/// never go into members.txt, so they never answer.
 async fn bootstrap(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     budget: &mut usize,
     now: u64,
-    routes: &BTreeMap<String, String>,
+    targets: &[String],
 ) -> Result<bool, String> {
     let ch = channel_id(&s.owner_pubkey);
     let writer_hex = ctx.writer.public_key().to_hex();
@@ -636,7 +702,7 @@ async fn bootstrap(
     }
     let joining = std::iter::once(writer_hex.clone())
         .chain(read_members(&ctx.root))
-        .chain(routes.values().cloned());
+        .chain(targets.iter().cloned());
     for hex in joining {
         if s.members_added.contains(&hex) {
             continue;
@@ -654,15 +720,43 @@ async fn bootstrap(
     Ok(s.members_added.contains(&writer_hex))
 }
 
-/// Rebuild cards and board from the writer's own kind-9 events. Deletes
-/// nothing: soft-deleted rows never come back from /query, and anything else
-/// is listed as a stray for the owner.
+/// Rebuild cards and board from the writer's own kind-9 events in #bench and
+/// the bound channels it joined, newest page first. Deletes nothing:
+/// soft-deleted rows never come back from /query, and anything else is
+/// listed as a stray for the owner.
 async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
     let writer_hex = ctx.writer.public_key().to_hex();
-    let filter = serde_json::json!({
-        "kinds": [9], "authors": [writer_hex], "#h": [s.channel_id], "limit": RECOVER_LIMIT,
-    });
-    let events = query_writer(ctx, s, filter, now).await?;
+    let mut chans = vec![s.channel_id.clone()];
+    chans.extend(
+        s.joined
+            .iter()
+            .filter(|(ch, m)| **ch != s.channel_id && m.contains(&writer_hex))
+            .map(|(ch, _)| ch.clone()),
+    );
+    let mut events: Vec<nostr::Event> = Vec::new();
+    let (mut until, mut cut) = (None, false);
+    for _ in 0..RECOVER_PAGES {
+        let mut filter = serde_json::json!({
+            "kinds": [9], "authors": [writer_hex], "#h": chans, "limit": RECOVER_LIMIT,
+        });
+        if let Some(u) = until {
+            filter["until"] = serde_json::json!(u);
+        }
+        let page = query_writer(ctx, s, filter, now).await?;
+        cut = page.len() as u32 >= RECOVER_LIMIT;
+        // Writer timestamps are strictly increasing, so nothing shares the
+        // oldest second of a page.
+        until = page
+            .iter()
+            .map(|e| e.created_at.as_secs())
+            .min()
+            .map(|t| t.saturating_sub(1));
+        events.extend(page);
+        if !cut {
+            break;
+        }
+    }
+    events.retain(|e| !s.kept.contains(&e.id.to_hex()));
     let r = rebuild_map(&events, &writer_hex);
     for (id, posted) in r.cards {
         match s.items.get_mut(&id) {
@@ -683,9 +777,9 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     s.needs_rebuild = false;
     s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
     // The partial map is kept; the Err is how state.json learns of the cut.
-    if events.len() as u32 >= RECOVER_LIMIT {
+    if cut {
         return Err(format!(
-            "rebuild truncated (>= {RECOVER_LIMIT} writer kind-9 events in #bench)"
+            "rebuild truncated (more than {RECOVER_PAGES} pages of {RECOVER_LIMIT} writer kind-9 events)"
         ));
     }
     Ok(())
@@ -721,70 +815,190 @@ fn forget_card(s: &mut BenchState, id: &str) {
     s.board_dirty = true;
 }
 
-/// Re-derive every answer from the approvers' kind-7 reactions on the live
-/// cards. The whole set comes back each tick, so a retraction is a reaction
-/// that stopped coming back and nothing is ever double-applied. The outbox
-/// file lands before state records the answer: a failed write is retried
-/// next tick instead of being lost.
+/// A stamped answerer's roster name and role; None for the owner's own keys.
+fn named(
+    i: &item::Item,
+    pk: &str,
+    owner_set: &[String],
+) -> (Option<String>, Option<item::AnswerRole>) {
+    if owner_set.iter().any(|o| o == pk) {
+        return (None, None);
+    }
+    let a = i
+        .stamp
+        .iter()
+        .flat_map(|s| &s.answerers)
+        .find(|a| a.pk == pk);
+    (a.map(|a| a.name.clone()), a.map(|a| a.role))
+}
+
+/// Re-derive every answer from the kind-7 taps (and, on scoped cards, the
+/// kind-9 thread replies) on the live cards, from the owner's keys and the
+/// cards' answerers only. The whole set comes back each tick, so a
+/// retraction is an event that stopped coming back and nothing is ever
+/// double-applied. The outbox file lands before state records the answer: a
+/// failed write is retried next tick instead of being lost.
 // ponytail: one /query per 2 s tick (30/min of the 300/min budget); swap for
 // the live #h tail via native_relay_client::start when the relay complains.
-async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
-    let cards: Vec<String> = s
+async fn poll_answers(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    now: u64,
+    owner_set: &[String],
+    routes: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    // A channel not ready for cards is not read either: its answers stand.
+    let live: Vec<&item::Item> = s
         .items
         .values()
-        .filter_map(live_card)
-        .map(|c| c.event_id.clone())
+        .filter(|i| i.kind == item::ItemKind::Pending && live_card(i).is_some())
+        .filter(|i| channels::channel_ready(s, i))
         .collect();
-    if cards.is_empty() {
+    if live.is_empty() {
         return Ok(());
     }
-    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
-        .chain(read_members(&ctx.root))
+    let cards: Vec<String> = live
+        .iter()
+        .filter_map(|i| live_card(i))
+        .map(|c| c.event_id.clone())
         .collect();
+    let mut answerers: Vec<String> = live
+        .iter()
+        .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
+        .map(|a| a.pk.clone())
+        .filter(|pk| !owner_set.contains(pk))
+        .collect();
+    answerers.sort();
+    answerers.dedup();
+    let authors: Vec<&String> = owner_set.iter().chain(&answerers).collect();
+    let chans: std::collections::BTreeSet<String> =
+        live.iter().map(|i| channels::card_channel(s, i)).collect();
+    let kinds = if live.iter().any(|i| i.scoped()) {
+        serde_json::json!([7, 9])
+    } else {
+        serde_json::json!([7])
+    };
+    let agents: Vec<String> = live
+        .iter()
+        .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
+        .filter(|a| a.agent)
+        .map(|a| a.pk.clone())
+        .chain(ctx.access.iter().map(|a| a.pubkey.clone()))
+        .collect();
+    let ids: Vec<String> = live.iter().map(|i| i.id.clone()).collect();
     let filter = serde_json::json!({
-        "kinds": [7], "authors": approvers, "#h": [s.channel_id], "#e": cards,
+        "kinds": kinds, "authors": authors, "#h": chans, "#e": cards,
         "limit": RECOVER_LIMIT,
     });
     let events = query(ctx, s, filter, now).await?;
-    // A cut page hides reactions: never infer a retraction from it.
+    // A cut page hides answers: never infer a retraction from it.
     if events.len() as u32 >= RECOVER_LIMIT {
         return Err(format!(
             "answers truncated (>= {RECOVER_LIMIT} reactions on live cards)"
         ));
     }
     let writer_hex = ctx.writer.public_key().to_hex();
-    for (id, item) in s.items.iter_mut() {
-        let Some(card) = live_card(item) else {
-            continue;
+    let hhmm = local_hhmm(now);
+    let mut refused = Vec::new();
+    for id in ids {
+        let item = s.items.get_mut(&id).expect("live id");
+        let card = live_card(item).expect("live card").event_id.clone();
+        for e in item::refused_taps(item, &events, owner_set, &writer_hex) {
+            let by = e.pubkey.to_hex();
+            let why = if item.needs == item::Needs::You && agents.contains(&by) {
+                "agent on a needs-you card"
+            } else {
+                "not an answerer on this card"
+            };
+            refused.push(RefusedTap {
+                item: id.clone(),
+                by,
+                event_id: e.id.to_hex(),
+                option: item::answer_option(item, &card, e).map_or(0, |i| i + 1),
+                at: e.created_at.as_secs(),
+                why: why.to_string(),
+            });
+        }
+        // The person's Other: kept while it is the newest, so its first-seen
+        // time holds; publish (a3) routes it unless it already pings the agent.
+        item.reply = match item::pick_reply(item, &events, owner_set, &writer_hex) {
+            Some(e)
+                if item
+                    .reply
+                    .as_ref()
+                    .is_some_and(|r| r.event_id == e.id.to_hex()) =>
+            {
+                item.reply.take()
+            }
+            Some(e) => {
+                let by = e.pubkey.to_hex();
+                let (by_name, role) = named(item, &by, owner_set);
+                let pinged = routes.get(&item.writer).is_some_and(|to| {
+                    e.tags
+                        .iter()
+                        .any(|t| matches!(t.as_slice(), [k, p, ..] if k == "p" && p == to))
+                });
+                if pinged {
+                    item.routed_reply = Some(e.id.to_hex());
+                }
+                Some(item::Reply {
+                    event_id: e.id.to_hex(),
+                    by,
+                    by_name,
+                    role,
+                    at: now,
+                    hhmm: hhmm.clone(),
+                })
+            }
+            None => None,
         };
-        let path = outbox_path(&ctx.root, id);
-        item.answer = match item::pick_answer(item, &events, &approvers, &writer_hex) {
-            Some((i, e)) => {
-                let reaction_id = e.id.to_hex();
+        let path = outbox_path(&ctx.root, &id);
+        match item::pick_answer(item, &events, owner_set, &writer_hex) {
+            Some((_, e))
                 if item
                     .answer
                     .as_ref()
-                    .is_some_and(|a| a.reaction_id == reaction_id)
-                {
-                    continue;
-                }
+                    .is_some_and(|a| a.reaction_id == e.id.to_hex()) => {}
+            Some((i, e)) => {
+                let by = e.pubkey.to_hex();
+                let (by_name, role) = named(item, &by, owner_set);
+                let source = if e.kind.as_u16() == 9 {
+                    item::AnswerSource::Reply
+                } else {
+                    item::AnswerSource::Tap
+                };
+                let eligible: Vec<&String> = item
+                    .stamp
+                    .iter()
+                    .flat_map(|st| &st.answerers)
+                    .map(|a| &a.pk)
+                    .collect();
+                // "owner" for the owner's own keys.
+                let answerer_role =
+                    role.map_or(serde_json::json!("owner"), |r| serde_json::json!(r));
                 std::fs::create_dir_all(path.parent().expect("outbox dir"))
                     .map_err(|e| format!("create outbox: {e}"))?;
                 let body = serde_json::json!({
-                    "item": id, "writer": item.writer, "card": card.event_id,
+                    "item": id, "writer": item.writer, "card": card,
                     "option": i + 1, "text": item.options[i], "reaction": e,
+                    "answerer": by, "answererRole": answerer_role,
+                    "eligible": eligible, "source": source,
                 });
                 crate::managed_agents::atomic_write_json_restricted(
                     &path,
                     body.to_string().as_bytes(),
                 )?;
                 item.changed_at = now;
-                Some(item::Answer {
-                    reaction_id,
+                item.answer = Some(item::Answer {
+                    reaction_id: e.id.to_hex(),
                     option: i,
                     answered_at: now,
-                    ..Default::default()
-                })
+                    by,
+                    by_name,
+                    role,
+                    source,
+                    hhmm: hhmm.clone(),
+                });
             }
             // Retried every tick with every error ignored (Windows sharing
             // violations included): a remove that failed, or a crash between
@@ -792,18 +1006,24 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
             // disk for the writer to act on.
             None => {
                 let _ = std::fs::remove_file(&path);
-                if item.answer.is_some() {
+                if item.answer.take().is_some() {
                     item.changed_at = now;
                 }
-                None
             }
-        };
+        }
     }
+    for t in refused {
+        if !s.refused_taps.iter().any(|x| x.event_id == t.event_id) {
+            s.refused_taps.push(t);
+        }
+    }
+    let over = s.refused_taps.len().saturating_sub(REFUSED_TAPS_MAX);
+    s.refused_taps.drain(..over);
     Ok(())
 }
 
 /// A pending item past its deadline folds off the board: Superseded, so
-/// publish (b) retires its card. Answered items are left alone, and a
+/// publish (b) retires its card. Engaged items are left alone, and a
 /// same-hash re-drop cannot revive one: a new deadline is needed.
 fn expire(s: &mut BenchState, now: u64) {
     for i in s.items.values_mut() {
@@ -815,16 +1035,48 @@ fn expire(s: &mut BenchState, now: u64) {
         if due
             && i.kind == item::ItemKind::Pending
             && i.validity == item::Validity::Current
-            && i.answer.is_none()
+            && !i.engaged()
         {
             i.validity = item::Validity::Superseded;
         }
     }
 }
 
-/// One 2 s tick: owner fence, bootstrap, recovery, the reaction poll (before
-/// intake, so a query failure aborts the tick before any drop is read),
-/// intake, expiry, publish.
+/// Re-resolve who may answer each open scoped request; an engaged one keeps
+/// the set it was answered under. A changed stamp changes the card_hash, so
+/// publish (b) reposts the unanswered card. Agents the writer's p tag cannot
+/// wake are reported.
+fn restamp(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    roles: Option<&roles::Roles>,
+    owner_set: &[String],
+    routes: &BTreeMap<String, String>,
+) {
+    let writer_hex = ctx.writer.public_key().to_hex();
+    for i in s.items.values_mut() {
+        if i.kind != item::ItemKind::Pending || i.validity != item::Validity::Current {
+            continue;
+        }
+        if !i.engaged() {
+            let target = routes.get(&i.writer).map(String::as_str);
+            i.stamp = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
+        }
+        for a in i.stamp.iter().flat_map(|st| &st.answerers) {
+            if a.agent && !ctx.agents.contains(&a.pk) {
+                let name = item::plain_title(&a.name);
+                s.unroutable
+                    .push(format!("{}: {name} does not admit the Bench writer", i.id));
+            }
+        }
+    }
+}
+
+/// One 2 s tick: owner fence, bootstrap, the bound channels' joins and admin
+/// check, recovery, the answer poll (before intake, so a query failure aborts
+/// the tick before any drop is read), intake, expiry, answerers, publish. An
+/// unreadable roles.json fails the tick only after publish: #bench and every
+/// unscoped card carry on.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -844,23 +1096,69 @@ pub(crate) async fn tick(
         );
     }
     s.last_tick = now_iso.to_string();
-    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+    // The owner's keys: the owner plus the phone's own key in members.txt.
+    let owner_set: Vec<String> = std::iter::once(s.owner_pubkey.clone())
         .chain(read_members(&ctx.root))
         .collect();
     let writer_hex = ctx.writer.public_key().to_hex();
-    let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &approvers, &writer_hex);
+    s.writer_pubkey = writer_hex.clone();
+    let (roles, roles_err) = match channels::read_roles(&ctx.root) {
+        Ok(r) => (r, None),
+        Err(e) => (None, Some(e)),
+    };
+    let done = roles_err.clone().map_or(Ok(()), Err);
+    let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &owner_set, &writer_hex);
     s.unroutable = unroutable;
+    // Route targets join only their own writer's channels: a bound folder's
+    // never joins #bench, and while roles.json is unreadable none does.
+    let bench_targets: Vec<String> = routes
+        .iter()
+        .filter(|(w, _)| {
+            roles_err.is_none() && roles.as_ref().is_none_or(|r| !r.writers.contains_key(*w))
+        })
+        .map(|(_, to)| to.clone())
+        .collect();
     let mut budget = MAX_POSTS_PER_TICK;
-    if !bootstrap(ctx, s, &mut budget, now, &routes).await? {
-        return Ok(());
+    if !bootstrap(ctx, s, &mut budget, now, &bench_targets).await? {
+        return done;
     }
+    if let Some(r) = &roles {
+        channels::join_bound(ctx, s, &mut budget, now, r, &routes).await;
+    }
+    channels::check_admins(ctx, s, now, &owner_set).await;
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
-    poll_answers(ctx, s, now).await?;
-    intake(s, &ctx.root, now_iso);
+    poll_answers(ctx, s, now, &owner_set, &routes).await?;
+    intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
     expire(s, now);
-    publish::publish(ctx, s, &mut budget, now, hhmm, &routes).await
+    restamp(ctx, s, roles.as_ref(), &owner_set, &routes);
+    publish::publish(ctx, s, &mut budget, now, hhmm, &routes).await?;
+    done
+}
+
+/// Who each managed agent takes instructions from, as this build enforces it.
+fn agent_access(
+    records: &[crate::managed_agents::ManagedAgentRecord],
+    owner_only_build: bool,
+) -> Vec<roles::AgentAccess> {
+    use crate::managed_agents::{access_policy, RespondTo};
+    records
+        .iter()
+        .map(|r| {
+            let (mode, list) = access_policy::projected_access_with_policy(r, owner_only_build);
+            roles::AgentAccess {
+                pubkey: r.pubkey.to_ascii_lowercase(),
+                anyone: matches!(mode, RespondTo::Anyone),
+                allowlist: match mode {
+                    RespondTo::Allowlist => {
+                        list.iter().map(|k| k.trim().to_ascii_lowercase()).collect()
+                    }
+                    _ => Vec::new(),
+                },
+            }
+        })
+        .collect()
 }
 
 /// The service loop. state.json (lastTick / lastError / admission) is the
@@ -921,23 +1219,19 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
         let result = match state.signing_keys() {
             Ok(owner) => {
                 // Re-read every tick: an allowlist edit takes effect without a
-                // relaunch. A broken store routes nothing (state.json says so).
-                let agents = crate::managed_agents::load_agent_store(&app)
-                    .map(|r| {
-                        admitting_agents(
-                            &r,
-                            &writer_hex,
-                            crate::managed_agents::access_policy::owner_only(),
-                        )
-                    })
-                    .unwrap_or_default();
+                // relaunch. A broken store routes nothing (state.json says so),
+                // and an agent with no access record counts as instructable by
+                // anyone.
+                let records = crate::managed_agents::load_agent_store(&app).unwrap_or_default();
+                let owner_only = crate::managed_agents::access_policy::owner_only();
                 let ctx = Ctx {
                     state: &state,
                     base: base.clone(),
                     owner,
                     writer: writer.clone(),
                     root: root.clone(),
-                    agents,
+                    agents: admitting_agents(&records, &writer_hex, owner_only),
+                    access: agent_access(&records, owner_only),
                 };
                 let now = nostr::Timestamp::now().as_secs();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();
