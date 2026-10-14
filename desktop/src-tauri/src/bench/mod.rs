@@ -1105,8 +1105,9 @@ fn expire(s: &mut BenchState, now: u64) {
 /// the set it was answered under, less anyone the roster no longer lets
 /// answer it (the poll then drops their answer or reply); an unreadable
 /// roster leaves it as it is. A changed stamp changes the card_hash, so
-/// publish (b) reposts the unanswered card and (a2) re-renders an engaged
-/// one. Agents the writer's p tag cannot wake are reported.
+/// publish (b) reposts a card nobody engaged with and (a2) re-renders any
+/// other, even once its answer or reply was taken back. Agents the writer's
+/// p tag cannot wake are reported.
 fn restamp(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -1122,6 +1123,7 @@ fn restamp(
         }
         let target = routes.get(&i.writer).map(String::as_str);
         let fresh = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
+        i.was_engaged |= i.engaged();
         if !i.engaged() {
             i.stamp = fresh;
         } else if let (Some(st), Some(fresh), false) = (i.stamp.as_mut(), fresh, roles_bad) {

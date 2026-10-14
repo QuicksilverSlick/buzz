@@ -727,6 +727,39 @@ async fn a_cut_page_never_keeps_a_removed_answer() {
 }
 
 #[tokio::test]
+async fn a_roster_removal_keeps_a_card_with_a_reply() {
+    // Craig replies (an Other), then is swapped for Dana: his reply is
+    // dropped, and the card he replied on is edited to name Dana, never
+    // deleted and reposted.
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let other = thread_reply(&p.craig, &card, "Shorter still?", b.now, &[]);
+    reply(&b, &[&list, &other]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].reply.is_some());
+    let dana = hex(&Keys::generate());
+    edit_people(&b, |people| {
+        people[0] = json!({"pk": dana, "name": "Dana", "role": "decider"});
+    });
+    let before = b.posts().len();
+    b.settle(4).await;
+    let item = &b.s.items[ASK];
+    assert!(item.reply.is_none());
+    let to = &item.stamp.as_ref().unwrap().answerers;
+    assert_eq!((to.len(), to[0].pk.as_str()), (1, dana.as_str()));
+    assert_eq!(b.card(ASK).event_id, card);
+    assert!(!b
+        .posts()
+        .iter()
+        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
+    let e = edits(&b, before, &card);
+    assert!(
+        e.last().is_some_and(|e| content(e).contains("Dana")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
 async fn recover_pages_through_every_channel() {
     let (mut b, _p, _list) = bound_bench().await;
     let card = b.card(ASK);

@@ -315,6 +315,11 @@ pub(crate) struct Item {
     /// The reply event id last routed to the writer's route target.
     #[serde(default)]
     pub routed_reply: Option<String>,
+    /// Someone answered or replied on this Drop's card, even if that was
+    /// taken back since (set by `restamp`): a new stamp edits the card in
+    /// place, never reposts it.
+    #[serde(default)]
+    pub was_engaged: bool,
     /// A receipt: the pending item as this close-out found it. Its card
     /// stays, edited to show the answer and this item as the outcome.
     #[serde(default)]
@@ -579,6 +584,7 @@ pub(crate) fn validate(
         pinged: Vec::new(),
         recorded_by: None,
         routed_reply: None,
+        was_engaged: false,
         request: None,
     })
 }

@@ -174,10 +174,12 @@ pub(super) async fn publish(
         };
         let want = item.answer.as_ref().map(|a| a.option);
         let want_by = item.answer.as_ref().and_then(|a| a.by_name.clone());
-        // An engaged card is never reposted: a roster removal (`restamp`)
-        // rewrites its For line in place.
-        let restamped =
-            item.stamp.is_some() && item.engaged() && card.hash != item::card_hash(&item);
+        // A card someone answered or replied on is never reposted: a roster
+        // change (`restamp`) rewrites its For line in place, also after the
+        // removal took their answer or reply back.
+        let restamped = item.stamp.is_some()
+            && (item.engaged() || item.was_engaged)
+            && card.hash != item::card_hash(&item);
         if item.recorded == want && item.recorded_by == want_by && !restamped {
             continue;
         }
