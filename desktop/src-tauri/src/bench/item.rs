@@ -171,6 +171,34 @@ pub(crate) struct Answer {
     pub answered_at: u64,
 }
 
+/// Who may answer a scoped card, resolved by the service (`roles::stamp`)
+/// and folded into its card_hash. The owner's own keys are implicit.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Stamp {
+    /// "": the card says "the owner".
+    pub owner_name: String,
+    /// Roster name of the writer's own key, for the Recommended line.
+    pub recommender: Option<String>,
+    pub answerers: Vec<Answerer>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Answerer {
+    pub pk: String,
+    pub name: String,
+    pub role: AnswerRole,
+    pub agent: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AnswerRole {
+    Owner,
+    Decider,
+}
+
 /// An answer change waits this long before it is routed, so an untap and a
 /// new tap (how the owner changes an answer) reach the agent as one notice.
 pub(crate) const ROUTE_SETTLE_SECS: u64 = 120;
@@ -237,6 +265,9 @@ pub(crate) struct Item {
     /// Bench clock of the last answer change: a new reaction or a clear.
     #[serde(default)]
     pub changed_at: u64,
+    /// Some iff scoped; set by the service, never by a drop.
+    #[serde(default)]
+    pub stamp: Option<Stamp>,
 }
 
 impl Item {
@@ -487,6 +518,7 @@ pub(crate) fn validate(
         quiet_repost: false,
         routed: None,
         changed_at: 0,
+        stamp: None,
     })
 }
 
@@ -727,10 +759,19 @@ fn state_name(s: StatusState) -> &'static str {
 /// box on the phone, for its own paragraph of prose().
 pub(crate) const CARD_FORMAT: u32 = 4;
 
-/// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
-/// Cards posted before CARD_FORMAT existed carry the bare Drop hash.
+/// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`,
+/// or `<Drop hash>.<stamp>.<CARD_FORMAT>` once it has a stamp, so a roster
+/// change reposts an unanswered card while unstamped markers stay as they
+/// were. Cards posted before CARD_FORMAT existed carry the bare Drop hash.
 pub(crate) fn card_hash(item: &Item) -> String {
-    format!("{}.{CARD_FORMAT}", item.hash)
+    match &item.stamp {
+        None => format!("{}.{CARD_FORMAT}", item.hash),
+        Some(st) => {
+            let json = serde_json::to_string(st).unwrap_or_default();
+            let stamp = short_hash(json.as_bytes());
+            format!("{}.{}.{CARD_FORMAT}", item.hash, &stamp[..8])
+        }
+    }
 }
 
 /// Card text: marker line, the title in bold, the summary as its own

@@ -19,6 +19,9 @@ use crate::secret_store::SecretStore;
 
 pub(crate) mod commands;
 mod item;
+// The tick calls these once the service half of scoped cards lands.
+#[cfg_attr(not(test), allow(dead_code))]
+mod roles;
 
 pub(crate) const RELAY_WS: &str = "wss://greymatterllc.communities.buzz.xyz";
 /// Generated once, never changed: the v5 namespace of every #bench id.
