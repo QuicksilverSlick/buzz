@@ -996,7 +996,10 @@ async fn poll_answers(
                     hhmm: hhmm.clone(),
                 })
             }
-            None if unread => item.reply.take().filter(|r| theirs(&r.by)),
+            None if unread => item
+                .reply
+                .take()
+                .filter(|r| theirs(&r.by) && item::eligible(item, &r.by, owner_set)),
             None => None,
         };
         let path = outbox_path(&ctx.root, &id);
@@ -1004,7 +1007,12 @@ async fn poll_answers(
             .then(|| item::pick_answer(item, &events, owner_set, &writer_hex, until))
             .flatten();
         match picked {
-            None if unread && item.answer.as_ref().is_some_and(|a| theirs(&a.by)) => {}
+            // Unless the roster no longer lets them answer (`restamp`).
+            None if unread
+                && item
+                    .answer
+                    .as_ref()
+                    .is_some_and(|a| theirs(&a.by) && item::eligible(item, &a.by, owner_set)) => {}
             Some((_, e))
                 if item
                     .answer
@@ -1093,14 +1101,17 @@ fn expire(s: &mut BenchState, now: u64) {
     }
 }
 
-/// Re-resolve who may answer each open scoped request; an engaged one keeps
-/// the set it was answered under. A changed stamp changes the card_hash, so
-/// publish (b) reposts the unanswered card. Agents the writer's p tag cannot
-/// wake are reported.
+/// Re-resolve who may answer each open scoped request. An engaged one keeps
+/// the set it was answered under, less anyone the roster no longer lets
+/// answer it (the poll then drops their answer or reply); an unreadable
+/// roster leaves it as it is. A changed stamp changes the card_hash, so
+/// publish (b) reposts the unanswered card and (a2) re-renders an engaged
+/// one. Agents the writer's p tag cannot wake are reported.
 fn restamp(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     roles: Option<&roles::Roles>,
+    roles_bad: bool,
     owner_set: &[String],
     routes: &BTreeMap<String, String>,
 ) {
@@ -1109,9 +1120,14 @@ fn restamp(
         if i.kind != item::ItemKind::Pending || i.validity != item::Validity::Current {
             continue;
         }
+        let target = routes.get(&i.writer).map(String::as_str);
+        let fresh = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
         if !i.engaged() {
-            let target = routes.get(&i.writer).map(String::as_str);
-            i.stamp = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
+            i.stamp = fresh;
+        } else if let (Some(st), Some(fresh), false) = (i.stamp.as_mut(), fresh, roles_bad) {
+            // Removals only: nobody is silently added to an answered card.
+            st.answerers
+                .retain(|a| fresh.answerers.iter().any(|f| f.pk == a.pk));
         }
         for a in i.stamp.iter().flat_map(|st| &st.answerers) {
             if a.agent && !ctx.agents.contains(&a.pk) {
@@ -1183,7 +1199,14 @@ pub(crate) async fn tick(
     let cut = poll_answers(ctx, s, now, &owner_set, &routes).await?;
     intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
     expire(s, now);
-    restamp(ctx, s, roles.as_ref(), &owner_set, &routes);
+    restamp(
+        ctx,
+        s,
+        roles.as_ref(),
+        roles_err.is_some(),
+        &owner_set,
+        &routes,
+    );
     publish::publish(ctx, s, &mut budget, now, hhmm, &routes).await?;
     done.and(cut.map_or(Ok(()), Err))
 }

@@ -441,8 +441,9 @@ async fn a_route_target_that_answers_is_not_routed() {
     let craig_tap = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
     reply(&b, &[&list, &craig_tap]);
     b.tick().await.unwrap();
-    // An answered card keeps the stamp it was answered under, even one that
-    // names the route target.
+    // While roles.json is unreadable an answered card keeps its stamp, even
+    // one that names the route target.
+    std::fs::write(b.root.join("roles.json"), "{not json").unwrap();
     let st = b.s.items.get_mut(ASK).unwrap().stamp.as_mut().unwrap();
     st.answerers.push(Answerer {
         pk: hex(&p.agent),
@@ -452,7 +453,9 @@ async fn a_route_target_that_answers_is_not_routed() {
     });
     b.now += ROUTE_SETTLE_SECS;
     let before = b.posts().len();
-    b.settle(2).await;
+    for _ in 0..2 {
+        assert!(b.tick().await.unwrap_err().starts_with("roles.json: "));
+    }
     assert!(notices(&b, before).is_empty());
     assert!(b
         .s
@@ -594,6 +597,133 @@ async fn unreadable_roles_hold_scoped_drops_and_cards_go_owner_only() {
     std::fs::write(b.root.join("roles.json"), good).unwrap();
     b.tick().await.unwrap();
     assert!(b.s.items.contains_key("reset-worker/second"));
+}
+
+/// Rewrites the project's people in roles.json.
+fn edit_people(b: &Bench, f: impl FnOnce(&mut Vec<Value>)) {
+    let path = b.root.join("roles.json");
+    let mut roles: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let people = roles["projects"]["reset"]["people"].as_array_mut().unwrap();
+    f(people);
+    std::fs::write(&path, roles.to_string()).unwrap();
+}
+
+/// The edits of `card` since post `before`.
+fn edits(b: &Bench, before: usize, card: &str) -> Vec<Value> {
+    b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(card))
+        .map(|(e, _)| e.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_roster_removal_takes_back_an_answered_card() {
+    // Craig answers; an unreadable roster leaves his answer as it is.
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let merge = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    b.tick().await.unwrap();
+    let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
+    std::fs::write(b.root.join("roles.json"), "{not json").unwrap();
+    assert!(b.tick().await.unwrap_err().starts_with("roles.json: "));
+    assert_eq!(b.s.items[ASK].answer.as_ref().unwrap().by, hex(&p.craig));
+    std::fs::write(b.root.join("roles.json"), good).unwrap();
+
+    // Demoted, he is off the card, which says so in place.
+    edit_people(&b, |people| people[0]["role"] = json!("member"));
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].stamp.as_ref().unwrap().answerers.is_empty());
+    let e = edits(&b, before, &card);
+    assert_eq!(e.len(), 1);
+    assert!(
+        content(&e[0]).contains("\nFor: Quicksilver (owner).\n"),
+        "{}",
+        content(&e[0])
+    );
+    // His answer is withdrawn, and his tap never counts again.
+    let before = b.posts().len();
+    b.settle(2).await;
+    let item = &b.s.items[ASK];
+    assert!(item.answer.is_none());
+    assert!(!b.root.join(format!("outbox/{ASK}.json")).exists());
+    let e = edits(&b, before, &card);
+    assert_eq!(e.len(), 1);
+    assert!(
+        content(&e[0]).contains("\nFor: Quicksilver (owner). Tap one number below to answer.\n")
+            && !content(&e[0]).contains("Recorded:"),
+        "{}",
+        content(&e[0])
+    );
+    // The card he tapped is never deleted.
+    assert_eq!(b.card(ASK).event_id, card);
+    assert!(!b
+        .posts()
+        .iter()
+        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
+}
+
+#[tokio::test]
+async fn the_owners_answer_survives_a_roster_change() {
+    // Craig leaves and Dana joins after the owner answered: Craig is off the
+    // card, Dana is not silently added, and the owner's answer stands.
+    let (mut b, _p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &hold]);
+    b.tick().await.unwrap();
+    let dana = hex(&Keys::generate());
+    edit_people(&b, |people| {
+        people[0] = json!({"pk": dana, "name": "Dana", "role": "decider"});
+    });
+    let before = b.posts().len();
+    b.settle(3).await;
+    let item = &b.s.items[ASK];
+    let a = item.answer.clone().unwrap();
+    assert_eq!((a.option, a.by_name), (1, None));
+    assert!(item.stamp.as_ref().unwrap().answerers.is_empty());
+    let e = edits(&b, before, &card);
+    assert_eq!(e.len(), 1);
+    assert!(
+        content(&e[0]).contains("\nFor: Quicksilver (owner).\n")
+            && content(&e[0]).contains("\nRecorded: 2. Keep the old one · Quicksilver · "),
+        "{}",
+        content(&e[0])
+    );
+    assert_eq!(b.card(ASK).event_id, card);
+}
+
+#[tokio::test]
+async fn a_cut_page_never_keeps_a_removed_answer() {
+    // Craig answers; then, while another card's answerer floods the
+    // answerers' page, he is demoted: his answer goes all the same.
+    let (mut b, p, list) = bound_bench().await;
+    let later = ask(&[
+        ("title", json!("Later")),
+        ("needs", json!("delegable")),
+        ("to", json!({"people": [hex(&p.orch)]})),
+    ]);
+    b.drop_file("reset-worker", "later", &later);
+    b.settle(6).await;
+    let (card, other) = (b.card(ASK).event_id, b.card("reset-worker/later").event_id);
+    let merge = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].answer.is_some());
+    let flood: Vec<nostr::Event> = (0..RECOVER_LIMIT as u64)
+        .map(|i| thread_reply(&p.orch, &other, "spam", b.now + 1 + i, &[]))
+        .collect();
+    let mut evs = vec![&list, &merge];
+    evs.extend(&flood);
+    reply(&b, &evs);
+    edit_people(&b, |people| people[0]["role"] = json!("member"));
+    let _ = b.tick().await;
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("their answers stand"), "{err}");
+    assert!(b.s.items[ASK].answer.is_none());
+    assert!(!b.root.join(format!("outbox/{ASK}.json")).exists());
 }
 
 #[tokio::test]
