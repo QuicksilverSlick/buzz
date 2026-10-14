@@ -11,16 +11,22 @@ use serde::{Deserialize, Serialize};
 use super::{item, post_as_owner, query, roles, spend, BenchState, Ctx};
 use crate::events;
 
-/// A failed join or a refused admin list is tried again this soon; a list
-/// that passed is re-read every RECHECK_SECS.
+/// A failed join, a refused admin list or a failed read is tried again this
+/// soon; a list that passed is re-read every RECHECK_SECS.
 const RETRY_SECS: u64 = 60;
 const RECHECK_SECS: u64 = 600;
+/// A passed list outlives failed reads this long: an admin added meanwhile
+/// could delete the owner's winning tap unseen.
+const TRUST_SECS: u64 = 3600;
 const JOIN_FAILED: &str = "could not add";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChannelCheck {
     pub checked_at: u64,
+    /// When the admin list was last read; behind checked_at, that read failed.
+    #[serde(default)]
+    pub ok_at: u64,
     /// Why no card goes here: a fixed reason, printed on the board.
     pub refused: Option<String>,
 }
@@ -120,6 +126,7 @@ pub(super) async fn join_bound(
                         ChannelCheck {
                             checked_at: now,
                             refused,
+                            ..Default::default()
                         },
                     );
                     break;
@@ -140,8 +147,8 @@ pub(super) async fn join_bound(
 /// can delete any event, the owner's winning tap included, so a channel with
 /// one outside the owner's keys gets no cards. Only the relay's own signed
 /// list counts. One that cannot be read refuses a first check and otherwise
-/// keeps the last verdict, so a relay hiccup never takes a channel's cards
-/// off the board.
+/// keeps the last verdict for TRUST_SECS after the last read, retrying every
+/// RETRY_SECS, so a relay hiccup never takes a channel's cards off the board.
 pub(super) async fn check_admins(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -157,7 +164,7 @@ pub(super) async fn check_admins(
             None => true,
             Some(c) if c.join_failed() => false,
             Some(c) => {
-                let wait = if c.refused.is_some() {
+                let wait = if c.refused.is_some() || c.ok_at < c.checked_at {
                     RETRY_SECS
                 } else {
                     RECHECK_SECS
@@ -167,13 +174,13 @@ pub(super) async fn check_admins(
         })
         .cloned();
     let Some(ch) = due else { return };
-    let refused = match admin_refusal(ctx, s, &ch, owner_set, now).await {
-        Ok(verdict) => verdict.map(str::to_string),
+    let (refused, ok_at) = match admin_refusal(ctx, s, &ch, owner_set, now).await {
+        Ok(verdict) => (verdict.map(str::to_string), now),
         Err(why) => {
             eprintln!("bench: {ch}: {why}");
             match s.channels.get(&ch) {
-                Some(c) => c.refused.clone(),
-                None => Some(why.to_string()),
+                Some(c) if now <= c.ok_at + TRUST_SECS => (c.refused.clone(), c.ok_at),
+                c => (Some(why.to_string()), c.map_or(0, |c| c.ok_at)),
             }
         }
     };
@@ -181,6 +188,7 @@ pub(super) async fn check_admins(
         ch,
         ChannelCheck {
             checked_at: now,
+            ok_at,
             refused,
         },
     );

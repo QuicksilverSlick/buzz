@@ -751,3 +751,47 @@ async fn an_unreadable_admin_list_refuses_only_a_first_check() {
         .iter()
         .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
 }
+
+#[tokio::test]
+async fn a_passed_admin_list_outlives_failed_reads_for_an_hour_only() {
+    let (mut b, _, _) = bound_bench().await;
+    let reads = |b: &Bench| {
+        let qs = b.relay.queries.lock().unwrap();
+        qs.iter()
+            .filter(|q| q[0]["kinds"] == json!([39001]))
+            .count()
+    };
+    let refused = |b: &Bench| b.s.channels[X].refused.clone();
+    let card = b.card(ASK).event_id;
+    let ok = b.s.channels[X].ok_at;
+    *b.relay.admins_down.lock().unwrap() = true;
+    // The recheck fails: the channel keeps its cards and is read again in a
+    // minute, not ten.
+    b.now = ok + 598;
+    b.settle(2).await;
+    let n = reads(&b);
+    assert_eq!(refused(&b), None);
+    b.now = ok + 658;
+    b.settle(1).await;
+    assert_eq!((reads(&b), refused(&b)), (n + 1, None));
+    // Trusted up to an hour after the last read, refused past it.
+    b.now = ok + 3598;
+    b.settle(1).await;
+    assert_eq!(refused(&b), None);
+    b.now = ok + 3658;
+    b.settle(1).await;
+    assert_eq!(
+        refused(&b).as_deref(),
+        Some("the admin list could not be read")
+    );
+    // A read that works again restores the same card.
+    *b.relay.admins_down.lock().unwrap() = false;
+    b.now += 60;
+    b.settle(2).await;
+    assert_eq!(refused(&b), None);
+    assert_eq!(b.card(ASK).event_id, card);
+    // state.json written before ok_at still loads.
+    let old: super::super::channels::ChannelCheck =
+        serde_json::from_value(json!({ "checkedAt": 1, "refused": null })).unwrap();
+    assert_eq!(old.ok_at, 0);
+}
