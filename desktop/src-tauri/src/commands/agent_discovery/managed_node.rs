@@ -80,7 +80,7 @@ fn managed_node_unsupported_step() -> InstallStepResult {
         ),
         exit_code: None,
         hint: Some(
-            "Install Node.js from https://nodejs.org, restart Buzz, then click Install again."
+            "Install Node.js from https://nodejs.org, restart Dreamforge, then click Install again."
                 .to_string(),
         ),
     }
@@ -596,7 +596,7 @@ fn verify_node_tree(dir: &std::path::Path) -> Result<(), String> {
 
 /// Guidance text shown when the Buzz-private npm prefix is not available.
 fn managed_npm_prefix_hint() -> String {
-    "Buzz could not create its private Node tools directory. Check app-data directory permissions, restart Buzz, then click Install again.".to_string()
+    "Dreamforge could not create its private Node tools directory. Check app-data directory permissions, restart Dreamforge, then click Install again.".to_string()
 }
 
 pub(super) fn managed_npm_command(command: &str) -> Result<Option<String>, Box<InstallStepResult>> {
@@ -657,7 +657,7 @@ fn shell_quote(path: &std::path::Path) -> String {
 pub(super) fn npm_eacces_hint(stderr: &str, _command: &str) -> Option<String> {
     if stderr.contains("EACCES: permission denied") || stderr.contains("npm error EACCES") {
         Some(
-            "npm could not write to Buzz's private Node tools directory. Check app-data directory permissions, restart Buzz, then click Install again."
+            "npm could not write to Dreamforge's private Node tools directory. Check app-data directory permissions, restart Dreamforge, then click Install again."
                 .to_string(),
         )
     } else {
