@@ -1432,3 +1432,4 @@ fn exported_board_drops_all_validate() {
 mod answers;
 mod desktop_cards;
 mod routes;
+mod scoped;

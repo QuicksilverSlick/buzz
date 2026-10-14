@@ -28,6 +28,7 @@ const ID_MAX: usize = 64;
 const OPTION_MAX: usize = 80;
 const OPTIONS_MAX: usize = 4;
 const LINKS_MAX: usize = 4;
+const TO_MAX: usize = 8;
 const LABEL_MAX: usize = 40;
 const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
@@ -68,6 +69,41 @@ pub(crate) struct Drop {
     pub private: bool,
     #[serde(default)]
     pub deadline: Option<String>,
+    /// Step 1 scoping. `channel`, `replyTo` and `to` need a `project`, which
+    /// roles.json must bind to the writer folder (`roles::bind`).
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// The thread root the card is posted under.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub to: Option<To>,
+    /// Training slug: the kind of decision this is.
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// 1-based option the writer recommends.
+    #[serde(default)]
+    pub recommend: Option<usize>,
+}
+
+/// Who a scoped card asks, before the service resolves it to answerers.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct To {
+    #[serde(default)]
+    pub people: Vec<String>,
+    #[serde(default)]
+    pub role: Option<ToRole>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ToRole {
+    /// The project's Owner and Decider entries.
+    Decider,
+    Owner,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -170,6 +206,19 @@ pub(crate) struct Item {
     pub links: Vec<Link>,
     pub needs: Needs,
     pub deadline: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// None: #bench. `roles::bind` fills in the project's first channel.
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub to: Option<To>,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub recommend: Option<usize>,
     pub hash: String,
     pub updated_at: String,
     #[serde(default)]
@@ -190,6 +239,14 @@ pub(crate) struct Item {
     pub changed_at: u64,
 }
 
+impl Item {
+    /// Uses a step 1 field. Only these get the new card lines, named
+    /// answerers and Other; every other drop keeps today's card exactly.
+    pub(crate) fn scoped(&self) -> bool {
+        self.project.is_some() || self.decision.is_some() || self.recommend.is_some()
+    }
+}
+
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
 /// like a validated link url, print on the card as they are.
 pub(crate) fn valid_name(s: &str, max: usize) -> bool {
@@ -200,7 +257,7 @@ pub(crate) fn valid_name(s: &str, max: usize) -> bool {
         && s.chars().all(|c| plain(c) || c == '-')
 }
 
-fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
+pub(crate) fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
     if s.chars().count() > max_chars {
         return Err(format!("{field}: longer than {max_chars} chars"));
     }
@@ -245,6 +302,16 @@ fn valid_uuid(s: &str) -> bool {
             19 => matches!(c.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+/// A channel id as Buzz writes it, so it compares as a plain string.
+pub(crate) fn valid_channel(s: &str) -> bool {
+    valid_uuid(s) && !s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// A pubkey or event id as Buzz writes it.
+pub(crate) fn valid_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Exactly `channel=<uuid>&id=<64hex>`: no path, fragment, userinfo, port,
@@ -318,7 +385,7 @@ pub(crate) fn validate(
     raw: &str,
     now_iso: &str,
 ) -> Result<Item, String> {
-    let d: Drop = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let mut d: Drop = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if !valid_name(writer, NAME_MAX) {
         return Err(format!("writer {writer:?}: not [a-z0-9][a-z0-9-]{{0,31}}"));
     }
@@ -388,6 +455,7 @@ pub(crate) fn validate(
         valid_text(&l.label, LABEL_MAX, "link label")?;
         valid_link(l)?;
     }
+    validate_scope(&mut d)?;
     let hash = version_hash(&d);
     Ok(Item {
         id: format!("{writer}/{id}"),
@@ -405,6 +473,12 @@ pub(crate) fn validate(
         links: d.links,
         needs: d.needs,
         deadline,
+        project: d.project,
+        channel: d.channel,
+        reply_to: d.reply_to,
+        to: d.to,
+        decision: d.decision,
+        recommend: d.recommend,
         hash,
         updated_at: now_iso.to_string(),
         card: None,
@@ -416,13 +490,66 @@ pub(crate) fn validate(
     })
 }
 
+/// The step 1 fields' shape only; whether roles.json lets this writer use
+/// them is `roles::bind`. `to.people` is sorted so its order never changes
+/// the hash.
+fn validate_scope(d: &mut Drop) -> Result<(), String> {
+    let slug = |field: &str, v: &Option<String>| match v {
+        Some(s) if !valid_name(s, NAME_MAX) => {
+            Err(format!("{field} {s:?}: not [a-z0-9][a-z0-9-]{{0,31}}"))
+        }
+        _ => Ok(()),
+    };
+    slug("project", &d.project)?;
+    slug("decision", &d.decision)?;
+    if d.project.is_none() {
+        for (set, field) in [
+            (d.channel.is_some(), "channel"),
+            (d.reply_to.is_some(), "replyTo"),
+            (d.to.is_some(), "to"),
+        ] {
+            if set {
+                return Err(format!("{field}: requires project"));
+            }
+        }
+    }
+    if let Some(c) = d.channel.as_deref().filter(|c| !valid_channel(c)) {
+        return Err(format!("channel {c:?}: not a lowercase RFC uuid"));
+    }
+    if let Some(r) = d.reply_to.as_deref().filter(|r| !valid_hex64(r)) {
+        return Err(format!("replyTo {r:?}: not 64 lowercase hex"));
+    }
+    if let Some(to) = &mut d.to {
+        if to.people.is_empty() && to.role.is_none() {
+            return Err("to: people or role is required".to_string());
+        }
+        if to.people.len() > TO_MAX {
+            return Err(format!("to: more than {TO_MAX} people"));
+        }
+        if let Some(pk) = to.people.iter().find(|pk| !valid_hex64(pk)) {
+            return Err(format!("to: {pk:?} is not 64 lowercase hex"));
+        }
+        to.people.sort();
+        to.people.dedup();
+    }
+    if let Some(n) = d.recommend {
+        if d.kind != ItemKind::Pending {
+            return Err("recommend is for pending items only".to_string());
+        }
+        if !(1..=d.options.len()).contains(&n) {
+            return Err(format!("recommend {n}: not 1 to {}", d.options.len()));
+        }
+    }
+    Ok(())
+}
+
 /// Content hash independent of JSON key order, id and updatedAt, so
 /// re-dropping identical content is a no-op.
 pub(crate) fn version_hash(d: &Drop) -> String {
     fn j<T: Serialize>(v: &T) -> String {
         serde_json::to_string(v).unwrap_or_default()
     }
-    let parts = [
+    let mut parts = vec![
         j(&d.kind),
         j(&d.title),
         j(&d.body),
@@ -437,6 +564,21 @@ pub(crate) fn version_hash(d: &Drop) -> String {
         j(&d.needs),
         j(&d.deadline),
     ];
+    // Only when set, so a drop without them hashes as it always has: a hash
+    // change reposts the card and clears its answer.
+    let scope = [
+        ("project", d.project.as_ref().map(j)),
+        ("channel", d.channel.as_ref().map(j)),
+        ("replyTo", d.reply_to.as_ref().map(j)),
+        ("to", d.to.as_ref().map(j)),
+        ("decision", d.decision.as_ref().map(j)),
+        ("recommend", d.recommend.as_ref().map(j)),
+    ];
+    parts.extend(
+        scope
+            .into_iter()
+            .filter_map(|(k, v)| Some(format!("{k}={}", v?))),
+    );
     short_hash(parts.join("\u{1f}").as_bytes())
 }
 
