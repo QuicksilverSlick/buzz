@@ -21,6 +21,7 @@ use crate::secret_store::SecretStore;
 mod channels;
 pub(crate) mod commands;
 mod item;
+mod pick;
 mod publish;
 mod roles;
 
