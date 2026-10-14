@@ -13,7 +13,7 @@ use crate::{
         stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
         validate_provider_config, BackendKind, CreateManagedAgentRequest,
         CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -681,11 +681,9 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
             agent_command_override,
             agent_args,
             mcp_command,
-            // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness;
-            // store the schema default only. Use idle_timeout_seconds or
-            // max_turn_duration_seconds for actual turn-length control.
-            turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
-            // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
+            // Deprecated and ignored by the harness (see the record field).
+            turn_timeout_seconds: 0,
+            // 0 or None → harness uses its own defaults, and the CLI also clamps 0 → minimum.
             idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
             max_turn_duration_seconds: input.max_turn_duration_seconds.filter(|s| *s > 0),
             parallelism: minted.parallelism.unwrap_or(DEFAULT_AGENT_PARALLELISM),

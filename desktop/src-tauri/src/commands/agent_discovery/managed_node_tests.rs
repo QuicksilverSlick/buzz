@@ -4,7 +4,7 @@ use super::*;
 fn test_npm_eacces_hint_guidance_mentions_buzz_private_dir() {
     let hint = npm_eacces_hint("EACCES: permission denied", "npm install -g foo").unwrap();
     assert!(
-        hint.contains("Buzz's private Node tools directory"),
+        hint.contains("Dreamforge's private Node tools directory"),
         "hint: {hint}"
     );
 }
@@ -13,10 +13,10 @@ fn test_npm_eacces_hint_guidance_mentions_buzz_private_dir() {
 fn test_rewrite_npm_install_uses_private_prefix() {
     assert_eq!(
         rewrite_npm_global_install(
-            "npm install -g @agentclientprotocol/codex-acp",
+            "npm install -g @agentclientprotocol/codex-acp@1.13.1",
             "'/tmp/Buzz Node'"
         ),
-        "npm install --global --prefix '/tmp/Buzz Node' @agentclientprotocol/codex-acp"
+        "npm install --global --prefix '/tmp/Buzz Node' @agentclientprotocol/codex-acp@1.13.1"
     );
 }
 

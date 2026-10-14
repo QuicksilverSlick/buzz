@@ -43,7 +43,7 @@ export const MODEL_NOT_FOUND_COPY =
   "The configured model is not available — open agent settings and select a different one from the dropdown.";
 
 export const CLI_ACP_INTERNAL_ERROR_COPY =
-  "The agent's harness reported an internal error. For Codex agents this can mean the configured model isn't supported by your installed codex-acp — check the model in `~/.codex/config.toml` or upgrade the adapter (`brew upgrade codex-acp`).";
+  "The agent's harness reported an internal error. For Codex agents this can mean the configured model isn't supported by your installed codex-acp — check the model in `~/.codex/config.toml` or reinstall the adapter from Settings → Agents → Agent runtimes.";
 
 const EMBEDDED_CODE_RE = /^Agent reported error \(code (-?\d+)\): /;
 /** Bare form of the standard JSON-RPC -32603 message (after stripping the ACP wrapper prefix). */

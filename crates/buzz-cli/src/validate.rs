@@ -178,6 +178,33 @@ pub fn read_or_stdin(value: &str) -> Result<String, CliError> {
     }
 }
 
+/// Resolve a `--content` value (literal text, or `-` for stdin) or, when
+/// given, a `--content-file` path read as UTF-8.
+///
+/// The file path exists for Windows: PowerShell 5.1 re-encodes piped text
+/// with `$OutputEncoding` (ASCII), so non-ASCII characters reach stdin as `?`.
+pub fn read_content_or_file(
+    content: Option<&str>,
+    content_file: Option<&str>,
+) -> Result<String, CliError> {
+    let Some(path) = content_file else {
+        return read_or_stdin(content.unwrap_or_default());
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::Usage(format!("failed to read {path:?}: {e}")))?;
+    let text = String::from_utf8(bytes).map_err(|e| {
+        CliError::Usage(format!(
+            "{path:?} is not valid UTF-8 (invalid byte at offset {}); save it as UTF-8",
+            e.utf8_error().valid_up_to()
+        ))
+    })?;
+    // `Set-Content -Encoding UTF8` in Windows PowerShell 5.1 writes a BOM.
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_owned(),
+        None => text,
+    })
+}
+
 /// Read content from a file path, or stdin if the value is "-".
 ///
 /// Unlike [`read_or_stdin`], `value` is never treated as literal content —
@@ -502,5 +529,29 @@ mod tests {
         // verbatim as if it were the patch content.
         let err = super::read_file_or_stdin("0001-does-not-exist.patch").unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    // --- read_content_or_file ---
+
+    #[test]
+    fn read_content_or_file_strips_one_bom_and_rejects_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.txt");
+        let path_str = path.to_str().unwrap();
+
+        std::fs::write(&path, "\u{feff}\u{feff}a — b 🚀").unwrap();
+        assert_eq!(
+            super::read_content_or_file(None, Some(path_str)).unwrap(),
+            "\u{feff}a — b 🚀",
+            "exactly one leading BOM is dropped"
+        );
+
+        // Windows-1252 em dash: what an ANSI-encoded save produces.
+        std::fs::write(&path, b"a \x97 b").unwrap();
+        let err = super::read_content_or_file(None, Some(path_str)).unwrap_err();
+        assert!(
+            matches!(&err, CliError::Usage(msg) if msg.contains("not valid UTF-8")),
+            "got {err:?}"
+        );
     }
 }

@@ -38,7 +38,7 @@ fn failure(
         ),
         exit_code: None,
         hint: Some(
-            "Buzz requires the vendor CLI executable, not only its desktop app. If the CLI was installed while Buzz was open, restart Buzz and check again."
+            "Dreamforge requires the vendor CLI executable, not only its desktop app. If the CLI was installed while Dreamforge was open, restart Dreamforge and check again."
                 .to_string(),
         ),
     })

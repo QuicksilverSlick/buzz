@@ -410,15 +410,19 @@ buzz agents archived"
 pub enum MessagesCmd {
     /// Send a message to a channel
     #[command(
-        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -"
+        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -\n  buzz messages send --channel <UUID> --content-file message.md   # UTF-8 file; use this on Windows"
     )]
     Send {
         /// Channel UUID (from 'buzz channels list')
         #[arg(long)]
         channel: String,
         /// Message text — supports @mentions and markdown. Use '-' to read from stdin.
-        #[arg(long)]
-        content: String,
+        #[arg(long, required_unless_present = "content_file")]
+        content: Option<String>,
+        /// Read the message text from a UTF-8 file. Use this on Windows, where
+        /// PowerShell pipes turn non-ASCII characters into '?'.
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
         /// Nostr event kind (default: channel default)
         #[arg(long)]
         kind: Option<u16>,
@@ -771,8 +775,11 @@ pub enum CanvasCmd {
         #[arg(long)]
         channel: String,
         /// Canvas content (markdown; use '-' to read from stdin)
-        #[arg(long)]
-        content: String,
+        #[arg(long, required_unless_present = "content_file")]
+        content: Option<String>,
+        /// Read the canvas content from a UTF-8 file (use this on Windows)
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
     },
     /// List canvas revision history for a channel, newest first
     History {
@@ -1790,8 +1797,11 @@ pub enum IssuesCmd {
         #[arg(long, alias = "subject")]
         title: String,
         /// Issue body, markdown. Use '-' to read from stdin.
-        #[arg(long)]
-        content: String,
+        #[arg(long, required_unless_present = "content_file")]
+        content: Option<String>,
+        /// Read the issue body from a UTF-8 file (use this on Windows)
+        #[arg(long, conflicts_with = "content")]
+        content_file: Option<String>,
         /// Label — can be specified multiple times
         #[arg(long = "label")]
         label: Vec<String>,
@@ -2349,6 +2359,29 @@ mod tests {
                 "--clear must conflict with {}",
                 extra[0]
             );
+        }
+    }
+
+    #[test]
+    fn content_and_content_file_are_mutually_exclusive() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        for cmd in [
+            &["messages", "send", "--channel", channel][..],
+            &["canvas", "set", "--channel", channel][..],
+            &["issues", "create", "--title", "t"][..],
+        ] {
+            let parse = |extra: &[&str]| {
+                Cli::try_parse_from(["buzz"].iter().chain(cmd).chain(extra).copied())
+            };
+            let both = parse(&["--content", "x", "--content-file", "m.txt"]);
+            assert_eq!(
+                both.err().map(|e| e.kind()),
+                Some(clap::error::ErrorKind::ArgumentConflict),
+                "{cmd:?}"
+            );
+            assert!(parse(&[]).is_err(), "{cmd:?} must require one of them");
+            assert!(parse(&["--content", "x"]).is_ok(), "{cmd:?}");
+            assert!(parse(&["--content-file", "m.txt"]).is_ok(), "{cmd:?}");
         }
     }
 

@@ -44,7 +44,7 @@
       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ],
     "system_prompt": null,
-    "turn_timeout_seconds": 300
+    "turn_timeout_seconds": 0
   },
   "provider_config": {
     "namespace": "buzz-agents-test",

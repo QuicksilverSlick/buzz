@@ -460,6 +460,17 @@ fn pending_provider_policy_round_trips() {
     assert!(reloaded.provider_policy_pending);
 }
 
+/// The harness ignores `turn_timeout_seconds`, so a stored value must not
+/// survive a load, but the key must still be written: older builds require it.
+#[test]
+fn deprecated_turn_timeout_is_dropped_on_load_but_still_written() {
+    let record = sample_agent_record(); // the fixture stores 320
+    assert_eq!(record.turn_timeout_seconds, 0);
+
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(json["turn_timeout_seconds"], 0);
+}
+
 #[test]
 fn stored_record_unknown_or_null_session_policy_degrades_to_channel() {
     for session_policy in [serde_json::json!("future"), serde_json::Value::Null] {

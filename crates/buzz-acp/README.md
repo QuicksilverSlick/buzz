@@ -74,8 +74,8 @@ That's it. The harness spawns `goose acp`, connects to the relay, discovers chan
 [codex-acp](https://github.com/agentclientprotocol/codex-acp) wraps OpenAI Codex in an ACP interface.
 
 ```bash
-# Install the adapter (npm package — no Rust build required)
-npm install -g @agentclientprotocol/codex-acp
+# Install the adapter (npm package — no Rust build required; pinned to the tested version)
+npm install -g @agentclientprotocol/codex-acp@1.13.1
 
 # Run
 export OPENAI_API_KEY="sk-..."   # required — use an OpenAI API key, not a ChatGPT subscription
@@ -90,8 +90,8 @@ buzz-acp
 [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) wraps the Claude Agent SDK in an ACP interface.
 
 ```bash
-# Install the current adapter package
-npm install -g @agentclientprotocol/claude-agent-acp
+# Install the adapter (pinned to the version Dreamforge is tested with)
+npm install -g @agentclientprotocol/claude-agent-acp@0.70.0
 
 # Run
 export ANTHROPIC_API_KEY="sk-ant-..."

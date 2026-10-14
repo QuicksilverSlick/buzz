@@ -4,7 +4,9 @@ use crate::client::BuzzClient;
 use crate::commands::with_git_provenance;
 use crate::commands::GIT_ORIGIN_CHANNEL_ENV;
 use crate::error::CliError;
-use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
+use crate::validate::{
+    read_content_or_file, read_or_stdin, sdk_err, validate_hex64, validate_repo_id,
+};
 use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
 use nostr::Timestamp;
 use serde::Deserialize;
@@ -240,7 +242,6 @@ pub async fn cmd_create_issue(
 ) -> Result<(), CliError> {
     validate_hex64(repo_owner)?;
     validate_repo_id(repo_id)?;
-    let body = read_or_stdin(content)?;
 
     let meta = GitIssueMeta {
         labels: labels.to_vec(),
@@ -253,7 +254,7 @@ pub async fn cmd_create_issue(
     };
 
     let builder = with_git_provenance(
-        buzz_sdk::build_git_issue(&repo, subject, &body, &meta).map_err(sdk_err)?,
+        buzz_sdk::build_git_issue(&repo, subject, content, &meta).map_err(sdk_err)?,
     )?;
     let event = client.sign_event(builder)?;
     let event_id = event.id.to_hex();
@@ -598,9 +599,12 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             channel,
             title,
             content,
+            content_file,
             label,
             to,
         } => {
+            // Read the body first so an unreadable file fails before a repo is created.
+            let body = read_content_or_file(content.as_deref(), content_file.as_deref())?;
             let (repo_owner, repo_id) = resolve_issue_repo_target(
                 client,
                 repo_owner.as_deref(),
@@ -608,7 +612,7 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
                 channel.as_deref(),
             )
             .await?;
-            cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &label, &to).await
+            cmd_create_issue(client, &repo_owner, &repo_id, &title, &body, &label, &to).await
         }
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
         IssuesCmd::List {
