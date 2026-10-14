@@ -9,6 +9,20 @@ use super::runtime_metadata::{
 };
 use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
 
+// Adapter installs are pinned to versions verified with Dreamforge: unpinned
+// ones pull whatever npm has, including codex-acp 2.x (skipped, block/buzz
+// #8247). Macros rather than consts so `concat!` can reuse them in the hints.
+macro_rules! claude_agent_acp_install_command {
+    () => {
+        "npm install -g @agentclientprotocol/claude-agent-acp@0.70.0"
+    };
+}
+macro_rules! codex_acp_install_command {
+    () => {
+        "npm install -g @agentclientprotocol/codex-acp@1.13.1"
+    };
+}
+
 pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     KnownAcpRuntime {
         id: "goose",
@@ -58,11 +72,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         underlying_cli: Some("claude"),
         cli_install_commands: &["curl -fsSL https://claude.ai/install.sh | bash"],
         cli_install_commands_windows: &[windows_install_command!("claude", "https://claude.ai/install.ps1")],
-        adapter_install_commands: &["npm install -g @agentclientprotocol/claude-agent-acp"],
+        adapter_install_commands: &[claude_agent_acp_install_command!()],
         cli_install_instructions_url: "https://code.claude.com/docs/en/getting-started",
         adapter_install_instructions_url: "https://github.com/agentclientprotocol/claude-agent-acp",
         cli_install_hint: "Buzz talks to Claude Code through the Claude Code CLI.",
-        adapter_install_hint: "Buzz talks to the Claude Code CLI through an ACP adapter. Install it with: npm install -g @agentclientprotocol/claude-agent-acp.",
+        adapter_install_hint: concat!("Buzz talks to the Claude Code CLI through an ACP adapter. Install it with: ", claude_agent_acp_install_command!(), "."),
         skill_dir: Some(".claude/skills"),
         supports_acp_model_switching: false,
         model_env_var: None,
@@ -97,11 +111,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         underlying_cli: None,
         cli_install_commands: &["curl -fsSL https://chatgpt.com/codex/install.sh | sh"],
         cli_install_commands_windows: &[windows_install_command!("codex", "https://chatgpt.com/codex/install.ps1")],
-        adapter_install_commands: &["npm install -g @agentclientprotocol/codex-acp"],
+        adapter_install_commands: &[codex_acp_install_command!()],
         cli_install_instructions_url: "https://developers.openai.com/codex/cli/",
         adapter_install_instructions_url: "https://github.com/agentclientprotocol/codex-acp",
         cli_install_hint: "Buzz talks to Codex through the Codex CLI.",
-        adapter_install_hint: "Buzz talks to the Codex CLI through an ACP adapter. Install it with: npm install -g @agentclientprotocol/codex-acp.",
+        adapter_install_hint: concat!("Buzz talks to the Codex CLI through an ACP adapter. Install it with: ", codex_acp_install_command!(), "."),
         skill_dir: Some(".codex/skills"),
         supports_acp_model_switching: false,
         model_env_var: None,

@@ -209,6 +209,13 @@ mod tests {
             .adapter_install_instructions_url
             .contains("claude-agent-acp"));
         assert!(claude.cli_install_hint.contains("Claude Code CLI"));
+        assert_eq!(
+            claude.adapter_install_commands,
+            ["npm install -g @agentclientprotocol/claude-agent-acp@0.70.0"]
+        );
+        assert!(claude
+            .adapter_install_hint
+            .contains(claude.adapter_install_commands[0]));
 
         let codex = known_acp_runtime_exact("codex").unwrap();
         assert_eq!(
@@ -217,6 +224,13 @@ mod tests {
         );
         assert!(codex.adapter_install_instructions_url.contains("codex-acp"));
         assert!(codex.cli_install_hint.contains("Codex CLI"));
+        assert_eq!(
+            codex.adapter_install_commands,
+            ["npm install -g @agentclientprotocol/codex-acp@1.13.1"]
+        );
+        assert!(codex
+            .adapter_install_hint
+            .contains(codex.adapter_install_commands[0]));
     }
 
     /// codex-acp runs the Codex engine it bundles (or `CODEX_PATH`), so an
