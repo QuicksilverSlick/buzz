@@ -40,7 +40,6 @@ use buzz_core::kind::{
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
-    OBSERVER_MAX_PLAINTEXT_LEN,
 };
 use clap::Parser;
 use config::{
@@ -1310,7 +1309,7 @@ impl ObserverPublishQueue {
     /// Pack and remove AT MOST ONE publishable frame: the front event's
     /// channel, gathered queue-wide in FIFO order (packed greedily until
     /// adding the next event would push the envelope over
-    /// `OBSERVER_MAX_PLAINTEXT_LEN`). Singletons ship unwrapped.
+    /// `OBSERVER_FRAME_MAX_LEN`). Singletons ship unwrapped.
     ///
     /// Two invariants bound the gather:
     /// - A frame never mixes channels (the desktop archive indexes a frame
@@ -1348,7 +1347,7 @@ impl ObserverPublishQueue {
             if gathering && event.channel_id == channel {
                 picked.push(event);
                 if picked.len() > 1
-                    && serialized_len(&batch_envelope(&picked)) > OBSERVER_MAX_PLAINTEXT_LEN
+                    && serialized_len(&batch_envelope(&picked)) > OBSERVER_FRAME_MAX_LEN
                 {
                     // Frame full: the overflow event stays queued and leads
                     // its channel's next slot.
@@ -1534,7 +1533,7 @@ struct ObserverChunkKey {
 /// Flush coalesced chunks before they exceed the NIP-44 plaintext limit (65,535 bytes).
 /// Leave headroom for the JSON envelope wrapping the text. This is a SOFT pre-flush
 /// of raw text below the hard cap; `fit_observer_event_to_budget` (the final ceiling,
-/// keyed to `OBSERVER_MAX_PLAINTEXT_LEN` in buzz-core/observer.rs:25) is what actually
+/// keyed to `OBSERVER_FRAME_MAX_LEN`) is what actually
 /// guarantees the serialized frame fits. Edit one of these two and review the other.
 const OBSERVER_CHUNK_MAX_TEXT_BYTES: usize = 60_000;
 
@@ -1668,8 +1667,14 @@ fn set_observer_chunk_text(payload: &mut serde_json::Value, text: String) {
 /// eliding actually shrinks the frame.
 const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 
+/// Serialized-frame ceiling for observer telemetry. nostr's NIP-44 v2 encoder
+/// rejects plaintext over 65_536 - 128 bytes (its `MAX_SUPPORTED_PLAINTEXT_SIZE`),
+/// tighter than buzz-core's 65_535 `OBSERVER_MAX_PLAINTEXT_LEN`, so frames fitted
+/// to 65_535 failed with "NIP-44 error: message too long" and were dropped.
+const OBSERVER_FRAME_MAX_LEN: usize = 65_536 - 128;
+
 /// Trim an oversized observer telemetry frame so its SERIALIZED form fits under
-/// `OBSERVER_MAX_PLAINTEXT_LEN`, instead of dropping the whole frame (silent
+/// `OBSERVER_FRAME_MAX_LEN`, instead of dropping the whole frame (silent
 /// telemetry loss). The common case — a frame already under budget — is left
 /// byte-identical.
 ///
@@ -1694,7 +1699,7 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 /// are out of this change's scope (buzz-core stays untouched). The clean `&mut`
 /// signature with one cheap redundant serialize is the deliberate tradeoff.
 fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
-    if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
+    if serialized_len(event) <= OBSERVER_FRAME_MAX_LEN {
         return;
     }
 
@@ -1710,7 +1715,7 @@ fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
     // never be re-elided, so the loop is bounded by the leaf count.
     while let Some(leaf) = largest_shrinkable_leaf(&mut event.payload) {
         elide_leaf(leaf);
-        if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
+        if serialized_len(event) <= OBSERVER_FRAME_MAX_LEN {
             return;
         }
     }
@@ -9826,7 +9831,7 @@ mod observer_publish_queue_tests {
             frames.len()
         );
         for frame in &frames {
-            assert!(serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN);
+            assert!(serialized_len(frame) <= OBSERVER_FRAME_MAX_LEN);
         }
         // Within each channel, FIFO order survives the gather.
         let mut seqs_a = Vec::new();
@@ -9867,7 +9872,7 @@ mod observer_publish_queue_tests {
         let mut seen = Vec::new();
         for frame in &frames {
             assert!(
-                serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN,
+                serialized_len(frame) <= OBSERVER_FRAME_MAX_LEN,
                 "every emitted frame must fit the plaintext cap"
             );
             seen.extend(frame_seqs(frame));
@@ -13881,7 +13886,7 @@ mod observer_payload_trim_tests {
         fit_observer_event_to_budget(&mut event);
 
         assert!(
-            serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN,
+            serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN,
             "frame must fit after trimming"
         );
         // Envelope intact.
@@ -13944,14 +13949,14 @@ mod observer_payload_trim_tests {
             }),
         );
         assert!(
-            serialized(&event).len() > OBSERVER_MAX_PLAINTEXT_LEN,
+            serialized(&event).len() > OBSERVER_FRAME_MAX_LEN,
             "precondition: oversized event body pushes the frame over the cap"
         );
 
         fit_observer_event_to_budget(&mut event);
 
         assert!(
-            serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN,
+            serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN,
             "frame must fit after trimming"
         );
         let blocks = event.payload["params"]["prompt"]
@@ -13982,6 +13987,45 @@ mod observer_payload_trim_tests {
     }
 
     #[test]
+    fn test_fitted_oversized_frame_encrypts_and_decrypts_to_valid_json() {
+        // 65_500 sits in the band nostr's NIP-44 encoder rejects (> 65_536 - 128)
+        // but the 65_535 hard cap allowed, which is where frames were dropped.
+        let sender = nostr::Keys::generate();
+        let recipient = nostr::Keys::generate();
+        let base = serialized(&event_with_payload(
+            "acp_read",
+            serde_json::json!({ "body": "" }),
+        ))
+        .len();
+        for target in [65_500, 100_000] {
+            let body = "x".repeat(target - base);
+            let mut event = event_with_payload("acp_read", serde_json::json!({ "body": body }));
+            assert_eq!(serialized(&event).len(), target, "precondition: frame size");
+
+            fit_observer_event_to_budget(&mut event);
+            let encrypted = encrypt_observer_payload(&sender, &recipient.public_key(), &event)
+                .unwrap_or_else(|error| panic!("{target}-byte frame must encrypt: {error}"));
+
+            let plaintext = nostr::nips::nip44::decrypt(
+                recipient.secret_key(),
+                &sender.public_key(),
+                encrypted,
+            )
+            .expect("decrypt");
+            let decoded: serde_json::Value =
+                serde_json::from_str(&plaintext).expect("decrypted frame is valid JSON");
+            assert_eq!(decoded["kind"], "acp_read");
+            assert!(
+                decoded["payload"]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("…[elided"),
+                "{target}-byte frame was trimmed with the elision marker"
+            );
+        }
+    }
+
+    #[test]
     fn test_multi_leaf_elides_largest_shrinkable_first_and_stops_when_it_fits() {
         // One leaf alone over the cap; a second smaller-but-still-large leaf.
         // Eliding the biggest should suffice, leaving the smaller intact.
@@ -13994,7 +14038,7 @@ mod observer_payload_trim_tests {
         );
         fit_observer_event_to_budget(&mut event);
 
-        assert!(serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN);
         assert!(
             event.payload["huge"].as_str().unwrap().contains("…[elided"),
             "the largest leaf is elided"
@@ -14024,7 +14068,7 @@ mod observer_payload_trim_tests {
         );
         fit_observer_event_to_budget(&mut event);
 
-        assert!(serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN);
         let text = event.payload["params"]["update"]["content"]["text"]
             .as_str()
             .unwrap();
@@ -14042,13 +14086,13 @@ mod observer_payload_trim_tests {
             .collect();
         let mut event = event_with_payload("acp_read", serde_json::json!({ "items": items }));
         assert!(
-            serialized(&event).len() > OBSERVER_MAX_PLAINTEXT_LEN,
+            serialized(&event).len() > OBSERVER_FRAME_MAX_LEN,
             "precondition: frame is over the cap"
         );
 
         fit_observer_event_to_budget(&mut event);
 
-        assert!(serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN);
         assert_eq!(
             event.payload["elided"].as_str().unwrap(),
             "acp_read payload too large",
@@ -14079,7 +14123,7 @@ mod observer_payload_trim_tests {
         let mut event = event_with_payload("acp_read", serde_json::json!({ "body": big }));
         fit_observer_event_to_budget(&mut event);
 
-        assert!(serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(serialized(&event).len() <= OBSERVER_FRAME_MAX_LEN);
         let leaf = event.payload["body"].as_str().unwrap();
         // Valid UTF-8 by construction (it's a &str); confirm head/tail are whole
         // multi-byte chars and the marker is present.
