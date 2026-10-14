@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::item::{self, ItemKind, Link, Severity, StatusState, Validity, OPTION_EMOJI};
+use super::item::{self, ItemKind, Link, Needs, Severity, StatusState, Validity, OPTION_EMOJI};
 use super::{live_card, load_state, post_as_owner, query, root_dir, BenchState, Ctx};
 use crate::app_state::AppState;
 use crate::events;
@@ -49,10 +49,29 @@ struct Card {
     links: Vec<Link>,
     order: i64,
     validity: Validity,
-    /// The live card only: one showing the item's current Drop.
+    /// RFC 3339: when the Bench took this drop (a receipt's outcome time).
+    updated_at: String,
+    /// The live card only: one showing the item's current Drop. A receipt's
+    /// is the card it keeps.
     card_event_id: Option<String>,
     answer: Option<CardAnswer>,
     recorded: Option<usize>,
+    /// None: #bench. A receipt's is its request's.
+    channel_id: Option<String>,
+    project: Option<String>,
+    /// Gets the For and Recommended lines and Other (`Item::scoped`).
+    scoped: bool,
+    needs: Needs,
+    /// Who may answer besides the owner's own keys.
+    answerers: Vec<item::Answerer>,
+    owner_name: Option<String>,
+    /// 1-based.
+    recommend: Option<usize>,
+    recommender: Option<String>,
+    /// The newest Other reply in the card's thread.
+    reply: Option<item::Reply>,
+    /// A receipt: the question as it closed.
+    request: Option<Box<Card>>,
 }
 
 /// 0-based, like `options` and `bench_answer`'s `option`.
@@ -61,6 +80,61 @@ struct Card {
 struct CardAnswer {
     option: usize,
     answered_at: u64,
+    by: String,
+    /// A stamped answerer's name; None: the owner's own keys.
+    by_name: Option<String>,
+    /// Answered from the owner's keys (owner plus members.txt).
+    by_owner: bool,
+    source: item::AnswerSource,
+}
+
+fn card(i: &item::Item, owner_set: &[String]) -> Card {
+    let stamp = i.stamp.as_ref();
+    let posted = if i.request.is_some() {
+        i.card.as_ref()
+    } else {
+        live_card(i)
+    };
+    Card {
+        id: i.id.clone(),
+        writer: i.writer.clone(),
+        kind: i.kind,
+        title: i.title.clone(),
+        body: i.body.clone(),
+        area: i.area.clone(),
+        severity: i.severity,
+        options: i.options.clone(),
+        state: i.state,
+        decided_by: i.decided_by.clone(),
+        deadline: i.deadline.clone(),
+        links: i.links.clone(),
+        order: i.order,
+        validity: i.validity,
+        updated_at: i.updated_at.clone(),
+        card_event_id: posted.map(|c| c.event_id.clone()),
+        answer: i.answer.as_ref().map(|a| CardAnswer {
+            option: a.option,
+            answered_at: a.answered_at,
+            by: a.by.clone(),
+            by_name: a.by_name.clone(),
+            // "" is an answer from before step 1, when only these keys counted.
+            by_owner: a.by.is_empty() || owner_set.contains(&a.by),
+            source: a.source,
+        }),
+        recorded: i.recorded,
+        channel_id: i.request.as_deref().unwrap_or(i).channel.clone(),
+        project: i.project.clone(),
+        scoped: i.scoped(),
+        needs: i.needs,
+        answerers: stamp.map(|st| st.answerers.clone()).unwrap_or_default(),
+        owner_name: stamp
+            .map(|st| st.owner_name.clone())
+            .filter(|n| !n.is_empty()),
+        recommend: i.recommend,
+        recommender: stamp.and_then(|st| st.recommender.clone()),
+        reply: i.reply.clone(),
+        request: i.request.as_deref().map(|r| Box::new(card(r, owner_set))),
+    }
 }
 
 /// The snapshot under `root`, through the service's own state loader.
@@ -72,32 +146,10 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
         };
     }
     let (s, _) = load_state(root);
-    let items = s
-        .items
-        .values()
-        .map(|i| Card {
-            id: i.id.clone(),
-            writer: i.writer.clone(),
-            kind: i.kind,
-            title: i.title.clone(),
-            body: i.body.clone(),
-            area: i.area.clone(),
-            severity: i.severity,
-            options: i.options.clone(),
-            state: i.state,
-            decided_by: i.decided_by.clone(),
-            deadline: i.deadline.clone(),
-            links: i.links.clone(),
-            order: i.order,
-            validity: i.validity,
-            card_event_id: live_card(i).map(|c| c.event_id.clone()),
-            answer: i.answer.as_ref().map(|a| CardAnswer {
-                option: a.option,
-                answered_at: a.answered_at,
-            }),
-            recorded: i.recorded,
-        })
+    let owner_set: Vec<String> = std::iter::once(s.owner_pubkey.clone())
+        .chain(super::read_members(root))
         .collect();
+    let items = s.items.values().map(|i| card(i, &owner_set)).collect();
     BenchCards {
         enabled: true,
         snapshot: Some(Snapshot {

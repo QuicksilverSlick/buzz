@@ -123,8 +123,8 @@ export function useBenchNeedsYouCount(): number | null {
 
 /**
  * The live Bench card a timeline message is, or null. Only rows in #bench
- * poll; every other row reads the cached snapshot and re-renders only if its
- * own selection changes.
+ * or a card's channel poll; every other row reads the cached snapshot and
+ * re-renders only if its own selection changes.
  */
 export function useBenchCardForMessage(
   message: BenchMessageRef,

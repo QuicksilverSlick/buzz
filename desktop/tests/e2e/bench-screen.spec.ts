@@ -9,6 +9,21 @@ const ITEM_ID = "dreamforge/ship-release";
 
 const WRITER = "a".repeat(64);
 
+// A legacy (unscoped) card: #bench, owner-only, no Other.
+const LEGACY = {
+  updatedAt: new Date().toISOString(),
+  channelId: null,
+  project: null,
+  scoped: false,
+  needs: "you" as const,
+  answerers: [],
+  ownerName: null,
+  recommend: null,
+  recommender: null,
+  reply: null,
+  request: null,
+};
+
 function benchSnapshot(
   answeredOption: number | null,
   channelId = "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
@@ -42,8 +57,16 @@ function benchSnapshot(
         answer:
           answeredOption === null
             ? null
-            : { option: answeredOption, answeredAt },
+            : {
+                option: answeredOption,
+                answeredAt,
+                by: OWNER,
+                byName: null,
+                byOwner: true,
+                source: "tap",
+              },
         recorded: answeredOption,
+        ...LEGACY,
       },
       {
         id: "dreamforge/relay",
@@ -63,6 +86,7 @@ function benchSnapshot(
         cardEventId: "f".repeat(64),
         answer: null,
         recorded: null,
+        ...LEGACY,
       },
     ],
   };

@@ -383,8 +383,8 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
-    // Non-null only for a live Bench card in #bench signed by the Bench
-    // writer key (see benchRowState); every other row renders as before.
+    // Non-null only for a live Bench card in its own channel signed by the
+    // Bench writer key (see benchRowState); every other row renders as before.
     const benchCard = useBenchCardForMessage({
       channelId,
       id: message.id,
@@ -442,6 +442,7 @@ export const MessageRow = React.memo(
             return (
               <BenchCard
                 card={benchCard.card}
+                onOther={onReply ? () => onReply(message) : undefined}
                 ownerPubkey={benchCard.ownerPubkey}
                 viewerPubkey={currentPubkey}
               />

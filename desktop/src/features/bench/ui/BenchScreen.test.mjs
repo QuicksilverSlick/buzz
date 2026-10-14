@@ -40,6 +40,11 @@ let SidebarProvider;
 let SidebarMenu;
 let BenchScreen;
 let BenchSidebarEntry;
+let RouterContextProvider;
+let createMemoryHistory;
+let createRootRoute;
+let createRouter;
+let router;
 
 const OWNER = "b".repeat(64);
 const STRANGER = "c".repeat(64);
@@ -63,6 +68,17 @@ function card(id, overrides = {}) {
     cardEventId: "e".repeat(64),
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -98,10 +114,19 @@ function wrap(element) {
     },
   });
   clients.push(client);
+  // Only the router context useAppNavigation reads; no route resolves.
+  router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ["/bench"] }),
+  });
   return createElement(
-    QueryClientProvider,
-    { client },
-    createElement(TooltipProvider, null, element),
+    RouterContextProvider,
+    { router },
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(TooltipProvider, null, element),
+    ),
   );
 }
 
@@ -119,6 +144,7 @@ before(async () => {
   Object.assign(globalThis, {
     document: dom.window.document,
     window: dom.window,
+    self: dom.window,
     IS_REACT_ACT_ENVIRONMENT: true,
   });
   for (const key of Object.getOwnPropertyNames(dom.window)) {
@@ -169,6 +195,12 @@ before(async () => {
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
   ({ SidebarMenu, SidebarProvider } = await import("@/shared/ui/sidebar"));
+  ({
+    RouterContextProvider,
+    createMemoryHistory,
+    createRootRoute,
+    createRouter,
+  } = await import("@tanstack/react-router"));
   ({ BenchScreen } = await import("./BenchScreen.tsx"));
   ({ BenchSidebarEntry } = await import("./BenchSidebarEntry.tsx"));
 });
@@ -214,6 +246,7 @@ test("screen: board-order sections, counts, empty copy and the error line", asyn
     ),
     [
       "Needs you",
+      "Waiting on others",
       "Answered, waiting for action",
       "Decided",
       "Where things stand",
@@ -338,6 +371,7 @@ test("screen: disabled, unreadable and not-yet-ticked Benches say so", async () 
   );
   for (const copy of [
     "Nothing needs you right now.",
+    "No card is waiting on anyone else.",
     "Nothing you answered is waiting on an agent.",
     "No decisions yet.",
     "No status updates yet.",
@@ -406,5 +440,102 @@ test("sidebar: hidden while disabled; the badge counts Needs you", async () => {
     screen.queryByTestId("sidebar-bench-count"),
     null,
     "no badge when nothing needs the owner",
+  );
+});
+
+const CRAIG = "d".repeat(64);
+const PROJECT_CHANNEL = "105f15cc-1d5a-431a-9826-9402fba1a12b";
+
+function scoped(id, overrides = {}) {
+  return card(id, {
+    channelId: PROJECT_CHANNEL,
+    project: "reset",
+    scoped: true,
+    answerers: [{ pk: CRAIG, name: "Craig", role: "decider", agent: false }],
+    ownerName: "Quicksilver",
+    cardEventId: "9".repeat(64),
+    ...overrides,
+  });
+}
+
+test("screen: sections depend on who is viewing; receipts are decided", async () => {
+  const items = [
+    card("w/mine"),
+    scoped("w/craig"),
+    card("w/closed", {
+      kind: "status",
+      options: [],
+      state: "done",
+      request: scoped("w/closed", { cardEventId: null }),
+    }),
+  ];
+  serveIdentity(OWNER);
+  serveSnapshot(snapshot(items));
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() =>
+    assert.deepEqual(cardIds(screen.getByTestId("bench-section-needsYou")), [
+      "w/mine",
+    ]),
+  );
+  const waiting = screen.getByTestId("bench-section-waitingOnOthers");
+  assert.deepEqual(cardIds(waiting), ["w/craig"]);
+  assert.ok(within(waiting).getByText("For Craig · Decider"));
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-decided")), [
+    "w/closed",
+  ]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
+
+  // Other opens the card's thread in its own channel.
+  await act(async () => {
+    fireEvent.click(
+      within(waiting).getByRole("button", {
+        name: "Other: reply in this card's thread",
+      }),
+    );
+  });
+  await waitFor(() =>
+    assert.equal(
+      router.history.location.pathname,
+      `/channels/${PROJECT_CHANNEL}`,
+    ),
+  );
+  // This bare router JSON-quotes search values; the app's does not.
+  assert.match(
+    decodeURIComponent(router.history.location.search),
+    /^\?thread="?9{64}"?$/,
+  );
+  cleanup();
+
+  // Anyone else sees every open card under Needs you, read-only.
+  serveIdentity(STRANGER);
+  serveSnapshot(snapshot(items));
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const needsYou = await waitFor(() => {
+    const section = screen.getByTestId("bench-section-needsYou");
+    assert.deepEqual(cardIds(section), ["w/craig", "w/mine"]);
+    return section;
+  });
+  assert.deepEqual(
+    cardIds(screen.getByTestId("bench-section-waitingOnOthers")),
+    [],
+  );
+  assert.ok(
+    within(needsYou).getByText(
+      "For Craig. Only Craig or Quicksilver can answer.",
+    ),
+  );
+});
+
+test("sidebar: the badge leaves out cards waiting on others", async () => {
+  serveSnapshot(snapshot([card("w/mine"), scoped("w/craig")]));
+  await act(async () => {
+    render(sidebarEntry(() => {}));
+  });
+  await waitFor(() =>
+    assert.equal(screen.getByTestId("sidebar-bench-count").textContent, "1"),
   );
 });

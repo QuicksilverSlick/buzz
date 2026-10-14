@@ -27,6 +27,17 @@ function card(id, overrides = {}) {
     cardEventId: "e".repeat(64),
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -149,4 +160,43 @@ test("last tick: RFC 3339 to unix seconds; empty or garbage is null", () => {
   assert.equal(benchLastTickSeconds("2026-10-12T10:00:00Z"), 1_791_799_200);
   assert.equal(benchLastTickSeconds(""), null);
   assert.equal(benchLastTickSeconds("not a time"), null);
+});
+
+test("sections: the owner sees cards for others apart; receipts are decided", () => {
+  const craig = [
+    { pk: "d".repeat(64), name: "Craig", role: "decider", agent: false },
+  ];
+  const items = [
+    card("w/mine"),
+    card("w/craig", { scoped: true, answerers: craig }),
+    card("w/craig-answered", {
+      scoped: true,
+      answerers: craig,
+      answer: {
+        option: 0,
+        answeredAt: 5,
+        by: "d".repeat(64),
+        byName: "Craig",
+        byOwner: false,
+        source: "tap",
+      },
+    }),
+    card("w/receipt", {
+      kind: "status",
+      options: [],
+      request: card("w/receipt"),
+    }),
+  ];
+  for (const viewer of [undefined, "B".repeat(64)]) {
+    const s = benchSections(snapshot(items), viewer);
+    assert.deepEqual(ids(s.needsYou), ["w/mine"]);
+    assert.deepEqual(ids(s.waitingOnOthers), ["w/craig"]);
+    assert.deepEqual(ids(s.answered), ["w/craig-answered"]);
+    assert.deepEqual(ids(s.decided), ["w/receipt"]);
+    assert.deepEqual(ids(s.status), []);
+  }
+  const other = benchSections(snapshot(items), "c".repeat(64));
+  assert.deepEqual(ids(other.needsYou), ["w/craig", "w/mine"]);
+  assert.deepEqual(other.waitingOnOthers, []);
+  assert.equal(benchNeedsYouCount(snapshot(items)), 1);
 });

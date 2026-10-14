@@ -61,6 +61,17 @@ function card(overrides = {}) {
     cardEventId: CARD_ID,
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -194,7 +205,10 @@ test("agent text renders inert: no markdown, no HTML, no unsafe links", async ()
     anchors.map((a) => [a.textContent, a.getAttribute("href")]),
     [["PR 42", "https://github.com/block/buzz/pull/42"]],
   );
-  assert.ok(screen.getByText("Critical"), "severity chip has a readable label");
+  assert.ok(
+    screen.getByText("Your decision"),
+    "severity chip has a readable label",
+  );
 });
 
 test("a click answers, shows Saving... until recorded, then the Recorded line", async () => {
@@ -357,4 +371,178 @@ test("row hook: only the writer-signed live card in #bench is a match", async ()
     1,
     "rows share one snapshot fetch",
   );
+});
+
+const CRAIG = "d".repeat(64);
+
+function scoped(overrides = {}) {
+  return card({
+    channelId: "105f15cc-1d5a-431a-9826-9402fba1a12b",
+    project: "reset",
+    scoped: true,
+    answerers: [{ pk: CRAIG, name: "Craig", role: "decider", agent: false }],
+    ownerName: "Quicksilver",
+    recommend: 2,
+    recommender: "Reset Worker",
+    ...overrides,
+  });
+}
+
+test("a scoped card shows who it is for, the recommendation and Other", async () => {
+  let others = 0;
+  await act(async () => {
+    render(
+      wrap(
+        benchCard({
+          card: scoped(),
+          onOther: () => {
+            others += 1;
+          },
+        }),
+      ),
+    );
+  });
+  assert.ok(screen.getByText("For Craig · Decider"));
+  const recommended = optionButton("2. Hold");
+  assert.equal(recommended.getAttribute("aria-label"), "2. Hold, recommended");
+  assert.ok(recommended.textContent.includes("Recommended"));
+  assert.equal(
+    optionButton("1. Ship it").getAttribute("aria-label"),
+    "1. Ship it",
+  );
+  await act(async () => {
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Other: reply in this card's thread",
+      }),
+    );
+  });
+  assert.equal(others, 1);
+  assert.equal(answerCalls().length, 0, "Other answers nothing itself");
+});
+
+test("Other is absent on a legacy card and without a thread to open", async () => {
+  const other = () => screen.queryByRole("button", { name: /^Other: reply/ });
+  for (const props of [
+    { card: card(), onOther: () => {} },
+    { card: scoped() },
+    { card: scoped({ cardEventId: null }), onOther: () => {} },
+  ]) {
+    await act(async () => {
+      render(wrap(benchCard(props)));
+    });
+    assert.equal(other(), null);
+    cleanup();
+  }
+});
+
+test("Craig's recorded answer: the owner overrides it, never undoes it", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  const craigs = scoped({
+    recorded: 0,
+    answer: {
+      option: 0,
+      answeredAt: 1,
+      by: CRAIG,
+      byName: "Craig",
+      byOwner: false,
+      source: "tap",
+    },
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: craigs })));
+  });
+  assert.ok(screen.getByText("Answer as owner (overrides)"));
+  assert.match(
+    screen.getByTestId("bench-card-recorded").textContent,
+    /^Recorded: 1\. Ship it · Craig · \S/,
+  );
+  await act(async () => {
+    fireEvent.click(optionButton("1. Ship it"));
+  });
+  assert.deepEqual(answerCalls(), [
+    { itemId: "dreamforge/ship-it", option: 0 },
+  ]);
+  // Craig's 1 still shows: not yet the owner's answer.
+  assert.ok(screen.getByText("Saving..."));
+  await act(async () => {
+    view.rerender(
+      wrap(
+        benchCard({
+          card: scoped({
+            recorded: 0,
+            answer: {
+              option: 0,
+              answeredAt: 2,
+              by: OWNER,
+              byName: null,
+              byOwner: true,
+              source: "tap",
+            },
+          }),
+        }),
+      ),
+    );
+  });
+  assert.equal(screen.queryByText("Saving..."), null);
+  assert.equal(screen.queryByText("Answer as owner (overrides)"), null);
+  assert.match(
+    screen.getByTestId("bench-card-recorded").textContent,
+    /^Recorded: 1\. Ship it · Quicksilver · \S/,
+  );
+});
+
+test("a receipt shows the request, the answer and the outcome as inert text", async () => {
+  const request = scoped({
+    title: "Send the <b>new</b> email?",
+    options: ["Send the new email", "Keep the old one"],
+    cardEventId: null,
+    recorded: 0,
+    answer: {
+      option: 0,
+      answeredAt: 1,
+      by: CRAIG,
+      byName: "Craig",
+      byOwner: false,
+      source: "tap",
+    },
+  });
+  const receipt = card({
+    kind: "decision",
+    severity: null,
+    options: [],
+    decidedBy: "claude",
+    title: "Sent the **new** email",
+    body: "Live since 14:20. <img src=x onerror=alert(1)>",
+    links: [{ label: "PR 9", url: "https://github.com/x/y/pull/9" }],
+    channelId: request.channelId,
+    request,
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: receipt, onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  assert.equal(root.querySelector("img"), null);
+  assert.equal(root.querySelector("b"), null);
+  assert.ok(root.textContent.includes("Send the <b>new</b> email?"));
+  const chosen = optionButton("1. Send the new email");
+  assert.equal(chosen.disabled, true);
+  assert.equal(chosen.getAttribute("aria-pressed"), "true");
+  assert.equal(optionButton("2. Keep the old one").disabled, true);
+  assert.match(
+    screen.getByTestId("bench-card-answered").textContent,
+    /^Answered: 1\. Send the new email · Craig · \S/,
+  );
+  const outcome = screen.getByTestId("bench-card-outcome");
+  assert.match(outcome.textContent, /^Outcome · \S/);
+  assert.ok(outcome.textContent.includes("Sent the **new** email"));
+  assert.ok(outcome.textContent.includes("<img src=x onerror=alert(1)>"));
+  assert.ok(outcome.textContent.includes("Decided by claude"));
+  assert.deepEqual(
+    [...outcome.querySelectorAll("a")].map((a) => a.getAttribute("href")),
+    ["https://github.com/x/y/pull/9"],
+  );
+  assert.equal(screen.queryByRole("button", { name: /^Other: reply/ }), null);
 });

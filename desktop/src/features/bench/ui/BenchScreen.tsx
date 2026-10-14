@@ -1,5 +1,6 @@
 import * as React from "react";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import type { BenchCard as BenchCardData } from "@/features/bench/lib/benchCards";
 import {
   type BenchSections,
@@ -25,6 +26,11 @@ const SECTIONS: ReadonlyArray<{
     empty: "Nothing needs you right now.",
   },
   {
+    key: "waitingOnOthers",
+    title: "Waiting on others",
+    empty: "No card is waiting on anyone else.",
+  },
+  {
     key: "answered",
     title: "Answered, waiting for action",
     empty: "Nothing you answered is waiting on an agent.",
@@ -42,15 +48,30 @@ function errorText(error: unknown): string {
 }
 
 /**
- * The Bench as a full screen: what needs the owner, what is answered and
- * waiting on an agent, what was decided, and where things stand. Cards answer
- * through `bench_answer`, which uses the Bench's own relay and keys, so the
- * screen works whichever community is active.
+ * The Bench as a full screen: what needs the owner, what waits on someone
+ * else, what is answered and waiting on an agent, what was decided, and where
+ * things stand. Cards answer through `bench_answer`, which uses the Bench's
+ * own relay and keys, so the screen works whichever community is active.
+ * Other opens the card's thread, where a reply is the answer.
  */
 export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
-  const sections = React.useMemo(() => benchSections(snapshot), [snapshot]);
+  const { goChannel } = useAppNavigation();
+  const sections = React.useMemo(
+    () => benchSections(snapshot, viewerPubkey),
+    [snapshot, viewerPubkey],
+  );
+  const benchChannel = snapshot?.channelId ?? "";
+  const openThread = React.useCallback(
+    (card: BenchCardData) => {
+      const channel = card.channelId ?? benchChannel;
+      if (channel && card.cardEventId) {
+        void goChannel(channel, { thread: card.cardEventId });
+      }
+    },
+    [benchChannel, goChannel],
+  );
 
   let content: React.ReactNode;
   if (!snapshot) {
@@ -98,6 +119,7 @@ export function BenchScreen() {
             cards={sections[section.key]}
             empty={section.empty}
             key={section.key}
+            onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}
             testId={`bench-section-${section.key}`}
             title={section.title}
@@ -139,6 +161,7 @@ export function BenchScreen() {
 function BenchSection({
   cards,
   empty,
+  onOther,
   ownerPubkey,
   testId,
   title,
@@ -146,6 +169,7 @@ function BenchSection({
 }: {
   cards: BenchCardData[];
   empty: string;
+  onOther: (card: BenchCardData) => void;
   ownerPubkey: string | null;
   testId: string;
   title: string;
@@ -171,6 +195,7 @@ function BenchSection({
             <li key={card.id}>
               <BenchCard
                 card={card}
+                onOther={() => onOther(card)}
                 ownerPubkey={ownerPubkey}
                 viewerPubkey={viewerPubkey}
               />

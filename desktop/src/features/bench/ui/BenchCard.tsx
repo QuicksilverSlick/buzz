@@ -13,8 +13,10 @@ import {
   benchAnswerReducer,
   benchCardMode,
   benchDeadlineSeconds,
+  benchForLabel,
   benchKindLabel,
   benchOptionViews,
+  benchReceipt,
   benchRecordedLine,
   benchSeverityChip,
   benchStateLabel,
@@ -36,25 +38,53 @@ function formatBenchTime(unixSeconds: number): string {
 }
 
 /**
- * A Bench decision card inside #bench. Every string here was written by an
- * agent, so it renders as plain React text: never markdown, never HTML.
- * Option buttons answer through `bench_answer` with the owner's keycap; the
- * card shows "Saving..." until the Bench's tick records it.
+ * A Bench decision card, in #bench or its project channel. Every string here
+ * was written by an agent, so it renders as plain React text: never
+ * markdown, never HTML. Option buttons answer through `bench_answer` with the
+ * owner's keycap; the card shows "Saving..." until the Bench's tick records
+ * it. `onOther` opens the card's thread, where a reply is the answer. A
+ * closed card is its receipt: the question, the answer and the outcome.
  */
 export function BenchCard({
   card,
   ownerPubkey,
   viewerPubkey,
+  onOther,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
   viewerPubkey?: string;
+  onOther?: () => void;
+}) {
+  return card.request ? (
+    <BenchReceiptCard card={card} />
+  ) : (
+    <BenchQuestionCard
+      card={card}
+      onOther={onOther}
+      ownerPubkey={ownerPubkey}
+      viewerPubkey={viewerPubkey}
+    />
+  );
+}
+
+function BenchQuestionCard({
+  card,
+  ownerPubkey,
+  viewerPubkey,
+  onOther,
+}: {
+  card: BenchCardData;
+  ownerPubkey: string | null;
+  viewerPubkey?: string;
+  onOther?: () => void;
 }) {
   const { interactive, readOnlyReason } = benchCardMode(
     card,
     ownerPubkey,
     viewerPubkey,
   );
+  const byOwner = card.answer?.byOwner ?? true;
   const [storedState, dispatch] = React.useReducer(
     benchAnswerReducer,
     INITIAL_BENCH_ANSWER_STATE,
@@ -64,10 +94,11 @@ export function BenchCard({
   const state = benchAnswerReducer(storedState, {
     type: "recorded",
     recorded: card.recorded,
+    byOwner,
   });
   React.useEffect(() => {
-    dispatch({ type: "recorded", recorded: card.recorded });
-  }, [card.recorded]);
+    dispatch({ type: "recorded", recorded: card.recorded, byOwner });
+  }, [card.recorded, byOwner]);
 
   const saving = state.phase === "saving";
   const attempt = state.attempt;
@@ -86,6 +117,7 @@ export function BenchCard({
       type: "click",
       option,
       recorded: card.recorded,
+      byOwner,
     } as const;
     const next = benchAnswerReducer(storedState, action);
     // Unchanged attempt: a save is still in flight, so the click is ignored.
@@ -100,18 +132,12 @@ export function BenchCard({
     });
   };
 
-  const severity = benchSeverityChip(card.severity);
-  const validity = benchValidityLabel(card.validity);
-  const stateLabel =
-    card.kind === "status" ? benchStateLabel(card.state) : null;
-  const deadline = benchDeadlineSeconds(card.deadline);
-  const links = safeBenchLinks(card.links);
   const options =
     card.kind === "pending" ? benchOptionViews(card, state, interactive) : [];
   const recordedLine = benchRecordedLine(card, formatBenchTime);
-  const meta = [benchKindLabel(card.kind), card.area, card.writer]
-    .filter(Boolean)
-    .join(" · ");
+  const overrides = interactive && card.recorded !== null && !byOwner;
+  const other =
+    onOther && card.kind === "pending" && card.scoped && card.cardEventId;
 
   return (
     <Card
@@ -119,16 +145,142 @@ export function BenchCard({
       data-bench-item={card.id}
       data-testid="bench-card"
     >
-      <div className="flex flex-wrap items-center gap-1.5">
-        {severity ? (
-          <Badge variant={severity.variant}>{severity.label}</Badge>
+      <BenchCardHeader card={card} />
+      <BenchCardText card={card} />
+      {overrides ? (
+        <p className="mt-2.5 text-xs text-muted-foreground">
+          Answer as owner (overrides)
+        </p>
+      ) : null}
+      {options.length > 0 ? (
+        <fieldset
+          aria-busy={saving}
+          aria-label="Answer"
+          className={cn(
+            "flex flex-wrap gap-1.5",
+            overrides ? "mt-1" : "mt-2.5",
+          )}
+        >
+          {options.map((option) => (
+            <BenchOptionButton
+              key={option.index}
+              onSelect={handleOption}
+              option={option}
+            />
+          ))}
+          {other ? (
+            <Button
+              aria-label="Other: reply in this card's thread"
+              className="h-auto min-h-8 py-1.5"
+              onClick={onOther}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              Other...
+            </Button>
+          ) : null}
+        </fieldset>
+      ) : null}
+      <div aria-live="polite" className="text-xs">
+        {saving ? (
+          <p className="mt-1.5 text-muted-foreground">Saving...</p>
+        ) : recordedLine ? (
+          <p
+            className="mt-1.5 font-medium text-foreground [overflow-wrap:anywhere]"
+            data-testid="bench-card-recorded"
+          >
+            {recordedLine}
+          </p>
         ) : null}
-        {stateLabel ? <Badge variant="secondary">{stateLabel}</Badge> : null}
-        {validity ? <Badge variant="outline">{validity}</Badge> : null}
-        <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">
-          {meta}
-        </span>
+        {state.phase === "failed" && state.error ? (
+          <p className="mt-1.5 text-destructive [overflow-wrap:anywhere]">
+            {state.error}
+          </p>
+        ) : null}
+        {readOnlyReason ? (
+          <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
+        ) : null}
       </div>
+    </Card>
+  );
+}
+
+/** The question as it closed, its answer, then the outcome: inert text. */
+function BenchReceiptCard({ card }: { card: BenchCardData }) {
+  const receipt = benchReceipt(card, formatBenchTime);
+  if (!receipt) return null;
+  const { request } = receipt;
+  const options = benchOptionViews(request, INITIAL_BENCH_ANSWER_STATE, false);
+  return (
+    <Card
+      className="mt-1 max-w-[min(100%,36rem)] px-3 py-2.5"
+      data-bench-item={card.id}
+      data-testid="bench-card"
+    >
+      <BenchCardHeader card={request} />
+      <BenchCardText card={request} />
+      {options.length > 0 ? (
+        <fieldset
+          aria-label="Options"
+          className="mt-2.5 flex flex-wrap gap-1.5"
+        >
+          {options.map((option) => (
+            <BenchOptionButton
+              key={option.index}
+              onSelect={() => {}}
+              option={option}
+            />
+          ))}
+        </fieldset>
+      ) : null}
+      <p
+        className="mt-1.5 text-xs font-medium text-foreground [overflow-wrap:anywhere]"
+        data-testid="bench-card-answered"
+      >
+        {receipt.answeredLine}
+      </p>
+      <section
+        aria-label="Outcome"
+        className="mt-2.5 border-t border-border/70 pt-2"
+        data-testid="bench-card-outcome"
+      >
+        <p className="text-xs text-muted-foreground">{receipt.outcomeLine}</p>
+        <BenchCardText card={card} />
+      </section>
+    </Card>
+  );
+}
+
+function BenchCardHeader({ card }: { card: BenchCardData }) {
+  const severity = benchSeverityChip(card.severity);
+  const validity = benchValidityLabel(card.validity);
+  const stateLabel =
+    card.kind === "status" ? benchStateLabel(card.state) : null;
+  const forLabel = benchForLabel(card);
+  const meta = [benchKindLabel(card.kind), card.area, card.writer]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {severity ? (
+        <Badge variant={severity.variant}>{severity.label}</Badge>
+      ) : null}
+      {forLabel ? <Badge variant="outline">{forLabel}</Badge> : null}
+      {stateLabel ? <Badge variant="secondary">{stateLabel}</Badge> : null}
+      {validity ? <Badge variant="outline">{validity}</Badge> : null}
+      <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+        {meta}
+      </span>
+    </div>
+  );
+}
+
+function BenchCardText({ card }: { card: BenchCardData }) {
+  const deadline = benchDeadlineSeconds(card.deadline);
+  const links = safeBenchLinks(card.links);
+  return (
+    <>
       <p className="mt-1.5 text-message font-semibold text-foreground [overflow-wrap:anywhere]">
         {card.title}
       </p>
@@ -156,42 +308,7 @@ export function BenchCard({
           ))}
         </ul>
       ) : null}
-      {options.length > 0 ? (
-        <fieldset
-          aria-busy={saving}
-          aria-label="Answer"
-          className="mt-2.5 flex flex-wrap gap-1.5"
-        >
-          {options.map((option) => (
-            <BenchOptionButton
-              key={option.index}
-              onSelect={handleOption}
-              option={option}
-            />
-          ))}
-        </fieldset>
-      ) : null}
-      <div aria-live="polite" className="text-xs">
-        {saving ? (
-          <p className="mt-1.5 text-muted-foreground">Saving...</p>
-        ) : recordedLine ? (
-          <p
-            className="mt-1.5 font-medium text-foreground [overflow-wrap:anywhere]"
-            data-testid="bench-card-recorded"
-          >
-            {recordedLine}
-          </p>
-        ) : null}
-        {state.phase === "failed" && state.error ? (
-          <p className="mt-1.5 text-destructive [overflow-wrap:anywhere]">
-            {state.error}
-          </p>
-        ) : null}
-        {readOnlyReason ? (
-          <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
-        ) : null}
-      </div>
-    </Card>
+    </>
   );
 }
 
@@ -205,15 +322,16 @@ function BenchOptionButton({
   const label = `${option.number}. ${option.text}`;
   // A retired card shows its answer on a disabled button: nothing to undo.
   const undoable = option.selected && !option.disabled;
+  const recommended = option.recommended ? ", recommended" : "";
   return (
     <Button
       aria-busy={option.pending || undefined}
       aria-label={
         undoable
-          ? `${label} (recorded, click to undo)`
+          ? `${label}${recommended} (recorded, click to undo)`
           : option.selected
-            ? `${label} (recorded)`
-            : label
+            ? `${label}${recommended} (recorded)`
+            : `${label}${recommended}`
       }
       aria-pressed={option.selected}
       className={cn(
@@ -229,6 +347,11 @@ function BenchOptionButton({
     >
       <span className="font-semibold tabular-nums">{option.number}.</span>
       <span className="min-w-0 [overflow-wrap:anywhere]">{option.text}</span>
+      {option.recommended ? (
+        <Badge aria-hidden variant="secondary">
+          Recommended
+        </Badge>
+      ) : null}
       {option.pending ? (
         <Spinner aria-hidden className="h-3.5 w-3.5 border-2" />
       ) : option.selected ? (

@@ -289,35 +289,126 @@ async fn bench_cards_snapshot() {
         keys(item),
         [
             "answer",
+            "answerers",
             "area",
             "body",
             "cardEventId",
+            "channelId",
             "deadline",
             "decidedBy",
             "id",
             "kind",
             "links",
+            "needs",
             "options",
             "order",
+            "ownerName",
+            "project",
+            "recommend",
+            "recommender",
             "recorded",
+            "reply",
+            "request",
+            "scoped",
             "severity",
             "state",
             "title",
+            "updatedAt",
             "validity",
             "writer"
         ]
     );
+    assert_eq!(item["updatedAt"], json!(NOW));
     assert_eq!(item["id"], json!(ITEM));
     assert_eq!(item["kind"], json!("pending"));
     assert_eq!(item["severity"], json!("critical"));
     assert_eq!(item["validity"], json!("current"));
     assert_eq!(item["options"], json!(["Stay", "Move"]));
     assert_eq!(item["cardEventId"], json!(card));
-    assert_eq!(item["answer"], json!({ "option": 1, "answeredAt": b.now }));
+    assert_eq!(
+        item["answer"],
+        json!({
+            "option": 1, "answeredAt": b.now, "by": b.owner_hex(), "byName": null,
+            "byOwner": true, "source": "tap",
+        })
+    );
     assert_eq!(item["recorded"], json!(1));
+    // A legacy card: #bench, owner-only, no Other.
+    for (k, v) in [
+        ("channelId", Value::Null),
+        ("project", Value::Null),
+        ("scoped", json!(false)),
+        ("needs", json!("you")),
+        ("answerers", json!([])),
+        ("ownerName", Value::Null),
+        ("recommend", Value::Null),
+        ("recommender", Value::Null),
+        ("reply", Value::Null),
+        ("request", Value::Null),
+    ] {
+        assert_eq!(item[k], v, "{k}");
+    }
     // Only a live card is offered for answering.
     b.s.items.get_mut(ITEM).unwrap().hash = "ffff".to_string();
     save_state(&b.root, &b.s, &mut String::new()).unwrap();
     let snap = serde_json::to_value(cards(&b.root)).unwrap();
     assert_eq!(snap["items"][0]["cardEventId"], Value::Null);
+}
+
+#[tokio::test]
+async fn bench_cards_snapshot_names_answerers_and_shows_receipts() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let craig_tap = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &craig_tap]);
+    b.tick().await.unwrap();
+    let find = |snap: &Value| -> Value {
+        snap["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == ASK)
+            .unwrap()
+            .clone()
+    };
+    save_state(&b.root, &b.s, &mut String::new()).unwrap();
+    let item = find(&serde_json::to_value(cards(&b.root)).unwrap());
+    assert_eq!(item["channelId"], json!(X));
+    assert_eq!(item["project"], json!("reset"));
+    assert_eq!(item["scoped"], json!(true));
+    assert_eq!(
+        item["answerers"],
+        json!([{"pk": hex(&p.craig), "name": "Craig", "role": "decider", "agent": false}])
+    );
+    assert_eq!(item["ownerName"], json!("Quicksilver"));
+    assert_eq!(item["recommend"], json!(2));
+    assert_eq!(item["recommender"], json!("Reset Worker"));
+    assert_eq!(item["cardEventId"], json!(card));
+    assert_eq!(item["answer"]["by"], json!(hex(&p.craig)));
+    assert_eq!(item["answer"]["byName"], json!("Craig"));
+    assert_eq!(item["answer"]["byOwner"], json!(false));
+
+    // The close-out: the receipt keeps the card and carries the question.
+    let close = drop_json(&[
+        ("kind", json!("decision")),
+        ("decidedBy", json!("claude")),
+        ("project", json!("reset")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+        ("title", json!("Sent the new email")),
+    ]);
+    b.drop_file("reset-worker", "welcome", &close);
+    b.tick().await.unwrap();
+    save_state(&b.root, &b.s, &mut String::new()).unwrap();
+    let item = find(&serde_json::to_value(cards(&b.root)).unwrap());
+    assert_eq!(item["kind"], json!("decision"));
+    assert_eq!(item["title"], json!("Sent the new email"));
+    assert_eq!(item["cardEventId"], json!(card));
+    assert_eq!(item["channelId"], json!(X));
+    let request = &item["request"];
+    assert_eq!(request["kind"], json!("pending"));
+    assert_eq!(request["title"], json!("Welcome email"));
+    assert_eq!(request["cardEventId"], Value::Null);
+    assert_eq!(request["answer"]["byName"], json!("Craig"));
+    assert_eq!(request["request"], Value::Null);
 }
