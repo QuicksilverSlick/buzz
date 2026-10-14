@@ -552,6 +552,16 @@ async fn kept_answered_cards_count_against_max_cards() {
     assert!(b.s.items[ITEM].card.is_some());
     assert!(b.s.items["orchestrator/c28"].card.is_some());
     assert!(b.s.items["orchestrator/c29"].card.is_none());
+    // A day on it is a receipt only: it stays, and gives its slot back.
+    let card = b.card(ITEM).event_id;
+    let before = b.posts().len();
+    b.now += ANSWER_KEEP_SECS;
+    b.settle(4).await;
+    assert_eq!(b.card(ITEM).event_id, card);
+    assert!(b.s.items["orchestrator/c29"].card.is_some());
+    assert!(!b.posts()[before..]
+        .iter()
+        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
 }
 
 // ── Saying how to answer ────────────────────────────────────────────────

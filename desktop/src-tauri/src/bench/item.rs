@@ -16,8 +16,8 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
     "3\u{FE0F}\u{20E3}",
     "4\u{FE0F}\u{20E3}",
 ];
-/// An answered card stays 24 h so late pills still land, then it is retired;
-/// also the attention clock on the board.
+/// An answered card holds a live slot 24 h so late pills still land, then it
+/// is a receipt only; also the attention clock on the board.
 pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 

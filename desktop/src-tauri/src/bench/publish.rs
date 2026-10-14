@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use super::channels::{card_channel, channel_ready, joined};
 use super::{
-    forget_card, item, live_card, local_hhmm, post_as_writer, same_drop, spend, BenchState, Ctx,
-    Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS,
+    forget_card, item, live_card, local_hhmm, post_as_writer, query, same_drop, spend, BenchState,
+    Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS, RECOVER_LIMIT,
 };
 use crate::events;
 
@@ -88,6 +88,29 @@ fn df_answer(parts: [&str; 3]) -> Result<nostr::Tag, String> {
     nostr::Tag::parse(["df-answer", n, by, id]).map_err(|e| e.to_string())
 }
 
+/// Whether a recovered card has anything on it but the writer's own seeds:
+/// a tap, a reply, a route notice, or a Recorded or receipt edit. A cut page
+/// holds more than the four seeds, so it counts too.
+async fn touched(
+    ctx: &Ctx<'_>,
+    s: &BenchState,
+    ch: &str,
+    card: &str,
+    now: u64,
+) -> Result<bool, String> {
+    let filter = serde_json::json!({
+        "kinds": [7, 9, 40003], "#h": [ch], "#e": [card], "limit": RECOVER_LIMIT,
+    });
+    let writer = ctx.writer.public_key();
+    Ok(query(ctx, s, filter, now).await?.iter().any(|e| {
+        let on_card = e
+            .tags
+            .iter()
+            .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "e" && v == card));
+        on_card && !(e.kind.as_u16() == 7 && e.pubkey == writer)
+    }))
+}
+
 /// A thread the relay will not take: its root is gone, in another channel or
 /// not a thread root.
 fn bad_thread(e: &str) -> bool {
@@ -109,8 +132,9 @@ pub(super) async fn publish(
     routes: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     // (a) The live cards: pending + current + unanswered by severity, in a
-    // channel ready for them; kept answered cards count against MAX_CARDS
-    // (the phone's pill window). Receipts do not.
+    // channel ready for them; an answered card counts against MAX_CARDS (the
+    // phone's pill window) for ANSWER_KEEP_SECS so late pills land, then
+    // stays on the relay as a receipt. Receipts do not count.
     let mut ranked: Vec<(u8, i64, String)> = s
         .items
         .values()
@@ -126,7 +150,13 @@ pub(super) async fn publish(
     let kept = s
         .items
         .values()
-        .filter(|i| i.kind == item::ItemKind::Pending && i.answer.is_some() && i.card.is_some())
+        .filter(|i| {
+            i.kind == item::ItemKind::Pending
+                && i.card.is_some()
+                && i.answer
+                    .as_ref()
+                    .is_some_and(|a| now.saturating_sub(a.answered_at) <= item::ANSWER_KEEP_SECS)
+        })
         .count();
     let wanted: Vec<String> = ranked
         .into_iter()
@@ -356,10 +386,15 @@ pub(super) async fn publish(
                 s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
                 continue;
             }
-            if !spend(budget, 1) {
-                return Ok(());
+            // An answered, replied or receipt card stays on the relay for good.
+            if touched(ctx, s, &ch, &orphan.event_id, now).await? {
+                s.kept.push(orphan.event_id.clone());
+            } else {
+                if !spend(budget, 1) {
+                    return Ok(());
+                }
+                delete(ctx, s, &ch, &orphan.event_id, now).await?;
             }
-            delete(ctx, s, &ch, &orphan.event_id, now).await?;
             s.orphan_cards.remove(id);
             let i = s.items.get_mut(id).expect("wanted id");
             i.quiet_repost |= same_drop(&orphan, i);

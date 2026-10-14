@@ -157,3 +157,59 @@ async fn receipts_do_not_count_against_max_cards() {
     assert!(b.s.items["orchestrator/c29"].card.is_some());
     assert_eq!(b.card(ITEM).event_id, receipt);
 }
+
+#[tokio::test]
+async fn recovered_orphans_are_deleted_only_when_untouched() {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    let (w, now) = (b.ctx.writer.clone(), b.now);
+    // State was lost: three cards of an older Drop are on the relay, one
+    // tapped, one edited (Recorded or a receipt) and one with seeds only.
+    let card =
+        |id: &str, at: u64| kind9(&w, at, Some(&format!("bench:card:orchestrator/{id}@abcd")));
+    let (tapped, edited, idle) = (
+        card("tapped", now - 50),
+        card("edited", now - 40),
+        card("idle", now - 30),
+    );
+    let owner_tap = tap(&b.ctx.owner, &tapped.id.to_hex(), OPTION_EMOJI[0], now - 45);
+    let edit_tags = crate::events::MessageEditTags {
+        media: &[],
+        custom_emoji: &[],
+        mentions: &[],
+        mention_refs: None,
+    };
+    let recorded = crate::events::build_message_edit(
+        channel_id(&b.owner_hex()),
+        edited.id,
+        "Recorded: 1. Stay",
+        edit_tags,
+        false,
+    )
+    .unwrap()
+    .sign_with_keys(&w)
+    .unwrap();
+    let seed = tap(&w, &idle.id.to_hex(), OPTION_EMOJI[0], now - 29);
+    reply(&b, &[&tapped, &edited, &idle, &owner_tap, &recorded, &seed]);
+    for id in ["tapped", "edited", "idle"] {
+        b.drop_file("orchestrator", id, &drop_json(&[]));
+    }
+    b.settle(8).await;
+
+    let deleted: Vec<String> = b
+        .posts()
+        .iter()
+        .filter(|(e, _)| e["kind"] == 5)
+        .filter_map(|(e, _)| tag_value(e, "e"))
+        .collect();
+    assert!(deleted.contains(&idle.id.to_hex()), "{deleted:?}");
+    for orphan in [&tapped, &edited] {
+        let id = orphan.id.to_hex();
+        assert!(!deleted.contains(&id), "{id} was deleted");
+        assert!(b.s.kept.contains(&id));
+    }
+    assert!(b.s.orphan_cards.is_empty());
+    for (id, orphan) in [("tapped", &tapped), ("edited", &edited), ("idle", &idle)] {
+        let posted = b.card(&format!("orchestrator/{id}")).event_id;
+        assert_ne!(posted, orphan.id.to_hex());
+    }
+}
