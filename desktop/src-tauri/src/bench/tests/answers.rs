@@ -56,7 +56,7 @@ fn pick_answer_rules() {
     let mut item = check(&[]).unwrap();
     let no_card = [tap(&owner, &card_hex, OPTION_EMOJI[1], 10)];
     let owner_hex = [owner.public_key().to_hex()];
-    assert!(pick_answer(&item, &no_card, &owner_hex, "").is_none());
+    assert!(pick_answer(&item, &no_card, &owner_hex, "", None).is_none());
     item.card = Some(Posted {
         event_id: card_hex.clone(),
         created_at: 1,
@@ -71,7 +71,7 @@ fn pick_answer_rules() {
         .collect();
     let writer_hex = writer.public_key().to_hex();
     let pick = |evs: &[nostr::Event]| {
-        pick_answer(&item, evs, &approvers, &writer_hex).map(|(i, e)| (i, e.id.to_hex()))
+        pick_answer(&item, evs, &approvers, &writer_hex, None).map(|(i, e)| (i, e.id.to_hex()))
     };
 
     // A broken signature: the content changed after signing.

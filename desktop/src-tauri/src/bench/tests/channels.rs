@@ -524,6 +524,43 @@ async fn other_replies_reach_the_route_target() {
     );
 }
 
+/// A card posted with replyTo sits in another message's thread, and Block's
+/// phone answers there naming only that root.
+#[tokio::test]
+async fn phone_replies_to_a_threaded_card_name_only_its_root() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let p = bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let root = "ab".repeat(32);
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(root))]));
+    b.settle(6).await;
+    let card = b.card(ASK);
+    // A reply from before the card is not about it; one after is its Other.
+    let early = thread_reply(&p.craig, &root, "Hi all", card.created_at, &[]);
+    reply(&b, &[&list, &early]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].reply.is_none());
+    // The read takes the root's thread from an hour before the oldest card.
+    let q = b.relay.queries.lock().unwrap().clone();
+    let read = q.iter().rev().find(|q| q[0]["#e"].is_array()).unwrap();
+    assert!(read[0]["#e"].as_array().unwrap().contains(&json!(root)));
+    assert_eq!(read[0]["since"], json!(b.card(ITEM).created_at - 3600));
+    let other = thread_reply(&p.craig, &root, "Shorter still?", card.created_at + 1, &[]);
+    let two = thread_reply(&p.craig, &root, "2", card.created_at + 2, &[]);
+    reply(&b, &[&list, &early, &other]);
+    b.tick().await.unwrap();
+    let r = b.s.items[ASK].reply.clone().unwrap();
+    assert_eq!(r.event_id, other.id.to_hex());
+    reply(&b, &[&list, &early, &other, &two]);
+    b.tick().await.unwrap();
+    let a = b.s.items[ASK].answer.clone().unwrap();
+    assert_eq!(
+        (a.option, a.source, a.reaction_id),
+        (1, AnswerSource::Reply, two.id.to_hex())
+    );
+}
+
 #[tokio::test]
 async fn unreadable_roles_hold_scoped_drops_and_cards_go_owner_only() {
     let (mut b, _p, _list) = bound_bench().await;

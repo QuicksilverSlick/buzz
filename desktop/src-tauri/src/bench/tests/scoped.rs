@@ -518,17 +518,17 @@ fn answer_vectors() {
             })
             .collect();
 
-        let answer = pick_answer(&item, &events, &owner_set, &writer_hex)
+        let answer = pick_answer(&item, &events, &owner_set, &writer_hex, None)
             .map(|(i, e)| json!({"who": alias(e), "option": i + 1}));
         assert_eq!(
             answer.unwrap_or(Value::Null),
             case["answer"],
             "{name}: answer"
         );
-        let reply =
-            pick_reply(&item, &events, &owner_set, &writer_hex).map(|e| json!({"who": alias(e)}));
+        let reply = pick_reply(&item, &events, &owner_set, &writer_hex, None)
+            .map(|e| json!({"who": alias(e)}));
         assert_eq!(reply.unwrap_or(Value::Null), case["reply"], "{name}: reply");
-        let refused: Vec<&str> = refused_taps(&item, &events, &owner_set, &writer_hex)
+        let refused: Vec<&str> = refused_taps(&item, &events, &owner_set, &writer_hex, None)
             .into_iter()
             .map(alias)
             .collect();
@@ -539,6 +539,102 @@ fn answer_vectors() {
             assert_eq!(json!(got), *want, "{name}: eligible {who}");
         }
     }
+}
+
+/// Thread replies shaped as Block's phone sends them
+/// (`send_message_provider.dart` `_buildReplyTags`): to the thread it shows,
+/// `["e", head, "", "reply"]` alone; deeper, `root` plus `reply`. Each counts
+/// for one card at most.
+#[test]
+fn each_thread_reply_counts_for_one_card() {
+    let craig = Keys::generate();
+    let owner_set = [hex('0')];
+    let card = |reply_to: Option<&str>, id: &str, at: u64| {
+        let mut i = ask();
+        i.reply_to = reply_to.map(str::to_string);
+        i.stamp.as_mut().unwrap().answerers[0].pk = craig.public_key().to_hex();
+        i.card = Some(Posted {
+            event_id: id.to_string(),
+            created_at: at,
+            hash: card_hash(&i),
+            seeded: 2,
+        });
+        i
+    };
+    let say = |text: &str, at: u64, tags: &[(&str, &str)]| {
+        let tags = tags
+            .iter()
+            .map(|(id, marker)| nostr::Tag::parse(["e", id, "", marker]).unwrap());
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), text)
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(at))
+            .sign_with_keys(&craig)
+            .unwrap()
+    };
+    let opt = |i: &Item, e: &nostr::Event, until: Option<u64>| {
+        answer_option(i, &i.card.as_ref().unwrap().event_id, e, until)
+    };
+    let (r, a, b, c1, c2): (&str, &str, &str, &str, &str) =
+        (&hex('a'), &hex('b'), &hex('c'), &hex('d'), &hex('e'));
+
+    // Card b sits in card a's thread: a reply to b is b's alone, and a reply
+    // to a, as the phone sends it from a's thread, is a's alone.
+    let (top, inner) = (card(None, a, 10), card(Some(a), b, 20));
+    let (ua, ub) = (
+        root_until(&top, [&top, &inner], &[]),
+        root_until(&inner, [&top, &inner], &[]),
+    );
+    assert_eq!((ua, ub), (None, None));
+    let to_b = say("2", 30, &[(a, "root"), (b, "reply")]);
+    assert_eq!(
+        (opt(&top, &to_b, ua), opt(&inner, &to_b, ub)),
+        (None, Some(1))
+    );
+    let to_a = say("1", 31, &[(a, "reply")]);
+    assert_eq!(
+        (opt(&top, &to_a, ua), opt(&inner, &to_a, ub)),
+        (Some(0), None)
+    );
+
+    // Two cards in the thread of a plain message r: a reply that names only
+    // r is the newest card's from before it, and nobody's before the first.
+    let (one, two) = (card(Some(r), c1, 40), card(Some(r), c2, 50));
+    let (u1, u2) = (
+        root_until(&one, [&one, &two], &[]),
+        root_until(&two, [&one, &two], &[]),
+    );
+    assert_eq!((u1, u2), (Some(50), Some(u64::MAX)));
+    let after = [
+        (40, (None, None)),
+        (45, (Some(0), None)),
+        (50, (Some(0), None)),
+        (51, (None, Some(0))),
+    ];
+    for (at, want) in after {
+        let e = say("1", at, &[(r, "reply")]);
+        assert_eq!((opt(&one, &e, u1), opt(&two, &e, u2)), want, "at {at}");
+    }
+    let other = say("Hold on", 55, &[(r, "root")]);
+    let replied =
+        |i: &Item, until| pick_reply(i, std::slice::from_ref(&other), &owner_set, "", until);
+    assert_eq!(replied(&two, u2).map(|e| e.id), Some(other.id));
+    assert!(replied(&one, u1).is_none());
+    // Deeper in r's thread a reply names its parent: another message is
+    // nobody's, a card is that card's however new.
+    let nested = say("1", 56, &[(r, "root"), (&hex('f'), "reply")]);
+    assert_eq!(
+        (opt(&one, &nested, u1), opt(&two, &nested, u2)),
+        (None, None)
+    );
+    let branch = say("2", 57, &[(r, "root"), (c1, "reply")]);
+    assert_eq!(
+        (opt(&one, &branch, u1), opt(&two, &branch, u2)),
+        (Some(1), None)
+    );
+    // Without that window a root reply is nobody's, and a kept card roots
+    // its own thread.
+    assert_eq!(opt(&two, &say("1", 58, &[(r, "reply")]), None), None);
+    assert_eq!(root_until(&one, [&one], &[r.to_string()]), None);
 }
 
 #[test]

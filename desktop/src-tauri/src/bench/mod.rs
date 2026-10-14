@@ -859,11 +859,27 @@ async fn poll_answers(
     if live.is_empty() {
         return Ok(None);
     }
-    let cards: Vec<String> = live
+    let mut cards: Vec<String> = live
         .iter()
         .filter_map(|i| live_card(i))
         .map(|c| c.event_id.clone())
         .collect();
+    // A reply that names only a card's thread root (`item::root_until`).
+    // Their whole threads match, so the read starts an hour (clock skew)
+    // before the oldest live card: nothing older counts on any of them.
+    let roots: Vec<String> = live
+        .iter()
+        .filter(|i| item::root_until(i, s.items.values(), &s.kept).is_some())
+        .filter_map(|i| i.reply_to.clone())
+        .collect();
+    let since = live
+        .iter()
+        .filter_map(|i| live_card(i))
+        .map(|c| c.created_at)
+        .min()
+        .filter(|_| !roots.is_empty())
+        .map(|t| t.saturating_sub(3600));
+    cards.extend(roots);
     let mut answerers: Vec<String> = live
         .iter()
         .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
@@ -890,10 +906,14 @@ async fn poll_answers(
     // The owner's keys are read apart from everyone else's, so nobody else's
     // traffic can cut the owner's page or stall the tick.
     let page = |authors: &[String]| {
-        serde_json::json!({
+        let mut f = serde_json::json!({
             "kinds": kinds, "authors": authors, "#h": chans, "#e": cards,
             "limit": RECOVER_LIMIT,
-        })
+        });
+        if let Some(t) = since {
+            f["since"] = t.into();
+        }
+        f
     };
     let mut events = query(ctx, s, page(owner_set), now).await?;
     // A cut page hides answers: never infer a retraction from it.
@@ -918,14 +938,15 @@ async fn poll_answers(
     let hhmm = local_hhmm(now);
     let mut refused = Vec::new();
     for id in ids {
+        let until = item::root_until(&s.items[&id], s.items.values(), &s.kept);
         let item = s.items.get_mut(&id).expect("live id");
         let card = live_card(item).expect("live card").event_id.clone();
         // Their page was cut, so an answer or reply of theirs here may be
         // hidden: theirs stand as they are. The owner's page is whole, so it
         // still decides once the owner spoke, and an answer of the owner's
         // that stopped coming back was withdrawn.
-        let unread = cut.is_some() && !item::owner_spoke(item, &card, &events, owner_set);
-        for e in item::refused_taps(item, &events, owner_set, &writer_hex) {
+        let unread = cut.is_some() && !item::owner_spoke(item, &card, &events, owner_set, until);
+        for e in item::refused_taps(item, &events, owner_set, &writer_hex, until) {
             let by = e.pubkey.to_hex();
             let why = if item.needs == item::Needs::You && agents.contains(&by) {
                 "agent on a needs-you card"
@@ -936,7 +957,7 @@ async fn poll_answers(
                 item: id.clone(),
                 by,
                 event_id: e.id.to_hex(),
-                option: item::answer_option(item, &card, e).map_or(0, |i| i + 1),
+                option: item::answer_option(item, &card, e, until).map_or(0, |i| i + 1),
                 at: e.created_at.as_secs(),
                 why: why.to_string(),
             });
@@ -944,7 +965,7 @@ async fn poll_answers(
         // The person's Other: kept while it is the newest, so its first-seen
         // time holds; publish (a3) routes it unless it already pings the agent.
         let picked = (!unread)
-            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex))
+            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until))
             .flatten();
         item.reply = match picked {
             Some(e)
@@ -980,7 +1001,7 @@ async fn poll_answers(
         };
         let path = outbox_path(&ctx.root, &id);
         let picked = (!unread)
-            .then(|| item::pick_answer(item, &events, owner_set, &writer_hex))
+            .then(|| item::pick_answer(item, &events, owner_set, &writer_hex, until))
             .flatten();
         match picked {
             None if unread && item.answer.as_ref().is_some_and(|a| theirs(&a.by)) => {}

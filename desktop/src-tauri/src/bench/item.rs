@@ -1171,23 +1171,85 @@ pub(crate) fn eligible(item: &Item, pk: &str, owner_set: &[String]) -> bool {
         })
 }
 
-fn refers_to(e: &nostr::Event, card_id: &str) -> bool {
-    e.tags
+/// The event a kind 9 replies to: its NIP-10 `reply` e tag, else its only e
+/// tag. A reply deeper in a thread names its own parent, so a card that is
+/// only the root of another card's thread is not what it answers.
+fn parent(e: &nostr::Event) -> Option<&str> {
+    let es: Vec<&[String]> = e
+        .tags
         .iter()
-        .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "e" && v == card_id))
+        .map(|t| t.as_slice())
+        .filter(|t| matches!(t, [k, _, ..] if k == "e"))
+        .collect();
+    let reply = es.iter().find(|t| t.get(3).is_some_and(|m| m == "reply"));
+    reply
+        .or(match es.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })
+        .map(|t| t[1].as_str())
+}
+
+/// Until when (inclusive) the live card of `item` also takes replies that
+/// name only its thread's root, as Block's phone sends from a thread it
+/// shows from the root: from its card to the next card the Bench has in that
+/// thread, so each such reply counts for one card, the newest before it.
+/// None without a thread, or in one rooted at a card: a reply there is that
+/// card's own.
+// shortcut: a card a re-ask left behind (`kept`) has no time here, so an
+// older card in its thread can take its root replies; keep kept cards'
+// times if threads come to hold several open cards.
+pub(crate) fn root_until<'a>(
+    item: &Item,
+    items: impl IntoIterator<Item = &'a Item>,
+    kept: &[String],
+) -> Option<u64> {
+    let root = item.reply_to.as_deref()?;
+    let after = item.card.as_ref()?.created_at;
+    let mut until = u64::MAX;
+    for j in items {
+        let Some(c) = &j.card else { continue };
+        if c.event_id == root {
+            return None;
+        }
+        let thread = j.request.as_deref().unwrap_or(j).reply_to.as_deref();
+        if thread == Some(root) && c.created_at > after {
+            until = until.min(c.created_at);
+        }
+    }
+    (!kept.iter().any(|k| k == root)).then_some(until)
+}
+
+/// Whether the kind 9 `e` replies to the card `card_id`: it names the card
+/// as its parent, or names only the card's thread root, after the card and
+/// by `root_until`.
+fn on_card(item: &Item, card_id: &str, e: &nostr::Event, root_until: Option<u64>) -> bool {
+    let (p, at) = (parent(e), e.created_at.as_secs());
+    p == Some(card_id)
+        || root_until.is_some_and(|until| {
+            p.is_some()
+                && p == item.reply_to.as_deref()
+                && item.card.as_ref().is_some_and(|c| c.created_at < at)
+                && at <= until
+        })
 }
 
 /// The 0-based option an event answers on the card `card_id`: a kind 7
 /// aimed at it by its `reaction_target` and echoing one seeded keycap
-/// byte for byte, or, on a scoped card only, a kind 9 in its thread whose
-/// whole text is "1" to "n" or exactly one option's label.
-pub(crate) fn answer_option(item: &Item, card_id: &str, e: &nostr::Event) -> Option<usize> {
+/// byte for byte, or, on a scoped card only, a kind 9 replying to it
+/// (`on_card`) whose whole text is "1" to "n" or exactly one option's label.
+pub(crate) fn answer_option(
+    item: &Item,
+    card_id: &str,
+    e: &nostr::Event,
+    root_until: Option<u64>,
+) -> Option<usize> {
     let n = item.options.len().min(OPTION_EMOJI.len());
     match e.kind.as_u16() {
         7 if reaction_target(e) == Some(card_id) => {
             OPTION_EMOJI[..n].iter().position(|o| *o == e.content)
         }
-        9 if item.scoped() && refers_to(e, card_id) => {
+        9 if item.scoped() && on_card(item, card_id, e, root_until) => {
             let t = e.content.trim();
             (1..=n).position(|k| t == k.to_string()).or_else(|| {
                 let mut hits = item.options[..n]
@@ -1204,12 +1266,12 @@ pub(crate) fn answer_option(item: &Item, card_id: &str, e: &nostr::Event) -> Opt
     }
 }
 
-/// A scoped card's Other: a kind 9 in its thread that names no option.
-fn free_text(item: &Item, card_id: &str, e: &nostr::Event) -> bool {
+/// A scoped card's Other: a kind 9 replying to it that names no option.
+fn free_text(item: &Item, card_id: &str, e: &nostr::Event, root_until: Option<u64>) -> bool {
     item.scoped()
         && e.kind.as_u16() == 9
-        && refers_to(e, card_id)
-        && answer_option(item, card_id, e).is_none()
+        && on_card(item, card_id, e, root_until)
+        && answer_option(item, card_id, e, root_until).is_none()
 }
 
 /// Whether the owner's keys answered or replied on the live card `card_id`.
@@ -1218,10 +1280,12 @@ pub(crate) fn owner_spoke(
     card_id: &str,
     events: &[nostr::Event],
     owner_set: &[String],
+    root_until: Option<u64>,
 ) -> bool {
     events.iter().any(|e| {
         owner_set.contains(&e.pubkey.to_hex())
-            && (answer_option(item, card_id, e).is_some() || free_text(item, card_id, e))
+            && (answer_option(item, card_id, e, root_until).is_some()
+                || free_text(item, card_id, e, root_until))
             && e.verify().is_ok()
     })
 }
@@ -1252,28 +1316,33 @@ pub(crate) fn pick_answer<'e>(
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
+    root_until: Option<u64>,
 ) -> Option<(usize, &'e nostr::Event)> {
     let card = &item.card.as_ref()?.event_id;
-    let only_owner = owner_spoke(item, card, events, owner_set);
+    let only_owner = owner_spoke(item, card, events, owner_set, root_until);
     events
         .iter()
         .filter(|e| counts(item, e, owner_set, writer_hex, only_owner))
-        .filter_map(|e| Some((answer_option(item, card, e)?, e)))
+        .filter_map(|e| Some((answer_option(item, card, e, root_until)?, e)))
         .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
 }
 
-/// The newest free-text reply in a scoped card's thread that `counts`.
+/// The newest free-text reply on a scoped card that `counts`.
 pub(crate) fn pick_reply<'e>(
     item: &Item,
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
+    root_until: Option<u64>,
 ) -> Option<&'e nostr::Event> {
     let card = &item.card.as_ref().filter(|_| item.scoped())?.event_id;
-    let only_owner = owner_spoke(item, card, events, owner_set);
+    let only_owner = owner_spoke(item, card, events, owner_set, root_until);
     events
         .iter()
-        .filter(|e| free_text(item, card, e) && counts(item, e, owner_set, writer_hex, only_owner))
+        .filter(|e| {
+            free_text(item, card, e, root_until)
+                && counts(item, e, owner_set, writer_hex, only_owner)
+        })
         .max_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
 }
 
@@ -1284,6 +1353,7 @@ pub(crate) fn refused_taps<'e>(
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
+    root_until: Option<u64>,
 ) -> Vec<&'e nostr::Event> {
     let Some(card) = &item.card else {
         return Vec::new();
@@ -1293,7 +1363,7 @@ pub(crate) fn refused_taps<'e>(
         .filter(|e| {
             let pk = e.pubkey.to_hex();
             pk != writer_hex
-                && answer_option(item, &card.event_id, e).is_some()
+                && answer_option(item, &card.event_id, e, root_until).is_some()
                 && !eligible(item, &pk, owner_set)
                 && e.verify().is_ok()
         })
