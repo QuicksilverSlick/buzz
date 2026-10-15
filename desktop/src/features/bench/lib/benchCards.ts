@@ -1,8 +1,9 @@
 /**
- * Pure logic for Bench decision cards in #bench: the wire types of the
- * `bench_cards` snapshot, the guard that decides which timeline message is a
- * live Bench card, chip/label mapping, the link filter, and the reducer that
- * tracks a click until the Bench records it.
+ * Pure logic for Bench decision cards in #bench and bound project channels:
+ * the wire types of the `bench_cards` snapshot, the guard that decides which
+ * timeline message is a live Bench card, who may answer it, chip/label
+ * mapping, the link filter, and the reducer that tracks a click until the
+ * Bench records it.
  *
  * Everything an agent wrote (title, body, options, link labels) stays plain
  * text: callers render it as React text, never markdown or HTML.
@@ -22,6 +23,61 @@ export type BenchStatusState =
   | "inactive";
 export type BenchValidity = "current" | "suspected-stale" | "superseded";
 export type BenchLink = { label: string; url: string };
+export type BenchNeeds = "you" | "delegable";
+export type BenchAnswerRole = "owner" | "decider";
+/** Who may answer a scoped card besides the owner's own keys. */
+export type BenchAnswerer = {
+  pk: string;
+  name: string;
+  role: BenchAnswerRole;
+  agent: boolean;
+};
+/** 0-based option; answeredAt is the Bench clock in unix seconds. */
+export type BenchAnswer = {
+  option: number;
+  answeredAt: number;
+  /** The answerer's hex; "" on answers from before named answerers. */
+  by: string;
+  /** A named answerer; null for the owner's own keys. */
+  byName: string | null;
+  /** From the owner's keys, so the owner's click on it undoes it. */
+  byOwner: boolean;
+  source: "tap" | "reply";
+};
+/** The newest "Other": a free-text reply in the card's thread. */
+export type BenchReply = {
+  eventId: string;
+  by: string;
+  byName: string | null;
+  role: BenchAnswerRole | null;
+  at: number;
+  hhmm: string;
+};
+export type BenchRisk = "low" | "medium" | "high";
+export type BenchUndo = "easy" | "hard" | "impossible";
+export type BenchConfidence = "high" | "medium" | "low";
+/** The drop's plain-language layout; every part is optional. */
+export type BenchPlain = {
+  whatChanges?: string | null;
+  askedBy?: string | null;
+  risk?: BenchRisk | null;
+  undo?: BenchUndo | null;
+  reach?: string | null;
+  ifYouWait?: string | null;
+  /** How sure the writer is of `recommend`. */
+  confidence?: BenchConfidence | null;
+  /** One line: why `recommend`. */
+  why?: string | null;
+  /** Folded on the card. */
+  details?: string | null;
+};
+/** The answer a card that came back was answered with; 0-based option. */
+export type BenchPreviousAnswer = {
+  option: number;
+  label: string;
+  byName: string | null;
+  answeredAt: number;
+};
 
 export type BenchCard = {
   id: string;
@@ -38,12 +94,34 @@ export type BenchCard = {
   links: BenchLink[];
   order: number;
   validity: BenchValidity;
-  /** The live card's kind 9 id; null when the item has no live card. */
+  /** RFC 3339: when the Bench took this drop. */
+  updatedAt: string;
+  /** The live card's kind 9 id (a receipt's kept card); null when none. */
   cardEventId: string | null;
-  /** 0-based option; answeredAt is the Bench clock in unix seconds. */
-  answer: { option: number; answeredAt: number } | null;
+  answer: BenchAnswer | null;
   /** 0-based option the card text shows as Recorded; null = unanswered. */
   recorded: number | null;
+  /** The card's channel; null for #bench. */
+  channelId: string | null;
+  project: string | null;
+  /** Has the For and Recommended lines and Other. */
+  scoped: boolean;
+  needs: BenchNeeds;
+  answerers: BenchAnswerer[];
+  ownerName: string | null;
+  /** 1-based. */
+  recommend: number | null;
+  recommender: string | null;
+  reply: BenchReply | null;
+  /** A receipt: the question as it closed; this card is its outcome. */
+  request: BenchCard | null;
+  // Absent on snapshots from before plain cards.
+  plain?: BenchPlain | null;
+  /** The exact command the writer runs on the recommended option. */
+  action?: string | null;
+  /** Re-dropped after an answer, and waiting again. */
+  backToYou?: boolean;
+  previousAnswer?: BenchPreviousAnswer | null;
 };
 
 export type BenchSnapshot = {
@@ -66,7 +144,8 @@ export type BenchCardMatch = {
 
 /** What a timeline row needs from the snapshot. */
 export type BenchRowState = {
-  /** The row sits in #bench, so the snapshot should stay fresh. */
+  /** The row sits in #bench or a card's channel, so the snapshot should
+   * stay fresh. */
   inBenchChannel: boolean;
   match: BenchCardMatch | null;
 };
@@ -83,10 +162,32 @@ export type BenchMessageRef = {
 const KIND_STREAM_MESSAGE = 9;
 const NOT_A_BENCH_ROW: BenchRowState = { inBenchChannel: false, match: null };
 
-const cardIndexCache = new WeakMap<
-  BenchSnapshot,
-  ReadonlyMap<string, BenchCard>
->();
+type BenchIndex = {
+  cards: ReadonlyMap<string, BenchCard>;
+  /** Bound channels that hold a card; #bench is the snapshot's own. */
+  channels: ReadonlySet<string>;
+};
+
+const cardIndexCache = new WeakMap<BenchSnapshot, BenchIndex>();
+
+function benchIndex(snapshot: BenchSnapshot): BenchIndex {
+  const cached = cardIndexCache.get(snapshot);
+  if (cached) return cached;
+  const cards = new Map<string, BenchCard>();
+  const channels = new Set<string>();
+  const ambiguous = new Set<string>();
+  for (const item of snapshot.items) {
+    const id = item.cardEventId;
+    if (!id) continue;
+    if (item.channelId) channels.add(item.channelId);
+    if (cards.has(id)) ambiguous.add(id);
+    else cards.set(id, item);
+  }
+  for (const id of ambiguous) cards.delete(id);
+  const index = { cards, channels };
+  cardIndexCache.set(snapshot, index);
+  return index;
+}
 
 /**
  * Live cards by their kind 9 event id. An id claimed by two items maps to
@@ -95,20 +196,7 @@ const cardIndexCache = new WeakMap<
 export function indexBenchCards(
   snapshot: BenchSnapshot | null | undefined,
 ): ReadonlyMap<string, BenchCard> {
-  if (!snapshot) return new Map();
-  const cached = cardIndexCache.get(snapshot);
-  if (cached) return cached;
-  const index = new Map<string, BenchCard>();
-  const ambiguous = new Set<string>();
-  for (const item of snapshot.items) {
-    const id = item.cardEventId;
-    if (!id) continue;
-    if (index.has(id)) ambiguous.add(id);
-    else index.set(id, item);
-  }
-  for (const id of ambiguous) index.delete(id);
-  cardIndexCache.set(snapshot, index);
-  return index;
+  return snapshot ? benchIndex(snapshot).cards : new Map();
 }
 
 export function enabledBenchSnapshot(
@@ -137,8 +225,8 @@ export function isBenchCandidate(message: BenchMessageRef): boolean {
 }
 
 /**
- * The guard. A message renders as a Bench card only when it is in the
- * snapshot's channel, its id is a live card's event id, and the Bench writer
+ * The guard. A message renders as a Bench card only when its id is a live
+ * card's event id, it is in that card's own channel, and the Bench writer
  * key signed it. Everything else renders exactly as before.
  */
 export function benchRowState(
@@ -146,22 +234,55 @@ export function benchRowState(
   message: BenchMessageRef,
 ): BenchRowState {
   const snapshot = enabledBenchSnapshot(cards);
-  if (!snapshot || !isBenchChannel(snapshot, message.channelId)) {
-    return NOT_A_BENCH_ROW;
-  }
+  const channelId = message.channelId;
+  const inCardChannel =
+    snapshot &&
+    (isBenchChannel(snapshot, channelId) ||
+      (channelId && benchIndex(snapshot).channels.has(channelId)));
+  if (!snapshot || !inCardChannel) return NOT_A_BENCH_ROW;
   if (!isBenchCandidate(message) || !snapshot.writerPubkey) {
     return { inBenchChannel: true, match: null };
   }
   const card = indexBenchCards(snapshot).get(message.id);
   const signer = normalizePubkey(message.signerPubkey ?? "");
   const signedByWriter = signer === normalizePubkey(snapshot.writerPubkey);
+  const inItsChannel = (card?.channelId ?? snapshot.channelId) === channelId;
   return {
     inBenchChannel: true,
     match:
-      card && signedByWriter
+      card && inItsChannel && signedByWriter
         ? { card, ownerPubkey: snapshot.ownerPubkey }
         : null,
   };
+}
+
+function sameKey(a: string, b: string): boolean {
+  return normalizePubkey(a) === normalizePubkey(b);
+}
+
+/**
+ * Whether `pubkey` may answer the card: one of the owner's keys, or a named
+ * answerer that is a human or answers a delegable card. item.rs `eligible`;
+ * answer_vectors.json pins both.
+ */
+export function benchEligible(
+  card: Pick<BenchCard, "answerers" | "needs">,
+  pubkey: string,
+  ownerKeys: readonly string[],
+): boolean {
+  return (
+    ownerKeys.some((key) => sameKey(key, pubkey)) ||
+    card.answerers.some(
+      (a) => sameKey(a.pk, pubkey) && (!a.agent || card.needs === "delegable"),
+    )
+  );
+}
+
+/** "Craig", "Craig or Dana", "Craig, Dana or Quicksilver". */
+function orList(names: readonly string[]): string {
+  return names.length < 2
+    ? (names[0] ?? "")
+    : `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`;
 }
 
 export type BenchCardMode = {
@@ -199,11 +320,19 @@ export function benchCardMode(
     return readOnly("May be stale: this card is being retired.");
   }
   if (!ownerPubkey) return readOnly("The Bench has no owner yet.");
-  if (
-    viewerPubkey !== undefined &&
-    normalizePubkey(viewerPubkey) !== normalizePubkey(ownerPubkey)
-  ) {
-    return readOnly("Only the Bench owner can answer this card.");
+  // bench_answer signs with the owner's key, so only the owner answers here.
+  if (viewerPubkey !== undefined && !sameKey(viewerPubkey, ownerPubkey)) {
+    if (benchEligible(card, viewerPubkey, [ownerPubkey])) {
+      return readOnly("Answer from your phone.");
+    }
+    const names = card.answerers.map((a) => a.name);
+    if (names.length === 0) {
+      return readOnly("Only the Bench owner can answer this card.");
+    }
+    const owner = card.ownerName ?? "the owner";
+    return readOnly(
+      `For ${orList(names)}. Only ${orList([...names, owner])} can answer.`,
+    );
   }
   return { interactive: true, readOnlyReason: null };
 }
@@ -214,7 +343,8 @@ const SEVERITY_CHIPS: Record<
   BenchSeverity,
   { label: string; variant: BenchChipVariant }
 > = {
-  critical: { label: "Critical", variant: "destructive" },
+  // An escalation to the owner; "Critical" is kept for real incidents.
+  critical: { label: "Your decision", variant: "destructive" },
   attention: { label: "Attention", variant: "warning" },
   info: { label: "Info", variant: "info" },
   good: { label: "Good", variant: "success" },
@@ -263,6 +393,20 @@ export function benchKindLabel(kind: string): string | null {
 
 export function benchStateLabel(state: string | null): string | null {
   return lookup(STATE_LABELS, state);
+}
+
+const ROLE_LABELS: Record<BenchAnswerRole, string> = {
+  owner: "Owner",
+  decider: "Decider",
+};
+
+/** "For Craig · Decider"; null when only the owner answers. */
+export function benchForLabel(card: BenchCard): string | null {
+  if (card.answerers.length === 0) return null;
+  const who = card.answerers.map(
+    (a) => `${a.name} · ${lookup(ROLE_LABELS, a.role) ?? a.role}`,
+  );
+  return `For ${who.join(", ")}`;
 }
 
 export function benchValidityLabel(validity: string): string | null {
@@ -329,11 +473,17 @@ export type BenchAnswerState = {
   error: string | null;
 };
 
+/** `byOwner`: the recorded answer came from the owner's own keys. */
 export type BenchAnswerAction =
-  | { type: "click"; option: number; recorded: number | null }
+  | {
+      type: "click";
+      option: number;
+      recorded: number | null;
+      byOwner: boolean;
+    }
   | { type: "commandFailed"; attempt: number; message: string }
   | { type: "timedOut"; attempt: number }
-  | { type: "recorded"; recorded: number | null };
+  | { type: "recorded"; recorded: number | null; byOwner: boolean };
 
 export const INITIAL_BENCH_ANSWER_STATE: BenchAnswerState = {
   attempt: 0,
@@ -343,19 +493,29 @@ export const INITIAL_BENCH_ANSWER_STATE: BenchAnswerState = {
   error: null,
 };
 
-/** Clicking the recorded option undoes it; any other option answers. */
+/**
+ * Clicking the owner's own recorded option undoes it; any other option, or
+ * someone else's recorded one, answers as the owner.
+ */
 export function answerTarget(
   option: number,
   recorded: number | null,
+  byOwner: boolean,
 ): number | null {
-  return option === recorded ? null : option;
+  return option === recorded && byOwner ? null : option;
 }
 
+/** A clear lands once the owner's answer is gone; another may then stand. */
 function settle(
   state: BenchAnswerState,
   recorded: number | null,
+  byOwner: boolean,
 ): BenchAnswerState {
-  return state.phase !== "idle" && recorded === state.target
+  const landed =
+    state.target === null
+      ? recorded === null || !byOwner
+      : recorded === state.target && byOwner;
+  return state.phase !== "idle" && landed
     ? { ...state, phase: "idle", clicked: null, target: null, error: null }
     : state;
 }
@@ -366,15 +526,15 @@ export function benchAnswerReducer(
 ): BenchAnswerState {
   switch (action.type) {
     case "recorded":
-      return settle(state, action.recorded);
+      return settle(state, action.recorded, action.byOwner);
     case "click": {
-      const base = settle(state, action.recorded);
+      const base = settle(state, action.recorded, action.byOwner);
       if (base.phase === "saving") return base;
       return {
         attempt: base.attempt + 1,
         phase: "saving",
         clicked: action.option,
-        target: answerTarget(action.option, action.recorded),
+        target: answerTarget(action.option, action.recorded, action.byOwner),
         error: null,
       };
     }
@@ -401,6 +561,8 @@ export type BenchOptionView = {
   number: string;
   text: string;
   selected: boolean;
+  /** The writer's recommendation. */
+  recommended: boolean;
   pending: boolean;
   disabled: boolean;
 };
@@ -431,13 +593,29 @@ export function benchOptionViews(
       number: String(index + 1),
       text,
       selected: shown === index,
+      recommended: card.recommend === index + 1,
       pending,
       disabled: !interactive || (saving && !pending),
     };
   });
 }
 
-/** "Recorded: 2. Ship it · 14:05", or null when nothing is recorded. */
+/**
+ * Who answered, as the card text names them (item.rs shown_name): a named
+ * answerer, else the owner. Null on a legacy card, whose text names no one.
+ */
+function shownName(card: BenchCard, byName: string | null): string | null {
+  return card.scoped ? (byName ?? card.ownerName ?? "the owner") : null;
+}
+
+function dotted(...parts: Array<string | null>): string {
+  return parts.filter((part) => part !== null).join(" · ");
+}
+
+/**
+ * "Recorded: 2. Ship it · 14:05" ("· Craig · 14:05" on a scoped card), or
+ * null when nothing is recorded.
+ */
 export function benchRecordedLine(
   card: BenchCard,
   formatTime: (unixSeconds: number) => string,
@@ -447,9 +625,154 @@ export function benchRecordedLine(
   const text = card.options[recorded];
   if (text === undefined) return null;
   const line = `Recorded: ${recorded + 1}. ${text}`;
-  return card.answer?.option === recorded
-    ? `${line} · ${formatTime(card.answer.answeredAt)}`
+  const a = card.answer;
+  return a?.option === recorded
+    ? dotted(line, shownName(card, a.byName), formatTime(a.answeredAt))
     : line;
+}
+
+export type BenchReceipt = {
+  /** The question as it closed. */
+  request: BenchCard;
+  /** "Answered: 2. Hold · Craig · 14:05", an Other reply, or none. */
+  answeredLine: string;
+  /** "Outcome · Done · 14:20". */
+  outcomeLine: string;
+};
+
+/** A closed card (item.rs render_receipt): question, answer, outcome. */
+export function benchReceipt(
+  card: BenchCard,
+  formatTime: (unixSeconds: number) => string,
+): BenchReceipt | null {
+  const request = card.request;
+  if (!request) return null;
+  const a = request.answer;
+  const option = a ? request.options[a.option] : undefined;
+  const reply = request.reply;
+  let answered = "no answer recorded";
+  if (a && option !== undefined) {
+    answered = dotted(
+      `${a.option + 1}. ${option}`,
+      shownName(request, a.byName),
+      formatTime(a.answeredAt),
+    );
+  } else if (reply) {
+    answered = dotted(
+      "Other, in this thread",
+      shownName(request, reply.byName),
+      formatTime(reply.at),
+    );
+  }
+  const at = benchDeadlineSeconds(card.updatedAt);
+  return {
+    request,
+    answeredLine: `Answered: ${answered}`,
+    outcomeLine: dotted(
+      "Outcome",
+      card.kind === "status" ? benchStateLabel(card.state) : null,
+      at === null ? null : formatTime(at),
+    ),
+  };
+}
+
+export type BenchPlainChip = {
+  label: string;
+  variant: "destructive" | "warning" | "secondary" | "outline";
+};
+
+export type BenchPlainView = {
+  /** Risk, undo and reach. */
+  chips: BenchPlainChip[];
+  /** What changes, asked by, if you wait. */
+  lines: Array<{ label: string; text: string }>;
+  /** "Recommended: 2. Hold · high confidence · why". */
+  recommended: string | null;
+  details: string | null;
+  /** `lead` is "If you choose Hold:", or "Action:" with no recommendation. */
+  action: { lead: string; command: string } | null;
+};
+
+const RISK_CHIPS: Record<BenchRisk, BenchPlainChip> = {
+  high: { label: "High risk", variant: "destructive" },
+  medium: { label: "Medium risk", variant: "warning" },
+  low: { label: "Low risk", variant: "secondary" },
+};
+
+const UNDO_LABELS: Record<BenchUndo, string> = {
+  easy: "Easy to undo",
+  hard: "Hard to undo",
+  impossible: "Can't be undone",
+};
+
+const CONFIDENCE_LABELS: Record<BenchConfidence, string> = {
+  high: "high confidence",
+  medium: "medium confidence",
+  low: "low confidence",
+};
+
+function filled(text: string | null | undefined): string | null {
+  return text?.trim() || null;
+}
+
+/** The plain-language parts a card shows; all empty without plain or action. */
+export function benchPlainView(card: BenchCard): BenchPlainView {
+  const plain = card.plain ?? {};
+  const chips: BenchPlainChip[] = [];
+  if (plain.risk && Object.hasOwn(RISK_CHIPS, plain.risk)) {
+    chips.push(RISK_CHIPS[plain.risk]);
+  }
+  const undo = lookup(UNDO_LABELS, plain.undo);
+  if (undo) chips.push({ label: undo, variant: "outline" });
+  const reach = filled(plain.reach);
+  if (reach) chips.push({ label: `Reach: ${reach}`, variant: "outline" });
+  const lines = (
+    [
+      ["What changes", plain.whatChanges],
+      ["Asked by", plain.askedBy],
+      ["If you wait", plain.ifYouWait],
+    ] as const
+  ).flatMap(([label, value]) => {
+    const text = filled(value);
+    return text ? [{ label, text }] : [];
+  });
+  const pick =
+    card.recommend === null ? undefined : card.options[card.recommend - 1];
+  const why = filled(plain.why);
+  const confidence = lookup(CONFIDENCE_LABELS, plain.confidence);
+  const command = filled(card.action);
+  return {
+    chips,
+    lines,
+    recommended:
+      pick !== undefined && (why || confidence)
+        ? dotted(`Recommended: ${card.recommend}. ${pick}`, confidence, why)
+        : null,
+    details: filled(plain.details),
+    action: command
+      ? {
+          lead: pick === undefined ? "Action:" : `If you choose ${pick}:`,
+          command,
+        }
+      : null,
+  };
+}
+
+/**
+ * "Earlier: Craig chose Merge PR · 14:05": what a card that is back to you
+ * came back from. Null once it is answered again.
+ */
+export function benchPreviousAnswerLine(
+  card: BenchCard,
+  formatTime: (unixSeconds: number) => string,
+): string | null {
+  const previous = card.previousAnswer;
+  if (!card.backToYou || !previous) return null;
+  const who = previous.byName ?? card.ownerName ?? "the owner";
+  return dotted(
+    `Earlier: ${who} chose ${previous.label}`,
+    formatTime(previous.answeredAt),
+  );
 }
 
 /** The keycaps the Bench seeds and reads as answers (item.rs OPTION_EMOJI). */
@@ -457,18 +780,123 @@ const BENCH_OPTION_KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
 
 /**
  * Whether a reaction is one of the card's answer keycaps: the pills phones
- * tap, which the desktop card already shows as its option buttons.
+ * tap, which the desktop card already shows as its option buttons. A
+ * receipt shows its question's.
  */
 export function isBenchAnswerKeycap(card: BenchCard, emoji: string): boolean {
   const index = BENCH_OPTION_KEYCAPS.indexOf(emoji);
-  return index !== -1 && index < card.options.length;
+  return index !== -1 && index < (card.request ?? card).options.length;
 }
 
-/** RFC 3339 deadline to unix seconds; null when it does not parse. */
+/** RFC 3339 (a deadline, updatedAt) to unix seconds; null if unparseable. */
 export function benchDeadlineSeconds(deadline: string | null): number | null {
   if (!deadline) return null;
   const ms = Date.parse(deadline);
   return Number.isFinite(ms) ? Math.floor(ms / 1_000) : null;
+}
+
+const MONTHS = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+];
+
+/**
+ * "2026-10-14", "Oct 14", "sept 14" or "october 14" as a test on a local
+ * date. A month is three or more letters of its name, so "decision 2" stays
+ * words.
+ */
+function searchDay(query: string): ((date: Date) => boolean) | null {
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(query);
+  if (iso) {
+    return (date) =>
+      date.getFullYear() === Number(iso[1]) &&
+      date.getMonth() + 1 === Number(iso[2]) &&
+      date.getDate() === Number(iso[3]);
+  }
+  const named = /^([a-z]{3,})\.?\s+(\d{1,2})$/.exec(query);
+  const month = named ? MONTHS.findIndex((m) => m.startsWith(named[1])) : -1;
+  if (!named || month === -1) return null;
+  return (date) =>
+    date.getMonth() === month && date.getDate() === Number(named[2]);
+}
+
+/** A card and, for a receipt, its request: the parts search looks at. */
+function searchParts(card: BenchCard): BenchCard[] {
+  return card.request ? [card, card.request] : [card];
+}
+
+function searchText(card: BenchCard): string {
+  return searchParts(card)
+    .flatMap((c) => [
+      c.id,
+      c.title,
+      c.body,
+      c.area,
+      c.writer,
+      c.project,
+      c.decidedBy,
+      c.ownerName,
+      c.recommender,
+      c.answer?.byName,
+      c.reply?.byName,
+      c.previousAnswer?.byName,
+      c.action,
+      ...Object.values(c.plain ?? {}),
+      ...c.answerers.map((a) => a.name),
+      ...c.options,
+      ...c.links.flatMap((link) => [link.label, link.url]),
+    ])
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+}
+
+function searchDates(card: BenchCard): Date[] {
+  return searchParts(card)
+    .flatMap((c) => [benchDeadlineSeconds(c.updatedAt), c.answer?.answeredAt])
+    .filter((at) => typeof at === "number")
+    .map((at) => new Date(at * 1_000));
+}
+
+/**
+ * The Bench search as a card predicate; a receipt matches on its request
+ * too. "#689" and "PR 689" match only that PR number ("#689", "PR 689",
+ * .../pull/689); a bare "689" matches it as a whole number anywhere, so "28"
+ * finds "28 Day Reset" and never "6890" or "3,689"; "2026-10-14" and
+ * "Oct 14" also match the local day a card was updated or answered;
+ * otherwise every word must be in the card's text, project, writer or names.
+ * Empty matches everything.
+ */
+export function benchSearch(query: string): (card: BenchCard) => boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return () => true;
+  const pr = /^(pr\s*)?(#)?(\d+)$/.exec(q);
+  if (pr) {
+    const number =
+      pr[1] || pr[2]
+        ? new RegExp(`(?:#|\\bpr\\s*#?|/pull/)${pr[3]}(?!\\d)`)
+        : new RegExp(`(?<![\\d,.])${pr[3]}(?!\\d)`);
+    return (card) => number.test(searchText(card));
+  }
+  const day = searchDay(q);
+  const words = q.split(/\s+/);
+  return (card) => {
+    const text = searchText(card);
+    return (
+      words.every((word) => text.includes(word)) ||
+      (day !== null && searchDates(card).some(day))
+    );
+  };
 }
 
 type IntervalApi = {

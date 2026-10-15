@@ -23,6 +23,7 @@ import {
   DraftsPanel,
   type DraftViewItem,
 } from "@/features/messages/ui/DraftsPanel";
+import { WorkflowAvatar } from "@/features/messages/ui/WorkflowAvatar";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import type { Reminder } from "@/features/reminders/lib/reminderTypes";
 import { isDue } from "@/features/reminders/lib/reminderFilters";
@@ -331,6 +332,11 @@ export function InboxListPane({
     const rowHighlightColor = isSelected
       ? "color-mix(in srgb, hsl(var(--background)) 70%, hsl(var(--muted)) 30%)"
       : "color-mix(in srgb, hsl(var(--background)) 75%, hsl(var(--muted)) 25%)";
+    const senderLabelNode = (
+      <span className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
+        {item.senderLabel}
+      </span>
+    );
     const handleRowContentClick = (event: React.MouseEvent<HTMLElement>) => {
       const target = event.target;
       if (
@@ -375,49 +381,57 @@ export function InboxListPane({
           onClick={handleRowContentClick}
         >
           <div className="flex min-w-0 items-start gap-2.5">
-            <div
-              className="relative shrink-0"
-              data-inbox-profile-trigger="true"
-            >
-              <UserProfilePopover
-                botIdenticonValue={item.senderLabel}
-                pubkey={item.item.pubkey}
-                role={profileRole}
-                triggerClassName={cn(
-                  "shrink-0 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                  isSenderAgent ? "rounded-[30%]" : "rounded-full",
-                )}
-                triggerElement="span"
-                triggerTestId={`home-inbox-avatar-${item.id}`}
+            {item.isWorkflowPost ? (
+              <WorkflowAvatar />
+            ) : (
+              <div
+                className="relative shrink-0"
+                data-inbox-profile-trigger="true"
               >
-                <span className="inline-flex shrink-0">
-                  <UserAvatar
-                    avatarUrl={item.avatarUrl}
-                    className="h-9 w-9"
-                    displayName={item.senderLabel}
-                    shape={isSenderAgent ? "squircle" : "circle"}
-                    size="md"
-                  />
-                </span>
-              </UserProfilePopover>
-            </div>
+                <UserProfilePopover
+                  botIdenticonValue={item.senderLabel}
+                  pubkey={item.item.pubkey}
+                  role={profileRole}
+                  triggerClassName={cn(
+                    "shrink-0 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                    isSenderAgent ? "rounded-[30%]" : "rounded-full",
+                  )}
+                  triggerElement="span"
+                  triggerTestId={`home-inbox-avatar-${item.id}`}
+                >
+                  <span className="inline-flex shrink-0">
+                    <UserAvatar
+                      avatarUrl={item.avatarUrl}
+                      className="h-9 w-9"
+                      displayName={item.senderLabel}
+                      shape={isSenderAgent ? "squircle" : "circle"}
+                      size="md"
+                    />
+                  </span>
+                </UserProfilePopover>
+              </div>
+            )}
 
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-start gap-2">
                 <span
                   className="flex min-w-0 flex-1 items-start leading-4"
-                  data-inbox-profile-trigger="true"
+                  data-inbox-profile-trigger={
+                    item.isWorkflowPost ? undefined : "true"
+                  }
                 >
-                  <UserProfilePopover
-                    botIdenticonValue={item.senderLabel}
-                    pubkey={item.item.pubkey}
-                    role={profileRole}
-                    triggerElement="span"
-                  >
-                    <span className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
-                      {item.senderLabel}
-                    </span>
-                  </UserProfilePopover>
+                  {item.isWorkflowPost ? (
+                    senderLabelNode
+                  ) : (
+                    <UserProfilePopover
+                      botIdenticonValue={item.senderLabel}
+                      pubkey={item.item.pubkey}
+                      role={profileRole}
+                      triggerElement="span"
+                    >
+                      {senderLabelNode}
+                    </UserProfilePopover>
+                  )}
                 </span>
                 <span
                   className={cn(

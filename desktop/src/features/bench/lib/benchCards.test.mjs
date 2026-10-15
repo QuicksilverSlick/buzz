@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -8,9 +9,15 @@ import {
   benchAnswerReducer,
   benchCardMode,
   benchDeadlineSeconds,
+  benchEligible,
+  benchForLabel,
   benchOptionViews,
+  benchPlainView,
+  benchPreviousAnswerLine,
+  benchReceipt,
   benchRecordedLine,
   benchRowState,
+  benchSearch,
   benchSeverityChip,
   benchStateLabel,
   benchValidityLabel,
@@ -47,6 +54,17 @@ function card(overrides = {}) {
     cardEventId: CARD_ID,
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -223,7 +241,7 @@ test("mode: decision and status cards are never interactive", () => {
 
 test("severity: each level has a readable label and a theme badge variant", () => {
   assert.deepEqual(benchSeverityChip("critical"), {
-    label: "Critical",
+    label: "Your decision",
     variant: "destructive",
   });
   assert.deepEqual(benchSeverityChip("attention"), {
@@ -328,14 +346,28 @@ test("links: blank labels and malformed entries are dropped", () => {
 // Pending / recorded reducer
 // ---------------------------------------------------------------------------
 
-function click(state, option, recorded) {
-  return benchAnswerReducer(state, { type: "click", option, recorded });
+function click(state, option, recorded, byOwner = true) {
+  return benchAnswerReducer(state, {
+    type: "click",
+    option,
+    recorded,
+    byOwner,
+  });
+}
+
+function record(state, recorded, byOwner = true) {
+  return benchAnswerReducer(state, { type: "recorded", recorded, byOwner });
 }
 
 test("answerTarget: clicking the recorded option undoes it", () => {
-  assert.equal(answerTarget(1, null), 1);
-  assert.equal(answerTarget(1, 0), 1);
-  assert.equal(answerTarget(1, 1), null);
+  assert.equal(answerTarget(1, null, true), 1);
+  assert.equal(answerTarget(1, 0, true), 1);
+  assert.equal(answerTarget(1, 1, true), null);
+  assert.equal(
+    answerTarget(1, 1, false),
+    1,
+    "someone else's answer is overridden, not undone",
+  );
 });
 
 test("reducer: a click saves until the snapshot records the target", () => {
@@ -348,29 +380,26 @@ test("reducer: a click saves until the snapshot records the target", () => {
     error: null,
   });
   assert.equal(
-    benchAnswerReducer(saving, { type: "recorded", recorded: null }),
+    record(saving, null),
     saving,
     "an unchanged snapshot keeps it saving",
   );
   assert.equal(
-    benchAnswerReducer(saving, { type: "recorded", recorded: 0 }),
+    record(saving, 0),
     saving,
     "another option recorded (a newer phone tap) is not this click",
   );
-  assert.deepEqual(
-    benchAnswerReducer(saving, { type: "recorded", recorded: 1 }),
-    { ...INITIAL_BENCH_ANSWER_STATE, attempt: 1 },
-  );
+  assert.deepEqual(record(saving, 1), {
+    ...INITIAL_BENCH_ANSWER_STATE,
+    attempt: 1,
+  });
 });
 
 test("reducer: undo waits for the card to show no answer", () => {
   const saving = click(INITIAL_BENCH_ANSWER_STATE, 0, 0);
   assert.equal(saving.target, null);
   assert.equal(saving.clicked, 0);
-  assert.equal(
-    benchAnswerReducer(saving, { type: "recorded", recorded: null }).phase,
-    "idle",
-  );
+  assert.equal(record(saving, null).phase, "idle");
 });
 
 test("reducer: clicks while saving are ignored", () => {
@@ -417,10 +446,7 @@ test("reducer: command errors and the 15 s timeout fail only their attempt", () 
 test("reducer: a late record clears the error; a retry starts fresh", () => {
   const saving = click(INITIAL_BENCH_ANSWER_STATE, 1, null);
   const failed = benchAnswerReducer(saving, { type: "timedOut", attempt: 1 });
-  assert.equal(
-    benchAnswerReducer(failed, { type: "recorded", recorded: 1 }).phase,
-    "idle",
-  );
+  assert.equal(record(failed, 1).phase, "idle");
   const retry = click(failed, 0, null);
   assert.equal(retry.phase, "saving");
   assert.equal(retry.attempt, 2);
@@ -529,6 +555,9 @@ test("keycaps: only the card's own answer keycaps, as the Bench reads them", () 
     isBenchAnswerKeycap(card({ kind: "status", options: [] }), "1️⃣"),
     false,
   );
+  const receipt = card({ kind: "decision", options: [], request: two });
+  assert.equal(isBenchAnswerKeycap(receipt, "2️⃣"), true, "its question's");
+  assert.equal(isBenchAnswerKeycap(receipt, "3️⃣"), false);
 });
 
 test("deadline: RFC 3339 to unix seconds, null when unparseable", () => {
@@ -590,4 +619,486 @@ test("poll group: no fetch while the window is hidden", () => {
   fake.tick();
   assert.equal(calls, 1);
   release();
+});
+
+// ---------------------------------------------------------------------------
+// Scoped cards: project channels, who may answer, receipts
+// ---------------------------------------------------------------------------
+
+const PROJECT = "105f15cc-1d5a-431a-9826-9402fba1a12b";
+const CRAIG = "d".repeat(64);
+const PROJECT_CARD = "9".repeat(64);
+
+function scoped(overrides = {}) {
+  return card({
+    id: "reset-worker/welcome",
+    channelId: PROJECT,
+    project: "reset",
+    scoped: true,
+    cardEventId: PROJECT_CARD,
+    answerers: [{ pk: CRAIG, name: "Craig", role: "decider", agent: false }],
+    ownerName: "Quicksilver",
+    ...overrides,
+  });
+}
+
+function answer(overrides = {}) {
+  return {
+    option: 1,
+    answeredAt: 99,
+    by: OWNER,
+    byName: null,
+    byOwner: true,
+    source: "tap",
+    ...overrides,
+  };
+}
+
+test("guard: a project card matches in its own channel only", () => {
+  const cards = snapshot([card(), scoped()]);
+  const inProject = benchRowState(
+    cards,
+    row({ channelId: PROJECT, id: PROJECT_CARD }),
+  );
+  assert.equal(inProject.inBenchChannel, true, "polls in the card's channel");
+  assert.equal(inProject.match?.card.id, "reset-worker/welcome");
+  assert.equal(
+    benchRowState(cards, row({ id: PROJECT_CARD })).match,
+    null,
+    "the same id in #bench is not this card",
+  );
+  assert.equal(
+    benchRowState(cards, row({ channelId: PROJECT })).match,
+    null,
+    "a #bench card's id in the project channel is not a card",
+  );
+  assert.deepEqual(
+    benchRowState(cards, row({ channelId: OTHER_CHANNEL, id: PROJECT_CARD })),
+    { inBenchChannel: false, match: null },
+  );
+  assert.equal(
+    benchRowState(
+      cards,
+      row({ channelId: PROJECT, id: PROJECT_CARD, signerPubkey: CRAIG }),
+    ).match,
+    null,
+    "only the writer key signs cards",
+  );
+});
+
+test("eligible: the shared answer vectors agree with item.rs", () => {
+  const vectors = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../../src-tauri/src/bench/answer_vectors.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const keys = new Map();
+  const key = (who) => {
+    if (!keys.has(who)) keys.set(who, String(keys.size).padStart(64, "a"));
+    return keys.get(who);
+  };
+  const ownerKeys = vectors.ownerSet.map(key);
+  let checked = 0;
+  for (const c of vectors.cases) {
+    const target = {
+      needs: c.needs,
+      answerers: c.to.map((t) => ({
+        pk: key(t.who),
+        name: t.who,
+        role: t.role,
+        agent: t.agent,
+      })),
+    };
+    for (const [who, want] of Object.entries(c.eligible)) {
+      assert.equal(
+        benchEligible(target, key(who).toUpperCase(), ownerKeys),
+        want,
+        `${c.name}: ${who}`,
+      );
+      checked += 1;
+    }
+  }
+  assert.ok(checked > 20, `checked ${checked}`);
+});
+
+test("mode: only the owner answers; others are told who can", () => {
+  assert.equal(benchCardMode(scoped(), OWNER, OWNER).interactive, true);
+  assert.deepEqual(benchCardMode(scoped(), OWNER, CRAIG), {
+    interactive: false,
+    readOnlyReason: "Answer from your phone.",
+  });
+  assert.equal(
+    benchCardMode(scoped(), OWNER, STRANGER).readOnlyReason,
+    "For Craig. Only Craig or Quicksilver can answer.",
+  );
+  const two = scoped({
+    ownerName: null,
+    answerers: [
+      { pk: CRAIG, name: "Craig", role: "decider", agent: false },
+      { pk: "f".repeat(64), name: "Dana", role: "owner", agent: false },
+    ],
+  });
+  assert.equal(
+    benchCardMode(two, OWNER, STRANGER).readOnlyReason,
+    "For Craig or Dana. Only Craig, Dana or the owner can answer.",
+  );
+  // An agent on a needs-you card is not eligible here either.
+  const agent = scoped({
+    answerers: [{ pk: CRAIG, name: "Bot", role: "decider", agent: true }],
+  });
+  assert.match(benchCardMode(agent, OWNER, CRAIG).readOnlyReason, /^For Bot/);
+});
+
+test("labels: For names each answerer and role; owner-only has none", () => {
+  assert.equal(benchForLabel(scoped()), "For Craig · Decider");
+  assert.equal(benchForLabel(card()), null);
+  assert.equal(benchSeverityChip("critical").label, "Your decision");
+});
+
+test("options: the recommended option is marked", () => {
+  const views = benchOptionViews(
+    scoped({ recommend: 2 }),
+    INITIAL_BENCH_ANSWER_STATE,
+    true,
+  );
+  assert.deepEqual(
+    views.map((o) => o.recommended),
+    [false, true],
+  );
+  assert.ok(
+    benchOptionViews(card(), INITIAL_BENCH_ANSWER_STATE, true).every(
+      (o) => !o.recommended,
+    ),
+  );
+});
+
+test("reducer: overriding another answer waits for the owner's own", () => {
+  // Craig's 2 is recorded; the owner clicks 2.
+  const saving = click(INITIAL_BENCH_ANSWER_STATE, 1, 1, false);
+  assert.equal(saving.target, 1, "an override, not an undo");
+  assert.equal(record(saving, 1, false), saving, "still Craig's answer");
+  assert.equal(record(saving, 1, true).phase, "idle");
+  // The owner clears their own answer and Craig's older one stands.
+  const clearing = click(INITIAL_BENCH_ANSWER_STATE, 0, 0, true);
+  assert.equal(clearing.target, null);
+  assert.equal(record(clearing, 0, true), clearing);
+  assert.equal(record(clearing, 1, false).phase, "idle");
+});
+
+test("recorded line: a scoped card names who answered", () => {
+  const formatTime = (s) => `t${s}`;
+  assert.equal(
+    benchRecordedLine(
+      scoped({
+        recorded: 1,
+        answer: answer({ by: CRAIG, byName: "Craig", byOwner: false }),
+      }),
+      formatTime,
+    ),
+    "Recorded: 2. Hold · Craig · t99",
+  );
+  assert.equal(
+    benchRecordedLine(scoped({ recorded: 1, answer: answer() }), formatTime),
+    "Recorded: 2. Hold · Quicksilver · t99",
+  );
+  assert.equal(
+    benchRecordedLine(
+      scoped({ recorded: 1, answer: answer(), ownerName: null }),
+      formatTime,
+    ),
+    "Recorded: 2. Hold · the owner · t99",
+  );
+  assert.equal(
+    benchRecordedLine(card({ recorded: 1, answer: answer() }), formatTime),
+    "Recorded: 2. Hold · t99",
+    "a legacy card names no one",
+  );
+});
+
+test("receipt: the request, the answer or Other reply, and the outcome", () => {
+  const formatTime = (s) => `t${s}`;
+  const outcome = (request, overrides = {}) =>
+    card({
+      kind: "decision",
+      options: [],
+      title: "Sent it",
+      updatedAt: "2026-10-12T10:00:00Z",
+      request,
+      ...overrides,
+    });
+  assert.equal(benchReceipt(card(), formatTime), null);
+  const answered = scoped({
+    cardEventId: null,
+    answer: answer({ option: 0, by: CRAIG, byName: "Craig", byOwner: false }),
+  });
+  const r = benchReceipt(outcome(answered), formatTime);
+  assert.equal(r.request, answered);
+  assert.equal(r.answeredLine, "Answered: 1. Ship it · Craig · t99");
+  assert.equal(r.outcomeLine, "Outcome · t1791799200");
+  const replied = scoped({
+    reply: {
+      eventId: "1".repeat(64),
+      by: OWNER,
+      byName: null,
+      role: null,
+      at: 50,
+      hhmm: "14:00",
+    },
+  });
+  assert.equal(
+    benchReceipt(outcome(replied), formatTime).answeredLine,
+    "Answered: Other, in this thread · Quicksilver · t50",
+  );
+  const status = outcome(card(), { kind: "status", state: "done" });
+  const none = benchReceipt(status, formatTime);
+  assert.equal(none.answeredLine, "Answered: no answer recorded");
+  assert.equal(none.outcomeLine, "Outcome · Done · t1791799200");
+  assert.equal(
+    benchReceipt(outcome(card({ answer: answer() })), formatTime).answeredLine,
+    "Answered: 2. Hold · t99",
+    "a legacy request names no one",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Plain cards, cards that came back, and search
+// ---------------------------------------------------------------------------
+
+test("plain: nothing to show without plain fields or an action", () => {
+  for (const extra of [{}, { plain: null, action: null }, { plain: {} }]) {
+    assert.deepEqual(benchPlainView(card({ recommend: 2, ...extra })), {
+      chips: [],
+      lines: [],
+      recommended: null,
+      details: null,
+      action: null,
+    });
+  }
+});
+
+test("plain: risk, undo and reach chips; the lines in order; details", () => {
+  const view = benchPlainView(
+    card({
+      recommend: 2,
+      plain: {
+        risk: "high",
+        undo: "impossible",
+        reach: " 3,089 members ",
+        ifYouWait: "The old email keeps going out.",
+        whatChanges: "Every member gets the new welcome email.",
+        askedBy: "Reset Worker",
+        details: "Line one\nLine two",
+      },
+    }),
+  );
+  assert.deepEqual(view.chips, [
+    { label: "High risk", variant: "destructive" },
+    { label: "Can't be undone", variant: "outline" },
+    { label: "Reach: 3,089 members", variant: "outline" },
+  ]);
+  assert.deepEqual(view.lines, [
+    { label: "What changes", text: "Every member gets the new welcome email." },
+    { label: "Asked by", text: "Reset Worker" },
+    { label: "If you wait", text: "The old email keeps going out." },
+  ]);
+  assert.equal(view.details, "Line one\nLine two");
+  assert.equal(
+    view.recommended,
+    null,
+    "no why or confidence: the button says it",
+  );
+  const chips = (plain) => benchPlainView(card({ plain })).chips;
+  assert.deepEqual(chips({ risk: "medium" }), [
+    { label: "Medium risk", variant: "warning" },
+  ]);
+  assert.deepEqual(chips({ risk: "low", undo: "easy" }), [
+    { label: "Low risk", variant: "secondary" },
+    { label: "Easy to undo", variant: "outline" },
+  ]);
+  assert.deepEqual(chips({ risk: "toString", undo: "hard", reach: "  " }), [
+    { label: "Hard to undo", variant: "outline" },
+  ]);
+  assert.deepEqual(
+    benchPlainView(
+      card({ plain: { whatChanges: " ", askedBy: "Orchestrator" } }),
+    ).lines,
+    [{ label: "Asked by", text: "Orchestrator" }],
+  );
+});
+
+test("plain: the recommended line, and what one tap approves", () => {
+  const merge =
+    "gh pr merge 711 --repo QuicksilverSlick/Metabolic-reset --squash";
+  const view = benchPlainView(
+    card({
+      options: ["Merge PR", "Hold"],
+      recommend: 1,
+      plain: { confidence: "high", why: "CI is green and Craig asked for it." },
+      action: merge,
+    }),
+  );
+  assert.equal(
+    view.recommended,
+    "Recommended: 1. Merge PR · high confidence · CI is green and Craig asked for it.",
+  );
+  assert.deepEqual(view.action, {
+    lead: "If you choose Merge PR:",
+    command: merge,
+  });
+  assert.equal(
+    benchPlainView(card({ recommend: 2, plain: { confidence: "low" } }))
+      .recommended,
+    "Recommended: 2. Hold · low confidence",
+  );
+  // No (or an out-of-range) recommendation: no line; the action stands alone.
+  for (const recommend of [null, 3]) {
+    const alone = benchPlainView(
+      card({ recommend, plain: { why: "because" }, action: merge }),
+    );
+    assert.equal(alone.recommended, null);
+    assert.deepEqual(alone.action, { lead: "Action:", command: merge });
+  }
+});
+
+test("came back: the answer it came back from", () => {
+  const formatTime = (s) => `t${s}`;
+  const previous = {
+    option: 0,
+    label: "Merge PR",
+    byName: null,
+    answeredAt: 7,
+  };
+  const back = { backToYou: true, previousAnswer: previous };
+  assert.equal(benchPreviousAnswerLine(card(), formatTime), null);
+  assert.equal(
+    benchPreviousAnswerLine(scoped(back), formatTime),
+    "Earlier: Quicksilver chose Merge PR · t7",
+  );
+  assert.equal(
+    benchPreviousAnswerLine(card(back), formatTime),
+    "Earlier: the owner chose Merge PR · t7",
+  );
+  assert.equal(
+    benchPreviousAnswerLine(
+      scoped({ ...back, previousAnswer: { ...previous, byName: "Craig" } }),
+      formatTime,
+    ),
+    "Earlier: Craig chose Merge PR · t7",
+  );
+  // Answered again: the service keeps `previous` but the card is no longer
+  // back to you, so only its Recorded line speaks.
+  assert.equal(
+    benchPreviousAnswerLine(
+      scoped({ previousAnswer: previous, backToYou: false, answer: answer() }),
+      formatTime,
+    ),
+    null,
+  );
+});
+
+test("search: PR numbers match #689, PR 689 and pull links, never 6890", () => {
+  const cards = [
+    card({ id: "w/hash", title: "#689 on hold" }),
+    card({ id: "w/pr", body: "Merge PR 689 now?" }),
+    card({
+      id: "w/link",
+      links: [
+        { label: "Pull request", url: "https://github.com/x/y/pull/689" },
+      ],
+    }),
+    card({ id: "w/longer", title: "#6890 and PR 1689" }),
+    card({ id: "w/members", title: "Reach 3,689 members" }),
+  ];
+  for (const query of ["689", "#689", "PR 689", "pr#689", " 689 "]) {
+    assert.deepEqual(
+      cards.filter(benchSearch(query)).map((c) => c.id),
+      ["w/hash", "w/pr", "w/link"],
+      query,
+    );
+  }
+});
+
+test("search: a bare number also matches as a whole number in the text", () => {
+  const cards = [
+    card({ id: "w/reset", title: "Welcome email", project: "28 Day Reset" }),
+    card({
+      id: "w/merge",
+      title: "Merge pull request 689",
+      action: "gh pr merge 689 --repo QuicksilverSlick/Metabolic-reset",
+    }),
+    card({ id: "w/longer", title: "Day 128 of 280" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("28"), ["w/reset"]);
+  assert.deepEqual(ids("689"), ["w/merge"]);
+  assert.deepEqual(ids("#689"), [], "# and PR stay PR numbers only");
+});
+
+test("search: words, names and a receipt's request; empty matches all", () => {
+  const craig = { pk: CRAIG, name: "Craig", role: "decider", agent: false };
+  const cards = [
+    card({ id: "w/reset", project: "reset", writer: "reset-worker" }),
+    card({ id: "w/craig", answerers: [craig], title: "Welcome email" }),
+    card({
+      id: "w/receipt",
+      kind: "status",
+      title: "Sent it",
+      request: card({ id: "w/receipt", title: "Send the new welcome email?" }),
+    }),
+    card({ id: "w/agent", recommender: "Orchestrator" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("RESET"), ["w/reset"]);
+  assert.deepEqual(ids("reset-worker"), ["w/reset"]);
+  assert.deepEqual(ids("craig"), ["w/craig"]);
+  assert.deepEqual(ids("welcome email"), ["w/craig", "w/receipt"]);
+  assert.deepEqual(ids("email welcome"), ["w/craig", "w/receipt"]);
+  assert.deepEqual(ids("orchestrator"), ["w/agent"]);
+  assert.deepEqual(ids("welcome rocket"), []);
+  assert.equal(ids("").length, 4);
+  assert.equal(ids("   ").length, 4);
+});
+
+test("search: a date matches the local day a card was updated or answered", () => {
+  const local = (month, day, hour) => new Date(2026, month - 1, day, hour);
+  const at = (date) => Math.floor(date.getTime() / 1_000);
+  const cards = [
+    card({ id: "w/updated", updatedAt: local(10, 14, 12).toISOString() }),
+    card({
+      id: "w/answered",
+      updatedAt: local(10, 1, 12).toISOString(),
+      answer: answer({ answeredAt: at(local(10, 14, 23)) }),
+    }),
+    card({
+      id: "w/receipt",
+      updatedAt: local(10, 20, 12).toISOString(),
+      request: card({
+        updatedAt: local(10, 2, 12).toISOString(),
+        answer: answer({ answeredAt: at(local(10, 14, 9)) }),
+      }),
+    }),
+    card({ id: "w/other", updatedAt: local(10, 15, 0).toISOString() }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  for (const query of [
+    "2026-10-14",
+    "Oct 14",
+    "october 14",
+    "oct. 14",
+    "octob 14",
+  ]) {
+    assert.deepEqual(
+      ids(query),
+      ["w/updated", "w/answered", "w/receipt"],
+      query,
+    );
+  }
+  assert.deepEqual(ids("2026-10-15"), ["w/other"]);
+  assert.deepEqual(ids("Nov 14"), []);
+  assert.deepEqual(ids("Foo 14"), [], "not a month: plain words");
+  assert.deepEqual(ids("octane 14"), [], "a month's letters, then others");
 });

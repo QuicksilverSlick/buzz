@@ -3,8 +3,10 @@
  * `BenchScreen` and `BenchSidebarEntry` mounted against a mocked Tauri IPC
  * boundary.
  *
- * - The screen shows four sections in the board's order, each with its own
- *   empty copy, plus the last update time and a visible lastError line.
+ * - The screen shows the board's sections in its order, plus Held next to
+ *   Decided, each with its own empty copy, the last update time and a
+ *   visible lastError line.
+ * - Search narrows every section; Open thread opens the card's thread.
  * - Answering from the screen sends `bench_answer` and the card moves to
  *   "Answered, waiting for action" once the snapshot records it.
  * - Only the owner's identity gets live option buttons.
@@ -40,9 +42,23 @@ let SidebarProvider;
 let SidebarMenu;
 let BenchScreen;
 let BenchSidebarEntry;
+let RouterContextProvider;
+let createMemoryHistory;
+let createRootRoute;
+let createRouter;
+let router;
 
 const OWNER = "b".repeat(64);
 const STRANGER = "c".repeat(64);
+
+/** A distinct card event id per item id, so rows keyed by it never clash. */
+function eventIdOf(id) {
+  return [...id]
+    .map((c) => c.charCodeAt(0).toString(16))
+    .join("")
+    .padEnd(64, "e")
+    .slice(0, 64);
+}
 
 function card(id, overrides = {}) {
   return {
@@ -60,9 +76,20 @@ function card(id, overrides = {}) {
     links: [],
     order: 0,
     validity: "current",
-    cardEventId: "e".repeat(64),
+    cardEventId: eventIdOf(id),
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -98,10 +125,19 @@ function wrap(element) {
     },
   });
   clients.push(client);
+  // Only the router context useAppNavigation reads; no route resolves.
+  router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ["/bench"] }),
+  });
   return createElement(
-    QueryClientProvider,
-    { client },
-    createElement(TooltipProvider, null, element),
+    RouterContextProvider,
+    { router },
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(TooltipProvider, null, element),
+    ),
   );
 }
 
@@ -119,6 +155,7 @@ before(async () => {
   Object.assign(globalThis, {
     document: dom.window.document,
     window: dom.window,
+    self: dom.window,
     IS_REACT_ACT_ENVIRONMENT: true,
   });
   for (const key of Object.getOwnPropertyNames(dom.window)) {
@@ -169,6 +206,12 @@ before(async () => {
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
   ({ SidebarMenu, SidebarProvider } = await import("@/shared/ui/sidebar"));
+  ({
+    RouterContextProvider,
+    createMemoryHistory,
+    createRootRoute,
+    createRouter,
+  } = await import("@tanstack/react-router"));
   ({ BenchScreen } = await import("./BenchScreen.tsx"));
   ({ BenchSidebarEntry } = await import("./BenchSidebarEntry.tsx"));
 });
@@ -214,8 +257,10 @@ test("screen: board-order sections, counts, empty copy and the error line", asyn
     ),
     [
       "Needs you",
+      "Waiting on others",
       "Answered, waiting for action",
       "Decided",
+      "Held",
       "Where things stand",
     ],
   );
@@ -225,9 +270,11 @@ test("screen: board-order sections, counts, empty copy and the error line", asyn
   assert.deepEqual(cardIds(screen.getByTestId("bench-section-answered")), [
     "w/answered",
   ]);
-  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), [
+  // Blocked is on hold: next to Decided, not under Where things stand.
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-held")), [
     "w/status",
   ]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
   const decided = screen.getByTestId("bench-section-decided");
   assert.deepEqual(cardIds(decided), []);
   assert.ok(within(decided).getByText("No decisions yet."));
@@ -273,7 +320,9 @@ test("screen: an answer goes through bench_answer and the card moves to Answered
       within(needsYou).getByRole("button", { name: /^2\. Hold/ }),
     );
   });
-  assert.deepEqual(answerCalls(), [{ itemId: "w/ship", option: 1 }]);
+  assert.deepEqual(answerCalls(), [
+    { itemId: "w/ship", cardEventId: eventIdOf("w/ship"), option: 1 },
+  ]);
 
   const answered = screen.getByTestId("bench-section-answered");
   await waitFor(() => assert.deepEqual(cardIds(answered), ["w/ship"]));
@@ -283,6 +332,48 @@ test("screen: an answer goes through bench_answer and the card moves to Answered
     within(answered).getByTestId("bench-card-recorded").textContent,
     /^Recorded: 2\. Hold/,
   );
+});
+
+test("screen: a replaced card is a new card; nothing from the one seen carries over", async () => {
+  serveIdentity(OWNER);
+  const seen = card("w/ship");
+  serveSnapshot(snapshot([seen]));
+  ipcHandlers.set("bench_answer", () => {
+    // Re-dropped between the look and the click: the Bench refuses the card
+    // the owner saw, and the next snapshot has its replacement.
+    serveSnapshot(
+      snapshot([
+        {
+          ...seen,
+          cardEventId: "f".repeat(64),
+          options: ["Ship it now", "Hold"],
+        },
+      ]),
+    );
+    return Promise.reject(new Error("This card changed - look again"));
+  });
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const needsYou = await waitFor(() =>
+    screen.getByTestId("bench-section-needsYou"),
+  );
+  await waitFor(() => assert.deepEqual(cardIds(needsYou), ["w/ship"]));
+
+  await act(async () => {
+    fireEvent.click(
+      within(needsYou).getByRole("button", { name: /^1\. Ship it$/ }),
+    );
+  });
+  assert.deepEqual(answerCalls(), [
+    { itemId: "w/ship", cardEventId: eventIdOf("w/ship"), option: 0 },
+  ]);
+  await waitFor(() =>
+    within(needsYou).getByRole("button", { name: /^1\. Ship it now/ }),
+  );
+  // Text, not the node: a jsdom node in a failure message never prints.
+  assert.equal(screen.queryByText(/This card changed/)?.textContent, undefined);
+  assert.equal(screen.queryByText("Saving...")?.textContent, undefined);
 });
 
 test("screen: only the owner's identity gets live buttons", async () => {
@@ -338,8 +429,10 @@ test("screen: disabled, unreadable and not-yet-ticked Benches say so", async () 
   );
   for (const copy of [
     "Nothing needs you right now.",
+    "No card is waiting on anyone else.",
     "Nothing you answered is waiting on an agent.",
     "No decisions yet.",
+    "Nothing is on hold.",
     "No status updates yet.",
   ]) {
     assert.ok(screen.getByText(copy), copy);
@@ -406,5 +499,166 @@ test("sidebar: hidden while disabled; the badge counts Needs you", async () => {
     screen.queryByTestId("sidebar-bench-count"),
     null,
     "no badge when nothing needs the owner",
+  );
+});
+
+const CRAIG = "d".repeat(64);
+const PROJECT_CHANNEL = "105f15cc-1d5a-431a-9826-9402fba1a12b";
+
+function scoped(id, overrides = {}) {
+  return card(id, {
+    channelId: PROJECT_CHANNEL,
+    project: "reset",
+    scoped: true,
+    answerers: [{ pk: CRAIG, name: "Craig", role: "decider", agent: false }],
+    ownerName: "Quicksilver",
+    cardEventId: "9".repeat(64),
+    ...overrides,
+  });
+}
+
+test("screen: sections depend on who is viewing; receipts are decided", async () => {
+  const items = [
+    card("w/mine"),
+    scoped("w/craig"),
+    card("w/closed", {
+      kind: "status",
+      options: [],
+      state: "done",
+      request: scoped("w/closed", { cardEventId: null }),
+    }),
+  ];
+  serveIdentity(OWNER);
+  serveSnapshot(snapshot(items));
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() =>
+    assert.deepEqual(cardIds(screen.getByTestId("bench-section-needsYou")), [
+      "w/mine",
+    ]),
+  );
+  const waiting = screen.getByTestId("bench-section-waitingOnOthers");
+  assert.deepEqual(cardIds(waiting), ["w/craig"]);
+  assert.ok(within(waiting).getByText("For Craig · Decider"));
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-decided")), [
+    "w/closed",
+  ]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
+
+  // Other opens the card's thread in its own channel.
+  await act(async () => {
+    fireEvent.click(
+      within(waiting).getByRole("button", {
+        name: "Other: reply in this card's thread",
+      }),
+    );
+  });
+  await waitFor(() =>
+    assert.equal(
+      router.history.location.pathname,
+      `/channels/${PROJECT_CHANNEL}`,
+    ),
+  );
+  // This bare router JSON-quotes search values; the app's does not.
+  assert.match(
+    decodeURIComponent(router.history.location.search),
+    /^\?messageId="?9{64}"?$/,
+  );
+  cleanup();
+
+  // Anyone else sees every open card under Needs you, read-only.
+  serveIdentity(STRANGER);
+  serveSnapshot(snapshot(items));
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const needsYou = await waitFor(() => {
+    const section = screen.getByTestId("bench-section-needsYou");
+    assert.deepEqual(cardIds(section), ["w/craig", "w/mine"]);
+    return section;
+  });
+  assert.deepEqual(
+    cardIds(screen.getByTestId("bench-section-waitingOnOthers")),
+    [],
+  );
+  assert.ok(
+    within(needsYou).getByText(
+      "For Craig. Only Craig or Quicksilver can answer.",
+    ),
+  );
+});
+
+test("sidebar: the badge leaves out cards waiting on others", async () => {
+  serveSnapshot(snapshot([card("w/mine"), scoped("w/craig")]));
+  await act(async () => {
+    render(sidebarEntry(() => {}));
+  });
+  await waitFor(() =>
+    assert.equal(screen.getByTestId("sidebar-bench-count").textContent, "1"),
+  );
+});
+
+test("screen: search narrows every section; Open thread opens the card's thread", async () => {
+  serveIdentity(OWNER);
+  serveSnapshot(
+    snapshot([
+      card("w/merge", { title: "Merge PR 689?" }),
+      card("w/held", {
+        kind: "status",
+        options: [],
+        state: "blocked",
+        title: "#689 on hold",
+        cardEventId: "7".repeat(64),
+      }),
+      card("w/other", { title: "Rotate the keys" }),
+      card("w/posting", { kind: "status", options: [], cardEventId: null }),
+    ]),
+  );
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const search = await waitFor(() =>
+    screen.getByRole("searchbox", { name: "Search the Bench" }),
+  );
+  await act(async () => {
+    fireEvent.change(search, { target: { value: "#689" } });
+  });
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-needsYou")), [
+    "w/merge",
+  ]);
+  const held = screen.getByTestId("bench-section-held");
+  assert.deepEqual(cardIds(held), ["w/held"]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
+  assert.ok(
+    within(screen.getByTestId("bench-section-decided")).getByText(
+      "No matching cards.",
+    ),
+  );
+
+  // A status card's thread is in #bench: the snapshot's channel.
+  await act(async () => {
+    fireEvent.click(within(held).getByRole("button", { name: "Open thread" }));
+  });
+  await waitFor(() =>
+    assert.equal(
+      router.history.location.pathname,
+      "/channels/8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
+    ),
+  );
+  assert.match(
+    decodeURIComponent(router.history.location.search),
+    /^\?messageId="?7{64}"?$/,
+  );
+
+  await act(async () => {
+    fireEvent.change(search, { target: { value: "" } });
+  });
+  const status = screen.getByTestId("bench-section-status");
+  assert.deepEqual(cardIds(status), ["w/posting"]);
+  assert.equal(
+    within(status).queryByRole("button", { name: "Open thread" }),
+    null,
+    "no thread before the card is posted",
   );
 });

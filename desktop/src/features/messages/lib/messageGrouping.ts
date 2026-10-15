@@ -2,6 +2,7 @@ import { getSentFromThreadRootId } from "@/features/messages/lib/sentFromThread"
 
 type MessageAuthorCandidate = {
   pubkey?: string | null;
+  isWorkflowPost?: boolean;
 };
 
 type MessageGroupingCandidate = {
@@ -27,6 +28,10 @@ export function startsNewMessageGroup(
   return getSentFromThreadRootId(message?.tags) !== null;
 }
 
+/**
+ * A workflow post keeps its owner as `pubkey` but shows as "Workflow", so it
+ * never groups with the owner's own messages in either order.
+ */
 export function hasSameMessageAuthor(
   previous: MessageAuthorCandidate | null | undefined,
   current: MessageAuthorCandidate | null | undefined,
@@ -35,7 +40,10 @@ export function hasSameMessageAuthor(
   const currentPubkey = current?.pubkey?.trim().toLowerCase();
 
   return Boolean(
-    previousPubkey && currentPubkey && previousPubkey === currentPubkey,
+    previousPubkey &&
+      currentPubkey &&
+      previousPubkey === currentPubkey &&
+      Boolean(previous?.isWorkflowPost) === Boolean(current?.isWorkflowPost),
   );
 }
 

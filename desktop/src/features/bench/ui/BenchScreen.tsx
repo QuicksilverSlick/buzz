@@ -1,6 +1,10 @@
 import * as React from "react";
 
-import type { BenchCard as BenchCardData } from "@/features/bench/lib/benchCards";
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import {
+  type BenchCard as BenchCardData,
+  benchSearch,
+} from "@/features/bench/lib/benchCards";
 import {
   type BenchSections,
   benchLastTickSeconds,
@@ -10,6 +14,7 @@ import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCards } from "@/features/bench/useBenchCards";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
+import { Input } from "@/shared/ui/input";
 import { PageHeader, SectionHeader } from "@/shared/ui/PageHeader";
 
 type SectionKey = Exclude<keyof BenchSections, "retiring">;
@@ -25,11 +30,17 @@ const SECTIONS: ReadonlyArray<{
     empty: "Nothing needs you right now.",
   },
   {
+    key: "waitingOnOthers",
+    title: "Waiting on others",
+    empty: "No card is waiting on anyone else.",
+  },
+  {
     key: "answered",
     title: "Answered, waiting for action",
     empty: "Nothing you answered is waiting on an agent.",
   },
   { key: "decided", title: "Decided", empty: "No decisions yet." },
+  { key: "held", title: "Held", empty: "Nothing is on hold." },
   {
     key: "status",
     title: "Where things stand",
@@ -42,15 +53,35 @@ function errorText(error: unknown): string {
 }
 
 /**
- * The Bench as a full screen: what needs the owner, what is answered and
- * waiting on an agent, what was decided, and where things stand. Cards answer
- * through `bench_answer`, which uses the Bench's own relay and keys, so the
- * screen works whichever community is active.
+ * The Bench as a full screen: what needs the owner, what waits on someone
+ * else, what is answered and waiting on an agent, what was decided, and where
+ * things stand. Cards answer through `bench_answer`, which uses the Bench's
+ * own relay and keys, so the screen works whichever community is active.
+ * Other and Open thread open the card's thread, where a reply is the answer.
+ * Search narrows every section at once.
  */
 export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
-  const sections = React.useMemo(() => benchSections(snapshot), [snapshot]);
+  const { goChannel } = useAppNavigation();
+  const [query, setQuery] = React.useState("");
+  const matches = React.useMemo(() => benchSearch(query), [query]);
+  const sections = React.useMemo(
+    () => benchSections(snapshot, viewerPubkey),
+    [snapshot, viewerPubkey],
+  );
+  const benchChannel = snapshot?.channelId ?? "";
+  const openThread = React.useCallback(
+    (card: BenchCardData) => {
+      const channel = card.channelId ?? benchChannel;
+      if (channel && card.cardEventId) {
+        // A message target opens its thread panel even when the card is
+        // older than the loaded timeline; `thread` alone did not.
+        void goChannel(channel, { messageId: card.cardEventId });
+      }
+    },
+    [benchChannel, goChannel],
+  );
 
   let content: React.ReactNode;
   if (!snapshot) {
@@ -93,11 +124,19 @@ export function BenchScreen() {
             </p>
           ) : null}
         </div>
+        <Input
+          aria-label="Search the Bench"
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search by title, PR number, project, name or date"
+          type="search"
+          value={query}
+        />
         {SECTIONS.map((section) => (
           <BenchSection
-            cards={sections[section.key]}
-            empty={section.empty}
+            cards={sections[section.key].filter(matches)}
+            empty={query.trim() ? "No matching cards." : section.empty}
             key={section.key}
+            onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}
             testId={`bench-section-${section.key}`}
             title={section.title}
@@ -139,6 +178,7 @@ export function BenchScreen() {
 function BenchSection({
   cards,
   empty,
+  onOther,
   ownerPubkey,
   testId,
   title,
@@ -146,6 +186,7 @@ function BenchSection({
 }: {
   cards: BenchCardData[];
   empty: string;
+  onOther: (card: BenchCardData) => void;
   ownerPubkey: string | null;
   testId: string;
   title: string;
@@ -168,9 +209,12 @@ function BenchSection({
       ) : (
         <ul className="space-y-3">
           {cards.map((card) => (
-            <li key={card.id}>
+            // A replaced card is a new row: nothing typed or saving on the
+            // card the owner saw carries over to the one that replaced it.
+            <li key={card.cardEventId ?? card.id}>
               <BenchCard
                 card={card}
+                onOther={() => onOther(card)}
                 ownerPubkey={ownerPubkey}
                 viewerPubkey={viewerPubkey}
               />

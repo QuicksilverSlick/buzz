@@ -3,7 +3,8 @@
 //! for drop files; this file is the service: constants and the debug fence,
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
 //! the writer's own events, the reaction poll and the outbox, inbox intake,
-//! the pinned relay posts and the 2 s loop.
+//! the pinned relay helpers and the 2 s loop. `publish` posts a tick's cards
+//! and board; `channels` covers project channels bound in roles.json.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,8 +18,14 @@ use crate::app_state::AppState;
 use crate::events;
 use crate::secret_store::SecretStore;
 
+mod channels;
 pub(crate) mod commands;
 mod item;
+mod pick;
+mod plain;
+mod publish;
+mod roles;
+mod route;
 
 pub(crate) const RELAY_WS: &str = "wss://greymatterllc.communities.buzz.xyz";
 /// Generated once, never changed: the v5 namespace of every #bench id.
@@ -41,8 +48,13 @@ const MAX_POSTS_PER_TICK: usize = 4;
 const MAX_CLOCK_LEAD_SECS: u64 = 600;
 const MAX_DROP_BYTES: u64 = 64 * 1024;
 const RECOVER_LIMIT: u32 = 500;
+/// Receipts are never deleted, so the writer's kind 9s only grow.
+const RECOVER_PAGES: usize = 10;
+const REFUSED_TAPS_MAX: usize = 50;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMED_OUT: &str = "submit timed out";
+/// lastError while roles.json does not read, before its error.
+const ROLES_HOLD: &str = "roles.json can't be read, so every card is on hold: ";
 
 /// The debug fence: a debug build may only ever reach a loopback relay. The
 /// host is checked parsed, since `ws://localhost@evil.example` starts fine.
@@ -120,6 +132,21 @@ pub(crate) struct BenchState {
     profile_published: bool,
     channel_created: bool,
     members_added: Vec<String>,
+    /// Who the owner added to each bound project channel.
+    joined: BTreeMap<String, Vec<String>>,
+    /// Each bound channel's join or admin check: cards go only where it passed.
+    channels: BTreeMap<String, channels::ChannelCheck>,
+    /// Engaged or owner-told cards a new question left behind: on the relay
+    /// for good, never adopted again by recover (which would retire them as
+    /// stale).
+    kept: Vec<String>,
+    /// Each kept card posted in a thread, as (its root, its created_at): it
+    /// still ends the root-reply window of an older card there.
+    kept_at: Vec<(String, u64)>,
+    /// Live cards whose owner's page was cut this tick, or every item while
+    /// roles.json does not read: their answers are unread, so nothing
+    /// expires, restamps, routes, retires or replaces them.
+    held: Vec<String>,
     /// Floor of the monotonic clock for writer events.
     last_created_at: u64,
     board: Option<Posted>,
@@ -130,11 +157,28 @@ pub(crate) struct BenchState {
     strays: Vec<String>,
     /// routes.json entries refused this tick, as `<writer>: <reason>`.
     unroutable: Vec<String>,
+    /// The last answers that did not count, newest last.
+    refused_taps: Vec<RefusedTap>,
     /// No notice before this: an agent never sees events from before it
     /// subscribes, so a launch (rebuild) or a join holds them one settle.
     routes_held_until: u64,
+    /// The owner's keys as the last tick resolved them (`owner_keys`).
+    owner_keys: Vec<String>,
     last_tick: String,
     last_error: Option<String>,
+}
+
+/// A valid answer on a live card from a key that may not answer it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RefusedTap {
+    pub item: String,
+    pub by: String,
+    pub event_id: String,
+    /// 1-based.
+    pub option: usize,
+    pub at: u64,
+    pub why: String,
 }
 
 /// state.json, else the previous snapshot, else fresh (which forces a rebuild
@@ -170,6 +214,17 @@ fn save_state(root: &Path, s: &BenchState, last_written: &mut String) -> Result<
     }
     crate::managed_agents::atomic_write_json_restricted(&path, text.as_bytes())?;
     *last_written = text;
+    Ok(())
+}
+
+/// state.json and state.prev.json alike, before an owner's notice first
+/// goes out: whichever one loads next holds it (`item::OwnerSent`), so
+/// neither a crash nor the fallback ever signs that notice afresh.
+fn save_both(root: &Path, s: &BenchState) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(s).map_err(|e| format!("serialize state: {e}"))?;
+    for name in ["state.prev.json", "state.json"] {
+        crate::managed_agents::atomic_write_json_restricted(&root.join(name), text.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -321,30 +376,99 @@ fn scan_inbox(
     out
 }
 
+/// What a new Drop keeps of the item it replaces. A close-out (a decision or
+/// status) of a carded request keeps the card, which becomes its receipt; a
+/// new question after an answer, a reply or the owner's word leaves the old
+/// card on the relay as it is and gets a card of its own with nothing told
+/// yet, which comes back to whoever answered (`item::Previous`); anything
+/// else keeps the card for publish to refresh. Each keeps the owner's word
+/// told on the old item, or a notice of the owner's still owed there, to be
+/// ended or withdrawn (`item::Item::ends`), whether its card is there or not
+/// (crowded out, deleted by hand).
+fn carry_card(
+    old: Option<&item::Item>,
+    mut new: item::Item,
+    kept: &mut Vec<String>,
+    kept_at: &mut Vec<(String, u64)>,
+) -> item::Item {
+    let Some(o) = old else { return new };
+    let asking = new.kind == item::ItemKind::Pending;
+    new.ends = o.ends.clone();
+    if !asking && o.card.is_some() && (o.kind == item::ItemKind::Pending || o.request.is_some()) {
+        let asked = item::Item {
+            card: None,
+            routed: None,
+            owner_sent: None,
+            ..o.clone()
+        };
+        new.request = o.request.clone().or(Some(Box::new(asked)));
+        new.card = o.card.clone();
+    } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
+        let asked = o.request.as_deref().unwrap_or(o);
+        if let Some(c) = &o.card {
+            kept.push(c.event_id.clone());
+            kept_at.extend(asked.reply_to.clone().map(|r| (r, c.created_at)));
+        }
+        let answered = asked.answer.as_ref().and_then(|a| {
+            Some(item::Previous {
+                option: a.option,
+                label: asked.options.get(a.option)?.clone(),
+                by: a.by.clone(),
+                by_name: a.by_name.clone(),
+                answered_at: a.answered_at,
+            })
+        });
+        new.previous = answered.or_else(|| o.previous.clone());
+    } else {
+        new.card = o.card.clone();
+        new.previous = o.previous.clone().filter(|_| asking);
+    }
+    if o.owner_told() {
+        new.ends = Some(Box::new(o.clone()));
+    }
+    new
+}
+
 /// Take every readable drop into state (keeping the card of the item it
-/// replaces) or reject it in place as `<stem>.rejected.json`; the writer
-/// cleans up its own rejections. Returns whether state changed.
-fn intake(s: &mut BenchState, root: &Path, now_iso: &str) -> bool {
+/// replaces, see `carry_card`) or reject it in place as
+/// `<stem>.rejected.json`; the writer cleans up its own rejections. Every
+/// drop waits while roles.json is unreadable, and a drop for a `held` card
+/// until its answers are read. Returns whether state changed.
+fn intake(
+    s: &mut BenchState,
+    root: &Path,
+    now_iso: &str,
+    roles: Option<&roles::Roles>,
+    roles_bad: bool,
+) -> bool {
+    // Which folders are bound, and who may scope cards, is unknown.
+    if roles_bad {
+        return false;
+    }
     let mut changed = false;
     for (path, writer, stem, raw) in scan_inbox(root, SystemTime::now()) {
-        let (reason, raw) = match raw {
-            Ok(raw) => match item::validate(&writer, &stem, &raw, now_iso) {
-                Ok(item) => {
-                    let old = s.items.get(&item.id);
-                    if old.is_none_or(|o| o.hash != item.hash) {
-                        // The hash-change re-drop is the writer's ack: the
-                        // rebuilt item carries no answer, so the file goes too,
-                        // whether or not state still remembers the answer.
-                        let _ = std::fs::remove_file(outbox_path(root, &item.id));
-                        let card = old.and_then(|o| o.card.clone());
-                        s.items.insert(item.id.clone(), item::Item { card, ..item });
-                        changed = true;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+        let checked = raw.map(|raw| {
+            let item = item::validate(&writer, &stem, &raw, now_iso);
+            let item = item.and_then(|mut i| roles::bind(&mut i, roles).map(|()| i));
+            (item, raw)
+        });
+        let (reason, raw) = match checked {
+            Ok((Ok(item), _)) if s.held.contains(&item.id) => continue,
+            Ok((Ok(item), _)) => {
+                let old = s.items.get(&item.id);
+                if old.is_none_or(|o| o.hash != item.hash) {
+                    // The hash-change re-drop is the writer's ack: the
+                    // rebuilt item carries no answer, so the file goes too,
+                    // whether or not state still remembers the answer.
+                    let _ = std::fs::remove_file(outbox_path(root, &item.id));
+                    let item = carry_card(old, item, &mut s.kept, &mut s.kept_at);
+                    s.items.insert(item.id.clone(), item);
+                    changed = true;
                 }
-                Err(reason) => (reason, Some(raw)),
-            },
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            Ok((Err(reason), raw)) => (reason, Some(raw)),
             Err(reason) => (reason, None),
         };
         let rejected = path.with_file_name(format!("{stem}.rejected.json"));
@@ -374,6 +498,9 @@ pub(crate) struct Ctx<'a> {
     /// Managed agents on this desktop that admit the writer: the only
     /// possible route targets.
     pub agents: Vec<String>,
+    /// Who every managed agent here takes instructions from: an agent a
+    /// human on a card can instruct never answers that card.
+    pub access: Vec<roles::AgentAccess>,
 }
 
 enum Outcome {
@@ -513,6 +640,58 @@ fn read_members(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The owner's keys: the owner plus members.txt, less every agent key the
+/// Bench knows (managed agents, routes.json targets, roles.json writers and
+/// agents, its own writer): agents run as this OS user and can write
+/// members.txt. Only a separate OS user for agents truly keeps them out.
+/// While roles.json is unreadable its agents are unknown, so no members.txt
+/// key counts. Err names each key left out, for lastError.
+fn owner_keys(
+    ctx: &Ctx<'_>,
+    owner: &str,
+    roles: Option<&roles::Roles>,
+    roles_bad: bool,
+) -> (Vec<String>, Result<(), String>) {
+    let targets: BTreeMap<String, String> = std::fs::read_to_string(ctx.root.join("routes.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let roles_agents = roles.into_iter().flat_map(|r| {
+        let writers = r.writers.values().filter_map(|w| w.pubkey.clone());
+        let people = r.projects.values().flat_map(|p| &p.people);
+        writers.chain(people.filter(|p| p.agent).map(|p| p.pk.clone()))
+    });
+    let agents: Vec<String> = ctx
+        .access
+        .iter()
+        .map(|a| a.pubkey.clone())
+        .chain(ctx.agents.iter().cloned())
+        .chain(targets.into_values())
+        .chain(roles_agents)
+        .chain([ctx.writer.public_key().to_hex()])
+        .map(|k| k.trim().to_ascii_lowercase())
+        .collect();
+    let (out, members): (Vec<String>, Vec<String>) = read_members(&ctx.root)
+        .into_iter()
+        .filter(|m| m != owner)
+        .partition(|m| roles_bad || agents.contains(m));
+    let set = std::iter::once(owner.to_string()).chain(members).collect();
+    let why = match out.as_slice() {
+        [] => Ok(()),
+        _ if roles_bad => Err(format!(
+            "roles.json is unreadable, so which keys are agents is unknown: no members.txt \
+             key counts as yours or joins #bench until it reads: {}",
+            out.join(", ")
+        )),
+        _ => Err(format!(
+            "members.txt lists agent keys, which never count as yours and are not joined \
+             to #bench as yours: {}",
+            out.join(", ")
+        )),
+    };
+    (set, why)
+}
+
 /// routes.json: `{"<writer folder>": "<agent hex>"}`, the agent that acts on
 /// that writer's answers. The owner's file, not the drop's: a drop could aim
 /// writer-signed mentions anywhere, and every target joins private #bench.
@@ -598,8 +777,9 @@ fn spend(budget: &mut usize, n: usize) -> bool {
     }
 }
 
-/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member and route
-/// target (owner). Each step is retried every tick until its flag is set. The
+/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per owner's key
+/// (`owner_keys`: members.txt less agent keys) and #bench route target
+/// (owner). Each step is retried every tick until its flag is set. The
 /// tag-free kind 0 goes first so a refused writer leaves no half-built
 /// channel behind. Route targets join to read their notices; they never go
 /// into members.txt, so they never answer.
@@ -608,7 +788,8 @@ async fn bootstrap(
     s: &mut BenchState,
     budget: &mut usize,
     now: u64,
-    routes: &BTreeMap<String, String>,
+    owner_set: &[String],
+    targets: &[String],
 ) -> Result<bool, String> {
     let ch = channel_id(&s.owner_pubkey);
     let writer_hex = ctx.writer.public_key().to_hex();
@@ -629,9 +810,12 @@ async fn bootstrap(
         post_as_owner(ctx, create).await?;
         s.channel_created = true;
     }
-    let joining = std::iter::once(writer_hex.clone())
-        .chain(read_members(&ctx.root))
-        .chain(routes.values().cloned());
+    let members = owner_set.iter().filter(|k| **k != s.owner_pubkey);
+    let joining = std::iter::once(&writer_hex)
+        .chain(members)
+        .chain(targets)
+        .cloned()
+        .collect::<Vec<_>>();
     for hex in joining {
         if s.members_added.contains(&hex) {
             continue;
@@ -649,15 +833,43 @@ async fn bootstrap(
     Ok(s.members_added.contains(&writer_hex))
 }
 
-/// Rebuild cards and board from the writer's own kind-9 events. Deletes
-/// nothing: soft-deleted rows never come back from /query, and anything else
-/// is listed as a stray for the owner.
+/// Rebuild cards and board from the writer's own kind-9 events in #bench and
+/// the bound channels it joined, newest page first. Deletes nothing:
+/// soft-deleted rows never come back from /query, and anything else is
+/// listed as a stray for the owner.
 async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
     let writer_hex = ctx.writer.public_key().to_hex();
-    let filter = serde_json::json!({
-        "kinds": [9], "authors": [writer_hex], "#h": [s.channel_id], "limit": RECOVER_LIMIT,
-    });
-    let events = query_writer(ctx, s, filter, now).await?;
+    let mut chans = vec![s.channel_id.clone()];
+    chans.extend(
+        s.joined
+            .iter()
+            .filter(|(ch, m)| **ch != s.channel_id && m.contains(&writer_hex))
+            .map(|(ch, _)| ch.clone()),
+    );
+    let mut events: Vec<nostr::Event> = Vec::new();
+    let (mut until, mut cut) = (None, false);
+    for _ in 0..RECOVER_PAGES {
+        let mut filter = serde_json::json!({
+            "kinds": [9], "authors": [writer_hex], "#h": chans, "limit": RECOVER_LIMIT,
+        });
+        if let Some(u) = until {
+            filter["until"] = serde_json::json!(u);
+        }
+        let page = query_writer(ctx, s, filter, now).await?;
+        cut = page.len() as u32 >= RECOVER_LIMIT;
+        // Writer timestamps are strictly increasing, so nothing shares the
+        // oldest second of a page.
+        until = page
+            .iter()
+            .map(|e| e.created_at.as_secs())
+            .min()
+            .map(|t| t.saturating_sub(1));
+        events.extend(page);
+        if !cut {
+            break;
+        }
+    }
+    events.retain(|e| !s.kept.contains(&e.id.to_hex()));
     let r = rebuild_map(&events, &writer_hex);
     for (id, posted) in r.cards {
         match s.items.get_mut(&id) {
@@ -678,9 +890,9 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     s.needs_rebuild = false;
     s.routes_held_until = now + item::ROUTE_SETTLE_SECS;
     // The partial map is kept; the Err is how state.json learns of the cut.
-    if events.len() as u32 >= RECOVER_LIMIT {
+    if cut {
         return Err(format!(
-            "rebuild truncated (>= {RECOVER_LIMIT} writer kind-9 events in #bench)"
+            "rebuild truncated (more than {RECOVER_PAGES} pages of {RECOVER_LIMIT} writer kind-9 events)"
         ));
     }
     Ok(())
@@ -716,69 +928,276 @@ fn forget_card(s: &mut BenchState, id: &str) {
     s.board_dirty = true;
 }
 
-/// Re-derive every answer from the approvers' kind-7 reactions on the live
-/// cards. The whole set comes back each tick, so a retraction is a reaction
-/// that stopped coming back and nothing is ever double-applied. The outbox
-/// file lands before state records the answer: a failed write is retried
-/// next tick instead of being lost.
-// ponytail: one /query per 2 s tick (30/min of the 300/min budget); swap for
-// the live #h tail via native_relay_client::start when the relay complains.
-async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), String> {
-    let cards: Vec<String> = s
+/// A stamped answerer's roster name and role; None for the owner's own keys.
+fn named(
+    i: &item::Item,
+    pk: &str,
+    owner_set: &[String],
+) -> (Option<String>, Option<item::AnswerRole>) {
+    if owner_set.iter().any(|o| o == pk) {
+        return (None, None);
+    }
+    let a = i
+        .stamp
+        .iter()
+        .flat_map(|s| &s.answerers)
+        .find(|a| a.pk == pk);
+    (a.map(|a| a.name.clone()), a.map(|a| a.role))
+}
+
+/// Re-derive every answer from the kind-7 taps (and, on scoped cards, the
+/// kind-9 thread replies) on the live cards, from the owner's keys and the
+/// cards' answerers only. The whole set comes back each tick, so a
+/// retraction is an event that stopped coming back and nothing is ever
+/// double-applied. The outbox file lands before state records the answer: a
+/// failed write is retried next tick instead of being lost. Ok(Some) says
+/// a page was cut: the cards it covers keep their answers, they are read
+/// again next tick, the tick goes on, and it is lastError. A card the
+/// owner's cut page covers is also `held` for the rest of the tick.
+// ponytail: one /query per 2 s tick, two once a live card has answerers,
+// twice that while a card takes its thread root's replies (up to 120/min of
+// the 300/min budget); swap for the live #h tail via
+// native_relay_client::start when the relay complains.
+async fn poll_answers(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    now: u64,
+    owner_set: &[String],
+    routes: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    s.held.clear();
+    // A channel not ready for cards is not read either: its answers stand.
+    let live: Vec<&item::Item> = s
         .items
         .values()
-        .filter_map(live_card)
+        .filter(|i| i.kind == item::ItemKind::Pending && live_card(i).is_some())
+        .filter(|i| channels::channel_ready(s, i))
+        .collect();
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let cards: Vec<String> = live
+        .iter()
+        .filter_map(|i| live_card(i))
         .map(|c| c.event_id.clone())
         .collect();
-    if cards.is_empty() {
-        return Ok(());
-    }
-    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
-        .chain(read_members(&ctx.root))
+    // Replies that name only a card's thread root (`item::root_until`) are a
+    // read of their own: their whole threads match, so it starts an hour
+    // (clock skew) before the oldest card that takes them, nothing older
+    // counts on any of them, and a busy thread never cuts the cards' page.
+    let rooted: Vec<&item::Item> = live
+        .iter()
+        .copied()
+        .filter(|i| item::root_until(i, s.items.values(), &s.kept, &s.kept_at).is_some())
         .collect();
-    let filter = serde_json::json!({
-        "kinds": [7], "authors": approvers, "#h": [s.channel_id], "#e": cards,
-        "limit": RECOVER_LIMIT,
-    });
-    let events = query(ctx, s, filter, now).await?;
-    // A cut page hides reactions: never infer a retraction from it.
-    if events.len() as u32 >= RECOVER_LIMIT {
-        return Err(format!(
-            "answers truncated (>= {RECOVER_LIMIT} reactions on live cards)"
-        ));
+    let roots: Vec<String> = rooted.iter().filter_map(|i| i.reply_to.clone()).collect();
+    let since = rooted
+        .iter()
+        .filter_map(|i| live_card(i))
+        .map(|c| c.created_at.saturating_sub(3600))
+        .min();
+    let rooted: Vec<String> = rooted.iter().map(|i| i.id.clone()).collect();
+    let mut answerers: Vec<String> = live
+        .iter()
+        .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
+        .map(|a| a.pk.clone())
+        .filter(|pk| !owner_set.contains(pk))
+        .collect();
+    answerers.sort();
+    answerers.dedup();
+    let chans: std::collections::BTreeSet<String> =
+        live.iter().map(|i| channels::card_channel(s, i)).collect();
+    let kinds = if live.iter().any(|i| i.scoped()) {
+        serde_json::json!([7, 9])
+    } else {
+        serde_json::json!([7])
+    };
+    let agents: Vec<String> = live
+        .iter()
+        .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
+        .filter(|a| a.agent)
+        .map(|a| a.pk.clone())
+        .chain(ctx.access.iter().map(|a| a.pubkey.clone()))
+        .collect();
+    let ids: Vec<String> = live.iter().map(|i| i.id.clone()).collect();
+    let page = |authors: &[String], e: &[String], since: Option<u64>| {
+        let mut f = serde_json::json!({
+            "kinds": kinds, "authors": authors, "#h": chans, "#e": e,
+            "limit": RECOVER_LIMIT,
+        });
+        if let Some(t) = since {
+            f["since"] = t.into();
+        }
+        f
+    };
+    // The owner's keys are read apart from everyone else's, so nobody else's
+    // traffic can cut the owner's page. A cut page hides answers: never infer
+    // a retraction from it. Each full page, as (the owner's, a thread's).
+    let mut events = Vec::new();
+    let mut full = Vec::new();
+    for (owners, authors) in [(true, owner_set), (false, answerers.as_slice())] {
+        for (threads, e, since) in [(false, &cards, None), (true, &roots, since)] {
+            if authors.is_empty() || e.is_empty() {
+                continue;
+            }
+            let got = query(ctx, s, page(authors, e, since), now).await?;
+            if got.len() as u32 >= RECOVER_LIMIT {
+                full.push((owners, threads));
+            }
+            events.extend(got);
+        }
     }
+    // Whether a page that `id` is read from was cut.
+    let cut = |owners: bool, id: &String| {
+        full.iter()
+            .any(|&(o, t)| o == owners && (!t || rooted.contains(id)))
+    };
+    let why = if full.iter().any(|f| f.0) {
+        Some(format!(
+            "answers truncated (>= {RECOVER_LIMIT} events from your keys on live cards); \
+             those cards' answers stand"
+        ))
+    } else {
+        (!full.is_empty()).then(|| {
+            format!(
+                "answers truncated (>= {RECOVER_LIMIT} events from the cards' answerers); \
+                 their answers stand"
+            )
+        })
+    };
+    let theirs = |by: &str| !owner_set.iter().any(|o| o == by);
     let writer_hex = ctx.writer.public_key().to_hex();
-    for (id, item) in s.items.iter_mut() {
-        let Some(card) = live_card(item) else {
+    let hhmm = local_hhmm(now);
+    let mut refused = Vec::new();
+    let mut held = Vec::new();
+    for id in ids {
+        // The owner's page was cut: everything on this card stands, and it
+        // is `held` until it is read, since an answer may be taken back or a
+        // tap unseen.
+        if cut(true, &id) {
+            held.push(id);
             continue;
+        }
+        let until = item::root_until(&s.items[&id], s.items.values(), &s.kept, &s.kept_at);
+        let item = s.items.get_mut(&id).expect("live id");
+        let card = live_card(item).expect("live card").event_id.clone();
+        // Their page was cut, so an answer or reply of theirs here may be
+        // hidden: theirs stand as they are. The owner's page is whole, so it
+        // still decides once the owner spoke, and an answer of the owner's
+        // that stopped coming back was withdrawn.
+        let unread = cut(false, &id) && !item::owner_spoke(item, &card, &events, owner_set, until);
+        for e in item::refused_taps(item, &events, owner_set, &writer_hex, until) {
+            let by = e.pubkey.to_hex();
+            let why = if item.needs == item::Needs::You && agents.contains(&by) {
+                "agent on a needs-you card"
+            } else {
+                "not an answerer on this card"
+            };
+            refused.push(RefusedTap {
+                item: id.clone(),
+                by,
+                event_id: e.id.to_hex(),
+                option: item::answer_option(item, &card, e, until).map_or(0, |i| i + 1),
+                at: e.created_at.as_secs(),
+                why: why.to_string(),
+            });
+        }
+        // The person's Other: kept while it is the newest, so its first-seen
+        // time holds; publish (a3) routes it unless it already pings the agent.
+        let picked = (!unread)
+            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until))
+            .flatten();
+        item.reply = match picked {
+            Some(e)
+                if item
+                    .reply
+                    .as_ref()
+                    .is_some_and(|r| r.event_id == e.id.to_hex()) =>
+            {
+                item.reply.take()
+            }
+            Some(e) => {
+                let by = e.pubkey.to_hex();
+                let (by_name, role) = named(item, &by, owner_set);
+                let pinged = routes.get(&item.writer).is_some_and(|to| {
+                    e.tags
+                        .iter()
+                        .any(|t| matches!(t.as_slice(), [k, p, ..] if k == "p" && p == to))
+                });
+                if pinged {
+                    item.routed_reply = Some(e.id.to_hex());
+                }
+                Some(item::Reply {
+                    event_id: e.id.to_hex(),
+                    by,
+                    by_name,
+                    role,
+                    at: now,
+                    hhmm: hhmm.clone(),
+                })
+            }
+            None if unread => item
+                .reply
+                .take()
+                .filter(|r| theirs(&r.by) && item::eligible(item, &r.by, owner_set)),
+            None => None,
         };
-        let path = outbox_path(&ctx.root, id);
-        item.answer = match item::pick_answer(item, &events, &approvers, &writer_hex) {
-            Some((i, e)) => {
-                let reaction_id = e.id.to_hex();
+        let path = outbox_path(&ctx.root, &id);
+        let picked = (!unread)
+            .then(|| item::pick_answer(item, &events, owner_set, &writer_hex, until))
+            .flatten();
+        match picked {
+            // Unless the roster no longer lets them answer (`restamp`).
+            None if unread
+                && item
+                    .answer
+                    .as_ref()
+                    .is_some_and(|a| theirs(&a.by) && item::eligible(item, &a.by, owner_set)) => {}
+            Some((_, e))
                 if item
                     .answer
                     .as_ref()
-                    .is_some_and(|a| a.reaction_id == reaction_id)
-                {
-                    continue;
-                }
+                    .is_some_and(|a| a.reaction_id == e.id.to_hex()) => {}
+            Some((i, e)) => {
+                let by = e.pubkey.to_hex();
+                let (by_name, role) = named(item, &by, owner_set);
+                let source = if e.kind.as_u16() == 9 {
+                    item::AnswerSource::Reply
+                } else {
+                    item::AnswerSource::Tap
+                };
+                let eligible: Vec<&String> = item
+                    .stamp
+                    .iter()
+                    .flat_map(|st| &st.answerers)
+                    .map(|a| &a.pk)
+                    .collect();
+                // "owner" for the owner's own keys.
+                let answerer_role =
+                    role.map_or(serde_json::json!("owner"), |r| serde_json::json!(r));
                 std::fs::create_dir_all(path.parent().expect("outbox dir"))
                     .map_err(|e| format!("create outbox: {e}"))?;
                 let body = serde_json::json!({
-                    "item": id, "writer": item.writer, "card": card.event_id,
+                    "item": id, "writer": item.writer, "card": card,
                     "option": i + 1, "text": item.options[i], "reaction": e,
+                    "answerer": by, "answererRole": answerer_role,
+                    "eligible": eligible, "source": source,
                 });
                 crate::managed_agents::atomic_write_json_restricted(
                     &path,
                     body.to_string().as_bytes(),
                 )?;
                 item.changed_at = now;
-                Some(item::Answer {
-                    reaction_id,
+                item.answer = Some(item::Answer {
+                    reaction_id: e.id.to_hex(),
                     option: i,
                     answered_at: now,
-                })
+                    by,
+                    by_name,
+                    role,
+                    source,
+                    hhmm: hhmm.clone(),
+                });
             }
             // Retried every tick with every error ignored (Windows sharing
             // violations included): a remove that failed, or a crash between
@@ -786,19 +1205,26 @@ async fn poll_answers(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(),
             // disk for the writer to act on.
             None => {
                 let _ = std::fs::remove_file(&path);
-                if item.answer.is_some() {
+                if item.answer.take().is_some() {
                     item.changed_at = now;
                 }
-                None
             }
-        };
+        }
     }
-    Ok(())
+    for t in refused {
+        if !s.refused_taps.iter().any(|x| x.event_id == t.event_id) {
+            s.refused_taps.push(t);
+        }
+    }
+    let over = s.refused_taps.len().saturating_sub(REFUSED_TAPS_MAX);
+    s.refused_taps.drain(..over);
+    s.held = held;
+    Ok(why)
 }
 
 /// A pending item past its deadline folds off the board: Superseded, so
-/// publish (b) retires its card. Answered items are left alone, and a
-/// same-hash re-drop cannot revive one: a new deadline is needed.
+/// publish (b) retires its card. Engaged and `held` items are left alone,
+/// and a same-hash re-drop cannot revive one: a new deadline is needed.
 fn expire(s: &mut BenchState, now: u64) {
     for i in s.items.values_mut() {
         let due = i
@@ -809,362 +1235,59 @@ fn expire(s: &mut BenchState, now: u64) {
         if due
             && i.kind == item::ItemKind::Pending
             && i.validity == item::Validity::Current
-            && i.answer.is_none()
+            && !i.engaged()
+            && !s.held.contains(&i.id)
         {
             i.validity = item::Validity::Superseded;
         }
     }
 }
 
-/// A kind 9 in #bench carrying its `client` marker; the p tag only for whom
-/// it pings (the owner for a card, the route target for a notice).
-async fn post_message(
+/// Re-resolve who may answer each open scoped request. An engaged or `held`
+/// one keeps the set it was answered under, less anyone the roster no
+/// longer lets answer it (the poll then drops their answer or reply); an
+/// unreadable roster leaves it as it is. A changed stamp changes the
+/// card_hash, so publish (b) reposts a card nobody engaged with and (a2)
+/// re-renders any other, even once its answer or reply was taken back.
+/// Agents the writer's p tag cannot wake are reported.
+fn restamp(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
-    text: &str,
-    ping: Option<&str>,
-    thread: Option<&events::ThreadRef>,
-    marker: String,
-    now: u64,
-) -> Result<Outcome, String> {
-    let builder = events::build_message_with_client_tags(
-        channel_id(&s.owner_pubkey),
-        text,
-        thread,
-        ping.as_slice(),
-        &[],
-        &[],
-        &[],
-        &[],
-        None,
-        &ctx.base,
-        &[vec!["client".to_string(), marker]],
-    )?;
-    post_as_writer(ctx, s, builder, now).await
-}
-
-/// kind 5 with h+e on one of the writer's own events (never 9005).
-async fn delete(
-    ctx: &Ctx<'_>,
-    s: &mut BenchState,
-    event_id: &str,
-    now: u64,
-) -> Result<Outcome, String> {
-    let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
-    let builder = events::build_delete_compat(channel_id(&s.owner_pubkey), target)?;
-    match post_as_writer(ctx, s, builder, now).await {
-        // A hard-purged target is already gone: nothing left to retire.
-        Err(e) if e.contains("not found") => Ok(Outcome::Duplicate),
-        r => r,
-    }
-}
-
-/// kind 40003 with h+e replacing the text of one of the writer's own kind 9s.
-async fn edit(
-    ctx: &Ctx<'_>,
-    s: &mut BenchState,
-    event_id: &str,
-    text: &str,
-    now: u64,
-) -> Result<Outcome, String> {
-    let target = nostr::EventId::from_hex(event_id).map_err(|e| e.to_string())?;
-    let edit_tags = events::MessageEditTags {
-        media: &[],
-        custom_emoji: &[],
-        mentions: &[],
-        mention_refs: None,
-    };
-    let builder =
-        events::build_message_edit(channel_id(&s.owner_pubkey), target, text, edit_tags, false)?;
-    post_as_writer(ctx, s, builder, now).await
-}
-
-/// Cards, seeds, then the board, at most `budget` posts; the next tick
-/// resumes where this one stopped because every step lands in state first.
-/// Cards are always delete + repost; only the board is ever edited, and the
-/// one-shot Recorded edit on an answered card.
-async fn publish(
-    ctx: &Ctx<'_>,
-    s: &mut BenchState,
-    budget: &mut usize,
-    now: u64,
-    hhmm: &str,
+    roles: Option<&roles::Roles>,
+    roles_bad: bool,
+    owner_set: &[String],
     routes: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    // (a) The live cards: pending + current + unanswered by severity; kept
-    // answered cards count against MAX_CARDS (the phone's pill window).
-    let mut ranked: Vec<(u8, i64, String)> = s
-        .items
-        .values()
-        .filter(|i| {
-            i.kind == item::ItemKind::Pending
-                && i.validity == item::Validity::Current
-                && i.answer.is_none()
-        })
-        .map(|i| (item::severity_rank(i.severity), i.order, i.id.clone()))
-        .collect();
-    ranked.sort();
-    let kept = s
-        .items
-        .values()
-        .filter(|i| i.answer.is_some() && i.card.is_some())
-        .count();
-    let wanted: Vec<String> = ranked
-        .into_iter()
-        .take(MAX_CARDS.saturating_sub(kept))
-        .map(|r| r.2)
-        .collect();
-
-    // (a2) Record / un-record on the live card, first so a tap is acknowledged
-    // within one tick. Diff-driven from what the card text shows (`recorded`)
-    // vs the answer, so it is a no-op after a restart.
-    for id in s.items.keys().cloned().collect::<Vec<_>>() {
-        let item = s.items[&id].clone();
-        let Some(card) = live_card(&item) else {
-            continue;
-        };
-        let want = item.answer.as_ref().map(|a| a.option);
-        if item.recorded == want {
+) {
+    let writer_hex = ctx.writer.public_key().to_hex();
+    for i in s.items.values_mut() {
+        if i.kind != item::ItemKind::Pending || i.validity != item::Validity::Current {
             continue;
         }
-        if !spend(budget, 1) {
-            return Ok(());
+        let target = routes.get(&i.writer).map(String::as_str);
+        let fresh = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
+        i.was_engaged |= i.engaged();
+        if !i.engaged() && !s.held.contains(&i.id) {
+            i.stamp = fresh;
+        } else if let (Some(st), Some(fresh), false) = (i.stamp.as_mut(), fresh, roles_bad) {
+            // Removals only: nobody is silently added to an answered card.
+            st.answerers
+                .retain(|a| fresh.answerers.iter().any(|f| f.pk == a.pk));
         }
-        let text = item::render_card(&item, hhmm);
-        match edit(ctx, s, &card.event_id, &text, now).await {
-            // The edit re-rendered the whole card, so it now shows this card
-            // format too: (b) must not retire it for an older one.
-            Ok(_) => {
-                let i = s.items.get_mut(&id).expect("edited id");
-                i.recorded = want;
-                i.card.as_mut().expect("edited card").hash = item::card_hash(&item);
-            }
-            // A hand-deleted card: the answer stays and is never reposted; an
-            // unanswered one comes back through (c).
-            Err(e) if e.contains("not found") => forget_card(s, &id),
-            Err(e) => return Err(e),
-        }
-    }
-
-    // (a3) Tell the writer's route target of a settled answer change, in the
-    // card's thread so the board stays newest. `routed` lands only once the
-    // relay took the notice, so a failed post is retried next tick.
-    for id in s.items.keys().cloned().collect::<Vec<_>>() {
-        let item = s.items[&id].clone();
-        let Some(to) = routes
-            .get(&item.writer)
-            .filter(|to| s.members_added.contains(to))
-        else {
-            continue;
-        };
-        if now < s.routes_held_until || !item::route_due(&item, now) {
-            continue;
-        }
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        let want = item.answer.as_ref().map(|a| a.option);
-        let prev = item.routed.as_ref().and_then(|r| r.option);
-        let at = item
-            .answer
-            .as_ref()
-            .map_or(item.changed_at, |a| a.answered_at);
-        let text = item::render_route(&item, prev, &local_hhmm(at));
-        let n = want.map_or("withdrawn".to_string(), |i| (i + 1).to_string());
-        let thread = live_card(&item)
-            .map(|c| nostr::EventId::from_hex(&c.event_id))
-            .transpose()
-            .map_err(|e| e.to_string())?
-            .map(|e| events::ThreadRef {
-                root_event_id: e,
-                parent_event_id: e,
-            });
-        let marker = format!("bench:route:{id}@{n}");
-        let outcome = match post_message(
-            ctx,
-            s,
-            &text,
-            Some(to.as_str()),
-            thread.as_ref(),
-            marker,
-            now,
-        )
-        .await
-        {
-            // The card was deleted by hand: the notice goes top-level next tick.
-            Err(e) if thread.is_some() && e.contains("not found") => {
-                forget_card(s, &id);
-                continue;
-            }
-            r => r?,
-        };
-        // A top-level notice is now newer than the board.
-        s.board_dirty |= thread.is_none();
-        let event_id = match outcome {
-            Outcome::Accepted { event_id } => event_id,
-            // Already on the relay: told all the same.
-            Outcome::Duplicate => String::new(),
-        };
-        s.items.get_mut(&id).expect("routed id").routed = Some(item::Routed {
-            option: want,
-            to: to.clone(),
-            event_id,
-            at: now,
-        });
-    }
-
-    // (b) Delete cards that are stale (another Drop or card format) or no
-    // longer wanted. An answered card is exempt for ANSWER_KEEP_SECS so late
-    // pills land, then retired here; it is never refreshed for format alone.
-    let stale: Vec<(String, String)> = s
-        .items
-        .values()
-        .filter_map(|i| {
-            let c = i.card.as_ref()?;
-            let retire = match &i.answer {
-                Some(a) => now.saturating_sub(a.answered_at) > item::ANSWER_KEEP_SECS,
-                None => c.hash != item::card_hash(i) || !wanted.contains(&i.id),
-            };
-            retire.then(|| (i.id.clone(), c.event_id.clone()))
-        })
-        .collect();
-    for (id, event_id) in stale {
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        delete(ctx, s, &event_id, now).await?;
-        forget_card(s, &id);
-    }
-
-    // (c) Post missing cards, adopting a recovered orphan when its hash matches.
-    for id in &wanted {
-        if s.items[id].card.is_some() {
-            continue;
-        }
-        if let Some(orphan) = s.orphan_cards.get(id).cloned() {
-            if orphan.hash == item::card_hash(&s.items[id]) {
-                s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
-                continue;
-            }
-            if !spend(budget, 1) {
-                return Ok(());
-            }
-            delete(ctx, s, &orphan.event_id, now).await?;
-            s.orphan_cards.remove(id);
-            let i = s.items.get_mut(id).expect("wanted id");
-            i.quiet_repost |= same_drop(&orphan, i);
-        }
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        let item = s.items[id].clone();
-        let hash = item::card_hash(&item);
-        let marker = format!("bench:card:{}@{hash}", item.id);
-        let text = item::render_card(&item, hhmm);
-        let owner = s.owner_pubkey.clone();
-        let ping = (item::ping_owner(&item) && !item.quiet_repost).then_some(owner.as_str());
-        match post_message(ctx, s, &text, ping, None, marker, now).await? {
-            Outcome::Accepted { event_id } => {
-                let created_at = s.last_created_at;
-                let i = s.items.get_mut(id).expect("wanted id");
-                i.card = Some(Posted {
-                    event_id,
-                    created_at,
-                    hash,
-                    seeded: 0,
-                });
-                i.quiet_repost = false;
-                s.board_dirty = true;
-            }
-            Outcome::Duplicate => {
-                s.needs_rebuild = true;
-                return Ok(());
+        for a in i.stamp.iter().flat_map(|st| &st.answerers) {
+            if a.agent && !ctx.agents.contains(&a.pk) {
+                let name = item::plain_title(&a.name);
+                s.unroutable
+                    .push(format!("{}: {name} does not admit the Bench writer", i.id));
             }
         }
     }
-
-    // (d) Seed one keycap reaction per option, in order, >= 1 s apart.
-    let ids: Vec<String> = s.items.keys().cloned().collect();
-    for id in ids {
-        loop {
-            let item = &s.items[&id];
-            let Some(card) = &item.card else { break };
-            if card.seeded >= item.options.len().min(item::OPTION_EMOJI.len()) {
-                break;
-            }
-            if !spend(budget, 1) {
-                return Ok(());
-            }
-            let target = nostr::EventId::from_hex(&card.event_id).map_err(|e| e.to_string())?;
-            let seed = events::build_reaction(target, item::OPTION_EMOJI[card.seeded])?;
-            post_as_writer(ctx, s, seed, now).await?;
-            let card = s
-                .items
-                .get_mut(&id)
-                .and_then(|i| i.card.as_mut())
-                .expect("seeded card");
-            card.seeded += 1;
-        }
-    }
-
-    // (e) The board: reposted after any card change or daily, edited in place
-    // for a text-only change so it keeps its id and stays newest.
-    let all: Vec<&item::Item> = s.items.values().collect();
-    let text = item::render_board(&all, &s.channel_id, hhmm, now);
-    let hash = item::board_hash(&text);
-    let aged = s
-        .board
-        .as_ref()
-        .is_none_or(|b| now.saturating_sub(b.created_at) > BOARD_MAX_AGE_SECS);
-    if s.board_dirty || aged {
-        // Both the post and the old board's delete, so the pair never splits
-        // the budget (a crash between them leaves two boards, which
-        // rebuild_map resolves by keeping the newest).
-        if !spend(budget, 2) {
-            return Ok(());
-        }
-        let marker = format!("bench:board@{hash}");
-        match post_message(ctx, s, &text, None, None, marker, now).await? {
-            Outcome::Accepted { event_id } => {
-                let old = s.board.replace(Posted {
-                    event_id,
-                    created_at: s.last_created_at,
-                    hash,
-                    seeded: 0,
-                });
-                s.board_dirty = false;
-                if let Some(old) = old {
-                    delete(ctx, s, &old.event_id, now).await?;
-                }
-            }
-            Outcome::Duplicate => s.needs_rebuild = true,
-        }
-    } else if let Some(board_id) = s
-        .board
-        .as_ref()
-        .filter(|b| b.hash != hash)
-        .map(|b| b.event_id.clone())
-    {
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        match edit(ctx, s, &board_id, &text, now).await {
-            Ok(_) => s.board.as_mut().expect("board").hash = hash,
-            // The board was deleted by hand: repost it next tick instead of
-            // retrying the edit every 2 s until the daily repost.
-            Err(e) if e.contains("not found") => {
-                s.board = None;
-                s.board_dirty = true;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
-/// One 2 s tick: owner fence, bootstrap, recovery, the reaction poll (before
-/// intake, so a query failure aborts the tick before any drop is read),
-/// intake, expiry, publish.
+/// One 2 s tick: owner fence, bootstrap, the bound channels' joins and admin
+/// check, recovery, the answer poll (before intake, so a query failure aborts
+/// the tick before any drop is read), intake, expiry, answerers, publish. An
+/// unreadable roles.json (every card and drop on hold), or a cut page of
+/// answers, fails the tick only after publish: #bench carries on.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -1184,23 +1307,78 @@ pub(crate) async fn tick(
         );
     }
     s.last_tick = now_iso.to_string();
-    let approvers: Vec<String> = std::iter::once(s.owner_pubkey.clone())
-        .chain(read_members(&ctx.root))
-        .collect();
     let writer_hex = ctx.writer.public_key().to_hex();
-    let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &approvers, &writer_hex);
+    s.writer_pubkey = writer_hex.clone();
+    let (roles, roles_err) = match channels::read_roles(&ctx.root) {
+        Ok(r) => (r, None),
+        Err(e) => (None, Some(format!("{ROLES_HOLD}{e}"))),
+    };
+    // The owner's keys: the owner plus the phone's own key in members.txt.
+    let (owner_set, not_owner) =
+        owner_keys(ctx, &s.owner_pubkey, roles.as_ref(), roles_err.is_some());
+    s.owner_keys = owner_set.clone();
+    let why: Vec<String> = roles_err.iter().cloned().chain(not_owner.err()).collect();
+    let done = (!why.is_empty())
+        .then(|| why.join("; "))
+        .map_or(Ok(()), Err);
+    let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &owner_set, &writer_hex);
     s.unroutable = unroutable;
+    // Route targets join only their own writer's channels: a bound folder's
+    // never joins #bench, and while roles.json is unreadable none does.
+    let bench_targets: Vec<String> = routes
+        .iter()
+        .filter(|(w, _)| {
+            roles_err.is_none() && roles.as_ref().is_none_or(|r| !r.writers.contains_key(*w))
+        })
+        .map(|(_, to)| to.clone())
+        .collect();
     let mut budget = MAX_POSTS_PER_TICK;
-    if !bootstrap(ctx, s, &mut budget, now, &routes).await? {
-        return Ok(());
+    if !bootstrap(ctx, s, &mut budget, now, &owner_set, &bench_targets).await? {
+        return done;
+    }
+    if let Some(r) = &roles {
+        channels::join_bound(ctx, s, &mut budget, now, r, &routes).await;
+    }
+    // Whose keys are the owner's is unknown, so the last verdict stands.
+    if roles_err.is_none() {
+        channels::check_admins(ctx, s, now, &owner_set).await;
     }
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
-    poll_answers(ctx, s, now).await?;
-    intake(s, &ctx.root, now_iso);
+    // Whose keys are the owner's is unknown, so no answer may be read as
+    // taken back: every card stands as it is, `held`, until roles.json reads.
+    let cut = if roles_err.is_some() {
+        s.held = s.items.keys().cloned().collect();
+        None
+    } else {
+        poll_answers(ctx, s, now, &owner_set, &routes).await?
+    };
+    intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
     expire(s, now);
-    publish(ctx, s, &mut budget, now, hhmm, &routes).await
+    restamp(
+        ctx,
+        s,
+        roles.as_ref(),
+        roles_err.is_some(),
+        &owner_set,
+        &routes,
+    );
+    let mut failed = Vec::new();
+    publish::publish(
+        ctx,
+        s,
+        &mut budget,
+        now,
+        hhmm,
+        &routes,
+        &owner_set,
+        &mut failed,
+    )
+    .await?;
+    let failed = (!failed.is_empty()).then(|| failed.join("; "));
+    done.and(cut.map_or(Ok(()), Err))
+        .and(failed.map_or(Ok(()), Err))
 }
 
 /// The service loop. state.json (lastTick / lastError / admission) is the
@@ -1261,23 +1439,19 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
         let result = match state.signing_keys() {
             Ok(owner) => {
                 // Re-read every tick: an allowlist edit takes effect without a
-                // relaunch. A broken store routes nothing (state.json says so).
-                let agents = crate::managed_agents::load_agent_store(&app)
-                    .map(|r| {
-                        admitting_agents(
-                            &r,
-                            &writer_hex,
-                            crate::managed_agents::access_policy::owner_only(),
-                        )
-                    })
-                    .unwrap_or_default();
+                // relaunch. A broken store routes nothing (state.json says so),
+                // and an agent with no access record counts as instructable by
+                // anyone.
+                let records = crate::managed_agents::load_agent_store(&app).unwrap_or_default();
+                let owner_only = crate::managed_agents::access_policy::owner_only();
                 let ctx = Ctx {
                     state: &state,
                     base: base.clone(),
                     owner,
                     writer: writer.clone(),
                     root: root.clone(),
-                    agents,
+                    agents: admitting_agents(&records, &writer_hex, owner_only),
+                    access: roles::agent_access(&records, owner_only),
                 };
                 let now = nostr::Timestamp::now().as_secs();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();

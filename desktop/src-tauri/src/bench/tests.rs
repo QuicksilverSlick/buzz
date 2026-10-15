@@ -2,6 +2,7 @@
 //! tick tests. This file carries the only literal events route in bench/.
 
 use super::item::*;
+use super::route::render_owner_route;
 use super::*;
 use serde_json::{json, Value};
 
@@ -706,7 +707,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     assert_eq!(scan_inbox(root, now).len(), 3);
 
     let mut s = BenchState::default();
-    assert!(intake(&mut s, root, NOW));
+    assert!(intake(&mut s, root, NOW, None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(
         (item.writer.as_str(), item.updated_at.as_str()),
@@ -734,7 +735,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     }
     assert!(inbox.join("old.rejected.json").exists());
     assert!(root.join("inbox/Bad Writer/z.json").exists());
-    assert!(!intake(&mut s, root, NOW));
+    assert!(!intake(&mut s, root, NOW, None, false));
 
     // An identical re-drop is a no-op; a reworded one keeps the card.
     let card = Posted {
@@ -746,7 +747,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     s.items.get_mut("orchestrator/good").unwrap().card = Some(card.clone());
     std::fs::write(inbox.join("good.json"), drop_json(&[])).unwrap();
     backdate("orchestrator/good.json");
-    assert!(!intake(&mut s, root, "2026-09-13T15:00:00Z"));
+    assert!(!intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
     assert_eq!(s.items["orchestrator/good"].updated_at, NOW);
     std::fs::write(
         inbox.join("good.json"),
@@ -754,7 +755,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     )
     .unwrap();
     backdate("orchestrator/good.json");
-    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z"));
+    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(item.card, Some(card));
     assert_ne!(item.hash, item.card.as_ref().unwrap().hash);
@@ -765,7 +766,10 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::{routing::post, Json, Router};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -791,8 +795,14 @@ struct Relay {
     /// Every /query body in order.
     queries: Mutex<Vec<Value>>,
     /// Event ids the relay no longer has: a kind 5, 40003 or reply on them is
-    /// refused.
+    /// refused. A channel id here refuses its kind 9000s.
     gone: Mutex<HashSet<String>>,
+    /// The relay's own key: NIP-11 `self`, and the signer of its 39001s.
+    keys: Keys,
+    /// A /query for the admin lists (kind 39001) fails with a 500.
+    admins_down: Mutex<bool>,
+    /// Its clock once set: an event over 900 s off is refused, first.
+    clock: Mutex<Option<u64>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -827,7 +837,18 @@ async fn fake_events(
             })),
         );
     }
+    let clock = *r.clock.lock().unwrap();
+    if clock.is_some_and(|t| ev["created_at"].as_u64().unwrap().abs_diff(t) > 900) {
+        let error = json!({ "error": "invalid: event timestamp too far from server time" });
+        return (StatusCode::BAD_REQUEST, Json(error));
+    }
     let kind = ev["kind"].as_u64().unwrap();
+    let h = tag_value(&ev, "h").unwrap_or_default();
+    if kind == 9000 && r.gone.lock().unwrap().contains(&h) {
+        let reply =
+            json!({ "event_id": ev["id"], "accepted": false, "message": "channel not found" });
+        return (StatusCode::OK, Json(reply));
+    }
     let target = tag_value(&ev, "e").unwrap_or_default();
     if matches!(kind, 5 | 9 | 40003) && r.gone.lock().unwrap().contains(&target) {
         let message = match kind {
@@ -853,14 +874,44 @@ async fn fake_events(
     (StatusCode::OK, Json(reply))
 }
 
-/// The reply is filter-agnostic: rebuild_map skips kind != 9 and pick_answer
-/// skips kind != 7, so one list serves recover and the poll.
-async fn fake_query(State(r): State<Arc<Relay>>, body: String) -> Json<Vec<Value>> {
-    r.queries
-        .lock()
-        .unwrap()
-        .push(serde_json::from_str(&body).unwrap());
-    Json(r.query_reply.lock().unwrap().clone())
+/// Only `authors`, `#e`, `until` and, past it, `limit` (newest first) apply,
+/// so recover can page and the poll's pages split as the relay's do, and
+/// `ids` with its `#h` (the owner's notice lookup). Kinds and other tags do
+/// not: rebuild_map skips kind != 9 and pick_answer kind != 7, so one list
+/// serves recover and the poll.
+async fn fake_query(
+    State(r): State<Arc<Relay>>,
+    body: String,
+) -> Result<Json<Vec<Value>>, StatusCode> {
+    let q: Value = serde_json::from_str(&body).unwrap();
+    r.queries.lock().unwrap().push(q.clone());
+    if q[0]["kinds"] == json!([39001]) && *r.admins_down.lock().unwrap() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut evs = r.query_reply.lock().unwrap().clone();
+    if let Some(authors) = q[0]["authors"].as_array() {
+        evs.retain(|e| authors.contains(&e["pubkey"]));
+    }
+    if let Some(ids) = q[0]["#e"].as_array() {
+        let tags = |e: &Value| e["tags"].as_array().cloned().unwrap_or_default();
+        evs.retain(|e| tags(e).iter().any(|t| t[0] == "e" && ids.contains(&t[1])));
+    }
+    if let Some(ids) = q[0]["ids"].as_array() {
+        evs.retain(|e| ids.contains(&e["id"]) && q[0]["#h"][0] == json!(tag_value(e, "h")));
+    }
+    if let Some(until) = q[0]["until"].as_u64() {
+        evs.retain(|e| e["created_at"].as_u64().unwrap() <= until);
+    }
+    let limit = q[0]["limit"].as_u64().unwrap_or(u64::MAX) as usize;
+    if evs.len() > limit {
+        evs.sort_by_key(|e| std::cmp::Reverse(e["created_at"].as_u64()));
+        evs.truncate(limit);
+    }
+    Ok(Json(evs))
+}
+
+async fn fake_nip11(State(r): State<Arc<Relay>>) -> Json<Value> {
+    Json(json!({ "self": r.keys.public_key().to_hex() }))
 }
 
 /// Serve the fake relay on a loopback port; returns the http base.
@@ -868,6 +919,7 @@ async fn fake_relay(relay: Arc<Relay>) -> String {
     let app = Router::new()
         .route("/events", post(fake_events))
         .route("/query", post(fake_query))
+        .route("/", get(fake_nip11))
         .with_state(relay);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -904,6 +956,9 @@ impl Bench {
             query_reply: Mutex::new(Vec::new()),
             queries: Mutex::new(Vec::new()),
             gone: Mutex::new(HashSet::new()),
+            keys: Keys::generate(),
+            admins_down: Mutex::new(false),
+            clock: Mutex::new(None),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
@@ -914,6 +969,7 @@ impl Bench {
             writer,
             root: root.clone(),
             agents: Vec::new(),
+            access: Vec::new(),
         };
         let (s, fresh) = load_state(&root);
         assert!(fresh);
@@ -1256,13 +1312,16 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
 #[tokio::test]
 async fn truncated_rebuild_is_reported() {
     let mut b = Bench::new(Gate::Open, &[]).await;
-    let stray = serde_json::to_value(kind9(&b.ctx.writer, b.now - 10, None)).unwrap();
-    *b.relay.query_reply.lock().unwrap() = vec![stray; RECOVER_LIMIT as usize];
+    // One more than every page holds.
+    let pages = RECOVER_LIMIT as usize * RECOVER_PAGES;
+    *b.relay.query_reply.lock().unwrap() = (0..=pages as u64)
+        .map(|i| serde_json::to_value(kind9(&b.ctx.writer, b.now - 10 - i, None)).unwrap())
+        .collect();
     let err = b.tick().await.unwrap_err();
     assert!(err.contains("rebuild truncated"), "{err}");
     // The partial map is kept and the next tick carries on.
     assert!(!b.s.needs_rebuild);
-    assert_eq!(b.s.strays.len(), RECOVER_LIMIT as usize);
+    assert_eq!(b.s.strays.len(), pages);
     b.tick().await.unwrap();
 }
 
@@ -1430,5 +1489,11 @@ fn exported_board_drops_all_validate() {
 }
 
 mod answers;
+mod channels;
 mod desktop_cards;
+mod one_tap;
+mod owner_signed;
+mod owner_word;
+mod receipts;
 mod routes;
+mod scoped;

@@ -276,6 +276,54 @@ test("relay-signed actor tag resolves the delegated timeline author", () => {
   assert.equal(message.author, "Delegated user");
 });
 
+test("a relay workflow post shows as the workflow, keeping its owner", () => {
+  const event = finalizeEvent(
+    {
+      kind: 9,
+      created_at: 1_700_000_000,
+      content: "@28 Day Orchestrator RECHECK",
+      tags: [
+        ["p", PUBKEY_B],
+        ["h", CHANNEL_ID],
+        ["buzz:workflow", "true"],
+        ["buzz:workflow-owner", PUBKEY_B],
+      ],
+    },
+    RELAY_SECRET,
+  );
+  const profiles = {
+    [PUBKEY_B]: {
+      displayName: "Workflow owner",
+      avatarUrl: "https://example.test/owner.png",
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+  };
+  const format = (relaySelf) =>
+    formatTimelineMessages(
+      [event],
+      null,
+      undefined,
+      null,
+      profiles,
+      undefined,
+      undefined,
+      undefined,
+      relaySelf,
+    )[0];
+
+  const message = format(RELAY_PUBKEY);
+  assert.equal(message.author, "Workflow");
+  assert.equal(message.isWorkflowPost, true);
+  assert.equal(message.avatarUrl, null);
+  assert.equal(message.pubkey, PUBKEY_B);
+
+  // Without a known relay identity the tag proves nothing.
+  const unverified = format(null);
+  assert.equal(unverified.isWorkflowPost, false);
+  assert.notEqual(unverified.author, "Workflow");
+});
+
 test("collectReactionActorPubkeys returns active kind:7 actors only", () => {
   const reactionId = `${"c".repeat(64)}`;
   const deletedReactionId = `${"d".repeat(64)}`;

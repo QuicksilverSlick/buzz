@@ -9,6 +9,9 @@
  *   click on the recorded option sends `option: null` (undo).
  * - A command error shows inline; read-only cards send nothing.
  * - The row hook matches only the live card signed by the writer key.
+ * - Plain fields show as chips and lines, the action as the command one tap
+ *   approves, details folded; a card without them renders as before.
+ * - Open thread shows on every card that has a thread.
  */
 
 import assert from "node:assert/strict";
@@ -61,6 +64,17 @@ function card(overrides = {}) {
     cardEventId: CARD_ID,
     answer: null,
     recorded: null,
+    updatedAt: "2026-10-12T10:00:00Z",
+    channelId: null,
+    project: null,
+    scoped: false,
+    needs: "you",
+    answerers: [],
+    ownerName: null,
+    recommend: null,
+    recommender: null,
+    reply: null,
+    request: null,
     ...overrides,
   };
 }
@@ -194,7 +208,10 @@ test("agent text renders inert: no markdown, no HTML, no unsafe links", async ()
     anchors.map((a) => [a.textContent, a.getAttribute("href")]),
     [["PR 42", "https://github.com/block/buzz/pull/42"]],
   );
-  assert.ok(screen.getByText("Critical"), "severity chip has a readable label");
+  assert.ok(
+    screen.getByText("Your decision"),
+    "severity chip has a readable label",
+  );
 });
 
 test("a click answers, shows Saving... until recorded, then the Recorded line", async () => {
@@ -208,7 +225,7 @@ test("a click answers, shows Saving... until recorded, then the Recorded line", 
     fireEvent.click(optionButton("1. Ship it"));
   });
   assert.deepEqual(answerCalls(), [
-    { itemId: "dreamforge/ship-it", option: 0 },
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: 0 },
   ]);
   assert.ok(screen.getByText("Saving..."));
   assert.equal(optionButton("1. Ship it").getAttribute("aria-busy"), "true");
@@ -248,7 +265,7 @@ test("clicking the recorded option undoes it with option: null", async () => {
     fireEvent.click(optionButton("2. Hold"));
   });
   assert.deepEqual(answerCalls(), [
-    { itemId: "dreamforge/ship-it", option: null },
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: null },
   ]);
   assert.ok(screen.getByText("Saving..."));
   await act(async () => {
@@ -357,4 +374,326 @@ test("row hook: only the writer-signed live card in #bench is a match", async ()
     1,
     "rows share one snapshot fetch",
   );
+});
+
+const CRAIG = "d".repeat(64);
+
+function scoped(overrides = {}) {
+  return card({
+    channelId: "105f15cc-1d5a-431a-9826-9402fba1a12b",
+    project: "reset",
+    scoped: true,
+    answerers: [{ pk: CRAIG, name: "Craig", role: "decider", agent: false }],
+    ownerName: "Quicksilver",
+    recommend: 2,
+    recommender: "Reset Worker",
+    ...overrides,
+  });
+}
+
+test("a scoped card shows who it is for, the recommendation and Other", async () => {
+  let others = 0;
+  await act(async () => {
+    render(
+      wrap(
+        benchCard({
+          card: scoped(),
+          onOther: () => {
+            others += 1;
+          },
+        }),
+      ),
+    );
+  });
+  assert.ok(screen.getByText("For Craig · Decider"));
+  const recommended = optionButton("2. Hold");
+  assert.equal(recommended.getAttribute("aria-label"), "2. Hold, recommended");
+  assert.ok(recommended.textContent.includes("Recommended"));
+  assert.equal(
+    optionButton("1. Ship it").getAttribute("aria-label"),
+    "1. Ship it",
+  );
+  await act(async () => {
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Other: reply in this card's thread",
+      }),
+    );
+  });
+  assert.equal(others, 1);
+  assert.equal(answerCalls().length, 0, "Other answers nothing itself");
+});
+
+test("Other is absent on a legacy card and without a thread to open", async () => {
+  const other = () => screen.queryByRole("button", { name: /^Other: reply/ });
+  for (const props of [
+    { card: card(), onOther: () => {} },
+    { card: scoped() },
+    { card: scoped({ cardEventId: null }), onOther: () => {} },
+  ]) {
+    await act(async () => {
+      render(wrap(benchCard(props)));
+    });
+    assert.equal(other(), null);
+    cleanup();
+  }
+});
+
+test("Craig's recorded answer: the owner overrides it, never undoes it", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  const craigs = scoped({
+    recorded: 0,
+    answer: {
+      option: 0,
+      answeredAt: 1,
+      by: CRAIG,
+      byName: "Craig",
+      byOwner: false,
+      source: "tap",
+    },
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: craigs })));
+  });
+  assert.ok(screen.getByText("Answer as owner (overrides)"));
+  assert.match(
+    screen.getByTestId("bench-card-recorded").textContent,
+    /^Recorded: 1\. Ship it · Craig · \S/,
+  );
+  await act(async () => {
+    fireEvent.click(optionButton("1. Ship it"));
+  });
+  assert.deepEqual(answerCalls(), [
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: 0 },
+  ]);
+  // Craig's 1 still shows: not yet the owner's answer.
+  assert.ok(screen.getByText("Saving..."));
+  await act(async () => {
+    view.rerender(
+      wrap(
+        benchCard({
+          card: scoped({
+            recorded: 0,
+            answer: {
+              option: 0,
+              answeredAt: 2,
+              by: OWNER,
+              byName: null,
+              byOwner: true,
+              source: "tap",
+            },
+          }),
+        }),
+      ),
+    );
+  });
+  assert.equal(screen.queryByText("Saving..."), null);
+  assert.equal(screen.queryByText("Answer as owner (overrides)"), null);
+  assert.match(
+    screen.getByTestId("bench-card-recorded").textContent,
+    /^Recorded: 1\. Ship it · Quicksilver · \S/,
+  );
+});
+
+test("a receipt shows the request, the answer and the outcome as inert text", async () => {
+  const request = scoped({
+    title: "Send the <b>new</b> email?",
+    options: ["Send the new email", "Keep the old one"],
+    cardEventId: null,
+    recorded: 0,
+    answer: {
+      option: 0,
+      answeredAt: 1,
+      by: CRAIG,
+      byName: "Craig",
+      byOwner: false,
+      source: "tap",
+    },
+  });
+  const receipt = card({
+    kind: "decision",
+    severity: null,
+    options: [],
+    decidedBy: "claude",
+    title: "Sent the **new** email",
+    body: "Live since 14:20. <img src=x onerror=alert(1)>",
+    links: [{ label: "PR 9", url: "https://github.com/x/y/pull/9" }],
+    channelId: request.channelId,
+    request,
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: receipt, onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  assert.equal(root.querySelector("img"), null);
+  assert.equal(root.querySelector("b"), null);
+  assert.ok(root.textContent.includes("Send the <b>new</b> email?"));
+  const chosen = optionButton("1. Send the new email");
+  assert.equal(chosen.disabled, true);
+  assert.equal(chosen.getAttribute("aria-pressed"), "true");
+  assert.equal(optionButton("2. Keep the old one").disabled, true);
+  assert.match(
+    screen.getByTestId("bench-card-answered").textContent,
+    /^Answered: 1\. Send the new email · Craig · \S/,
+  );
+  const outcome = screen.getByTestId("bench-card-outcome");
+  assert.match(outcome.textContent, /^Outcome · \S/);
+  assert.ok(outcome.textContent.includes("Sent the **new** email"));
+  assert.ok(outcome.textContent.includes("<img src=x onerror=alert(1)>"));
+  assert.ok(outcome.textContent.includes("Decided by claude"));
+  assert.deepEqual(
+    [...outcome.querySelectorAll("a")].map((a) => a.getAttribute("href")),
+    ["https://github.com/x/y/pull/9"],
+  );
+  assert.equal(screen.queryByRole("button", { name: /^Other: reply/ }), null);
+});
+
+test("a receipt's header shows where the decision stands, not the request's urgency", async () => {
+  const request = card({
+    kind: "pending",
+    severity: "critical",
+    options: ["Merge it", "Hold"],
+    cardEventId: null,
+    recorded: 1,
+  });
+  const receipt = card({
+    kind: "status",
+    state: "blocked",
+    severity: null,
+    options: [],
+    title: "Held",
+    request,
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: receipt, onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  const header = root.firstElementChild.textContent;
+  assert.ok(header.includes("Blocked"), header);
+  assert.ok(!header.includes("Your decision"), header);
+  assert.ok(!header.includes("Pending"), header);
+});
+
+test("a plain card shows its chips, lines, recommendation, action and folded details", async () => {
+  const merge =
+    "gh pr merge 711 --repo QuicksilverSlick/Metabolic-reset --squash";
+  let view;
+  await act(async () => {
+    view = render(
+      wrap(
+        benchCard({
+          card: scoped({
+            options: ["Merge PR", "Hold"],
+            recommend: 1,
+            plain: {
+              risk: "high",
+              undo: "hard",
+              reach: "3,089 members",
+              whatChanges: "The <b>new</b> check goes live.",
+              askedBy: "Reset Worker",
+              ifYouWait: "Members keep the old check.",
+              confidence: "high",
+              why: "CI is green.",
+              details: "Full notes **here**",
+            },
+            action: merge,
+            backToYou: true,
+            previousAnswer: {
+              option: 1,
+              label: "Hold",
+              byName: null,
+              answeredAt: 1,
+            },
+          }),
+          onOther: () => {},
+        }),
+      ),
+    );
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  for (const text of [
+    "Back to you",
+    "High risk",
+    "Hard to undo",
+    "Reach: 3,089 members",
+    "Recommended: 1. Merge PR · high confidence · CI is green.",
+  ]) {
+    assert.ok(screen.getByText(text), text);
+  }
+  assert.match(root.textContent, /Earlier: Quicksilver chose Hold · \S/);
+  assert.ok(
+    root.textContent.includes("What changes: The <b>new</b> check goes live."),
+  );
+  assert.equal(root.querySelector("b"), null, "plain text stays inert");
+  assert.ok(root.textContent.includes("Asked by: Reset Worker"));
+  assert.ok(
+    root.textContent.includes("If you wait: Members keep the old check."),
+  );
+  const action = screen.getByTestId("bench-card-action");
+  assert.equal(action.textContent, `If you choose Merge PR: ${merge}`);
+  assert.equal(action.querySelector("code").textContent, merge);
+  const details = root.querySelector("details");
+  assert.equal(details.open, false, "details start folded");
+  assert.equal(details.querySelector("summary").textContent, "Details");
+  assert.ok(details.textContent.includes("Full notes **here**"));
+});
+
+test("a card without plain fields shows none of them", async () => {
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: scoped({ recommend: 1 }) })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  assert.equal(root.querySelector("details"), null);
+  assert.equal(screen.queryByTestId("bench-card-action"), null);
+  assert.equal(screen.queryByText("Back to you"), null);
+  assert.doesNotMatch(root.textContent, /risk|chose|What changes/);
+});
+
+test("Open thread is on question, status and receipt cards with a thread", async () => {
+  const thread = () => screen.queryByRole("button", { name: "Open thread" });
+  const receipt = card({
+    kind: "status",
+    options: [],
+    state: "done",
+    request: scoped({ cardEventId: null }),
+  });
+  for (const shown of [
+    card(),
+    card({ kind: "status", options: [], state: "blocked" }),
+    receipt,
+  ]) {
+    let opened = 0;
+    await act(async () => {
+      render(
+        wrap(
+          benchCard({
+            card: shown,
+            onOther: () => {
+              opened += 1;
+            },
+          }),
+        ),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(thread());
+    });
+    assert.equal(opened, 1, shown.kind);
+    cleanup();
+  }
+  for (const props of [
+    { card: card({ cardEventId: null }), onOther: () => {} },
+    { card: { ...receipt, cardEventId: null }, onOther: () => {} },
+    { card: card() },
+  ]) {
+    await act(async () => {
+      render(wrap(benchCard(props)));
+    });
+    assert.equal(thread(), null);
+    cleanup();
+  }
 });

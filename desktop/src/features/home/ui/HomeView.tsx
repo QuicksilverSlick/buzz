@@ -379,6 +379,7 @@ export function HomeView({
       getMessageReadAt,
       getThreadReadAt,
       profiles: feedProfiles,
+      relaySelfPubkey,
     });
     return filterInboxItems(items);
   }, [
@@ -390,6 +391,7 @@ export function HomeView({
     getMessageReadAt,
     getThreadReadAt,
     readStateVersion,
+    relaySelfPubkey,
   ]);
   const { effectiveDoneSet, markItemRead, markItemUnread } =
     useHomeInboxReadState({

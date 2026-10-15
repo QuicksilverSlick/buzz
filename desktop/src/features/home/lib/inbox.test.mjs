@@ -594,3 +594,35 @@ test("nested-anchor: old selected event stays resolvable by conversationId after
   // The new representative is the latest reply.
   assert.equal(inboxItem.id, LATEST_EVENT_ID);
 });
+
+test("a relay workflow post shows as the workflow, not the relay's key", () => {
+  const relay = "a".repeat(64);
+  const owner = "b".repeat(64);
+  const post = item({
+    pubkey: relay,
+    content: "@28 Day Orchestrator RECHECK",
+    tags: [
+      ["p", owner],
+      ["h", CHANNEL_ID],
+      ["buzz:workflow", "true"],
+      ["buzz:workflow-owner", owner],
+    ],
+  });
+
+  const [workflowItem] = buildInboxItems({
+    channels,
+    feed: feedWith({ mentions: [post] }),
+    relaySelfPubkey: relay,
+  });
+  assert.equal(workflowItem.senderLabel, "Workflow");
+  assert.equal(workflowItem.isWorkflowPost, true);
+
+  // The same tags from any other signer are only tags.
+  const [forged] = buildInboxItems({
+    channels,
+    feed: feedWith({ mentions: [{ ...post, pubkey: owner }] }),
+    relaySelfPubkey: relay,
+  });
+  assert.notEqual(forged.senderLabel, "Workflow");
+  assert.equal(forged.isWorkflowPost, false);
+});

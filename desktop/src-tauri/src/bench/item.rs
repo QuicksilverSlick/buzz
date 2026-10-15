@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) use super::plain::Plain;
+
 /// Writer folder of the one-time claude.ai board import. Its decisions keep
 /// the owner's own `decidedBy` values and its cards never ping him.
 pub(crate) const MIGRATION_WRITER: &str = "claude-ai";
@@ -16,8 +18,8 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
     "3\u{FE0F}\u{20E3}",
     "4\u{FE0F}\u{20E3}",
 ];
-/// An answered card stays 24 h so late pills still land, then it is retired;
-/// also the attention clock on the board.
+/// An answered card holds a live slot 24 h so late pills still land, then it
+/// is a receipt only; also the attention clock on the board.
 pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
@@ -25,13 +27,14 @@ const TITLE_MAX: usize = 120;
 const BODY_MAX: usize = 4000;
 pub(crate) const NAME_MAX: usize = 32;
 const ID_MAX: usize = 64;
-const OPTION_MAX: usize = 80;
+pub(crate) const OPTION_MAX: usize = 80;
 const OPTIONS_MAX: usize = 4;
 const LINKS_MAX: usize = 4;
+const TO_MAX: usize = 8;
 const LABEL_MAX: usize = 40;
 const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
-const BOARD_TITLE_MAX: usize = 60;
+pub(crate) const BOARD_TITLE_MAX: usize = 60;
 /// U+FEFF, zero-width no-break space: invisible on both apps, and whitespace
 /// to the phone's regexes (Dart `\s`) and the desktop's emphasis rules
 /// (micromark's `/\s/`).
@@ -68,6 +71,47 @@ pub(crate) struct Drop {
     pub private: bool,
     #[serde(default)]
     pub deadline: Option<String>,
+    /// Step 1 scoping. `channel`, `replyTo` and `to` need a `project`, which
+    /// roles.json must bind to the writer folder (`roles::bind`).
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// The thread root the card is posted under.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub to: Option<To>,
+    /// Training slug: the kind of decision this is.
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// 1-based option the writer recommends.
+    #[serde(default)]
+    pub recommend: Option<usize>,
+    /// The plain-language layout (`plain::Plain`).
+    #[serde(default)]
+    pub plain: Option<Plain>,
+    /// The exact command the writer runs if the recommended option is chosen.
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// Who a scoped card asks, before the service resolves it to answerers.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct To {
+    #[serde(default)]
+    pub people: Vec<String>,
+    #[serde(default)]
+    pub role: Option<ToRole>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ToRole {
+    /// The project's Owner and Decider entries.
+    Decider,
+    Owner,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -123,31 +167,94 @@ pub(crate) enum Needs {
     Delegable,
 }
 
-/// The approver's answer on a pending item, derived from a kind-7 reaction.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// The answer on a pending item, derived from a keycap tap (or, on a scoped
+/// card, a thread reply naming an option).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Answer {
-    /// The approver's kind-7 id: the change key.
+    /// The answering event's id: the change key.
     pub reaction_id: String,
     /// 0-based index into `options`.
     pub option: usize,
     /// Bench clock when first seen.
     pub answered_at: u64,
+    /// The answerer's hex; "" on answers recorded before step 1.
+    #[serde(default)]
+    pub by: String,
+    /// A stamped answerer's roster name; None: the owner's own keys.
+    #[serde(default)]
+    pub by_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<AnswerRole>,
+    #[serde(default)]
+    pub source: AnswerSource,
+    /// Local HH:MM when recorded; "" before step 1.
+    #[serde(default)]
+    pub hhmm: String,
 }
 
-/// An answer change waits this long before it is routed, so an untap and a
-/// new tap (how the owner changes an answer) reach the agent as one notice.
-pub(crate) const ROUTE_SETTLE_SECS: u64 = 120;
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AnswerSource {
+    #[default]
+    Tap,
+    Reply,
+}
 
-/// The last answer notice sent to the writer's route target.
+/// The newest free-text reply on a scoped card from someone who may answer
+/// it: their "Other", routed to the writer like an answer.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Routed {
-    /// 0-based option the notice announced; None: a withdrawal.
-    pub option: Option<usize>,
-    pub to: String,
+pub(crate) struct Reply {
     pub event_id: String,
+    pub by: String,
+    /// None: the owner's own keys.
+    pub by_name: Option<String>,
+    pub role: Option<AnswerRole>,
     pub at: u64,
+    pub hhmm: String,
+}
+
+/// Who may answer a scoped card, resolved by the service (`roles::stamp`)
+/// and folded into its card_hash. The owner's own keys are implicit.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Stamp {
+    /// "": the card says "the owner".
+    pub owner_name: String,
+    /// Roster name of the writer's own key, for the Recommended line.
+    pub recommender: Option<String>,
+    pub answerers: Vec<Answerer>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Answerer {
+    pub pk: String,
+    pub name: String,
+    pub role: AnswerRole,
+    pub agent: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AnswerRole {
+    Owner,
+    Decider,
+}
+
+/// The answer a card came back from: the writer asked again after it
+/// (`carry_card`), so the card says "Back to you" and pings this answerer.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Previous {
+    /// 0-based, and the option's text as it was.
+    pub option: usize,
+    pub label: String,
+    /// The answerer's hex; "" on answers recorded before step 1.
+    pub by: String,
+    pub by_name: Option<String>,
+    pub answered_at: u64,
 }
 
 /// A validated drop, namespaced by writer, as kept in state.json.
@@ -170,6 +277,23 @@ pub(crate) struct Item {
     pub links: Vec<Link>,
     pub needs: Needs,
     pub deadline: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// None: #bench. `roles::bind` fills in the project's first channel.
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub to: Option<To>,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub recommend: Option<usize>,
+    #[serde(default)]
+    pub plain: Option<Plain>,
+    #[serde(default)]
+    pub action: Option<String>,
     pub hash: String,
     pub updated_at: String,
     #[serde(default)]
@@ -188,6 +312,67 @@ pub(crate) struct Item {
     /// Bench clock of the last answer change: a new reaction or a clear.
     #[serde(default)]
     pub changed_at: u64,
+    /// Some iff scoped; set by the service, never by a drop.
+    #[serde(default)]
+    pub stamp: Option<Stamp>,
+    #[serde(default)]
+    pub reply: Option<Reply>,
+    /// Scoped: the hex already p-tagged for this Drop.
+    #[serde(default)]
+    pub pinged: Vec<String>,
+    /// The name the live card's Recorded line shows; None: the legacy line.
+    #[serde(default)]
+    pub recorded_by: Option<String>,
+    /// The reply event id last routed to the writer's route target.
+    #[serde(default)]
+    pub routed_reply: Option<String>,
+    /// Someone answered or replied on this Drop's card, even if that was
+    /// taken back since (set by `restamp`): a new stamp edits the card in
+    /// place, never reposts it.
+    #[serde(default)]
+    pub was_engaged: bool,
+    /// A receipt: the pending item as this close-out found it. Its card
+    /// stays, edited to show the answer and this item as the outcome.
+    #[serde(default)]
+    pub request: Option<Box<Item>>,
+    /// Set by the service, never by a drop.
+    #[serde(default)]
+    pub previous: Option<Previous>,
+    /// An owner's notice signed and not yet known to be on the relay.
+    #[serde(default)]
+    pub owner_sent: Option<OwnerSent>,
+    /// The item this re-ask replaced (`carry_card`) while the owner's word
+    /// told on its card is not yet ended there (`render_owner_ended`), or
+    /// the one this close-out closed while an owner's notice there is in
+    /// flight or an approval its answer no longer matches is not yet taken
+    /// back (`render_owner_withdrawal`). This item's own notices wait for
+    /// it, so it never holds one of its own.
+    #[serde(default)]
+    pub ends: Option<Box<Item>>,
+}
+
+impl Item {
+    /// Uses a step 1 field. Only these get the new card lines, named
+    /// answerers and Other; every other drop keeps today's card exactly.
+    pub(crate) fn scoped(&self) -> bool {
+        self.project.is_some() || self.decision.is_some() || self.recommend.is_some()
+    }
+
+    /// Someone answered or replied: its card is a record now, never deleted.
+    pub(crate) fn engaged(&self) -> bool {
+        self.answer.is_some() || self.reply.is_some()
+    }
+
+    /// The owner's approval was the last notice told on this card, or an
+    /// owner's notice here is signed and not yet known to be on the relay.
+    pub(crate) fn owner_told(&self) -> bool {
+        self.owner_sent.is_some() || self.routed.as_ref().is_some_and(|r| r.owner)
+    }
+
+    /// Asked again after an answer, and waiting again.
+    pub(crate) fn back_to_you(&self) -> bool {
+        self.kind == ItemKind::Pending && self.previous.is_some() && self.answer.is_none()
+    }
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,max-1}$`: writer, id and area. Writer and area,
@@ -200,7 +385,7 @@ pub(crate) fn valid_name(s: &str, max: usize) -> bool {
         && s.chars().all(|c| plain(c) || c == '-')
 }
 
-fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
+pub(crate) fn valid_text(s: &str, max_chars: usize, field: &str) -> Result<(), String> {
     if s.chars().count() > max_chars {
         return Err(format!("{field}: longer than {max_chars} chars"));
     }
@@ -245,6 +430,16 @@ fn valid_uuid(s: &str) -> bool {
             19 => matches!(c.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+/// A channel id as Buzz writes it, so it compares as a plain string.
+pub(crate) fn valid_channel(s: &str) -> bool {
+    valid_uuid(s) && !s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// A pubkey or event id as Buzz writes it.
+pub(crate) fn valid_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Exactly `channel=<uuid>&id=<64hex>`: no path, fragment, userinfo, port,
@@ -318,7 +513,7 @@ pub(crate) fn validate(
     raw: &str,
     now_iso: &str,
 ) -> Result<Item, String> {
-    let d: Drop = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let mut d: Drop = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if !valid_name(writer, NAME_MAX) {
         return Err(format!("writer {writer:?}: not [a-z0-9][a-z0-9-]{{0,31}}"));
     }
@@ -334,13 +529,26 @@ pub(crate) fn validate(
     for o in &d.options {
         valid_text(o, OPTION_MAX, "option")?;
         // Printed through plain_text: an emoji-only option would leave the
-        // owner a bare "1." beside its keycap.
-        if !plain_text(o, usize::MAX)
-            .bytes()
-            .any(|b| b.is_ascii_alphanumeric())
-        {
+        // owner a bare "1." beside its keycap, and a label without a letter
+        // ("2", "'1'") reads as another option's ("chose: 1", a reply "1").
+        let plain = plain_text(o, usize::MAX);
+        if !plain.bytes().any(|b| b.is_ascii_alphanumeric()) {
             return Err("option: no plain letters or digits".to_string());
         }
+        if !plain.bytes().any(|b| b.is_ascii_alphabetic()) {
+            return Err("option: a label needs a word, not just a number".to_string());
+        }
+    }
+    // As printed and as a reply names them (`answer_option`), each option
+    // reads apart: "chose: <label>" must name one.
+    let mut read: Vec<String> = d
+        .options
+        .iter()
+        .map(|o| plain_text(o, usize::MAX).to_ascii_lowercase())
+        .collect();
+    read.sort();
+    if read.windows(2).any(|w| w[0] == w[1]) {
+        return Err("option: two options read the same".to_string());
     }
     match d.kind {
         ItemKind::Pending => {
@@ -388,6 +596,8 @@ pub(crate) fn validate(
         valid_text(&l.label, LABEL_MAX, "link label")?;
         valid_link(l)?;
     }
+    validate_scope(&mut d)?;
+    super::plain::validate(d.plain.as_ref(), d.action.as_deref(), d.recommend.is_some())?;
     let hash = version_hash(&d);
     Ok(Item {
         id: format!("{writer}/{id}"),
@@ -405,6 +615,14 @@ pub(crate) fn validate(
         links: d.links,
         needs: d.needs,
         deadline,
+        project: d.project,
+        channel: d.channel,
+        reply_to: d.reply_to,
+        to: d.to,
+        decision: d.decision,
+        recommend: d.recommend,
+        plain: d.plain,
+        action: d.action,
         hash,
         updated_at: now_iso.to_string(),
         card: None,
@@ -413,7 +631,70 @@ pub(crate) fn validate(
         quiet_repost: false,
         routed: None,
         changed_at: 0,
+        stamp: None,
+        reply: None,
+        pinged: Vec::new(),
+        recorded_by: None,
+        routed_reply: None,
+        was_engaged: false,
+        request: None,
+        previous: None,
+        owner_sent: None,
+        ends: None,
     })
+}
+
+/// The step 1 fields' shape only; whether roles.json lets this writer use
+/// them is `roles::bind`. `to.people` is sorted so its order never changes
+/// the hash.
+fn validate_scope(d: &mut Drop) -> Result<(), String> {
+    let slug = |field: &str, v: &Option<String>| match v {
+        Some(s) if !valid_name(s, NAME_MAX) => {
+            Err(format!("{field} {s:?}: not [a-z0-9][a-z0-9-]{{0,31}}"))
+        }
+        _ => Ok(()),
+    };
+    slug("project", &d.project)?;
+    slug("decision", &d.decision)?;
+    if d.project.is_none() {
+        for (set, field) in [
+            (d.channel.is_some(), "channel"),
+            (d.reply_to.is_some(), "replyTo"),
+            (d.to.is_some(), "to"),
+        ] {
+            if set {
+                return Err(format!("{field}: requires project"));
+            }
+        }
+    }
+    if let Some(c) = d.channel.as_deref().filter(|c| !valid_channel(c)) {
+        return Err(format!("channel {c:?}: not a lowercase RFC uuid"));
+    }
+    if let Some(r) = d.reply_to.as_deref().filter(|r| !valid_hex64(r)) {
+        return Err(format!("replyTo {r:?}: not 64 lowercase hex"));
+    }
+    if let Some(to) = &mut d.to {
+        if to.people.is_empty() && to.role.is_none() {
+            return Err("to: people or role is required".to_string());
+        }
+        if to.people.len() > TO_MAX {
+            return Err(format!("to: more than {TO_MAX} people"));
+        }
+        if let Some(pk) = to.people.iter().find(|pk| !valid_hex64(pk)) {
+            return Err(format!("to: {pk:?} is not 64 lowercase hex"));
+        }
+        to.people.sort();
+        to.people.dedup();
+    }
+    if let Some(n) = d.recommend {
+        if d.kind != ItemKind::Pending {
+            return Err("recommend is for pending items only".to_string());
+        }
+        if !(1..=d.options.len()).contains(&n) {
+            return Err(format!("recommend {n}: not 1 to {}", d.options.len()));
+        }
+    }
+    Ok(())
 }
 
 /// Content hash independent of JSON key order, id and updatedAt, so
@@ -422,7 +703,7 @@ pub(crate) fn version_hash(d: &Drop) -> String {
     fn j<T: Serialize>(v: &T) -> String {
         serde_json::to_string(v).unwrap_or_default()
     }
-    let parts = [
+    let mut parts = vec![
         j(&d.kind),
         j(&d.title),
         j(&d.body),
@@ -437,6 +718,23 @@ pub(crate) fn version_hash(d: &Drop) -> String {
         j(&d.needs),
         j(&d.deadline),
     ];
+    // Only when set, so a drop without them hashes as it always has: a hash
+    // change reposts the card and clears its answer.
+    let scope = [
+        ("project", d.project.as_ref().map(j)),
+        ("channel", d.channel.as_ref().map(j)),
+        ("replyTo", d.reply_to.as_ref().map(j)),
+        ("to", d.to.as_ref().map(j)),
+        ("decision", d.decision.as_ref().map(j)),
+        ("recommend", d.recommend.as_ref().map(j)),
+        ("plain", d.plain.as_ref().map(j)),
+        ("action", d.action.as_ref().map(j)),
+    ];
+    parts.extend(
+        scope
+            .into_iter()
+            .filter_map(|(k, v)| Some(format!("{k}={}", v?))),
+    );
     short_hash(parts.join("\u{1f}").as_bytes())
 }
 
@@ -582,21 +880,203 @@ fn state_name(s: StatusState) -> &'static str {
 /// and keeps its answer and its 24 h keep. 3: title and options moved out of
 /// the fence, which the phone draws as unwrapped monospace, and the summary
 /// left in it is hard-wrapped. 4: the summary leaves the fence, a grey code
-/// box on the phone, for its own paragraph of prose().
+/// box on the phone, for its own paragraph of prose(). Scoped cards and
+/// receipts came without a bump: no unscoped card's text changed.
 pub(crate) const CARD_FORMAT: u32 = 4;
 
-/// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`.
-/// Cards posted before CARD_FORMAT existed carry the bare Drop hash.
+/// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`,
+/// or `<Drop hash>.<stamp>.<CARD_FORMAT>` once it has a stamp, so a roster
+/// change reposts an unanswered card while unstamped markers stay as they
+/// were. Cards posted before CARD_FORMAT existed carry the bare Drop hash.
 pub(crate) fn card_hash(item: &Item) -> String {
-    format!("{}.{CARD_FORMAT}", item.hash)
+    match &item.stamp {
+        None => format!("{}.{CARD_FORMAT}", item.hash),
+        Some(st) => {
+            let json = serde_json::to_string(st).unwrap_or_default();
+            let stamp = short_hash(json.as_bytes());
+            format!("{}.{}.{CARD_FORMAT}", item.hash, &stamp[..8])
+        }
+    }
 }
 
-/// Card text: marker line, the title in bold, the summary as its own
-/// paragraph of prose() (agent text stays inert), the options as a numbered
-/// list, then the validated deadline and links so the phone can open them,
-/// and on an unanswered pending card the line that says how to answer.
-/// Everything but the summary and the url goes through plain_text.
+/// Card text: "Back to you" on a card asked again, the request
+/// (`card_head`), then on an unanswered pending card the line that says how
+/// to answer, `as of`, and the Recorded trailer.
+/// A scoped card says who it is for instead, adds the recommendation, names
+/// who answered and ends with the Other line. A receipt is
+/// `render_receipt`. Names go through plain_title like every board line.
 pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
+    if let Some(request) = &item.request {
+        return render_receipt(request, item, hhmm);
+    }
+    // The first line is what the phone's notification shows.
+    let titled = plain_text(&item.title, usize::MAX)
+        .to_ascii_lowercase()
+        .starts_with("back to you");
+    let mut out = if item.back_to_you() && !titled {
+        "Back to you\n".to_string()
+    } else {
+        String::new()
+    };
+    out.push_str(&card_head(item));
+    let pending = item.kind == ItemKind::Pending;
+    let scoped = pending && item.scoped();
+    let tap = "Tap one number below to answer.";
+    if scoped {
+        out.push_str(&format!("\n{}", for_line(item)));
+        if item.answer.is_none() {
+            out.push_str(&format!(" {tap}"));
+        }
+        out.push_str(&recommended(item));
+    } else if pending && item.answer.is_none() {
+        out.push_str(&format!("\n{tap}"));
+    }
+    out.push_str(&format!("\nas of {hhmm}"));
+    if let Some(a) = &item.answer {
+        if let Some(o) = item.options.get(a.option) {
+            let tail = if scoped {
+                let at = if a.hhmm.is_empty() { hhmm } else { &a.hhmm };
+                format!("{} \u{b7} {at}", shown_name(item, a.by_name.as_deref()))
+            } else {
+                hhmm.to_string()
+            };
+            out.push_str(&format!(
+                "\nRecorded: {}. {} \u{b7} {tail}",
+                a.option + 1,
+                plain_title(o)
+            ));
+        }
+    }
+    // The phone has no Other button: a reply in the thread is the answer.
+    if scoped {
+        out.push_str("\nOr reply in this thread.");
+    }
+    out
+}
+
+/// A closed card: the request as it was asked, what was answered, then the
+/// close-out drop as its Outcome, appended so the question is never lost.
+fn render_receipt(request: &Item, outcome: &Item, hhmm: &str) -> String {
+    let mut out = card_head(request);
+    out.push_str(&recommended(request));
+    // An answer recorded before step 1 has no time of its own.
+    let by = |name: Option<&str>, at: &str| {
+        let mut s = String::new();
+        if request.scoped() {
+            s.push_str(&format!(" \u{b7} {}", shown_name(request, name)));
+        }
+        if !at.is_empty() {
+            s.push_str(&format!(" \u{b7} {at}"));
+        }
+        s
+    };
+    let answered = match (&request.answer, &request.reply) {
+        (Some(a), _) => request.options.get(a.option).map(|o| {
+            let by = by(a.by_name.as_deref(), &a.hhmm);
+            format!("{}. {}{by}", a.option + 1, plain_title(o))
+        }),
+        (None, Some(r)) => Some(format!(
+            "Other, in this thread{}",
+            by(r.by_name.as_deref(), &r.hhmm)
+        )),
+        (None, None) => None,
+    };
+    let answered = answered.unwrap_or_else(|| "no answer recorded".to_string());
+    out.push_str(&format!("\nAnswered: {answered}"));
+    let state = outcome
+        .state
+        .map(|s| format!("{} \u{b7} ", state_name(s)))
+        .unwrap_or_default();
+    out.push_str(&format!("\n\nOutcome \u{b7} {state}{hhmm}"));
+    let title = plain_text(&outcome.title, usize::MAX);
+    if !title.is_empty() {
+        out.push_str(&format!("\n**{title}**"));
+    }
+    if !outcome.body.trim().is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&prose(&summary(&outcome.body)));
+        out.push('\n');
+    }
+    for l in &outcome.links {
+        let label = plain_text(&l.label, usize::MAX);
+        out.push_str(&format!("\n{label}: {}", l.url));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// "For: Craig or Quicksilver (owner)."
+fn for_line(item: &Item) -> String {
+    let names: Vec<String> = item
+        .stamp
+        .iter()
+        .flat_map(|s| &s.answerers)
+        .map(|a| plain_title(&a.name))
+        .collect();
+    let owner = owner_text(item);
+    if names.is_empty() {
+        return format!("For: {owner}.");
+    }
+    format!("For: {} or {owner}.", names.join(", "))
+}
+
+fn recommended(item: &Item) -> String {
+    let Some(n) = item.recommend else {
+        return String::new();
+    };
+    let who = item
+        .stamp
+        .as_ref()
+        .and_then(|s| s.recommender.as_deref())
+        .map_or(item.writer.clone(), plain_title);
+    let tail = super::plain::recommended_tail(item, n);
+    format!("\nRecommended: {n} ({who}){tail}")
+}
+
+/// The owner's name from roles.json, if it named one.
+fn owner_name(item: &Item) -> Option<String> {
+    let s = item.stamp.as_ref()?;
+    Some(plain_title(&s.owner_name)).filter(|n| !n.is_empty())
+}
+
+/// "Quicksilver (owner)", or "the owner".
+fn owner_text(item: &Item) -> String {
+    owner_name(item).map_or("the owner".to_string(), |n| format!("{n} (owner)"))
+}
+
+/// Who answered, as a card names them: the stamped answerer's name, else
+/// (the owner's own keys) the owner's.
+fn shown_name(item: &Item, by_name: Option<&str>) -> String {
+    by_name
+        .map(plain_title)
+        .or_else(|| owner_name(item))
+        .unwrap_or_else(|| "the owner".to_string())
+}
+
+/// Who answered, with their role, as a notice names them.
+pub(crate) fn answerer_text(
+    item: &Item,
+    by_name: Option<&str>,
+    role: Option<AnswerRole>,
+) -> String {
+    let role = role.map(|r| match r {
+        AnswerRole::Owner => "owner",
+        AnswerRole::Decider => "decider",
+    });
+    match (by_name, role) {
+        (Some(n), Some(r)) => format!("{} ({r})", plain_title(n)),
+        (Some(n), None) => plain_title(n),
+        (None, _) => owner_text(item),
+    }
+}
+
+/// The request as a card shows it: marker line, the title in bold, the
+/// summary as its own paragraph of prose() (agent text stays inert), the
+/// plain-language lines (`plain::lines`), the options as a numbered list,
+/// then the validated deadline and links so the
+/// phone can open them. Everything but the summary and the url goes through
+/// plain_text.
+fn card_head(item: &Item) -> String {
     let mut out = format!(
         "{} \u{b7} {} \u{b7} {}",
         marker(item),
@@ -617,6 +1097,11 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
         out.push_str(&prose(&summary(&item.body)));
         out.push('\n');
     }
+    let plain = super::plain::lines(item);
+    if !plain.is_empty() {
+        out.push_str(&plain);
+        out.push('\n');
+    }
     if item.kind == ItemKind::Pending {
         for (i, o) in item.options.iter().enumerate() {
             out.push_str(&format!("\n{}. {}", i + 1, plain_text(o, usize::MAX)));
@@ -632,20 +1117,6 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
         let label = plain_text(&l.label, usize::MAX);
         out.push_str(&format!("\n{label}: {}", l.url));
     }
-    if item.kind == ItemKind::Pending && item.answer.is_none() {
-        out.push_str("\nTap one number below to answer.");
-    }
-    out.push_str(&format!("\nas of {hhmm}"));
-    // Through plain_title like every board line.
-    if let Some(a) = &item.answer {
-        if let Some(o) = item.options.get(a.option) {
-            out.push_str(&format!(
-                "\nRecorded: {}. {} \u{b7} {hhmm}",
-                a.option + 1,
-                plain_title(o)
-            ));
-        }
-    }
     out
 }
 
@@ -658,93 +1129,66 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
         && item.writer != MIGRATION_WRITER
 }
 
-/// Whether the route target is owed a notice: the answer has settled and is
-/// not the one it was last told. A clear that was never routed owes nothing;
-/// a re-tap of the told option is no change.
-pub(crate) fn route_due(item: &Item, now: u64) -> bool {
-    let want = item.answer.as_ref().map(|a| a.option);
-    let told = item.routed.as_ref().map(|r| r.option);
-    told.map_or(want.is_some(), |t| t != want)
-        && now.saturating_sub(item.changed_at) >= ROUTE_SETTLE_SECS
+/// Who to p-tag on a new card. Owner-only cards keep today's rule; a card
+/// with answerers pings its humans, and its agents only when it is
+/// delegable, each once per Drop. A card that came back also pings whoever
+/// answered it last, once per Drop, while they may still answer it.
+pub(crate) fn card_pings(item: &Item, owner_hex: &str, owner_set: &[String]) -> Vec<String> {
+    let answerers = item.stamp.as_ref().map_or(&[][..], |s| &s.answerers);
+    let mut pings: Vec<String> = if answerers.is_empty() {
+        // A scoped Drop's `pinged` says whether the owner was pinged yet, so
+        // a card that loses its answerers still reaches him once.
+        let told = if item.scoped() {
+            item.pinged.iter().any(|p| p == owner_hex)
+        } else {
+            item.quiet_repost
+        };
+        (ping_owner(item) && !told)
+            .then(|| owner_hex.to_string())
+            .into_iter()
+            .collect()
+    } else {
+        answerers
+            .iter()
+            .filter(|a| {
+                (!a.agent || item.needs == Needs::Delegable) && !item.pinged.contains(&a.pk)
+            })
+            .map(|a| a.pk.clone())
+            .collect()
+    };
+    let back = item.previous.as_ref().map(|p| match p.by.as_str() {
+        "" => owner_hex,
+        by => by,
+    });
+    if let Some(by) = back.filter(|by| {
+        eligible(item, by, owner_set) && !item.pinged.iter().chain(&pings).any(|p| p == by)
+    }) {
+        pings.push(by.to_string());
+    }
+    pings
 }
 
-/// The notice for the item's current answer; `prev` is the option the target
-/// was last told (None: never, or a withdrawal). Card text goes through
-/// plain_text as on the card: it is drop text, so the agent is pointed at the
-/// outbox file, which carries the owner's signed reaction.
-pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> String {
-    let id = &item.id;
-    let opt = |i: usize| {
-        let text = item.options.get(i).map(|o| plain_text(o, usize::MAX));
-        format!("{}. {}", i + 1, text.unwrap_or_default())
+/// The line that opens a card's thread from its text, for posts made once
+/// the card's own id is known; empty if the link fails the link rules.
+pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
+    let l = Link {
+        label: "Open thread".to_string(),
+        url: format!("buzz://message?channel={channel}&id={card_id}"),
     };
-    let head = format!("{id}\nCard: {}", plain_text(&item.title, usize::MAX));
-    let details =
-        format!("Answered {hhmm} by the owner. Details: outbox/{id}.json in the Bench folder.");
-    let clear = format!(
-        "reply in this thread, then clear the card by re-dropping {id} as a decision or status."
-    );
-    match (item.answer.as_ref().map(|a| a.option), prev) {
-        (Some(n), None) => format!(
-            "Bench answer \u{b7} {head}\nChosen: {}\n{details}\nAct on it, {clear}",
-            opt(n)
-        ),
-        (Some(n), Some(p)) => format!(
-            "Bench answer changed \u{b7} {head}\nChosen: {}\nWas: {}\n{details}\n\
-             Undo what you did for the old choice if it conflicts, {clear}",
-            opt(n),
-            opt(p)
-        ),
-        (None, Some(p)) => format!(
-            "Bench answer withdrawn \u{b7} {head}\nWas: {}\nThe owner cleared the answer at \
-             {hhmm}. Stop if you have not acted; if you have, say in this thread what to \
-             undo. Do not clear the card.",
-            opt(p)
-        ),
-        (None, None) => String::new(),
+    match valid_link(&l) {
+        Ok(()) => format!("\n{}: {}", l.label, l.url),
+        Err(_) => String::new(),
     }
 }
 
-/// The event a reaction is aimed at: its last `e` tag, how the relay scopes
-/// a reaction.
-pub(crate) fn reaction_target(e: &nostr::Event) -> Option<&str> {
-    e.tags
-        .iter()
-        .filter_map(|t| match t.as_slice() {
-            [k, v, ..] if k == "e" => Some(v.as_str()),
-            _ => None,
-        })
-        .last()
-}
-
-/// The answer on `item`'s live card: the NEWEST valid kind 7 by an approver
-/// other than the writer, aimed at the card by its `reaction_target` and
-/// echoing one seeded keycap byte-for-byte.
-/// Latest wins so a second tap changes the answer; a retraction is the
-/// reaction no longer coming back from the relay, which hands the answer to
-/// the next newest.
-pub(crate) fn pick_answer<'e>(
-    item: &Item,
-    events: &'e [nostr::Event],
-    approvers: &[String],
-    writer_hex: &str,
-) -> Option<(usize, &'e nostr::Event)> {
-    let card = item.card.as_ref()?;
-    let n = item.options.len().min(OPTION_EMOJI.len());
-    events
-        .iter()
-        .filter_map(|e| {
-            let pk = e.pubkey.to_hex();
-            let ok = e.kind.as_u16() == 7
-                && pk != writer_hex
-                && approvers.contains(&pk)
-                && reaction_target(e) == Some(card.event_id.as_str())
-                && e.verify().is_ok();
-            let i = OPTION_EMOJI[..n].iter().position(|o| *o == e.content)?;
-            ok.then_some((i, e))
-        })
-        .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
-}
+pub(crate) use super::pick::{
+    answer_option, eligible, owner_spoke, pick_answer, pick_reply, reaction_target, refused_taps,
+    root_until,
+};
+pub(crate) use super::route::{
+    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
+    route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
+};
 
 /// Board text. Stale and superseded items are folded (not rendered).
 pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64) -> String {
@@ -756,10 +1200,15 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
             .collect()
     };
     let by_area = |i: &&Item| (i.area.clone(), i.order, i.id.clone());
-    let (mut answered, mut pending): (Vec<&Item>, Vec<&Item>) = current(ItemKind::Pending)
+    let (mut answered, open): (Vec<&Item>, Vec<&Item>) = current(ItemKind::Pending)
         .into_iter()
         .partition(|i| i.answer.is_some());
+    // A card someone else may answer is not the owner's to-do.
+    let (mut waiting, mut pending): (Vec<&Item>, Vec<&Item>) = open
+        .into_iter()
+        .partition(|i| i.stamp.as_ref().is_some_and(|s| !s.answerers.is_empty()));
     pending.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
+    waiting.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
     answered.sort_by_key(|i| (i.answer.as_ref().map(|a| a.answered_at), i.id.clone()));
     let mut decisions = current(ItemKind::Decision);
     decisions.sort_by_key(by_area);
@@ -770,6 +1219,9 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
         "Bench \u{b7} as of {hhmm} \u{b7} needs you: {}",
         pending.len()
     );
+    if !waiting.is_empty() {
+        out.push_str(&format!(" \u{b7} waiting on others: {}", waiting.len()));
+    }
     if !answered.is_empty() {
         out.push_str(&format!(" \u{b7} answered: {}", answered.len()));
     }
@@ -779,22 +1231,54 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     out.push_str(
         "\nTo answer: tap one number under a card. To undo or change it, tap that number again first.",
     );
+    // A card lives in its item's channel; a receipt's in its request's.
     let link = |i: &Item| {
+        let ch = i.request.as_deref().unwrap_or(i).channel.as_deref();
+        let ch = ch.unwrap_or(channel);
         i.card
             .as_ref()
-            .map(|c| format!("buzz://message?channel={channel}&id={}", c.event_id))
+            .map(|c| format!("buzz://message?channel={ch}&id={}", c.event_id))
+    };
+    let target =
+        |i: &Item| link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
+    // A closed item's card: its question, answer and outcome.
+    let receipt = |i: &Item| {
+        link(i)
+            .filter(|_| i.request.is_some())
+            .map(|l| format!(" \u{b7} {l}"))
+            .unwrap_or_default()
     };
     // Bullets, not ordinals: a numbered line reads like an option keycap.
     section(
         &mut out,
         "Needs you",
         pending.iter().map(|i| {
-            let target = link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
             format!(
-                "- {} {} ({}) {target}",
+                "- {} {} ({}) {}",
                 marker(i),
                 plain_title(&i.title),
-                i.area
+                i.area,
+                target(i)
+            )
+        }),
+    );
+    section(
+        &mut out,
+        "Waiting on others",
+        waiting.iter().map(|i| {
+            let names: Vec<String> = i
+                .stamp
+                .iter()
+                .flat_map(|s| &s.answerers)
+                .map(|a| plain_title(&a.name))
+                .collect();
+            format!(
+                "- {} {} ({}) for {} {}",
+                marker(i),
+                plain_title(&i.title),
+                i.area,
+                names.join(", "),
+                target(i)
             )
         }),
     );
@@ -834,10 +1318,11 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
                 "(claude)"
             };
             format!(
-                "- {} {} ({}) {by}",
+                "- {} {} ({}) {by}{}",
                 marker(i),
                 plain_title(&i.title),
-                i.area
+                i.area,
+                receipt(i)
             )
         }),
     );
@@ -847,17 +1332,18 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
         status.iter().map(|i| {
             let state = i.state.map_or("?", state_name);
             format!(
-                "- {} {}: {} \u{2014} {state}",
+                "- {} {}: {} \u{2014} {state}{}",
                 marker(i),
                 i.area,
-                plain_title(&i.title)
+                plain_title(&i.title),
+                receipt(i)
             )
         }),
     );
     out
 }
 
-fn section(out: &mut String, name: &str, lines: impl Iterator<Item = String>) {
+pub(crate) fn section(out: &mut String, name: &str, lines: impl Iterator<Item = String>) {
     let mut lines = lines.peekable();
     if lines.peek().is_none() {
         return;

@@ -16,6 +16,7 @@ fn answered(option: usize, answered_at: u64) -> Option<Answer> {
         reaction_id: "ab".repeat(32),
         option,
         answered_at,
+        ..Default::default()
     })
 }
 
@@ -55,7 +56,7 @@ fn pick_answer_rules() {
     let mut item = check(&[]).unwrap();
     let no_card = [tap(&owner, &card_hex, OPTION_EMOJI[1], 10)];
     let owner_hex = [owner.public_key().to_hex()];
-    assert!(pick_answer(&item, &no_card, &owner_hex, "").is_none());
+    assert!(pick_answer(&item, &no_card, &owner_hex, "", None).is_none());
     item.card = Some(Posted {
         event_id: card_hex.clone(),
         created_at: 1,
@@ -70,7 +71,7 @@ fn pick_answer_rules() {
         .collect();
     let writer_hex = writer.public_key().to_hex();
     let pick = |evs: &[nostr::Event]| {
-        pick_answer(&item, evs, &approvers, &writer_hex).map(|(i, e)| (i, e.id.to_hex()))
+        pick_answer(&item, evs, &approvers, &writer_hex, None).map(|(i, e)| (i, e.id.to_hex()))
     };
 
     // A broken signature: the content changed after signing.
@@ -246,6 +247,9 @@ async fn owner_tap_records_answer_and_writes_outbox() {
             reaction_id: owner_tap.id.to_hex(),
             option: 1,
             answered_at: b.now,
+            by: b.owner_hex(),
+            hhmm: local_hhmm(b.now),
+            ..Default::default()
         })
     );
     assert_eq!(b.s.items[ITEM].recorded, Some(1));
@@ -257,6 +261,11 @@ async fn owner_tap_records_answer_and_writes_outbox() {
     assert_eq!(out["text"], json!("Move"));
     let reaction: nostr::Event = serde_json::from_value(out["reaction"].clone()).unwrap();
     assert!(reaction.verify().is_ok() && reaction.id == owner_tap.id);
+    // Who answered: the owner's own tap.
+    assert_eq!(out["answerer"], json!(b.owner_hex()));
+    assert_eq!(out["answererRole"], json!("owner"));
+    assert_eq!(out["eligible"], json!([]));
+    assert_eq!(out["source"], json!("tap"));
     assert_eq!(
         last_query(&b),
         json!([{
@@ -271,7 +280,13 @@ async fn owner_tap_records_answer_and_writes_outbox() {
     let posts = b.posts()[before..].to_vec();
     assert_eq!(b.kinds()[before..], [40003, 40003]);
     assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
-    assert!(text(&posts[0].0).ends_with("Recorded: 2. Move · 14:05"));
+    // The edit knows the card's id, so it links the card's thread.
+    let thread = format!(
+        "Open thread: buzz://message?channel={}&id={}",
+        b.channel(),
+        card.event_id
+    );
+    assert!(text(&posts[0].0).ends_with(&format!("Recorded: 2. Move · 14:05\n{thread}")));
     assert_eq!(tag_value(&posts[1].0, "e").unwrap(), board_id(&b));
     let board = text(&posts[1].0);
     assert!(
@@ -324,7 +339,7 @@ async fn retraction_unrecords_in_place_and_latest_wins() {
 }
 
 #[tokio::test]
-async fn answered_card_kept_24h_then_retired_never_reposted() {
+async fn answered_card_is_never_retired() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let card = b.card(ITEM);
     let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
@@ -335,27 +350,23 @@ async fn answered_card_kept_24h_then_retired_never_reposted() {
     b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
     b.settle(2).await;
     assert!(!b.kinds()[before..].iter().any(|k| matches!(k, 5 | 9)));
+    let old_board = board_id(&b);
     b.now += 86_401;
     let before = b.posts().len();
-    b.tick().await.unwrap();
-    // The retire, then the board repost pair.
-    let posts = b.posts()[before..].to_vec();
-    assert_eq!(b.kinds()[before..], [5, 9, 5]);
-    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
-    let item = &b.s.items[ITEM];
-    assert!(item.card.is_none() && item.recorded.is_none() && item.answer.is_some());
-    assert!(outbox(&b).is_some());
-    assert!(
-        text(&posts[1].0).contains("🟠 24h"),
-        "{:?}",
-        text(&posts[1].0)
-    );
-    let before = b.posts().len();
     b.settle(3).await;
-    assert!(!b.posts()[before..].iter().any(|(e, _)| {
-        tag_value(e, "client")
-            .is_some_and(|c| c.starts_with("bench:card:orchestrator/relay-choice"))
-    }));
+    // Only the day-old board is reposted, flagging the wait; the card stays.
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [9, 5]);
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), old_board);
+    assert!(
+        text(&posts[0].0).contains("🟠 24h"),
+        "{:?}",
+        text(&posts[0].0)
+    );
+    let item = &b.s.items[ITEM];
+    assert!(item.recorded == Some(1) && item.answer.is_some());
+    assert_eq!(b.card(ITEM).event_id, card.event_id);
+    assert!(outbox(&b).is_some());
 }
 
 #[tokio::test]
@@ -380,7 +391,7 @@ async fn recorded_edit_not_found_drops_card_keeps_answer() {
 }
 
 #[tokio::test]
-async fn ack_by_redrop_clears_answer_and_outbox() {
+async fn ack_by_redrop_clears_answer_and_keeps_the_old_card() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let card = b.card(ITEM);
     let owner_tap = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
@@ -393,14 +404,20 @@ async fn ack_by_redrop_clears_answer_and_outbox() {
         "relay-choice",
         &drop_json(&[("title", json!("Relay choice, reworded"))]),
     );
+    let old_board = board_id(&b);
     b.settle(3).await;
-    // The existing reword flow: the old card goes, the new one is reposted
-    // and seeded, the board follows; the tap on the old card counts no more.
-    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
+    // A new question after an answer: the answered card stays on the relay as
+    // it is, a new one is posted and seeded, the board follows; the tap on
+    // the old card counts no more.
+    let posts = b.posts()[before..].to_vec();
+    assert_eq!(b.kinds()[before..], [9, 7, 7, 9, 5]);
+    assert_eq!(tag_value(&posts[4].0, "e").unwrap(), old_board);
     let item = &b.s.items[ITEM];
     assert!(item.answer.is_none() && item.recorded.is_none());
     assert!(outbox(&b).is_none());
     assert_ne!(b.card(ITEM).event_id, card.event_id);
+    // A relaunch never adopts the old card back, so it is never retired.
+    assert_eq!(b.s.kept, [card.event_id]);
 }
 
 #[tokio::test]
@@ -541,6 +558,16 @@ async fn kept_answered_cards_count_against_max_cards() {
     assert!(b.s.items[ITEM].card.is_some());
     assert!(b.s.items["orchestrator/c28"].card.is_some());
     assert!(b.s.items["orchestrator/c29"].card.is_none());
+    // A day on it is a receipt only: it stays, and gives its slot back.
+    let card = b.card(ITEM).event_id;
+    let before = b.posts().len();
+    b.now += ANSWER_KEEP_SECS;
+    b.settle(4).await;
+    assert_eq!(b.card(ITEM).event_id, card);
+    assert!(b.s.items["orchestrator/c29"].card.is_some());
+    assert!(!b.posts()[before..]
+        .iter()
+        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
 }
 
 // ── Saying how to answer ────────────────────────────────────────────────

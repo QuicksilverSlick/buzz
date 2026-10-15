@@ -416,6 +416,35 @@ test("buildTimelineItems: consecutive same-author messages within the window are
   );
 });
 
+test("buildTimelineItems: a workflow post never groups with its owner's messages", () => {
+  // A workflow post keeps its owner as `pubkey` but shows as "Workflow".
+  const entries = [
+    entry({ id: "a", pubkey: "owner", createdAt: dayAt(2026, 6, 14) }),
+    entry({
+      id: "b",
+      pubkey: "owner",
+      isWorkflowPost: true,
+      createdAt: dayAt(2026, 6, 14, 12, 1),
+    }),
+    entry({
+      id: "c",
+      pubkey: "owner",
+      isWorkflowPost: true,
+      createdAt: dayAt(2026, 6, 14, 12, 2),
+    }),
+    entry({ id: "d", pubkey: "owner", createdAt: dayAt(2026, 6, 14, 12, 3) }),
+  ];
+
+  const messageItems = buildTimelineItems(entries, null).items.filter(
+    (item) => item.kind === "message",
+  );
+
+  assert.deepEqual(
+    messageItems.map((item) => item.isContinuation),
+    [false, false, true, false],
+  );
+});
+
 test("buildTimelineItems: pending messages remain standalone until acknowledged", () => {
   const entries = [
     entry({ id: "a", pubkey: "author-a", createdAt: dayAt(2026, 6, 14) }),

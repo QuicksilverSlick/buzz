@@ -18,6 +18,10 @@ import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
+import {
+  isRelayWorkflowPost,
+  WORKFLOW_POST_LABEL,
+} from "@/features/messages/lib/workflowPost";
 import { getMentionTagPubkey } from "@/shared/lib/resolveMentionNames";
 import {
   KIND_JOB_ACCEPTED,
@@ -475,24 +479,30 @@ export function formatTimelineMessages(
     const authorProfile = profiles?.[authorPubkey.toLowerCase()];
     const isAgent = role === "bot" || authorProfile?.isAgent === true;
     const ownerPubkey = isAgent ? (authorProfile?.ownerPubkey ?? null) : null;
+    // A workflow post keeps its owner as `pubkey` (the profile it opens) but
+    // shows as the workflow, not as the owner or the relay's nameless key.
+    const isWorkflowPost = isRelayWorkflowPost(event, relaySelfPubkey);
     return {
       id: event.id,
       renderKey: event.localKey ?? event.id,
       createdAt: event.created_at,
       pubkey: authorPubkey,
       signerPubkey: normalizePubkey(event.pubkey),
-      author,
+      author: isWorkflowPost ? WORKFLOW_POST_LABEL : author,
       isAgent,
+      isWorkflowPost,
       ownerPubkey,
       ownerLabel: isAgent
         ? formatOwnerLabel(ownerPubkey, currentPubkey, ownerProfiles)
         : null,
-      avatarUrl: getAuthorAvatarUrl({
-        authorPubkey,
-        currentPubkey,
-        currentUserAvatarUrl,
-        profiles,
-      }),
+      avatarUrl: isWorkflowPost
+        ? null
+        : getAuthorAvatarUrl({
+            authorPubkey,
+            currentPubkey,
+            currentUserAvatarUrl,
+            profiles,
+          }),
       role,
       personaDisplayName:
         role === "bot"

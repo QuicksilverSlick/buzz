@@ -61,8 +61,12 @@ import {
 import { MessageTimestamp } from "./MessageTimestamp";
 import { SentFromThreadLine } from "./SentFromThreadLine";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
+import { WorkflowAvatar } from "./WorkflowAvatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { useMessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
+import {
+  useAgentMentionPubkeysByName,
+  useMessageAgentAddressPrefix,
+} from "./MessageAgentAddressPrefix";
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
 export type ThreadDepthGuideAction = {
@@ -280,18 +284,10 @@ export const MessageRow = React.memo(
         : message.role;
     const isAuthorAgent =
       message.isAgent === true || profilePopoverRole === "bot";
-    const agentMentionPubkeysByName = React.useMemo(() => {
-      if (!mentionPubkeysByName) {
-        return undefined;
-      }
-      const values: Record<string, string> = {};
-      for (const [name, pubkey] of Object.entries(mentionPubkeysByName)) {
-        if (isKnownAgentPubkey(pubkey)) {
-          values[name] = pubkey;
-        }
-      }
-      return Object.keys(values).length > 0 ? values : undefined;
-    }, [isKnownAgentPubkey, mentionPubkeysByName]);
+    const agentMentionPubkeysByName = useAgentMentionPubkeysByName(
+      mentionPubkeysByName,
+      isKnownAgentPubkey,
+    );
     const agentAddressPrefix = useMessageAgentAddressPrefix({
       profiles,
       body: message.body,
@@ -383,8 +379,8 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
-    // Non-null only for a live Bench card in #bench signed by the Bench
-    // writer key (see benchRowState); every other row renders as before.
+    // Non-null only for a live Bench card in its own channel signed by the
+    // Bench writer key (see benchRowState); every other row renders as before.
     const benchCard = useBenchCardForMessage({
       channelId,
       id: message.id,
@@ -442,6 +438,7 @@ export const MessageRow = React.memo(
             return (
               <BenchCard
                 card={benchCard.card}
+                onOther={onReply ? () => onReply(message) : undefined}
                 ownerPubkey={benchCard.ownerPubkey}
                 viewerPubkey={currentPubkey}
               />
@@ -508,14 +505,18 @@ export const MessageRow = React.memo(
 
     const avatarNode = (
       <div className="relative shrink-0">
-        <UserAvatar
-          accent={message.accent}
-          avatarUrl={message.avatarUrl ?? null}
-          className="shrink-0"
-          displayName={message.author}
-          shape={isAuthorAgent ? "squircle" : "circle"}
-          testId="message-avatar"
-        />
+        {message.isWorkflowPost ? (
+          <WorkflowAvatar />
+        ) : (
+          <UserAvatar
+            accent={message.accent}
+            avatarUrl={message.avatarUrl ?? null}
+            className="shrink-0"
+            displayName={message.author}
+            shape={isAuthorAgent ? "squircle" : "circle"}
+            testId="message-avatar"
+          />
+        )}
         {showRespondToIndicator &&
         !hideAgentAccessBadge &&
         !isThreadReplyLayout ? (
@@ -980,6 +981,7 @@ export const MessageRow = React.memo(
     prev.message.body === next.message.body &&
     prev.message.author === next.message.author &&
     prev.message.isAgent === next.message.isAgent &&
+    prev.message.isWorkflowPost === next.message.isWorkflowPost &&
     prev.message.ownerPubkey === next.message.ownerPubkey &&
     prev.message.ownerLabel === next.message.ownerLabel &&
     prev.message.avatarUrl === next.message.avatarUrl &&

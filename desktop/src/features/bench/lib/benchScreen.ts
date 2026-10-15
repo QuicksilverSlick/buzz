@@ -11,15 +11,26 @@ import {
   type BenchSnapshot,
   enabledBenchSnapshot,
 } from "@/features/bench/lib/benchCards";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSections = {
-  /** Pending, current and unanswered: by severity, then order. */
+  /**
+   * Pending, current and unanswered, by severity, then order: the owner's
+   * own cards, or for any other viewer every one.
+   */
   needsYou: BenchCard[];
+  /** The owner's view only: unanswered cards that name other answerers. */
+  waitingOnOthers: BenchCard[];
   /** Pending and current with an answer: oldest answer first. */
   answered: BenchCard[];
-  /** Current decisions: by area, then order. */
+  /** Current decisions and every receipt not on hold: by area, then order. */
   decided: BenchCard[];
-  /** Current status items: by area, then order. */
+  /**
+   * Current status items on hold (blocked or inactive), receipts too, next to
+   * Decided: a Hold answer's close-out lands here. By area, then order.
+   */
+  held: BenchCard[];
+  /** Every other current status item: by area, then order. */
   status: BenchCard[];
   /** Stale or superseded items. The board folds them; so does the screen. */
   retiring: number;
@@ -77,37 +88,63 @@ const byArea = byKeys(
 
 const EMPTY_SECTIONS: BenchSections = {
   needsYou: [],
+  waitingOnOthers: [],
   answered: [],
   decided: [],
+  held: [],
   status: [],
   retiring: 0,
 };
 
+/**
+ * `viewer`: the active identity; undefined (unknown) reads as the owner,
+ * like benchCardMode. The sidebar badge passes none.
+ */
 export function benchSections(
   snapshot: BenchSnapshot | null | undefined,
+  viewer?: string,
 ): BenchSections {
   if (!snapshot) return EMPTY_SECTIONS;
   const sections: BenchSections = {
     needsYou: [],
+    waitingOnOthers: [],
     answered: [],
     decided: [],
+    held: [],
     status: [],
     retiring: 0,
   };
+  const owner = snapshot.ownerPubkey;
+  const ownerView =
+    viewer === undefined ||
+    (owner !== null && normalizePubkey(viewer) === normalizePubkey(owner));
   for (const card of snapshot.items) {
     if (card.validity !== "current") {
       sections.retiring += 1;
     } else if (card.kind === "pending") {
-      (card.answer ? sections.answered : sections.needsYou).push(card);
-    } else if (card.kind === "decision") {
+      const waiting = ownerView && card.answerers.length > 0;
+      (card.answer
+        ? sections.answered
+        : waiting
+          ? sections.waitingOnOthers
+          : sections.needsYou
+      ).push(card);
+    } else if (
+      card.kind === "status" &&
+      (card.state === "blocked" || card.state === "inactive")
+    ) {
+      sections.held.push(card);
+    } else if (card.kind === "decision" || card.request) {
       sections.decided.push(card);
     } else if (card.kind === "status") {
       sections.status.push(card);
     }
   }
   sections.needsYou.sort(byNeed);
+  sections.waitingOnOthers.sort(byNeed);
   sections.answered.sort(byAnswerTime);
   sections.decided.sort(byArea);
+  sections.held.sort(byArea);
   sections.status.sort(byArea);
   return sections;
 }

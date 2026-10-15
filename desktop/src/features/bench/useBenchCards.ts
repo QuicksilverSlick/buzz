@@ -31,6 +31,8 @@ const BENCH_SIDEBAR_POLL_MS = 15_000;
 
 export type BenchAnswerInput = {
   itemId: string;
+  /** The card the owner saw: the Bench refuses to answer any other. */
+  cardEventId: string;
   /** 0-based option; null clears the owner's answer. */
   option: number | null;
 };
@@ -99,8 +101,8 @@ export function useBenchCards() {
 export function useBenchAnswer() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ itemId, option }: BenchAnswerInput) =>
-      invokeTauri<void>("bench_answer", { itemId, option }),
+    mutationFn: ({ itemId, cardEventId, option }: BenchAnswerInput) =>
+      invokeTauri<void>("bench_answer", { itemId, cardEventId, option }),
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: BENCH_CARDS_QUERY_KEY }),
   });
@@ -123,8 +125,8 @@ export function useBenchNeedsYouCount(): number | null {
 
 /**
  * The live Bench card a timeline message is, or null. Only rows in #bench
- * poll; every other row reads the cached snapshot and re-renders only if its
- * own selection changes.
+ * or a card's channel poll; every other row reads the cached snapshot and
+ * re-renders only if its own selection changes.
  */
 export function useBenchCardForMessage(
   message: BenchMessageRef,
