@@ -23,6 +23,10 @@ import {
   formatItemTimestamp,
 } from "@/shared/lib/datetime";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
+import {
+  isRelayWorkflowPost,
+  WORKFLOW_POST_LABEL,
+} from "@/features/messages/lib/workflowPost";
 
 export type InboxFilter =
   | "all"
@@ -51,6 +55,8 @@ export type InboxItem = {
   fullTimestampLabel: string;
   groupItems: FeedItem[];
   isActionRequired: boolean;
+  /** The representative event is a relay workflow post (`isRelayWorkflowPost`). */
+  isWorkflowPost?: boolean;
   latestActivityAt: number;
   mentionNames: string[];
   mentionPubkeysByName?: Record<string, string>;
@@ -70,6 +76,8 @@ export type InboxReply = {
   authorLabel: string;
   authorPubkey: string;
   isAgent?: boolean;
+  /** True for a message a relay workflow posted (`isRelayWorkflowPost`). */
+  isWorkflowPost?: boolean;
   ownerLabel?: string | null;
   ownerPubkey?: string | null;
   avatarUrl: string | null;
@@ -467,6 +475,7 @@ export function buildInboxItems({
   getMessageReadAt,
   getThreadReadAt,
   profiles,
+  relaySelfPubkey,
 }: {
   channels?: InboxChannel[];
   currentPubkey?: string;
@@ -478,6 +487,8 @@ export function buildInboxItems({
     channelId?: string | null,
   ) => number | null;
   profiles?: UserProfileLookup;
+  /** Active relay identity from NIP-11 `self`; names relay workflow posts. */
+  relaySelfPubkey?: string | null;
 }): InboxItem[] {
   if (!feed) {
     return [];
@@ -582,12 +593,15 @@ export function buildInboxItems({
       const categories = [
         ...new Set(group.items.map((groupItem) => groupItem.category)),
       ].sort((left, right) => categoryPriority(left) - categoryPriority(right));
-      const senderLabel = resolveUserLabel({
-        pubkey: item.pubkey,
-        currentPubkey,
-        profiles,
-        preferResolvedSelfLabel: true,
-      });
+      const isWorkflowPost = isRelayWorkflowPost(item, relaySelfPubkey);
+      const senderLabel = isWorkflowPost
+        ? WORKFLOW_POST_LABEL
+        : resolveUserLabel({
+            pubkey: item.pubkey,
+            currentPubkey,
+            profiles,
+            preferResolvedSelfLabel: true,
+          });
       const subject = feedHeadline(item, group.items);
       const preview = feedPreview(item);
       const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
@@ -614,6 +628,7 @@ export function buildInboxItems({
         fullTimestampLabel: formatInboxFullTimestamp(item.createdAt),
         groupItems: group.items,
         isActionRequired: categories.includes("needs_action"),
+        isWorkflowPost,
         latestActivityAt: group.latestActivityAt,
         mentionNames: mentionNames ?? [],
         mentionPubkeysByName,

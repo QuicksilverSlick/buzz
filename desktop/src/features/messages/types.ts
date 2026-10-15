@@ -27,6 +27,8 @@ export type TimelineMessage = {
   author: string;
   /** True when the displayed author is known to be an agent. */
   isAgent?: boolean;
+  /** True for a message a relay workflow posted (`isRelayWorkflowPost`). */
+  isWorkflowPost?: boolean;
   /** Verified owner pubkey for an agent author, when available. */
   ownerPubkey?: string | null;
   /** Viewer-relative owner label (for example, "you" or "baxen"). */

@@ -5,8 +5,32 @@ import { getVisibleAgentAddressPubkeys } from "../lib/getVisibleAgentAddressPubk
 
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
+import { cn } from "@/shared/lib/cn";
 import { truncateNpub } from "@/shared/lib/pubkey";
-import { InlineChip } from "@/shared/ui/InlineChip";
+import {
+  MENTION_CHIP_BASE_CLASSES,
+  MENTION_CHIP_HOVER_CLASSES,
+} from "@/shared/ui/mentionChip";
+import { UserAvatar } from "@/shared/ui/UserAvatar";
+
+/** The subset of resolved mentions that are known agents (agent chips). */
+export function useAgentMentionPubkeysByName(
+  mentionPubkeysByName: Record<string, string> | undefined,
+  isKnownAgentPubkey: (pubkey: string) => boolean,
+) {
+  return React.useMemo(() => {
+    if (!mentionPubkeysByName) {
+      return undefined;
+    }
+    const values: Record<string, string> = {};
+    for (const [name, pubkey] of Object.entries(mentionPubkeysByName)) {
+      if (isKnownAgentPubkey(pubkey)) {
+        values[name] = pubkey;
+      }
+    }
+    return Object.keys(values).length > 0 ? values : undefined;
+  }, [isKnownAgentPubkey, mentionPubkeysByName]);
+}
 
 /** Resolve all literal competitors before hiding tag-backed address chips. */
 export function useMessageAgentAddressPrefix({
@@ -39,7 +63,11 @@ export function useMessageAgentAddressPrefix({
   ) : undefined;
 }
 
-/** Visible send-state prefix for recipients kept in the composer address tray. */
+/**
+ * Visible send-state prefix for recipients kept in the composer address tray.
+ * Each chip leads with the agent's own avatar, as the tray showed it while
+ * composing, so the sent message reads as the same agent.
+ */
 export function MessageAgentAddressPrefix({
   profiles,
   pubkeys,
@@ -64,18 +92,30 @@ export function MessageAgentAddressPrefix({
               role="bot"
               triggerElement="span"
             >
-              <InlineChip
-                className="agent-mention-highlight"
+              <span
+                className={cn(
+                  MENTION_CHIP_BASE_CLASSES,
+                  MENTION_CHIP_HOVER_CLASSES,
+                  "agent-mention-highlight cursor-pointer gap-[var(--inline-chip-icon-gap)]",
+                )}
                 data-mention=""
-                icon="agent"
-                interactive
               >
+                <span aria-hidden="true" className="inline-flex select-none">
+                  <UserAvatar
+                    avatarUrl={profile?.avatarUrl ?? null}
+                    className="h-[1.15em] w-[1.15em]"
+                    displayName={label}
+                    shape="squircle"
+                    size="xs"
+                    testId="message-agent-address-avatar"
+                  />
+                </span>
                 {label}
                 <AgentManagementMarker
                   pubkey={pubkey}
                   ownerPubkey={profile?.ownerPubkey}
                 />
-              </InlineChip>
+              </span>
             </UserProfilePopover>{" "}
           </React.Fragment>
         );

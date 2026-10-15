@@ -8,11 +8,16 @@ import { formatItemTimestamp } from "@/shared/lib/datetime";
 import type { TimelineMessage } from "@/features/messages/types";
 import { getConfigNudgeAuthorPubkey } from "@/features/messages/ui/configNudgeAuthPubkey";
 import { MessageActionBar } from "@/features/messages/ui/MessageActionBar";
+import {
+  useAgentMentionPubkeysByName,
+  useMessageAgentAddressPrefix,
+} from "@/features/messages/ui/MessageAgentAddressPrefix";
 import { MessageAgentOwner } from "@/features/messages/ui/MessageAgentOwner";
 import { MessageMetaSeparator } from "@/features/messages/ui/MessageHeader";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { UnreadDivider } from "@/features/messages/ui/UnreadDivider";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
+import { WorkflowAvatar } from "@/features/messages/ui/WorkflowAvatar";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
@@ -106,6 +111,20 @@ export function InboxMessageRow({
     [agentPubkeys, knownAgentPubkeys],
   );
   const isAuthorAgent = isKnownAgentPubkey(message.authorPubkey);
+  // Agent mentions render as in the channel timeline: agent chips in the body
+  // and the addressed-agent prefix with each agent's avatar.
+  const agentMentionPubkeysByName = useAgentMentionPubkeysByName(
+    message.mentionPubkeysByName,
+    isKnownAgentPubkey,
+  );
+  const agentAddressPrefix = useMessageAgentAddressPrefix({
+    profiles,
+    body: message.content,
+    tags: message.tags,
+    mentionNames: message.mentionNames,
+    mentionPubkeysByName: message.mentionPubkeysByName,
+    isKnownAgentPubkey,
+  });
   const profileRole = isAuthorAgent ? "bot" : undefined;
   const hoverTimestampLabel = formatTimeWithoutDayPeriod(
     message.timeLabel ?? message.fullTimestampLabel,
@@ -204,14 +223,18 @@ export function InboxMessageRow({
               triggerElement="span"
             >
               <span className="inline-flex shrink-0">
-                <UserAvatar
-                  accent={isAuthorAgent}
-                  avatarUrl={message.avatarUrl}
-                  className="h-9 w-9 shrink-0"
-                  displayName={message.authorLabel}
-                  shape={isAuthorAgent ? "squircle" : "circle"}
-                  size="md"
-                />
+                {message.isWorkflowPost ? (
+                  <WorkflowAvatar />
+                ) : (
+                  <UserAvatar
+                    accent={isAuthorAgent}
+                    avatarUrl={message.avatarUrl}
+                    className="h-9 w-9 shrink-0"
+                    displayName={message.authorLabel}
+                    shape={isAuthorAgent ? "squircle" : "circle"}
+                    size="md"
+                  />
+                )}
               </span>
             </UserProfilePopover>
           </div>
@@ -283,6 +306,8 @@ export function InboxMessageRow({
               )}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
+              agentMentionPubkeysByName={agentMentionPubkeysByName}
+              leadingInlineContent={agentAddressPrefix}
               mentionNames={message.mentionNames}
               mentionPubkeysByName={message.mentionPubkeysByName}
               videoReviewCommentRootId={videoReviewCommentRootId}
