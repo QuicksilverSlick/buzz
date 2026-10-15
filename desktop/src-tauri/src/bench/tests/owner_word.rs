@@ -37,7 +37,6 @@ fn a_title_never_speaks_for_the_owner() {
         event_id: String::new(),
         at: 0,
         owner: true,
-        label: None,
         card: None,
     };
     let back = render_owner_withdrawal(&item, &told).unwrap();

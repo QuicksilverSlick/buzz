@@ -134,8 +134,9 @@ pub(crate) struct BenchState {
     joined: BTreeMap<String, Vec<String>>,
     /// Each bound channel's join or admin check: cards go only where it passed.
     channels: BTreeMap<String, channels::ChannelCheck>,
-    /// Engaged cards a new question left behind: on the relay for good, never
-    /// adopted again by recover (which would retire them as stale).
+    /// Engaged or owner-told cards a new question left behind: on the relay
+    /// for good, never adopted again by recover (which would retire them as
+    /// stale).
     kept: Vec<String>,
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.
@@ -374,9 +375,11 @@ fn scan_inbox(
 
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
-/// new question after an answer or a reply leaves the old card on the relay
-/// as it is and gets a card of its own, which comes back to whoever answered
-/// (`item::Previous`); anything else keeps the card for publish to refresh.
+/// new question after an answer, a reply or the owner's word leaves the old
+/// card on the relay as it is and gets a card of its own with nothing told
+/// yet, which comes back to whoever answered (`item::Previous`), and the
+/// owner's approval told on the old card ends there (`item::Item::ends`);
+/// anything else keeps the card for publish to refresh.
 fn carry_card(
     old: Option<&item::Item>,
     mut new: item::Item,
@@ -385,6 +388,7 @@ fn carry_card(
 ) -> item::Item {
     let Some(o) = old else { return new };
     let asking = new.kind == item::ItemKind::Pending;
+    new.ends = o.ends.clone();
     if !asking && o.card.is_some() && (o.kind == item::ItemKind::Pending || o.request.is_some()) {
         let asked = item::Item {
             card: None,
@@ -394,7 +398,7 @@ fn carry_card(
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
-    } else if asking && (o.engaged() || o.request.is_some()) {
+    } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
         let asked = o.request.as_deref().unwrap_or(o);
         if let Some(c) = &o.card {
             kept.push(c.event_id.clone());
@@ -410,24 +414,12 @@ fn carry_card(
             })
         });
         new.previous = answered.or_else(|| o.previous.clone());
+        if o.owner_told() {
+            new.ends = Some(Box::new(o.clone()));
+        }
     } else {
         new.card = o.card.clone();
         new.previous = o.previous.clone().filter(|_| asking);
-    }
-    // Asked again, what the route target was told (or may have been, as an
-    // owner's notice not yet on the relay) still stands, from the earlier
-    // card. Any answer here is a new one (`route_due`); only a different
-    // one replaces or takes it back.
-    if asking {
-        let stands = |r: &item::Routed| item::Routed {
-            option: None,
-            ..r.clone()
-        };
-        new.routed = o.routed.as_ref().map(stands);
-        new.owner_sent = o.owner_sent.as_ref().map(|sent| item::OwnerSent {
-            routed: stands(&sent.routed),
-            ..sent.clone()
-        });
     }
     new
 }

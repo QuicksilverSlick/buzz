@@ -31,7 +31,6 @@ fn told(option: Option<usize>) -> Option<Routed> {
         event_id: String::new(),
         at: 0,
         owner: false,
-        label: None,
         card: None,
     })
 }
@@ -231,7 +230,6 @@ async fn routed_answer_lifecycle() {
             event_id: ev["id"].as_str().unwrap().to_string(),
             at: b.now,
             owner: true,
-            label: Some("Move".to_string()),
             card: Some(card.clone()),
         })
     );

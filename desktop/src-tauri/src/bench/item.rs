@@ -341,6 +341,11 @@ pub(crate) struct Item {
     /// An owner's notice signed and not yet known to be on the relay.
     #[serde(default)]
     pub owner_sent: Option<OwnerSent>,
+    /// The item this re-ask replaced (`carry_card`) while the owner's word
+    /// told on its card is not yet ended there (`render_owner_ended`). This
+    /// item's own notices wait for it, so it never holds one of its own.
+    #[serde(default)]
+    pub ends: Option<Box<Item>>,
 }
 
 impl Item {
@@ -353,6 +358,12 @@ impl Item {
     /// Someone answered or replied: its card is a record now, never deleted.
     pub(crate) fn engaged(&self) -> bool {
         self.answer.is_some() || self.reply.is_some()
+    }
+
+    /// The owner's approval was the last notice told on this card, or an
+    /// owner's notice here is signed and not yet known to be on the relay.
+    pub(crate) fn owner_told(&self) -> bool {
+        self.owner_sent.is_some() || self.routed.as_ref().is_some_and(|r| r.owner)
     }
 
     /// Asked again after an answer, and waiting again.
@@ -626,6 +637,7 @@ pub(crate) fn validate(
         request: None,
         previous: None,
         owner_sent: None,
+        ends: None,
     })
 }
 
@@ -1171,8 +1183,8 @@ pub(crate) use super::pick::{
     root_until,
 };
 pub(crate) use super::route::{
-    owner_route, render_owner_withdrawal, render_route, render_route_reply, route_due, OwnerSent,
-    Routed, ROUTE_SETTLE_SECS,
+    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
+    route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).

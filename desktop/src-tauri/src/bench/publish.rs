@@ -67,13 +67,14 @@ async fn post_message(
 /// Once its time is too old for the relay, or the card it replies to is
 /// gone, a lookup by id in the channel it went to (its h tag, else `ch`)
 /// says whether it landed; if not, it never can, and the next tick signs one
-/// afresh. Either way `owner_sent` clears, and `routed` lands if the relay
-/// has it. The item's own card is never forgotten here: after a re-ask it
-/// is not the card this event replies to.
+/// afresh. Either way the `owner_sent` it was kept in (`slot`) clears, and
+/// `routed` lands there if the relay has it. No card is forgotten here: the
+/// item's own may not be the card this event replies to.
 async fn resend_owner(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     id: &str,
+    ends: bool,
     ch: &str,
     sent: item::OwnerSent,
     now: u64,
@@ -108,12 +109,93 @@ async fn resend_owner(
         .tags
         .iter()
         .any(|t| matches!(t.as_slice(), [k, ..] if k == "e"));
-    let i = s.items.get_mut(id).expect("routed id");
+    let i = slot(s, id, ends);
     i.owner_sent = None;
     if told {
         i.routed = Some(sent.routed);
         s.board_dirty |= top && ch == s.channel_id;
     }
+    Ok(())
+}
+
+/// The item an owner's notice is kept on: `id` itself, or (`ends`) the item
+/// its re-ask replaced.
+fn slot<'a>(s: &'a mut BenchState, id: &str, ends: bool) -> &'a mut item::Item {
+    let i = s.items.get_mut(id).expect("routed id");
+    match ends {
+        true => i.ends.as_deref_mut().expect("re-asked item"),
+        false => i,
+    }
+}
+
+/// A card's thread: under the root it was posted in reply to, if any.
+fn thread_of(
+    card: Option<&Posted>,
+    root: Option<&str>,
+) -> Result<Option<events::ThreadRef>, String> {
+    let id = |h: &str| nostr::EventId::from_hex(h).map_err(|e| e.to_string());
+    let Some(c) = card.map(|c| id(&c.event_id)).transpose()? else {
+        return Ok(None);
+    };
+    Ok(Some(events::ThreadRef {
+        root_event_id: root.map(id).transpose()?.unwrap_or(c),
+        parent_event_id: c,
+    }))
+}
+
+/// The owner's approval told on the card `id` re-asked (`item::Item::ends`)
+/// ends there, in the owner's own message (`item::render_owner_ended`),
+/// kept on disk before it goes and only ever sent again as itself, like any
+/// owner's notice. One still unsettled there is settled first, as itself;
+/// then `owner_told` says whether an ending is still owed.
+async fn end_approval(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    id: &str,
+    old: &item::Item,
+    now: u64,
+) -> Result<(), String> {
+    let ch = card_channel(s, old);
+    if let Some(sent) = old.owner_sent.clone() {
+        return resend_owner(ctx, s, id, true, &ch, sent, now).await;
+    }
+    let told = old.routed.clone().expect("the owner's approval");
+    let text = item::render_owner_ended(old).ok_or("its card has no name")?;
+    let thread = thread_of(old.card.as_ref(), old.reply_to.as_deref())?;
+    let marker = format!("bench:route:{id}@ended");
+    let ping = [told.to.as_str()];
+    let builder = message(ctx, &ch, &text, &ping, thread.as_ref(), marker, Vec::new())?;
+    let ev = builder
+        .custom_created_at(next_ts(s, now)?)
+        .sign_with_keys(&ctx.owner)
+        .map_err(|e| e.to_string())?;
+    // Once it lands the last notice there is no approval, so none is owed.
+    let ended = item::Routed {
+        option: None,
+        event_id: ev.id.to_hex(),
+        at: now,
+        owner: false,
+        ..told
+    };
+    slot(s, id, true).owner_sent = Some(item::OwnerSent {
+        event: ev.clone(),
+        routed: ended.clone(),
+    });
+    save_both(&ctx.root, s)?;
+    let landed = match submit(ctx, &ev, &ctx.owner, None).await {
+        // Its card was deleted by hand, so it never landed: it goes
+        // top-level next tick.
+        Err(e) if thread.is_some() && e.contains("not found") => false,
+        r => r.map(|_| true)?,
+    };
+    let old = slot(s, id, true);
+    old.owner_sent = None;
+    if landed {
+        old.routed = Some(ended);
+    } else {
+        old.card = None;
+    }
+    s.board_dirty |= landed && thread.is_none() && ch == s.channel_id;
     Ok(())
 }
 
@@ -337,30 +419,31 @@ pub(super) async fn publish(
         if now < s.routes_held_until || s.held.contains(&id) || !channel_ready(s, &item) {
             continue;
         }
+        // The owner's approval on the card this one re-asked ends there
+        // first: this card's notices wait for it.
+        if let Some(old) = item.ends.as_deref() {
+            if old.owner_told() {
+                if !spend(budget, 1) {
+                    return Ok(());
+                }
+                if let Err(e) = end_approval(ctx, s, &id, old, now).await {
+                    failed.push(format!("{id}: the owner's approval did not end: {e}"));
+                }
+                continue;
+            }
+            s.items.get_mut(&id).expect("routed id").ends = None;
+        }
         // An owner's notice already signed is settled first, as itself.
         if let Some(sent) = item.owner_sent.clone() {
             if !spend(budget, 1) {
                 return Ok(());
             }
-            if let Err(e) = resend_owner(ctx, s, &id, &ch, sent, now).await {
+            if let Err(e) = resend_owner(ctx, s, &id, false, &ch, sent, now).await {
                 failed.push(format!("{id}: the owner's notice did not go again: {e}"));
             }
             continue;
         }
-        let card = live_card(&item)
-            .map(|c| nostr::EventId::from_hex(&c.event_id))
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let root = item
-            .reply_to
-            .as_deref()
-            .map(nostr::EventId::from_hex)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let thread = card.map(|c| events::ThreadRef {
-            root_event_id: root.unwrap_or(c),
-            parent_event_id: c,
-        });
+        let thread = thread_of(live_card(&item), item.reply_to.as_deref())?;
         let link = live_card(&item).map_or(String::new(), |c| item::thread_line(&ch, &c.event_id));
         let ping = [to.as_str()];
         if item::route_due(&item, now, owner_set) {
@@ -377,18 +460,12 @@ pub(super) async fn publish(
             // that way and now withdrawn or not the owner's tap is taken back
             // that way first, as a withdrawal (the other answer follows next
             // tick). Anything else, or text that fails the checks again, is
-            // the writer's. One told before a re-ask still stands beside the
-            // same answer on the new card: only a different one takes it back.
+            // the writer's.
             let mine = item::owner_route(&item, owner_set);
-            let label = item
-                .answer
-                .as_ref()
-                .and_then(|a| item.options.get(a.option));
-            let stands = |r: &item::Routed| r.stands() && r.label.as_ref() == label;
             let taken_back = item
                 .routed
                 .as_ref()
-                .filter(|r| r.owner && mine.is_none() && !stands(r))
+                .filter(|r| r.owner && mine.is_none())
                 .and_then(|r| item::render_owner_withdrawal(&item, r));
             let answer = item.answer.as_ref().filter(|_| taken_back.is_none());
             let want = answer.map(|a| a.option);
@@ -409,7 +486,6 @@ pub(super) async fn publish(
                 event_id: String::new(),
                 at: now,
                 owner: as_owner && want.is_some(),
-                label: want.and_then(|w| item.options.get(w).cloned()),
                 card: live_card(&item).map(|c| c.event_id.clone()),
             };
             let builder = message(ctx, &ch, &text, &ping, thread.as_ref(), marker, extra)?;

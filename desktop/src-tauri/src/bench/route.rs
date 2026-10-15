@@ -16,30 +16,19 @@ pub(crate) const ROUTE_SETTLE_SECS: u64 = 120;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Routed {
     /// 0-based option the notice announced on this item's card. None: a
-    /// withdrawal, or, with `label`, an answer on the card before a re-ask
-    /// (`carry_card`), which still stands.
+    /// withdrawal, or the end of the owner's approval (`render_owner_ended`).
     pub option: Option<usize>,
     pub to: String,
     pub event_id: String,
     pub at: u64,
-    /// The notice was the owner's own message (`render_owner_route`): a
-    /// withdrawal or someone else's answer takes it back the same way first.
+    /// The notice was the owner's own approval (`render_owner_route`): a
+    /// withdrawal or someone else's answer takes it back the same way first,
+    /// and a re-ask ends it on its card (`render_owner_ended`).
     #[serde(default)]
     pub owner: bool,
-    /// The told option's text, which still stands; None after a withdrawal
-    /// (and on a notice from before it was kept: then this card's option).
-    #[serde(default)]
-    pub label: Option<String>,
     /// The card it was told for, which the owner's own message names.
     #[serde(default)]
     pub card: Option<String>,
-}
-
-impl Routed {
-    /// Told on the card before a re-ask (`carry_card`), and it still stands.
-    pub(crate) fn stands(&self) -> bool {
-        self.option.is_none() && self.label.is_some()
-    }
 }
 
 /// An owner's notice signed and maybe not on the relay yet, on disk before
@@ -57,16 +46,13 @@ pub(crate) struct OwnerSent {
 /// it is not the one it was last told; or the owner's message told it and
 /// it is someone else's now; or it may go out as the owner's own message
 /// (`owner_route`) and the last notice was not one. A clear that was never
-/// routed owes nothing and a re-tap of the told option is no change, but a
-/// re-ask is a new question: any answer on its card is news, the same one
-/// as before too, or the agent that asked waits for good.
+/// routed owes nothing and a re-tap of the told option is no change. A
+/// re-ask starts with nothing told (`carry_card`), so any answer on its card
+/// is news, as on a first card.
 pub(crate) fn route_due(item: &Item, now: u64, owner_set: &[String]) -> bool {
     let want = item.answer.as_ref().map(|a| a.option);
     let told = item.routed.as_ref();
-    let changed = match told {
-        Some(r) if !r.stands() => r.option != want,
-        _ => want.is_some(),
-    };
+    let changed = told.map_or(want.is_some(), |r| r.option != want);
     let owner = told.is_some_and(|r| r.owner);
     let theirs = owner && item.answer.as_ref().is_some_and(|a| a.by_name.is_some());
     let unsigned = !owner && owner_route(item, owner_set).is_some();
@@ -154,14 +140,6 @@ fn owner_label(o: &str) -> Option<&str> {
     exact(o, usize::MAX)
 }
 
-/// The option a notice told, which still stands: as kept, else (told before
-/// the text was kept) this card's.
-fn told_label<'a>(item: &'a Item, r: &'a Routed) -> Option<&'a str> {
-    r.label
-        .as_deref()
-        .or_else(|| item.options.get(r.option?).map(String::as_str))
-}
-
 /// Who the owner's own message says spoke: roles.json's name for the owner
 /// if it is shaped like a name (ASCII letters and digits, single spaces
 /// between words, at most 40), so it can never carry a sentence of its
@@ -214,8 +192,11 @@ pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
             out.push_str(&format!("\nAction: {action}"));
         }
     }
-    let told = item.routed.as_ref().and_then(|r| told_label(item, r));
-    if let Some(was) = told.filter(|was| *was != label) {
+    let told = item
+        .routed
+        .as_ref()
+        .and_then(|r| item.options.get(r.option?));
+    if let Some(was) = told.filter(|was| was.as_str() != label) {
         out.push_str(&format!(
             "\nThis replaces the earlier answer: {}. Do not act on that one; undo what was \
              done for it if it conflicts.",
@@ -229,7 +210,7 @@ pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
 /// `render_owner_route`, now withdrawn or someone else's: so no approval of
 /// the owner's outlives it. It names the card that approval named.
 pub(crate) fn render_owner_withdrawal(item: &Item, told: &Routed) -> Option<String> {
-    let label = owner_label(told_label(item, told)?)?;
+    let label = owner_label(item.options.get(told.option?)?)?;
     let card = told
         .card
         .as_deref()
@@ -240,5 +221,20 @@ pub(crate) fn render_owner_withdrawal(item: &Item, told: &Routed) -> Option<Stri
         "{who} withdrew: {label} on card {card}. I no longer approve the action that option \
          describes. Stop if you have not acted; if you have, say in this thread what to undo. \
          Do not clear the card."
+    ))
+}
+
+/// The owner's own message, in the thread of the card a re-ask left behind
+/// (`carry_card`), ending the approval last told there: no approval of the
+/// owner's outlives its card. Fixed wording; it names the card that
+/// approval named.
+pub(crate) fn render_owner_ended(old: &Item) -> Option<String> {
+    let told = old.routed.as_ref()?.card.as_deref();
+    let card = card_name(told.or(old.card.as_ref().map(|c| c.event_id.as_str()))?)?;
+    let who = owner_who(old);
+    Some(format!(
+        "{who}'s approval on card {card} ends here: this card was asked again. Do not act on \
+         it from now on; wait for the answer on the new card. Nothing here asks you to undo \
+         what you already did."
     ))
 }
