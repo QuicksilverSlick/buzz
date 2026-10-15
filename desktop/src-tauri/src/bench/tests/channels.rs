@@ -1067,3 +1067,30 @@ async fn a_passed_admin_list_outlives_failed_reads_for_an_hour_only() {
         serde_json::from_value(json!({ "checkedAt": 1, "refused": null })).unwrap();
     assert_eq!(old.ok_at, 0);
 }
+
+#[tokio::test]
+async fn an_unreadable_roles_json_keeps_the_admin_verdict() {
+    let (mut b, _p, _list) = bound_bench().await;
+    // The phone's own key, in members.txt, is an admin of X.
+    let phone = Keys::generate();
+    std::fs::write(b.root.join("members.txt"), hex(&phone) + "\n").unwrap();
+    let list = admins(&b, &b.relay.keys.clone(), &[&hex(&phone)]);
+    reply(&b, &[&list]);
+    b.now += 600;
+    b.settle(2).await;
+    let refused = |b: &Bench| b.s.channels[X].refused.clone();
+    assert_eq!(refused(&b), None);
+    // Unreadable past a recheck: whose keys are the owner's is unknown, so
+    // the last verdict stands.
+    let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
+    std::fs::write(b.root.join("roles.json"), "{").unwrap();
+    b.now += 600;
+    for _ in 0..2 {
+        let err = b.tick().await.unwrap_err();
+        assert!(err.starts_with(ROLES_HOLD), "{err}");
+    }
+    assert_eq!(refused(&b), None);
+    std::fs::write(b.root.join("roles.json"), good).unwrap();
+    b.tick().await.unwrap();
+    assert_eq!(refused(&b), None);
+}

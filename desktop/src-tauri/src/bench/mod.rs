@@ -1339,7 +1339,10 @@ pub(crate) async fn tick(
     if let Some(r) = &roles {
         channels::join_bound(ctx, s, &mut budget, now, r, &routes).await;
     }
-    channels::check_admins(ctx, s, now, &owner_set).await;
+    // Whose keys are the owner's is unknown, so the last verdict stands.
+    if roles_err.is_none() {
+        channels::check_admins(ctx, s, now, &owner_set).await;
+    }
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
