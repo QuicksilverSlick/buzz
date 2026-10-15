@@ -4,7 +4,13 @@
 use super::answers::{last_query, reply, tap, ITEM};
 use super::*;
 
-const HEAD: &str = "Bench answer · orchestrator/relay-choice\nCard: Relay choice\n";
+/// The owner's answer, as the owner's own message.
+fn chose(label: &str) -> String {
+    format!(
+        "The owner chose: {label} on Relay choice (orchestrator/relay-choice). \
+         I approve the action that option describes."
+    )
+}
 
 fn answered(option: usize, changed_at: u64) -> Item {
     let mut item = check(&[]).unwrap();
@@ -196,7 +202,7 @@ async fn routed_answer_lifecycle() {
     // A thread reply leaves the board newest: nothing else was posted.
     assert_eq!(b.kinds()[before..], [9]);
     let ev = &n[0];
-    assert_eq!(ev["pubkey"], json!(b.writer_hex()));
+    assert_eq!(ev["pubkey"], json!(b.owner_hex()));
     assert_eq!(tag_value(ev, "h"), Some(b.channel()));
     assert!(ev["tags"]
         .as_array()
@@ -213,11 +219,7 @@ async fn routed_answer_lifecycle() {
         tag_value(ev, "client").unwrap(),
         "bench:route:orchestrator/relay-choice@2"
     );
-    assert!(
-        content(ev).starts_with(&format!("{HEAD}Chosen: 2. Move\nAnswered ")),
-        "{}",
-        content(ev)
-    );
+    assert_eq!(content(ev), chose("Move"));
     assert_eq!(
         b.s.items[ITEM].routed,
         Some(Routed {
@@ -251,10 +253,7 @@ async fn routed_answer_lifecycle() {
         tag_value(&n[0], "client").unwrap(),
         "bench:route:orchestrator/relay-choice@1"
     );
-    assert!(content(&n[0]).starts_with(
-        "Bench answer changed · orchestrator/relay-choice\nCard: Relay choice\n\
-         Chosen: 1. Stay\nWas: 2. Move\n"
-    ));
+    assert_eq!(content(&n[0]), chose("Stay"));
 
     // A clear after a notice is a withdrawal, sent once, after the settle.
     reply(&b, &[]);
@@ -267,17 +266,23 @@ async fn routed_answer_lifecycle() {
         tag_value(&n[0], "client").unwrap(),
         "bench:route:orchestrator/relay-choice@withdrawn"
     );
+    // A withdrawal approves nothing: it stays the writer's, and links the
+    // card's thread.
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
     assert!(content(&n[0]).starts_with(
         "Bench answer withdrawn · orchestrator/relay-choice\nCard: Relay choice\nWas: 1. Stay\n"
     ));
-    assert!(content(&n[0]).ends_with("Do not clear the card."));
+    assert!(content(&n[0]).ends_with(&format!(
+        "Do not clear the card.{}",
+        thread_line(&b.channel(), &card)
+    )));
 
     // Answered again, then acked by a re-drop: nothing more is ever sent.
     let last = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now + 1);
     reply(&b, &[&last]);
     b.tick().await.unwrap();
     let n = settle_past(&mut b, 1).await;
-    assert!(content(&n[0]).starts_with(&format!("{HEAD}Chosen: 2. Move\n")));
+    assert_eq!(content(&n[0]), chose("Move"));
     b.drop_file(
         "orchestrator",
         "relay-choice",
@@ -313,7 +318,7 @@ async fn quick_changes_coalesce_into_one_notice() {
     b.settle(3).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(content(&n[0]).starts_with(&format!("{HEAD}Chosen: 2. Move\n")));
+    assert_eq!(content(&n[0]), chose("Move"));
     // A tap withdrawn inside the settle was never routed: nothing is sent.
     let mut b = seeded_bench(Gate::Open, &[]).await;
     route(&mut b);
@@ -436,5 +441,5 @@ async fn a_join_or_a_launch_holds_notices_one_settle() {
     b.tick().await.unwrap();
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(content(&n[0]).starts_with("Bench answer changed"));
+    assert_eq!(content(&n[0]), chose("Stay"));
 }

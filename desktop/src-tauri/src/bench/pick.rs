@@ -78,16 +78,21 @@ pub(crate) fn root_until<'a>(
 
 /// Whether the kind 9 `e` replies to the card `card_id`: it names the card
 /// as its parent, or names only the card's thread root, after the card and
-/// by `root_until`.
+/// by `root_until`. The Bench's own route notices never do: it signs those
+/// with the owner's keys for the owner's answers.
 fn on_card(item: &Item, card_id: &str, e: &nostr::Event, root_until: Option<u64>) -> bool {
+    let notice = e.tags.iter().any(
+        |t| matches!(t.as_slice(), [k, m, ..] if k == "client" && m.starts_with("bench:route:")),
+    );
     let (p, at) = (parent(e), e.created_at.as_secs());
-    p == Some(card_id)
-        || root_until.is_some_and(|until| {
-            p.is_some()
-                && p == item.reply_to.as_deref()
-                && item.card.as_ref().is_some_and(|c| c.created_at < at)
-                && at <= until
-        })
+    !notice
+        && (p == Some(card_id)
+            || root_until.is_some_and(|until| {
+                p.is_some()
+                    && p == item.reply_to.as_deref()
+                    && item.card.as_ref().is_some_and(|c| c.created_at < at)
+                    && at <= until
+            }))
 }
 
 /// The 0-based option an event answers on the card `card_id`: a kind 7

@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) use super::plain::Plain;
+
 /// Writer folder of the one-time claude.ai board import. Its decisions keep
 /// the owner's own `decidedBy` values and its cards never ping him.
 pub(crate) const MIGRATION_WRITER: &str = "claude-ai";
@@ -86,6 +88,12 @@ pub(crate) struct Drop {
     /// 1-based option the writer recommends.
     #[serde(default)]
     pub recommend: Option<usize>,
+    /// The plain-language layout (`plain::Plain`).
+    #[serde(default)]
+    pub plain: Option<Plain>,
+    /// The exact command the writer runs if the recommended option is chosen.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 /// Who a scoped card asks, before the service resolves it to answerers.
@@ -250,6 +258,20 @@ pub(crate) struct Routed {
     pub at: u64,
 }
 
+/// The answer a card came back from: the writer asked again after it
+/// (`carry_card`), so the card says "Back to you" and pings this answerer.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Previous {
+    /// 0-based, and the option's text as it was.
+    pub option: usize,
+    pub label: String,
+    /// The answerer's hex; "" on answers recorded before step 1.
+    pub by: String,
+    pub by_name: Option<String>,
+    pub answered_at: u64,
+}
+
 /// A validated drop, namespaced by writer, as kept in state.json.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -283,6 +305,10 @@ pub(crate) struct Item {
     pub decision: Option<String>,
     #[serde(default)]
     pub recommend: Option<usize>,
+    #[serde(default)]
+    pub plain: Option<Plain>,
+    #[serde(default)]
+    pub action: Option<String>,
     pub hash: String,
     pub updated_at: String,
     #[serde(default)]
@@ -324,6 +350,9 @@ pub(crate) struct Item {
     /// stays, edited to show the answer and this item as the outcome.
     #[serde(default)]
     pub request: Option<Box<Item>>,
+    /// Set by the service, never by a drop.
+    #[serde(default)]
+    pub previous: Option<Previous>,
 }
 
 impl Item {
@@ -336,6 +365,11 @@ impl Item {
     /// Someone answered or replied: its card is a record now, never deleted.
     pub(crate) fn engaged(&self) -> bool {
         self.answer.is_some() || self.reply.is_some()
+    }
+
+    /// Asked again after an answer, and waiting again.
+    pub(crate) fn back_to_you(&self) -> bool {
+        self.kind == ItemKind::Pending && self.previous.is_some() && self.answer.is_none()
     }
 }
 
@@ -548,6 +582,7 @@ pub(crate) fn validate(
         valid_link(l)?;
     }
     validate_scope(&mut d)?;
+    super::plain::validate(d.plain.as_ref(), d.action.as_deref(), d.recommend.is_some())?;
     let hash = version_hash(&d);
     Ok(Item {
         id: format!("{writer}/{id}"),
@@ -571,6 +606,8 @@ pub(crate) fn validate(
         to: d.to,
         decision: d.decision,
         recommend: d.recommend,
+        plain: d.plain,
+        action: d.action,
         hash,
         updated_at: now_iso.to_string(),
         card: None,
@@ -586,6 +623,7 @@ pub(crate) fn validate(
         routed_reply: None,
         was_engaged: false,
         request: None,
+        previous: None,
     })
 }
 
@@ -672,6 +710,8 @@ pub(crate) fn version_hash(d: &Drop) -> String {
         ("to", d.to.as_ref().map(j)),
         ("decision", d.decision.as_ref().map(j)),
         ("recommend", d.recommend.as_ref().map(j)),
+        ("plain", d.plain.as_ref().map(j)),
+        ("action", d.action.as_ref().map(j)),
     ];
     parts.extend(
         scope
@@ -842,8 +882,9 @@ pub(crate) fn card_hash(item: &Item) -> String {
     }
 }
 
-/// Card text: the request (`card_head`), then on an unanswered pending card
-/// the line that says how to answer, `as of`, and the Recorded trailer.
+/// Card text: "Back to you" on a card asked again, the request
+/// (`card_head`), then on an unanswered pending card the line that says how
+/// to answer, `as of`, and the Recorded trailer.
 /// A scoped card says who it is for instead, adds the recommendation, names
 /// who answered and ends with the Other line. A receipt is
 /// `render_receipt`. Names go through plain_title like every board line.
@@ -851,7 +892,16 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     if let Some(request) = &item.request {
         return render_receipt(request, item, hhmm);
     }
-    let mut out = card_head(item);
+    // The first line is what the phone's notification shows.
+    let titled = plain_text(&item.title, usize::MAX)
+        .to_ascii_lowercase()
+        .starts_with("back to you");
+    let mut out = if item.back_to_you() && !titled {
+        "Back to you\n".to_string()
+    } else {
+        String::new()
+    };
+    out.push_str(&card_head(item));
     let pending = item.kind == ItemKind::Pending;
     let scoped = pending && item.scoped();
     let tap = "Tap one number below to answer.";
@@ -962,7 +1012,8 @@ fn recommended(item: &Item) -> String {
         .as_ref()
         .and_then(|s| s.recommender.as_deref())
         .map_or(item.writer.clone(), plain_title);
-    format!("\nRecommended: {n} ({who})")
+    let tail = super::plain::recommended_tail(item, n);
+    format!("\nRecommended: {n} ({who}){tail}")
 }
 
 /// The owner's name from roles.json, if it named one.
@@ -1000,7 +1051,8 @@ fn answerer_text(item: &Item, by_name: Option<&str>, role: Option<AnswerRole>) -
 
 /// The request as a card shows it: marker line, the title in bold, the
 /// summary as its own paragraph of prose() (agent text stays inert), the
-/// options as a numbered list, then the validated deadline and links so the
+/// plain-language lines (`plain::lines`), the options as a numbered list,
+/// then the validated deadline and links so the
 /// phone can open them. Everything but the summary and the url goes through
 /// plain_text.
 fn card_head(item: &Item) -> String {
@@ -1022,6 +1074,11 @@ fn card_head(item: &Item) -> String {
         // line's url to `[url](url)` first.
         out.push_str("\n\n");
         out.push_str(&prose(&summary(&item.body)));
+        out.push('\n');
+    }
+    let plain = super::plain::lines(item);
+    if !plain.is_empty() {
+        out.push_str(&plain);
         out.push('\n');
     }
     if item.kind == ItemKind::Pending {
@@ -1053,10 +1110,11 @@ pub(crate) fn ping_owner(item: &Item) -> bool {
 
 /// Who to p-tag on a new card. Owner-only cards keep today's rule; a card
 /// with answerers pings its humans, and its agents only when it is
-/// delegable, each once per Drop.
-pub(crate) fn card_pings(item: &Item, owner_hex: &str) -> Vec<String> {
+/// delegable, each once per Drop. A card that came back also pings whoever
+/// answered it last, once per Drop, while they may still answer it.
+pub(crate) fn card_pings(item: &Item, owner_hex: &str, owner_set: &[String]) -> Vec<String> {
     let answerers = item.stamp.as_ref().map_or(&[][..], |s| &s.answerers);
-    if answerers.is_empty() {
+    let mut pings: Vec<String> = if answerers.is_empty() {
         // A scoped Drop's `pinged` says whether the owner was pinged yet, so
         // a card that loses its answerers still reaches him once.
         let told = if item.scoped() {
@@ -1064,16 +1122,29 @@ pub(crate) fn card_pings(item: &Item, owner_hex: &str) -> Vec<String> {
         } else {
             item.quiet_repost
         };
-        return (ping_owner(item) && !told)
+        (ping_owner(item) && !told)
             .then(|| owner_hex.to_string())
             .into_iter()
-            .collect();
+            .collect()
+    } else {
+        answerers
+            .iter()
+            .filter(|a| {
+                (!a.agent || item.needs == Needs::Delegable) && !item.pinged.contains(&a.pk)
+            })
+            .map(|a| a.pk.clone())
+            .collect()
+    };
+    let back = item.previous.as_ref().map(|p| match p.by.as_str() {
+        "" => owner_hex,
+        by => by,
+    });
+    if let Some(by) = back.filter(|by| {
+        eligible(item, by, owner_set) && !item.pinged.iter().chain(&pings).any(|p| p == by)
+    }) {
+        pings.push(by.to_string());
     }
-    answerers
-        .iter()
-        .filter(|a| (!a.agent || item.needs == Needs::Delegable) && !item.pinged.contains(&a.pk))
-        .map(|a| a.pk.clone())
-        .collect()
+    pings
 }
 
 /// Whether the route target is owed a notice: the answer has settled and is
@@ -1151,6 +1222,49 @@ pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
         answerer_text(item, r.by_name.as_deref(), r.role),
         r.event_id
     )
+}
+
+/// The notice for an answer from the owner's own keys, which the Bench posts
+/// from the owner's identity so the agent acts on the owner's word (spec
+/// section 9). Fixed wording around the option label and title as the card
+/// shows them, plus the card's action line when the recommended option was
+/// chosen; None when any of them fails the drop checks again, and the
+/// writer's notice goes instead.
+pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
+    let a = item.answer.as_ref()?;
+    let option = item.options.get(a.option)?;
+    valid_text(&item.title, TITLE_MAX, "title").ok()?;
+    valid_text(option, OPTION_MAX, "option").ok()?;
+    let label = plain_text(option, usize::MAX);
+    let title = plain_text(&item.title, usize::MAX);
+    if label.is_empty() || title.is_empty() {
+        return None;
+    }
+    let who = owner_name(item).unwrap_or_else(|| "The owner".to_string());
+    let mut out = format!(
+        "{who} chose: {label} on {title} ({}). I approve the action that option describes.",
+        item.id
+    );
+    if let Some(action) = item.action.as_deref() {
+        super::plain::valid_action(action).ok()?;
+        if item.recommend == Some(a.option + 1) {
+            out.push_str(&format!("\nAction: {action}"));
+        }
+    }
+    Some(out)
+}
+
+/// The line that opens a card's thread from its text, for posts made once
+/// the card's own id is known; empty if the link fails the link rules.
+pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
+    let l = Link {
+        label: "Open thread".to_string(),
+        url: format!("buzz://message?channel={channel}&id={card_id}"),
+    };
+    match valid_link(&l) {
+        Ok(()) => format!("\n{}: {}", l.label, l.url),
+        Err(_) => String::new(),
+    }
 }
 
 pub(crate) use super::pick::{

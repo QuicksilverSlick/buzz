@@ -640,7 +640,7 @@ fn each_thread_reply_counts_for_one_card() {
 #[test]
 fn card_pings_follow_the_answerers() {
     let owner = hex('f');
-    let pings = |item: &Item| card_pings(item, &owner);
+    let pings = |item: &Item| card_pings(item, &owner, std::slice::from_ref(&owner));
     // Owner-only cards keep today's rule, scoped or not.
     let legacy = check(&[]).unwrap();
     assert_eq!(pings(&legacy), std::slice::from_ref(&owner));

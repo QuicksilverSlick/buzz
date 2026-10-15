@@ -288,9 +288,11 @@ async fn bench_cards_snapshot() {
     assert_eq!(
         keys(item),
         [
+            "action",
             "answer",
             "answerers",
             "area",
+            "backToYou",
             "body",
             "cardEventId",
             "channelId",
@@ -303,6 +305,8 @@ async fn bench_cards_snapshot() {
             "options",
             "order",
             "ownerName",
+            "plain",
+            "previousAnswer",
             "project",
             "recommend",
             "recommender",
@@ -345,6 +349,10 @@ async fn bench_cards_snapshot() {
         ("recommender", Value::Null),
         ("reply", Value::Null),
         ("request", Value::Null),
+        ("plain", Value::Null),
+        ("action", Value::Null),
+        ("backToYou", json!(false)),
+        ("previousAnswer", Value::Null),
     ] {
         assert_eq!(item[k], v, "{k}");
     }

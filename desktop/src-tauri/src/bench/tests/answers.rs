@@ -280,7 +280,13 @@ async fn owner_tap_records_answer_and_writes_outbox() {
     let posts = b.posts()[before..].to_vec();
     assert_eq!(b.kinds()[before..], [40003, 40003]);
     assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
-    assert!(text(&posts[0].0).ends_with("Recorded: 2. Move · 14:05"));
+    // The edit knows the card's id, so it links the card's thread.
+    let thread = format!(
+        "Open thread: buzz://message?channel={}&id={}",
+        b.channel(),
+        card.event_id
+    );
+    assert!(text(&posts[0].0).ends_with(&format!("Recorded: 2. Move · 14:05\n{thread}")));
     assert_eq!(tag_value(&posts[1].0, "e").unwrap(), board_id(&b));
     let board = text(&posts[1].0);
     assert!(

@@ -72,6 +72,25 @@ struct Card {
     reply: Option<item::Reply>,
     /// A receipt: the question as it closed.
     request: Option<Box<Card>>,
+    /// The drop's plain-language fields, as written.
+    plain: Option<item::Plain>,
+    /// The command the writer runs if the recommended option is chosen.
+    action: Option<String>,
+    /// Asked again after an answer, and waiting again.
+    back_to_you: bool,
+    /// The answer the card came back from.
+    previous_answer: Option<CardPrevious>,
+}
+
+/// 0-based, like `options`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CardPrevious {
+    option: usize,
+    label: String,
+    /// None: the owner's own keys.
+    by_name: Option<String>,
+    answered_at: u64,
 }
 
 /// 0-based, like `options` and `bench_answer`'s `option`.
@@ -134,6 +153,15 @@ fn card(i: &item::Item, owner_set: &[String]) -> Card {
         recommender: stamp.and_then(|st| st.recommender.clone()),
         reply: i.reply.clone(),
         request: i.request.as_deref().map(|r| Box::new(card(r, owner_set))),
+        plain: i.plain.clone(),
+        action: i.action.clone(),
+        back_to_you: i.back_to_you(),
+        previous_answer: i.previous.as_ref().map(|p| CardPrevious {
+            option: p.option,
+            label: p.label.clone(),
+            by_name: p.by_name.clone(),
+            answered_at: p.answered_at,
+        }),
     }
 }
 

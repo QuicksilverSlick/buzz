@@ -866,10 +866,10 @@ async fn fake_events(
     (StatusCode::OK, Json(reply))
 }
 
-/// Only `authors`, `until` and, past it, `limit` (newest first) apply, so
-/// recover can page and the poll's two pages split as the relay's do. Kinds
-/// and tags do not: rebuild_map skips kind != 9 and pick_answer kind != 7, so
-/// one list serves recover and the poll.
+/// Only `authors`, `#e`, `until` and, past it, `limit` (newest first) apply,
+/// so recover can page and the poll's pages split as the relay's do. Kinds
+/// and other tags do not: rebuild_map skips kind != 9 and pick_answer kind
+/// != 7, so one list serves recover and the poll.
 async fn fake_query(
     State(r): State<Arc<Relay>>,
     body: String,
@@ -882,6 +882,10 @@ async fn fake_query(
     let mut evs = r.query_reply.lock().unwrap().clone();
     if let Some(authors) = q[0]["authors"].as_array() {
         evs.retain(|e| authors.contains(&e["pubkey"]));
+    }
+    if let Some(ids) = q[0]["#e"].as_array() {
+        let tags = |e: &Value| e["tags"].as_array().cloned().unwrap_or_default();
+        evs.retain(|e| tags(e).iter().any(|t| t[0] == "e" && ids.contains(&t[1])));
     }
     if let Some(until) = q[0]["until"].as_u64() {
         evs.retain(|e| e["created_at"].as_u64().unwrap() <= until);
@@ -1474,6 +1478,7 @@ fn exported_board_drops_all_validate() {
 mod answers;
 mod channels;
 mod desktop_cards;
+mod one_tap;
 mod receipts;
 mod routes;
 mod scoped;

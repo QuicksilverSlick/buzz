@@ -13,7 +13,7 @@ pub(super) const ASK: &str = "reset-worker/welcome";
 pub(super) struct People {
     pub(super) craig: Keys,
     /// Reset Worker: writes the folder and is its route target.
-    agent: Keys,
+    pub(super) agent: Keys,
     /// An agent decider: never an answerer on a needs-you card.
     orch: Keys,
 }
@@ -24,7 +24,7 @@ pub(super) fn hex(k: &Keys) -> String {
 
 /// roles.json binds reset-worker to project reset in X, Craig decides;
 /// routes.json sends the folder's answers to Reset Worker.
-fn bind(b: &mut Bench) -> People {
+pub(super) fn bind(b: &mut Bench) -> People {
     let p = People {
         craig: Keys::generate(),
         agent: Keys::generate(),
@@ -47,7 +47,7 @@ fn bind(b: &mut Bench) -> People {
 }
 
 /// X's owner and admin list as `signer` publishes it: the owner, plus `more`.
-fn admins(b: &Bench, signer: &Keys, more: &[&str]) -> nostr::Event {
+pub(super) fn admins(b: &Bench, signer: &Keys, more: &[&str]) -> nostr::Event {
     let mut tags = vec![
         nostr::Tag::parse(["d", X]).unwrap(),
         nostr::Tag::parse(["p", &b.owner_hex(), "owner"]).unwrap(),
@@ -62,7 +62,7 @@ fn admins(b: &Bench, signer: &Keys, more: &[&str]) -> nostr::Event {
 }
 
 /// Reset Worker asks the project's deciders, recommending option 2.
-fn ask(overrides: &[(&str, Value)]) -> String {
+pub(super) fn ask(overrides: &[(&str, Value)]) -> String {
     let mut o = vec![
         ("project", json!("reset")),
         ("to", json!({"role": "decider"})),
@@ -87,7 +87,13 @@ pub(super) async fn bound_bench() -> (Bench, People, nostr::Event) {
     (b, p, list)
 }
 
-fn thread_reply(keys: &Keys, card: &str, text: &str, at: u64, pings: &[&str]) -> nostr::Event {
+pub(super) fn thread_reply(
+    keys: &Keys,
+    card: &str,
+    text: &str,
+    at: u64,
+    pings: &[&str],
+) -> nostr::Event {
     let card = nostr::EventId::from_hex(card).unwrap();
     let thread = crate::events::ThreadRef {
         root_event_id: card,
@@ -112,7 +118,7 @@ fn thread_reply(keys: &Keys, card: &str, text: &str, at: u64, pings: &[&str]) ->
     .unwrap()
 }
 
-fn notices(b: &Bench, before: usize) -> Vec<Value> {
+pub(super) fn notices(b: &Bench, before: usize) -> Vec<Value> {
     b.posts()[before..]
         .iter()
         .filter(|(e, _)| tag_value(e, "client").is_some_and(|c| c.starts_with("bench:route:")))
@@ -120,7 +126,7 @@ fn notices(b: &Bench, before: usize) -> Vec<Value> {
         .collect()
 }
 
-fn tags(ev: &Value, name: &str) -> Vec<Value> {
+pub(super) fn tags(ev: &Value, name: &str) -> Vec<Value> {
     ev["tags"]
         .as_array()
         .unwrap()
@@ -130,7 +136,7 @@ fn tags(ev: &Value, name: &str) -> Vec<Value> {
         .collect()
 }
 
-fn content(ev: &Value) -> &str {
+pub(super) fn content(ev: &Value) -> &str {
     ev["content"].as_str().unwrap()
 }
 
@@ -259,6 +265,8 @@ async fn craig_answers_and_the_owner_overrides() {
     b.settle(2).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
+    // Craig's answer is the writer's notice, with Guest authority.
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
     assert_eq!(tag_value(&n[0], "h").as_deref(), Some(X));
     assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
     assert_eq!(tags(&n[0], "e"), [json!(["e", card, "", "reply"])]);
@@ -291,11 +299,28 @@ async fn craig_answers_and_the_owner_overrides() {
     b.settle(2).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(
-        content(&n[0]).starts_with("Bench answer changed · reset-worker/welcome")
-            && content(&n[0]).contains(" by Quicksilver (owner). "),
-        "{}",
-        content(&n[0])
+    // The owner's is the owner's own message, in the same thread, to the
+    // same agent.
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(
+        content(&n[0]),
+        "Quicksilver chose: Keep the old one on Welcome email (reset-worker/welcome). \
+         I approve the action that option describes."
+    );
+    assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
+    assert_eq!(tags(&n[0], "e"), [json!(["e", card, "", "reply"])]);
+    assert_eq!(
+        tag_value(&n[0], "client").unwrap(),
+        format!("bench:route:{ASK}@2")
+    );
+    assert_eq!(
+        tags(&n[0], "df-answer"),
+        [json!([
+            "df-answer",
+            "2",
+            b.owner_hex(),
+            owner_tap.id.to_hex()
+        ])]
     );
 }
 
@@ -489,7 +514,7 @@ async fn other_replies_reach_the_route_target() {
     );
     assert_eq!(
         content(&n[0]),
-        render_route_reply(&b.s.items[ASK], &local_hhmm(r.at))
+        render_route_reply(&b.s.items[ASK], &local_hhmm(r.at)) + &thread_line(X, &card)
     );
     assert!(!content(&n[0]).contains("shorter"));
     assert_eq!(tags(&n[0], "p"), [json!(["p", agent])]);
@@ -544,11 +569,23 @@ async fn phone_replies_to_a_threaded_card_name_only_its_root() {
     reply(&b, &[&list, &early]);
     b.tick().await.unwrap();
     assert!(b.s.items[ASK].reply.is_none());
-    // The read takes the root's thread from an hour before the oldest card.
+    // The root's thread is a read of its own, from an hour before the card
+    // that takes it, not the older #bench card; the cards' read has no since.
     let q = b.relay.queries.lock().unwrap().clone();
     let read = q.iter().rev().find(|q| q[0]["#e"].is_array()).unwrap();
-    assert!(read[0]["#e"].as_array().unwrap().contains(&json!(root)));
-    assert_eq!(read[0]["since"], json!(b.card(ITEM).created_at - 3600));
+    assert_eq!(read[0]["#e"], json!([root]));
+    assert_eq!(read[0]["since"], json!(card.created_at - 3600));
+    assert!(card.created_at - 3600 > b.card(ITEM).created_at - 3600);
+    let cards = q
+        .iter()
+        .rev()
+        .find(|q| q[0]["#e"].is_array() && q[0]["#e"] != json!([root]))
+        .unwrap();
+    assert_eq!(
+        cards[0]["#e"],
+        json!([b.card(ITEM).event_id, card.event_id])
+    );
+    assert_eq!(cards[0].get("since"), None);
     let other = thread_reply(&p.craig, &root, "Shorter still?", card.created_at + 1, &[]);
     let two = thread_reply(&p.craig, &root, "2", card.created_at + 2, &[]);
     reply(&b, &[&list, &early, &other]);
@@ -816,10 +853,13 @@ async fn the_owners_word_stands_across_taps_and_other() {
     b.settle(2).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(
-        content(&n[0]).starts_with(&format!("Bench answer · {ASK}\n")),
-        "{}",
-        content(&n[0])
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(
+        content(&n[0]),
+        format!(
+            "Quicksilver chose: Keep the old one on Welcome email ({ASK}). \
+             I approve the action that option describes."
+        )
     );
 
     // Craig merges, then the owner replies inside the settle: Craig's answer
@@ -847,6 +887,8 @@ async fn the_owners_word_stands_across_taps_and_other() {
     b.settle(2).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
+    // Free text stays the writer's, even the owner's own.
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
     assert!(
         content(&n[0]).starts_with(&format!("Bench reply · {ASK}\n"))
             && content(&n[0]).contains("\nQuicksilver (owner) replied in this thread"),

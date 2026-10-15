@@ -6,14 +6,17 @@ use std::collections::BTreeMap;
 
 use super::channels::{card_channel, channel_ready, joined};
 use super::{
-    forget_card, item, live_card, local_hhmm, post_as_writer, query, same_drop, spend, BenchState,
-    Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS, RECOVER_LIMIT,
+    forget_card, item, live_card, local_hhmm, next_ts, post_as_owner, post_as_writer, query,
+    same_drop, spend, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS,
+    RECOVER_LIMIT,
 };
 use crate::events;
 
 /// A kind 9 carrying its `client` marker; the p tags only for whom it pings
 /// (a card's answerers or the owner, a notice's route target). `extra` tags
-/// go on unchecked: only the Bench's own `df-` tags.
+/// go on unchecked: only the Bench's own `df-` tags. `as_owner`: signed by
+/// the owner's identity (`item::render_owner_route`), still on the
+/// monotonic clock so the board stays newest.
 #[allow(clippy::too_many_arguments)]
 async fn post_message(
     ctx: &Ctx<'_>,
@@ -25,6 +28,7 @@ async fn post_message(
     marker: String,
     extra: Vec<nostr::Tag>,
     now: u64,
+    as_owner: bool,
 ) -> Result<Outcome, String> {
     let ch = uuid::Uuid::parse_str(ch).map_err(|e| e.to_string())?;
     let builder = events::build_message_with_client_tags(
@@ -41,6 +45,9 @@ async fn post_message(
         &[vec!["client".to_string(), marker]],
     )?
     .tags(extra);
+    if as_owner {
+        return post_as_owner(ctx, builder.custom_created_at(next_ts(s, now)?)).await;
+    }
     post_as_writer(ctx, s, builder, now).await
 }
 
@@ -122,7 +129,7 @@ fn bad_thread(e: &str) -> bool {
 /// Cards, seeds, then the board, at most `budget` posts. A card is posted
 /// once per Drop and card format; it is edited to record an answer and, once
 /// closed out, to become a receipt. Only a card nobody engaged with is ever
-/// deleted.
+/// deleted. Every post made once a card's own id is known links its thread.
 pub(super) async fn publish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -130,6 +137,7 @@ pub(super) async fn publish(
     now: u64,
     hhmm: &str,
     routes: &BTreeMap<String, String>,
+    owner_set: &[String],
 ) -> Result<(), String> {
     // (a) The live cards: pending + current + unanswered by severity, in a
     // channel ready for them; an answered card counts against MAX_CARDS (the
@@ -186,8 +194,8 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let text = item::render_card(&item, hhmm);
         let ch = card_channel(s, &item);
+        let text = item::render_card(&item, hhmm) + &item::thread_line(&ch, &card.event_id);
         match edit(ctx, s, &ch, &card.event_id, &text, now).await {
             // The edit re-rendered the whole card, so it now shows this card
             // format too: (b) must not retire it for an older one.
@@ -218,8 +226,8 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let (event_id, text) = (card.event_id.clone(), item::render_card(item, hhmm));
-        let ch = card_channel(s, item);
+        let (event_id, ch) = (card.event_id.clone(), card_channel(s, item));
+        let text = item::render_card(item, hhmm) + &item::thread_line(&ch, &event_id);
         match edit(ctx, s, &ch, &event_id, &text, now).await {
             Ok(_) => {
                 let i = s.items.get_mut(&id).expect("receipt id");
@@ -271,6 +279,7 @@ pub(super) async fn publish(
             root_event_id: root.unwrap_or(c),
             parent_event_id: c,
         });
+        let link = live_card(&item).map_or(String::new(), |c| item::thread_line(&ch, &c.event_id));
         let ping = [to.as_str()];
         if item::route_due(&item, now) {
             if !spend(budget, 1) {
@@ -282,7 +291,17 @@ pub(super) async fn publish(
                 .answer
                 .as_ref()
                 .map_or(item.changed_at, |a| a.answered_at);
-            let text = item::render_route(&item, prev, &local_hhmm(at));
+            // The owner's own answer goes out as the owner's own message, so
+            // the agent acts on the owner's word. Anyone else's answer, a
+            // withdrawal, or text that fails the checks again is the writer's.
+            let owners = item
+                .answer
+                .as_ref()
+                .filter(|a| owner_set.contains(&a.by))
+                .and_then(|_| item::render_owner_route(&item));
+            let as_owner = owners.is_some();
+            let text =
+                owners.unwrap_or_else(|| item::render_route(&item, prev, &local_hhmm(at)) + &link);
             let n = want.map_or("withdrawn".to_string(), |i| (i + 1).to_string());
             // Who answered, by key, so an agent elsewhere needs no outbox file.
             let extra = match &item.answer {
@@ -300,6 +319,7 @@ pub(super) async fn publish(
                 marker,
                 extra,
                 now,
+                as_owner,
             );
             let outcome = match posted.await {
                 // The card was deleted by hand: the notice goes top-level next tick.
@@ -334,7 +354,7 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let text = item::render_route_reply(&item, &local_hhmm(r.at));
+        let text = item::render_route_reply(&item, &local_hhmm(r.at)) + &link;
         let marker = format!("bench:route:{id}@r{}", &r.event_id[..16]);
         let extra = vec![df_answer(["other", &r.by, &r.event_id])?];
         let posted = post_message(
@@ -347,6 +367,7 @@ pub(super) async fn publish(
             marker,
             extra,
             now,
+            false,
         );
         match posted.await {
             Err(e) if thread.is_some() && e.contains("not found") => {
@@ -412,7 +433,7 @@ pub(super) async fn publish(
         let hash = item::card_hash(&item);
         let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
-        let pings = item::card_pings(&item, &s.owner_pubkey);
+        let pings = item::card_pings(&item, &s.owner_pubkey, owner_set);
         let pinged: Vec<&str> = pings.iter().map(String::as_str).collect();
         let thread = item
             .reply_to
@@ -434,6 +455,7 @@ pub(super) async fn publish(
             marker,
             Vec::new(),
             now,
+            false,
         );
         match posted.await {
             // Rather than stall every card behind this one, it goes top-level.
@@ -509,7 +531,20 @@ pub(super) async fn publish(
             return Ok(());
         }
         let marker = format!("bench:board@{hash}");
-        match post_message(ctx, s, &bench, &text, &[], None, marker, Vec::new(), now).await? {
+        match post_message(
+            ctx,
+            s,
+            &bench,
+            &text,
+            &[],
+            None,
+            marker,
+            Vec::new(),
+            now,
+            false,
+        )
+        .await?
+        {
             Outcome::Accepted { event_id } => {
                 let old = s.board.replace(Posted {
                     event_id,

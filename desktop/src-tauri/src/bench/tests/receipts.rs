@@ -50,7 +50,16 @@ async fn close_out_edits_the_card_into_a_receipt() {
     assert_eq!(tag_value(&posts[0].0, "h").unwrap(), b.channel());
     let item = &b.s.items[ITEM];
     let receipt = content(&posts[0].0);
-    assert_eq!(receipt, render_card(item, "14:05"));
+    let link = format!(
+        "buzz://message?channel={}&id={}",
+        b.channel(),
+        card.event_id
+    );
+    // The edit knows the card's id, so the receipt links its thread.
+    assert_eq!(
+        receipt,
+        render_card(item, "14:05") + &format!("\nOpen thread: {link}")
+    );
     let request = item.request.as_ref().unwrap();
     let at = &request.answer.as_ref().unwrap().hhmm;
     assert!(
@@ -61,7 +70,7 @@ async fn close_out_edits_the_card_into_a_receipt() {
         receipt.ends_with(&format!(
             "1. Stay\n2. Move\n\nAnswered: 2. Move · {at}\n\nOutcome · 14:05\n\
              **Moved the relay**\n\nMoved the community to the new relay.\n\n\
-             PR: https://github.com/x/y/pull/1"
+             PR: https://github.com/x/y/pull/1\nOpen thread: {link}"
         )),
         "{receipt}"
     );
@@ -69,11 +78,6 @@ async fn close_out_edits_the_card_into_a_receipt() {
     assert_eq!(item.card.as_ref().unwrap().hash, card_hash(item));
     // The board links the decision to its receipt.
     let board = content(&posts[1].0);
-    let link = format!(
-        "buzz://message?channel={}&id={}",
-        b.channel(),
-        card.event_id
-    );
     assert!(
         board.contains(&format!(
             "- 🧭 Moved the relay (dreamforge) (claude) · {link}"

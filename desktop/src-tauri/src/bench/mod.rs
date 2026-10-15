@@ -22,6 +22,7 @@ mod channels;
 pub(crate) mod commands;
 mod item;
 mod pick;
+mod plain;
 mod publish;
 mod roles;
 
@@ -354,8 +355,8 @@ fn scan_inbox(
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
 /// new question after an answer or a reply leaves the old card on the relay
-/// as it is and gets a card of its own; anything else keeps the card for
-/// publish to refresh.
+/// as it is and gets a card of its own, which comes back to whoever answered
+/// (`item::Previous`); anything else keeps the card for publish to refresh.
 fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<String>) -> item::Item {
     let Some(o) = old else { return new };
     let asking = new.kind == item::ItemKind::Pending;
@@ -369,8 +370,20 @@ fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<Stri
         new.card = o.card.clone();
     } else if asking && (o.engaged() || o.request.is_some()) {
         kept.extend(o.card.as_ref().map(|c| c.event_id.clone()));
+        let asked = o.request.as_deref().unwrap_or(o);
+        let answered = asked.answer.as_ref().and_then(|a| {
+            Some(item::Previous {
+                option: a.option,
+                label: asked.options.get(a.option)?.clone(),
+                by: a.by.clone(),
+                by_name: a.by_name.clone(),
+                answered_at: a.answered_at,
+            })
+        });
+        new.previous = answered.or_else(|| o.previous.clone());
     } else {
         new.card = o.card.clone();
+        new.previous = o.previous.clone().filter(|_| asking);
     }
     new
 }
@@ -839,9 +852,11 @@ fn named(
 /// retraction is an event that stopped coming back and nothing is ever
 /// double-applied. The outbox file lands before state records the answer: a
 /// failed write is retried next tick instead of being lost. Ok(Some) says
-/// the answerers' page was cut: the tick goes on, and it is lastError.
-// ponytail: one /query per 2 s tick, two once a live card has answerers
-// (60/min of the 300/min budget); swap for the live #h tail via
+/// a page was cut: the cards it covers keep their answers, they are read
+/// again next tick, the tick goes on, and it is lastError.
+// ponytail: one /query per 2 s tick, two once a live card has answerers,
+// twice that while a card takes its thread root's replies (up to 120/min of
+// the 300/min budget); swap for the live #h tail via
 // native_relay_client::start when the relay complains.
 async fn poll_answers(
     ctx: &Ctx<'_>,
@@ -860,27 +875,27 @@ async fn poll_answers(
     if live.is_empty() {
         return Ok(None);
     }
-    let mut cards: Vec<String> = live
+    let cards: Vec<String> = live
         .iter()
         .filter_map(|i| live_card(i))
         .map(|c| c.event_id.clone())
         .collect();
-    // A reply that names only a card's thread root (`item::root_until`).
-    // Their whole threads match, so the read starts an hour (clock skew)
-    // before the oldest live card: nothing older counts on any of them.
-    let roots: Vec<String> = live
+    // Replies that name only a card's thread root (`item::root_until`) are a
+    // read of their own: their whole threads match, so it starts an hour
+    // (clock skew) before the oldest card that takes them, nothing older
+    // counts on any of them, and a busy thread never cuts the cards' page.
+    let rooted: Vec<&item::Item> = live
         .iter()
+        .copied()
         .filter(|i| item::root_until(i, s.items.values(), &s.kept).is_some())
-        .filter_map(|i| i.reply_to.clone())
         .collect();
-    let since = live
+    let roots: Vec<String> = rooted.iter().filter_map(|i| i.reply_to.clone()).collect();
+    let since = rooted
         .iter()
         .filter_map(|i| live_card(i))
-        .map(|c| c.created_at)
-        .min()
-        .filter(|_| !roots.is_empty())
-        .map(|t| t.saturating_sub(3600));
-    cards.extend(roots);
+        .map(|c| c.created_at.saturating_sub(3600))
+        .min();
+    let rooted: Vec<String> = rooted.iter().map(|i| i.id.clone()).collect();
     let mut answerers: Vec<String> = live
         .iter()
         .flat_map(|i| i.stamp.iter().flat_map(|st| &st.answerers))
@@ -904,11 +919,9 @@ async fn poll_answers(
         .chain(ctx.access.iter().map(|a| a.pubkey.clone()))
         .collect();
     let ids: Vec<String> = live.iter().map(|i| i.id.clone()).collect();
-    // The owner's keys are read apart from everyone else's, so nobody else's
-    // traffic can cut the owner's page or stall the tick.
-    let page = |authors: &[String]| {
+    let page = |authors: &[String], e: &[String], since: Option<u64>| {
         let mut f = serde_json::json!({
-            "kinds": kinds, "authors": authors, "#h": chans, "#e": cards,
+            "kinds": kinds, "authors": authors, "#h": chans, "#e": e,
             "limit": RECOVER_LIMIT,
         });
         if let Some(t) = since {
@@ -916,29 +929,50 @@ async fn poll_answers(
         }
         f
     };
-    let mut events = query(ctx, s, page(owner_set), now).await?;
-    // A cut page hides answers: never infer a retraction from it.
-    if events.len() as u32 >= RECOVER_LIMIT {
-        return Err(format!(
-            "answers truncated (>= {RECOVER_LIMIT} reactions on live cards)"
-        ));
+    // The owner's keys are read apart from everyone else's, so nobody else's
+    // traffic can cut the owner's page. A cut page hides answers: never infer
+    // a retraction from it. Each full page, as (the owner's, a thread's).
+    let mut events = Vec::new();
+    let mut full = Vec::new();
+    for (owners, authors) in [(true, owner_set), (false, answerers.as_slice())] {
+        for (threads, e, since) in [(false, &cards, None), (true, &roots, since)] {
+            if authors.is_empty() || e.is_empty() {
+                continue;
+            }
+            let got = query(ctx, s, page(authors, e, since), now).await?;
+            if got.len() as u32 >= RECOVER_LIMIT {
+                full.push((owners, threads));
+            }
+            events.extend(got);
+        }
     }
-    let mut cut = None;
-    if !answerers.is_empty() {
-        let others = query(ctx, s, page(&answerers), now).await?;
-        if others.len() as u32 >= RECOVER_LIMIT {
-            cut = Some(format!(
+    // Whether a page that `id` is read from was cut.
+    let cut = |owners: bool, id: &String| {
+        full.iter()
+            .any(|&(o, t)| o == owners && (!t || rooted.contains(id)))
+    };
+    let why = if full.iter().any(|f| f.0) {
+        Some(format!(
+            "answers truncated (>= {RECOVER_LIMIT} events from your keys on live cards); \
+             those cards' answers stand"
+        ))
+    } else {
+        (!full.is_empty()).then(|| {
+            format!(
                 "answers truncated (>= {RECOVER_LIMIT} events from the cards' answerers); \
                  their answers stand"
-            ));
-        }
-        events.extend(others);
-    }
+            )
+        })
+    };
     let theirs = |by: &str| !owner_set.iter().any(|o| o == by);
     let writer_hex = ctx.writer.public_key().to_hex();
     let hhmm = local_hhmm(now);
     let mut refused = Vec::new();
     for id in ids {
+        // The owner's page was cut: everything on this card stands.
+        if cut(true, &id) {
+            continue;
+        }
         let until = item::root_until(&s.items[&id], s.items.values(), &s.kept);
         let item = s.items.get_mut(&id).expect("live id");
         let card = live_card(item).expect("live card").event_id.clone();
@@ -946,7 +980,7 @@ async fn poll_answers(
         // hidden: theirs stand as they are. The owner's page is whole, so it
         // still decides once the owner spoke, and an answer of the owner's
         // that stopped coming back was withdrawn.
-        let unread = cut.is_some() && !item::owner_spoke(item, &card, &events, owner_set, until);
+        let unread = cut(false, &id) && !item::owner_spoke(item, &card, &events, owner_set, until);
         for e in item::refused_taps(item, &events, owner_set, &writer_hex, until) {
             let by = e.pubkey.to_hex();
             let why = if item.needs == item::Needs::You && agents.contains(&by) {
@@ -1079,7 +1113,7 @@ async fn poll_answers(
     }
     let over = s.refused_taps.len().saturating_sub(REFUSED_TAPS_MAX);
     s.refused_taps.drain(..over);
-    Ok(cut)
+    Ok(why)
 }
 
 /// A pending item past its deadline folds off the board: Superseded, so
@@ -1145,8 +1179,8 @@ fn restamp(
 /// One 2 s tick: owner fence, bootstrap, the bound channels' joins and admin
 /// check, recovery, the answer poll (before intake, so a query failure aborts
 /// the tick before any drop is read), intake, expiry, answerers, publish. An
-/// unreadable roles.json, or a cut page of the answerers' taps, fails the
-/// tick only after publish: #bench and every unscoped card carry on.
+/// unreadable roles.json, or a cut page of answers, fails the tick only
+/// after publish: #bench and every unscoped card carry on.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -1210,7 +1244,7 @@ pub(crate) async fn tick(
         &owner_set,
         &routes,
     );
-    publish::publish(ctx, s, &mut budget, now, hhmm, &routes).await?;
+    publish::publish(ctx, s, &mut budget, now, hhmm, &routes, &owner_set).await?;
     done.and(cut.map_or(Ok(()), Err))
 }
 
