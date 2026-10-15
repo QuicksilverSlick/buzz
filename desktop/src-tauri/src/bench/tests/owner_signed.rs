@@ -434,9 +434,15 @@ fn a_bare_number_is_no_option_label() {
         json!(["2", "1"]),
         json!(["Stay", "42"]),
         json!(["**3**", "Go"]),
+        json!(["\"2\"", "Go"]),
+        json!(["Go", "'1'"]),
+        json!(["1.5", "Go"]),
     ] {
         let err = check(&[("options", options.clone())]).unwrap_err();
-        assert_eq!(err, "option: a label can't be just a number", "{options}");
+        assert_eq!(
+            err, "option: a label needs a word, not just a number",
+            "{options}"
+        );
     }
     assert!(check(&[("options", json!(["Plan 2", "Plan 1"]))]).is_ok());
 }
