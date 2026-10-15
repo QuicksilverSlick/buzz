@@ -2,6 +2,7 @@
 //! tick tests. This file carries the only literal events route in bench/.
 
 use super::item::*;
+use super::route::render_owner_route;
 use super::*;
 use serde_json::{json, Value};
 
@@ -1479,6 +1480,7 @@ mod answers;
 mod channels;
 mod desktop_cards;
 mod one_tap;
+mod owner_signed;
 mod owner_word;
 mod receipts;
 mod routes;

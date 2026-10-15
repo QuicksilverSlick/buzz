@@ -6,32 +6,29 @@ use std::collections::BTreeMap;
 
 use super::channels::{card_channel, channel_ready, joined};
 use super::{
-    forget_card, item, live_card, local_hhmm, next_ts, post_as_owner, post_as_writer, query,
-    same_drop, spend, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS,
-    RECOVER_LIMIT,
+    forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, same_drop, save_both,
+    spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS, RECOVER_LIMIT,
 };
 use crate::events;
 
+/// Twice the relay's +-900 s created_at window: past it the relay refuses an
+/// event's time before it would answer duplicate, so only a lookup can tell.
+const OWNER_RESEND_SECS: u64 = 1800;
+
 /// A kind 9 carrying its `client` marker; the p tags only for whom it pings
 /// (a card's answerers or the owner, a notice's route target). `extra` tags
-/// go on unchecked: only the Bench's own `df-` tags. `as_owner`: signed by
-/// the owner's identity (`item::render_owner_route`), still on the
-/// monotonic clock so the board stays newest.
-#[allow(clippy::too_many_arguments)]
-async fn post_message(
+/// go on unchecked: only the Bench's own `df-` tags.
+fn message(
     ctx: &Ctx<'_>,
-    s: &mut BenchState,
     ch: &str,
     text: &str,
     pings: &[&str],
     thread: Option<&events::ThreadRef>,
     marker: String,
     extra: Vec<nostr::Tag>,
-    now: u64,
-    as_owner: bool,
-) -> Result<Outcome, String> {
+) -> Result<nostr::EventBuilder, String> {
     let ch = uuid::Uuid::parse_str(ch).map_err(|e| e.to_string())?;
-    let builder = events::build_message_with_client_tags(
+    Ok(events::build_message_with_client_tags(
         ch,
         text,
         thread,
@@ -44,11 +41,72 @@ async fn post_message(
         &ctx.base,
         &[vec!["client".to_string(), marker]],
     )?
-    .tags(extra);
-    if as_owner {
-        return post_as_owner(ctx, builder.custom_created_at(next_ts(s, now)?)).await;
-    }
+    .tags(extra))
+}
+
+/// `message`, from the writer.
+#[allow(clippy::too_many_arguments)]
+async fn post_message(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    ch: &str,
+    text: &str,
+    pings: &[&str],
+    thread: Option<&events::ThreadRef>,
+    marker: String,
+    extra: Vec<nostr::Tag>,
+    now: u64,
+) -> Result<Outcome, String> {
+    let builder = message(ctx, ch, text, pings, thread, marker, extra)?;
     post_as_writer(ctx, s, builder, now).await
+}
+
+/// An owner's notice that may not have reached the relay (a timeout, a lost
+/// reply, a restart): sent again as that same event, never signed afresh.
+/// Once its time is too old for the relay, or its card is gone, a lookup by
+/// id says whether it landed; if not, it never can, and the next tick signs
+/// one afresh. Either way `owner_sent` clears, and `routed` lands if the
+/// relay has it.
+async fn resend_owner(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    id: &str,
+    ch: &str,
+    sent: item::OwnerSent,
+    now: u64,
+) -> Result<(), String> {
+    let ev = &sent.event;
+    let (mut told, mut gone) = (false, false);
+    if now < ev.created_at.as_secs() + OWNER_RESEND_SECS {
+        match submit(ctx, ev, &ctx.owner, None).await {
+            Ok(_) => told = true,
+            // Its card is gone; whether it landed first, the lookup says.
+            Err(e) if e.contains("not found") => gone = true,
+            Err(e) => return Err(e),
+        }
+    }
+    if !told {
+        let filter = serde_json::json!({
+            "ids": [ev.id.to_hex()], "kinds": [9], "#h": [ch],
+        });
+        told = query(ctx, s, filter, now)
+            .await?
+            .iter()
+            .any(|e| e.id == ev.id);
+    }
+    let top = !ev
+        .tags
+        .iter()
+        .any(|t| matches!(t.as_slice(), [k, ..] if k == "e"));
+    let i = s.items.get_mut(id).expect("routed id");
+    i.owner_sent = None;
+    if told {
+        i.routed = Some(sent.routed);
+        s.board_dirty |= top && ch == s.channel_id;
+    } else if gone {
+        forget_card(s, id);
+    }
+    Ok(())
 }
 
 /// kind 5 with h+e on one of the writer's own events (never 9005).
@@ -262,7 +320,17 @@ pub(super) async fn publish(
                 .push(format!("{id}: route target is an answerer on this card"));
             continue;
         }
-        if now < s.routes_held_until || s.held.contains(&id) {
+        // A channel no longer ready is not read either (an untap there is
+        // unseen), so its answers wait, like a held card's.
+        if now < s.routes_held_until || s.held.contains(&id) || !channel_ready(s, &item) {
+            continue;
+        }
+        // An owner's notice already signed is settled first, as itself.
+        if let Some(sent) = item.owner_sent.clone() {
+            if !spend(budget, 1) {
+                return Ok(());
+            }
+            resend_owner(ctx, s, &id, &ch, sent, now).await?;
             continue;
         }
         let card = live_card(&item)
@@ -281,7 +349,7 @@ pub(super) async fn publish(
         });
         let link = live_card(&item).map_or(String::new(), |c| item::thread_line(&ch, &c.event_id));
         let ping = [to.as_str()];
-        if item::route_due(&item, now) {
+        if item::route_due(&item, now, owner_set) {
             if !spend(budget, 1) {
                 return Ok(());
             }
@@ -290,25 +358,21 @@ pub(super) async fn publish(
                 .answer
                 .as_ref()
                 .map_or(item.changed_at, |a| a.answered_at);
-            // The owner's own answer goes out as the owner's own message, so
-            // the agent acts on the owner's word. One told that way and now
-            // withdrawn or someone else's is taken back that way first, as a
-            // withdrawal (the other answer follows next tick). Anyone else's
-            // answer, any other withdrawal, or text that fails the checks
-            // again is the writer's.
-            let mine = item
-                .answer
-                .as_ref()
-                .is_some_and(|a| owner_set.contains(&a.by));
+            // The owner's own tap goes out as the owner's own message, so the
+            // agent acts on the owner's word (`item::owner_route`). One told
+            // that way and now withdrawn or not the owner's tap is taken back
+            // that way first, as a withdrawal (the other answer follows next
+            // tick). Anything else, or text that fails the checks again, is
+            // the writer's.
+            let mine = item::owner_route(&item, owner_set);
             let taken_back = item
                 .routed
                 .as_ref()
-                .filter(|r| r.owner && !mine)
-                .and_then(|r| item::render_owner_withdrawal(&item, r.option?));
+                .filter(|r| r.owner && mine.is_none())
+                .and_then(|r| item::render_owner_withdrawal(&item, r));
             let answer = item.answer.as_ref().filter(|_| taken_back.is_none());
             let want = answer.map(|a| a.option);
-            let owners =
-                taken_back.or_else(|| item::render_owner_route(&item, prev).filter(|_| mine));
+            let owners = taken_back.or(mine);
             let as_owner = owners.is_some();
             let text =
                 owners.unwrap_or_else(|| item::render_route(&item, prev, &local_hhmm(at)) + &link);
@@ -319,21 +383,39 @@ pub(super) async fn publish(
                 _ => Vec::new(),
             };
             let marker = format!("bench:route:{id}@{n}");
-            let posted = post_message(
-                ctx,
-                s,
-                &ch,
-                &text,
-                &ping,
-                thread.as_ref(),
-                marker,
-                extra,
-                now,
-                as_owner,
-            );
-            let outcome = match posted.await {
-                // The card was deleted by hand: the notice goes top-level next tick.
+            let mut routed = item::Routed {
+                option: want,
+                to: to.clone(),
+                event_id: String::new(),
+                at: now,
+                owner: as_owner && want.is_some(),
+                label: want.and_then(|w| item.options.get(w).cloned()),
+                card: live_card(&item).map(|c| c.event_id.clone()),
+            };
+            let builder = message(ctx, &ch, &text, &ping, thread.as_ref(), marker, extra)?;
+            let posted = if as_owner {
+                // On the monotonic clock so the board stays newest, and on
+                // disk before it goes (`resend_owner`).
+                let ev = builder
+                    .custom_created_at(next_ts(s, now)?)
+                    .sign_with_keys(&ctx.owner)
+                    .map_err(|e| e.to_string())?;
+                routed.event_id = ev.id.to_hex();
+                let sent = item::OwnerSent {
+                    event: ev.clone(),
+                    routed: routed.clone(),
+                };
+                s.items.get_mut(&id).expect("routed id").owner_sent = Some(sent);
+                save_both(&ctx.root, s)?;
+                submit(ctx, &ev, &ctx.owner, None).await
+            } else {
+                post_as_writer(ctx, s, builder, now).await
+            };
+            let outcome = match posted {
+                // The card was deleted by hand: the notice goes top-level next
+                // tick. The relay refused it, so an owner's never landed.
                 Err(e) if thread.is_some() && e.contains("not found") => {
+                    s.items.get_mut(&id).expect("routed id").owner_sent = None;
                     forget_card(s, &id);
                     continue;
                 }
@@ -341,18 +423,13 @@ pub(super) async fn publish(
             };
             // A top-level notice is now newer than the board.
             s.board_dirty |= thread.is_none() && ch == s.channel_id;
-            let event_id = match outcome {
-                Outcome::Accepted { event_id } => event_id,
-                // Already on the relay: told all the same.
-                Outcome::Duplicate => String::new(),
-            };
-            s.items.get_mut(&id).expect("routed id").routed = Some(item::Routed {
-                option: want,
-                to: to.clone(),
-                event_id,
-                at: now,
-                owner: as_owner && want.is_some(),
-            });
+            // A writer's already on the relay is told all the same.
+            if let (false, Outcome::Accepted { event_id }) = (as_owner, outcome) {
+                routed.event_id = event_id;
+            }
+            let i = s.items.get_mut(&id).expect("routed id");
+            i.owner_sent = None;
+            i.routed = Some(routed);
         }
         // The person's Other: no settle, a reply is not undone by a tap.
         let Some(r) = item
@@ -378,7 +455,6 @@ pub(super) async fn publish(
             marker,
             extra,
             now,
-            false,
         );
         match posted.await {
             Err(e) if thread.is_some() && e.contains("not found") => {
@@ -467,7 +543,6 @@ pub(super) async fn publish(
             marker,
             Vec::new(),
             now,
-            false,
         );
         match posted.await {
             // Rather than stall every card behind this one, it goes top-level.
@@ -543,20 +618,7 @@ pub(super) async fn publish(
             return Ok(());
         }
         let marker = format!("bench:board@{hash}");
-        match post_message(
-            ctx,
-            s,
-            &bench,
-            &text,
-            &[],
-            None,
-            marker,
-            Vec::new(),
-            now,
-            false,
-        )
-        .await?
-        {
+        match post_message(ctx, s, &bench, &text, &[], None, marker, Vec::new(), now).await? {
             Outcome::Accepted { event_id } => {
                 let old = s.board.replace(Posted {
                     event_id,

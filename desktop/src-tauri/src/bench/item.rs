@@ -27,14 +27,14 @@ const TITLE_MAX: usize = 120;
 const BODY_MAX: usize = 4000;
 pub(crate) const NAME_MAX: usize = 32;
 const ID_MAX: usize = 64;
-const OPTION_MAX: usize = 80;
+pub(crate) const OPTION_MAX: usize = 80;
 const OPTIONS_MAX: usize = 4;
 const LINKS_MAX: usize = 4;
 const TO_MAX: usize = 8;
 const LABEL_MAX: usize = 40;
 const URL_MAX: usize = 512;
 const SUMMARY_MAX: usize = 400;
-const BOARD_TITLE_MAX: usize = 60;
+pub(crate) const BOARD_TITLE_MAX: usize = 60;
 /// U+FEFF, zero-width no-break space: invisible on both apps, and whitespace
 /// to the phone's regexes (Dart `\s`) and the desktop's emphasis rules
 /// (micromark's `/\s/`).
@@ -243,25 +243,6 @@ pub(crate) enum AnswerRole {
     Decider,
 }
 
-/// An answer change waits this long before it is routed, so an untap and a
-/// new tap (how the owner changes an answer) reach the agent as one notice.
-pub(crate) const ROUTE_SETTLE_SECS: u64 = 120;
-
-/// The last answer notice sent to the writer's route target.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Routed {
-    /// 0-based option the notice announced; None: a withdrawal.
-    pub option: Option<usize>,
-    pub to: String,
-    pub event_id: String,
-    pub at: u64,
-    /// The notice was the owner's own message (`render_owner_route`): a
-    /// withdrawal or someone else's answer takes it back the same way first.
-    #[serde(default)]
-    pub owner: bool,
-}
-
 /// The answer a card came back from: the writer asked again after it
 /// (`carry_card`), so the card says "Back to you" and pings this answerer.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -357,6 +338,9 @@ pub(crate) struct Item {
     /// Set by the service, never by a drop.
     #[serde(default)]
     pub previous: Option<Previous>,
+    /// An owner's notice signed and not yet known to be on the relay.
+    #[serde(default)]
+    pub owner_sent: Option<OwnerSent>,
 }
 
 impl Item {
@@ -539,6 +523,17 @@ pub(crate) fn validate(
             return Err("option: no plain letters or digits".to_string());
         }
     }
+    // As printed and as a reply names them (`answer_option`), each option
+    // reads apart: "chose: <label>" must name one.
+    let mut read: Vec<String> = d
+        .options
+        .iter()
+        .map(|o| plain_text(o, usize::MAX).to_ascii_lowercase())
+        .collect();
+    read.sort();
+    if read.windows(2).any(|w| w[0] == w[1]) {
+        return Err("option: two options read the same".to_string());
+    }
     match d.kind {
         ItemKind::Pending => {
             if d.severity.is_none() {
@@ -628,6 +623,7 @@ pub(crate) fn validate(
         was_engaged: false,
         request: None,
         previous: None,
+        owner_sent: None,
     })
 }
 
@@ -1041,7 +1037,11 @@ fn shown_name(item: &Item, by_name: Option<&str>) -> String {
 }
 
 /// Who answered, with their role, as a notice names them.
-fn answerer_text(item: &Item, by_name: Option<&str>, role: Option<AnswerRole>) -> String {
+pub(crate) fn answerer_text(
+    item: &Item,
+    by_name: Option<&str>,
+    role: Option<AnswerRole>,
+) -> String {
     let role = role.map(|r| match r {
         AnswerRole::Owner => "owner",
         AnswerRole::Decider => "decider",
@@ -1151,140 +1151,6 @@ pub(crate) fn card_pings(item: &Item, owner_hex: &str, owner_set: &[String]) -> 
     pings
 }
 
-/// Whether the route target is owed a notice: the answer has settled and is
-/// not the one it was last told, or the owner's message told it and it is
-/// someone else's now. A clear that was never routed owes nothing; a re-tap
-/// of the told option is no change.
-pub(crate) fn route_due(item: &Item, now: u64) -> bool {
-    let want = item.answer.as_ref().map(|a| a.option);
-    let told = item.routed.as_ref().map(|r| r.option);
-    let theirs = item.routed.as_ref().is_some_and(|r| r.owner)
-        && item.answer.as_ref().is_some_and(|a| a.by_name.is_some());
-    (told.map_or(want.is_some(), |t| t != want) || theirs)
-        && now.saturating_sub(item.changed_at) >= ROUTE_SETTLE_SECS
-}
-
-/// The notice for the item's current answer; `prev` is the option the target
-/// was last told (None: never, or a withdrawal). Card text goes through
-/// plain_text as on the card: it is drop text, so the agent is pointed at the
-/// outbox file, which carries the owner's signed reaction.
-pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> String {
-    let id = &item.id;
-    let opt = |i: usize| {
-        let text = item.options.get(i).map(|o| plain_text(o, usize::MAX));
-        format!("{}. {}", i + 1, text.unwrap_or_default())
-    };
-    let head = format!("{id}\nCard: {}", plain_text(&item.title, usize::MAX));
-    let by = match &item.answer {
-        Some(a) if item.scoped() => answerer_text(item, a.by_name.as_deref(), a.role),
-        _ => "the owner".to_string(),
-    };
-    let details =
-        format!("Answered {hhmm} by {by}. Details: outbox/{id}.json in the Bench folder.");
-    let clear = format!(
-        "reply in this thread, then clear the card by re-dropping {id} as a decision or status."
-    );
-    match (item.answer.as_ref().map(|a| a.option), prev) {
-        (Some(n), None) => format!(
-            "Bench answer \u{b7} {head}\nChosen: {}\n{details}\nAct on it, {clear}",
-            opt(n)
-        ),
-        (Some(n), Some(p)) => format!(
-            "Bench answer changed \u{b7} {head}\nChosen: {}\nWas: {}\n{details}\n\
-             Undo what you did for the old choice if it conflicts, {clear}",
-            opt(n),
-            opt(p)
-        ),
-        (None, Some(p)) => {
-            // On a scoped card someone other than the owner may have cleared it.
-            let cleared = if item.scoped() {
-                format!("The answer was cleared at {hhmm}.")
-            } else {
-                format!("The owner cleared the answer at {hhmm}.")
-            };
-            format!(
-                "Bench answer withdrawn \u{b7} {head}\nWas: {}\n{cleared} Stop if you have not \
-                 acted; if you have, say in this thread what to undo. Do not clear the card.",
-                opt(p)
-            )
-        }
-        (None, None) => String::new(),
-    }
-}
-
-/// The notice for a free-text reply on a scoped card (its Other). Like an
-/// answer notice it carries no reply text: the agent reads the reply itself
-/// in the thread, with the trust it gives that person.
-pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
-    let Some(r) = &item.reply else {
-        return String::new();
-    };
-    let id = &item.id;
-    format!(
-        "Bench reply \u{b7} {id}\nCard: {}\n{} replied in this thread at {hhmm} instead of \
-         choosing an option. Read their reply (event {}) in this thread, answer them there, \
-         and when it is settled close the card by re-dropping {id} as a decision or status \
-         with the outcome.",
-        plain_text(&item.title, usize::MAX),
-        answerer_text(item, r.by_name.as_deref(), r.role),
-        r.event_id
-    )
-}
-
-/// An option's label as the card shows it, for the owner's own message;
-/// None if it fails the drop checks again.
-fn owner_label(item: &Item, option: usize) -> Option<String> {
-    let o = item.options.get(option)?;
-    valid_text(o, OPTION_MAX, "option").ok()?;
-    Some(plain_text(o, usize::MAX)).filter(|l| !l.is_empty())
-}
-
-/// The notice for an answer from the owner's own keys, which the Bench posts
-/// from the owner's identity so the agent acts on the owner's word (spec
-/// section 9). Fixed wording around the option labels the card shows and
-/// the item id, never the title (writer text the owner did not choose),
-/// plus the card's action line when the recommended option was chosen.
-/// `prev` is the option the target was last told, which this replaces.
-/// None when any of them fails the drop checks again, and the writer's
-/// notice goes instead.
-pub(crate) fn render_owner_route(item: &Item, prev: Option<usize>) -> Option<String> {
-    let a = item.answer.as_ref()?;
-    let label = owner_label(item, a.option)?;
-    let who = owner_name(item).unwrap_or_else(|| "The owner".to_string());
-    let mut out = format!(
-        "{who} chose: {label} on card {}. I approve the action that option describes.",
-        item.id
-    );
-    if let Some(action) = item.action.as_deref() {
-        super::plain::valid_action(action).ok()?;
-        if item.recommend == Some(a.option + 1) {
-            out.push_str(&format!("\nAction: {action}"));
-        }
-    }
-    if let Some(p) = prev {
-        out.push_str(&format!(
-            "\nThis replaces the earlier answer: {}. Do not act on that one; undo what was \
-             done for it if it conflicts.",
-            owner_label(item, p)?
-        ));
-    }
-    Some(out)
-}
-
-/// The owner's own message taking back the answer `told`, last routed as
-/// `render_owner_route`, now withdrawn or someone else's: so no approval of
-/// the owner's outlives it. Fixed wording around the label, as there.
-pub(crate) fn render_owner_withdrawal(item: &Item, told: usize) -> Option<String> {
-    let who = owner_name(item).unwrap_or_else(|| "The owner".to_string());
-    Some(format!(
-        "{who} withdrew: {} on card {}. I no longer approve the action that option \
-         describes. Stop if you have not acted; if you have, say in this thread what to undo. \
-         Do not clear the card.",
-        owner_label(item, told)?,
-        item.id
-    ))
-}
-
 /// The line that opens a card's thread from its text, for posts made once
 /// the card's own id is known; empty if the link fails the link rules.
 pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
@@ -1301,6 +1167,10 @@ pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
 pub(crate) use super::pick::{
     answer_option, eligible, owner_spoke, pick_answer, pick_reply, reaction_target, refused_taps,
     root_until,
+};
+pub(crate) use super::route::{
+    owner_route, render_owner_withdrawal, render_route, render_route_reply, route_due, OwnerSent,
+    Routed, ROUTE_SETTLE_SECS,
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).

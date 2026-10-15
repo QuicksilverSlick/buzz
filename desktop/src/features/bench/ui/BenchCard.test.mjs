@@ -225,7 +225,7 @@ test("a click answers, shows Saving... until recorded, then the Recorded line", 
     fireEvent.click(optionButton("1. Ship it"));
   });
   assert.deepEqual(answerCalls(), [
-    { itemId: "dreamforge/ship-it", option: 0 },
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: 0 },
   ]);
   assert.ok(screen.getByText("Saving..."));
   assert.equal(optionButton("1. Ship it").getAttribute("aria-busy"), "true");
@@ -265,7 +265,7 @@ test("clicking the recorded option undoes it with option: null", async () => {
     fireEvent.click(optionButton("2. Hold"));
   });
   assert.deepEqual(answerCalls(), [
-    { itemId: "dreamforge/ship-it", option: null },
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: null },
   ]);
   assert.ok(screen.getByText("Saving..."));
   await act(async () => {
@@ -465,7 +465,7 @@ test("Craig's recorded answer: the owner overrides it, never undoes it", async (
     fireEvent.click(optionButton("1. Ship it"));
   });
   assert.deepEqual(answerCalls(), [
-    { itemId: "dreamforge/ship-it", option: 0 },
+    { itemId: "dreamforge/ship-it", cardEventId: CARD_ID, option: 0 },
   ]);
   // Craig's 1 still shows: not yet the owner's answer.
   assert.ok(screen.getByText("Saving..."));

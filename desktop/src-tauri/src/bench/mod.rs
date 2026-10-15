@@ -25,6 +25,7 @@ mod pick;
 mod plain;
 mod publish;
 mod roles;
+mod route;
 
 pub(crate) const RELAY_WS: &str = "wss://greymatterllc.communities.buzz.xyz";
 /// Generated once, never changed: the v5 namespace of every #bench id.
@@ -157,6 +158,8 @@ pub(crate) struct BenchState {
     /// No notice before this: an agent never sees events from before it
     /// subscribes, so a launch (rebuild) or a join holds them one settle.
     routes_held_until: u64,
+    /// The owner's keys as the last tick resolved them (`owner_keys`).
+    owner_keys: Vec<String>,
     last_tick: String,
     last_error: Option<String>,
 }
@@ -207,6 +210,17 @@ fn save_state(root: &Path, s: &BenchState, last_written: &mut String) -> Result<
     }
     crate::managed_agents::atomic_write_json_restricted(&path, text.as_bytes())?;
     *last_written = text;
+    Ok(())
+}
+
+/// state.json and state.prev.json alike, before an owner's notice first
+/// goes out: whichever one loads next holds it (`item::OwnerSent`), so
+/// neither a crash nor the fallback ever signs that notice afresh.
+fn save_both(root: &Path, s: &BenchState) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(s).map_err(|e| format!("serialize state: {e}"))?;
+    for name in ["state.prev.json", "state.json"] {
+        crate::managed_agents::atomic_write_json_restricted(&root.join(name), text.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -375,6 +389,7 @@ fn carry_card(
         let asked = item::Item {
             card: None,
             routed: None,
+            owner_sent: None,
             ..o.clone()
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
@@ -398,6 +413,21 @@ fn carry_card(
     } else {
         new.card = o.card.clone();
         new.previous = o.previous.clone().filter(|_| asking);
+    }
+    // Asked again, what the route target was told (or may have been, as an
+    // owner's notice not yet on the relay) still stands, from the earlier
+    // card: another answer here replaces it in the owner's words, the same
+    // one approves nothing twice (`route_due`).
+    if asking {
+        let stands = |r: &item::Routed| item::Routed {
+            option: None,
+            ..r.clone()
+        };
+        new.routed = o.routed.as_ref().map(stands);
+        new.owner_sent = o.owner_sent.as_ref().map(|sent| item::OwnerSent {
+            routed: stands(&sent.routed),
+            ..sent.clone()
+        });
     }
     new
 }
@@ -612,6 +642,50 @@ fn read_members(root: &Path) -> Vec<String> {
         })
         .filter(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
         .collect()
+}
+
+/// The owner's keys: the owner plus members.txt, less every agent key the
+/// Bench knows (managed agents, routes.json targets, roles.json writers and
+/// agents, its own writer): agents run as this OS user and can write
+/// members.txt. Only a separate OS user for agents truly keeps them out.
+/// Err names each key left out, for lastError.
+fn owner_keys(
+    ctx: &Ctx<'_>,
+    owner: &str,
+    roles: Option<&roles::Roles>,
+) -> (Vec<String>, Result<(), String>) {
+    let targets: BTreeMap<String, String> = std::fs::read_to_string(ctx.root.join("routes.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let roles_agents = roles.into_iter().flat_map(|r| {
+        let writers = r.writers.values().filter_map(|w| w.pubkey.clone());
+        let people = r.projects.values().flat_map(|p| &p.people);
+        writers.chain(people.filter(|p| p.agent).map(|p| p.pk.clone()))
+    });
+    let agents: Vec<String> = ctx
+        .access
+        .iter()
+        .map(|a| a.pubkey.clone())
+        .chain(ctx.agents.iter().cloned())
+        .chain(targets.into_values())
+        .chain(roles_agents)
+        .chain([ctx.writer.public_key().to_hex()])
+        .map(|k| k.trim().to_ascii_lowercase())
+        .collect();
+    let (out, members): (Vec<String>, Vec<String>) = read_members(&ctx.root)
+        .into_iter()
+        .filter(|m| m != owner)
+        .partition(|m| agents.contains(m));
+    let set = std::iter::once(owner.to_string()).chain(members).collect();
+    let why = match out.as_slice() {
+        [] => Ok(()),
+        _ => Err(format!(
+            "members.txt lists agent keys, which never count as yours: {}",
+            out.join(", ")
+        )),
+    };
+    (set, why)
 }
 
 /// routes.json: `{"<writer folder>": "<agent hex>"}`, the agent that acts on
@@ -1224,17 +1298,16 @@ pub(crate) async fn tick(
         );
     }
     s.last_tick = now_iso.to_string();
-    // The owner's keys: the owner plus the phone's own key in members.txt.
-    let owner_set: Vec<String> = std::iter::once(s.owner_pubkey.clone())
-        .chain(read_members(&ctx.root))
-        .collect();
     let writer_hex = ctx.writer.public_key().to_hex();
     s.writer_pubkey = writer_hex.clone();
     let (roles, roles_err) = match channels::read_roles(&ctx.root) {
         Ok(r) => (r, None),
         Err(e) => (None, Some(e)),
     };
-    let done = roles_err.clone().map_or(Ok(()), Err);
+    // The owner's keys: the owner plus the phone's own key in members.txt.
+    let (owner_set, not_owner) = owner_keys(ctx, &s.owner_pubkey, roles.as_ref());
+    s.owner_keys = owner_set.clone();
+    let done = roles_err.clone().map_or(Ok(()), Err).and(not_owner);
     let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &owner_set, &writer_hex);
     s.unroutable = unroutable;
     // Route targets join only their own writer's channels: a bound folder's

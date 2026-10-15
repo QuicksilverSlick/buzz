@@ -7,6 +7,7 @@ use super::answers::{reply, tap, ITEM};
 use super::channels::{
     admins, ask, bind, bound_bench, content, hex, notices, tags, thread_reply, ASK, X,
 };
+use super::owner_signed::carded;
 use super::*;
 use crate::bench::commands::cards;
 
@@ -234,25 +235,25 @@ fn whoever_answered_last_is_pinged_once_while_they_may_answer() {
 
 #[test]
 fn the_owners_notice_is_fixed_wording() {
-    let mut item = check(&[("recommend", json!(2)), ("action", json!(MERGE))]).unwrap();
+    let mut item = carded(check(&[("recommend", json!(2)), ("action", json!(MERGE))]).unwrap());
     item.answer = Some(Answer {
         option: 1,
         ..Default::default()
     });
     let chose = |who: &str, label: &str| {
         format!(
-            "{who} chose: {label} on card orchestrator/relay-choice. \
+            "{who} chose: {label} on card abababababab. \
              I approve the action that option describes."
         )
     };
     assert_eq!(
-        render_owner_route(&item, None).unwrap(),
+        render_owner_route(&item).unwrap(),
         format!("{}\nAction: {MERGE}", chose("The owner", "Move"))
     );
     // Not the recommended option: nothing more.
     item.answer.as_mut().unwrap().option = 0;
     assert_eq!(
-        render_owner_route(&item, None).unwrap(),
+        render_owner_route(&item).unwrap(),
         chose("The owner", "Stay")
     );
     // Named as roles.json names the owner, and the option as the card shows it.
@@ -260,23 +261,35 @@ fn the_owners_notice_is_fixed_wording() {
         owner_name: "Quicksilver".to_string(),
         ..Default::default()
     });
-    item.options[0] = "Stay \u{2014} for now".to_string();
+    item.options[0] = "Stay - for now".to_string();
     assert_eq!(
-        render_owner_route(&item, None).unwrap(),
+        render_owner_route(&item).unwrap(),
         chose("Quicksilver", "Stay - for now")
     );
-    // Anything the drop checks would refuse now: the writer's notice instead.
+    // Anything the drop checks would refuse now, or that would not read
+    // exactly as both apps showed it: the writer's notice instead.
     type Spoil = fn(&mut Item);
-    let bad: [(&str, Spoil); 3] = [
+    let bad: [(&str, Spoil); 7] = [
         ("option", |i| i.options[0] = "nsec1abc".to_string()),
         ("empty option", |i| i.options[0] = "***".to_string()),
         ("action", |i| i.action = Some("rm `x`".to_string())),
+        ("em dash", |i| {
+            i.options[0] = "Stay \u{2014} for now".to_string()
+        }),
+        ("Greek", |i| i.options[0] = "St\u{3b1}y".to_string()),
+        ("spaced", |i| i.options[0] = "Stay  for now".to_string()),
+        ("owner name", |i| {
+            i.stamp.as_mut().unwrap().owner_name = "Quicks\u{3b9}lver".to_string()
+        }),
     ];
     for (name, spoil) in bad {
         let mut spoiled = item.clone();
         spoil(&mut spoiled);
-        assert_eq!(render_owner_route(&spoiled, None), None, "{name}");
+        assert_eq!(render_owner_route(&spoiled), None, "{name}");
     }
+    // No live card to name: the writer's notice.
+    item.card = None;
+    assert_eq!(render_owner_route(&item), None);
 }
 
 #[test]
@@ -335,8 +348,9 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
     assert_eq!(
         content(&n[0]),
         format!(
-            "Quicksilver chose: Merge PR on card {id}. \
-             I approve the action that option describes.\nAction: {MERGE}"
+            "Quicksilver chose: Merge PR on card {}. \
+             I approve the action that option describes.\nAction: {MERGE}",
+            &card[..12]
         )
     );
     assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
@@ -365,9 +379,10 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
     assert_eq!(
         content(&n[0]),
         format!(
-            "Quicksilver chose: Hold on card {id}. I approve the action that option describes.\n\
+            "Quicksilver chose: Hold on card {}. I approve the action that option describes.\n\
              This replaces the earlier answer: Merge PR. Do not act on that one; undo what was \
-             done for it if it conflicts."
+             done for it if it conflicts.",
+            &card[..12]
         )
     );
 }

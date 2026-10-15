@@ -51,6 +51,15 @@ let router;
 const OWNER = "b".repeat(64);
 const STRANGER = "c".repeat(64);
 
+/** A distinct card event id per item id, so rows keyed by it never clash. */
+function eventIdOf(id) {
+  return [...id]
+    .map((c) => c.charCodeAt(0).toString(16))
+    .join("")
+    .padEnd(64, "e")
+    .slice(0, 64);
+}
+
 function card(id, overrides = {}) {
   return {
     id,
@@ -67,7 +76,7 @@ function card(id, overrides = {}) {
     links: [],
     order: 0,
     validity: "current",
-    cardEventId: "e".repeat(64),
+    cardEventId: eventIdOf(id),
     answer: null,
     recorded: null,
     updatedAt: "2026-10-12T10:00:00Z",
@@ -311,7 +320,9 @@ test("screen: an answer goes through bench_answer and the card moves to Answered
       within(needsYou).getByRole("button", { name: /^2\. Hold/ }),
     );
   });
-  assert.deepEqual(answerCalls(), [{ itemId: "w/ship", option: 1 }]);
+  assert.deepEqual(answerCalls(), [
+    { itemId: "w/ship", cardEventId: eventIdOf("w/ship"), option: 1 },
+  ]);
 
   const answered = screen.getByTestId("bench-section-answered");
   await waitFor(() => assert.deepEqual(cardIds(answered), ["w/ship"]));
@@ -321,6 +332,48 @@ test("screen: an answer goes through bench_answer and the card moves to Answered
     within(answered).getByTestId("bench-card-recorded").textContent,
     /^Recorded: 2\. Hold/,
   );
+});
+
+test("screen: a replaced card is a new card; nothing from the one seen carries over", async () => {
+  serveIdentity(OWNER);
+  const seen = card("w/ship");
+  serveSnapshot(snapshot([seen]));
+  ipcHandlers.set("bench_answer", () => {
+    // Re-dropped between the look and the click: the Bench refuses the card
+    // the owner saw, and the next snapshot has its replacement.
+    serveSnapshot(
+      snapshot([
+        {
+          ...seen,
+          cardEventId: "f".repeat(64),
+          options: ["Ship it now", "Hold"],
+        },
+      ]),
+    );
+    return Promise.reject(new Error("This card changed - look again"));
+  });
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const needsYou = await waitFor(() =>
+    screen.getByTestId("bench-section-needsYou"),
+  );
+  await waitFor(() => assert.deepEqual(cardIds(needsYou), ["w/ship"]));
+
+  await act(async () => {
+    fireEvent.click(
+      within(needsYou).getByRole("button", { name: /^1\. Ship it$/ }),
+    );
+  });
+  assert.deepEqual(answerCalls(), [
+    { itemId: "w/ship", cardEventId: eventIdOf("w/ship"), option: 0 },
+  ]);
+  await waitFor(() =>
+    within(needsYou).getByRole("button", { name: /^1\. Ship it now/ }),
+  );
+  // Text, not the node: a jsdom node in a failure message never prints.
+  assert.equal(screen.queryByText(/This card changed/)?.textContent, undefined);
+  assert.equal(screen.queryByText("Saving...")?.textContent, undefined);
 });
 
 test("screen: only the owner's identity gets live buttons", async () => {

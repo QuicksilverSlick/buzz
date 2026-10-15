@@ -116,6 +116,9 @@ function BenchQuestionCard({
 
   const { mutateAsync: answer } = useBenchAnswer();
   const handleOption = (option: number) => {
+    // Only the card on screen: the Bench refuses it once it is replaced.
+    const cardEventId = card.cardEventId;
+    if (!cardEventId) return;
     const action = {
       type: "click",
       option,
@@ -126,13 +129,15 @@ function BenchQuestionCard({
     // Unchanged attempt: a save is still in flight, so the click is ignored.
     if (next.attempt === storedState.attempt) return;
     dispatch(action);
-    answer({ itemId: card.id, option: next.target }).catch((error: unknown) => {
-      dispatch({
-        type: "commandFailed",
-        attempt: next.attempt,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    });
+    answer({ itemId: card.id, cardEventId, option: next.target }).catch(
+      (error: unknown) => {
+        dispatch({
+          type: "commandFailed",
+          attempt: next.attempt,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
   };
 
   const options =

@@ -5,10 +5,10 @@ use super::answers::{last_query, reply, tap, ITEM};
 use super::*;
 
 /// The owner's answer, as the owner's own message.
-fn chose(label: &str) -> String {
+fn chose(card: &str, label: &str) -> String {
     format!(
-        "The owner chose: {label} on card orchestrator/relay-choice. \
-         I approve the action that option describes."
+        "The owner chose: {label} on card {}. I approve the action that option describes.",
+        &card[..12]
     )
 }
 
@@ -31,6 +31,8 @@ fn told(option: Option<usize>) -> Option<Routed> {
         event_id: String::new(),
         at: 0,
         owner: false,
+        label: None,
+        card: None,
     })
 }
 
@@ -39,28 +41,28 @@ fn route_due_fires_once_per_settled_answer() {
     let s = ROUTE_SETTLE_SECS;
     let mut item = answered(1, 1000);
     // Settle gating: not before 120 s, then due.
-    assert!(!route_due(&item, 1000 + s - 1));
-    assert!(route_due(&item, 1000 + s));
+    assert!(!route_due(&item, 1000 + s - 1, &[]));
+    assert!(route_due(&item, 1000 + s, &[]));
     // Told: due no more, and a re-tap of the same option is no change.
     item.routed = told(Some(1));
-    assert!(!route_due(&item, 9999));
+    assert!(!route_due(&item, 9999, &[]));
     item.changed_at = 5000;
-    assert!(!route_due(&item, 5000 + s));
+    assert!(!route_due(&item, 5000 + s, &[]));
     // A changed answer is due again once it settles.
     item.answer.as_mut().unwrap().option = 0;
-    assert!(!route_due(&item, 5000 + s - 1) && route_due(&item, 5000 + s));
+    assert!(!route_due(&item, 5000 + s - 1, &[]) && route_due(&item, 5000 + s, &[]));
     // A clear after a notice is a withdrawal, once.
     item.answer = None;
-    assert!(route_due(&item, 5000 + s));
+    assert!(route_due(&item, 5000 + s, &[]));
     item.routed = told(None);
-    assert!(!route_due(&item, 9999));
+    assert!(!route_due(&item, 9999, &[]));
     // A clear that was never routed owes nothing.
     item.routed = None;
-    assert!(!route_due(&item, 9999));
+    assert!(!route_due(&item, 9999, &[]));
     // After a withdrawal a new answer is due again.
     item.routed = told(None);
     item.answer = answered(0, 5000).answer;
-    assert!(route_due(&item, 5000 + s));
+    assert!(route_due(&item, 5000 + s, &[]));
 }
 
 #[test]
@@ -220,7 +222,7 @@ async fn routed_answer_lifecycle() {
         tag_value(ev, "client").unwrap(),
         "bench:route:orchestrator/relay-choice@2"
     );
-    assert_eq!(content(ev), chose("Move"));
+    assert_eq!(content(ev), chose(&card, "Move"));
     assert_eq!(
         b.s.items[ITEM].routed,
         Some(Routed {
@@ -229,6 +231,8 @@ async fn routed_answer_lifecycle() {
             event_id: ev["id"].as_str().unwrap().to_string(),
             at: b.now,
             owner: true,
+            label: Some("Move".to_string()),
+            card: Some(card.clone()),
         })
     );
     assert!(settle_past(&mut b, 2).await.is_empty());
@@ -257,7 +261,7 @@ async fn routed_answer_lifecycle() {
     );
     assert_eq!(
         content(&n[0]),
-        chose("Stay")
+        chose(&card, "Stay")
             + "\nThis replaces the earlier answer: Move. Do not act on that one; undo what was \
                done for it if it conflicts."
     );
@@ -278,9 +282,12 @@ async fn routed_answer_lifecycle() {
     assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
     assert_eq!(
         content(&n[0]),
-        "The owner withdrew: Stay on card orchestrator/relay-choice. I no longer approve the \
-         action that option describes. Stop if you have not acted; if you have, say in this \
-         thread what to undo. Do not clear the card."
+        format!(
+            "The owner withdrew: Stay on card {}. I no longer approve the action that option \
+             describes. Stop if you have not acted; if you have, say in this thread what to \
+             undo. Do not clear the card.",
+            &card[..12]
+        )
     );
     assert!(!b.s.items[ITEM].routed.as_ref().unwrap().owner);
 
@@ -289,7 +296,7 @@ async fn routed_answer_lifecycle() {
     reply(&b, &[&last]);
     b.tick().await.unwrap();
     let n = settle_past(&mut b, 1).await;
-    assert_eq!(content(&n[0]), chose("Move"));
+    assert_eq!(content(&n[0]), chose(&card, "Move"));
     b.drop_file(
         "orchestrator",
         "relay-choice",
@@ -325,7 +332,7 @@ async fn quick_changes_coalesce_into_one_notice() {
     b.settle(3).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert_eq!(content(&n[0]), chose("Move"));
+    assert_eq!(content(&n[0]), chose(&card, "Move"));
     // A tap withdrawn inside the settle was never routed: nothing is sent.
     let mut b = seeded_bench(Gate::Open, &[]).await;
     route(&mut b);
@@ -348,14 +355,15 @@ async fn no_route_or_a_refused_route_sends_nothing_and_says_why() {
     assert!(settle_past(&mut b, 3).await.is_empty());
     assert!(b.s.unroutable.is_empty() && b.s.items[ITEM].routed.is_none());
     // Every refused entry is listed; none joins #bench or is told anything.
+    // (A route target in members.txt is an agent's key, never the owner's:
+    // owner_signed::an_agent_key_in_members_txt_is_never_the_owners.)
     let stranger = "a1".repeat(32);
-    b.ctx.agents = vec![b.owner_hex(), "cd".repeat(32), b.writer_hex()];
+    b.ctx.agents = vec![b.owner_hex(), b.writer_hex()];
     let routes = json!({
         "orchestrator": stranger,
         "Bad Writer": "a2".repeat(32),
         "short": "abc",
         "me": b.owner_hex(),
-        "phone": "cd".repeat(32),
         "self": b.writer_hex(),
     });
     std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
@@ -368,7 +376,6 @@ async fn no_route_or_a_refused_route_sends_nothing_and_says_why() {
             "Bad Writer: not a writer folder name",
             "me: the writer, the owner or an approver",
             "orchestrator: not a managed agent here that admits the Bench writer",
-            "phone: the writer, the owner or an approver",
             "self: the writer, the owner or an approver",
             "short: not a 64-hex pubkey",
         ]
@@ -448,5 +455,5 @@ async fn a_join_or_a_launch_holds_notices_one_settle() {
     b.tick().await.unwrap();
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(content(&n[0]).starts_with(&chose("Stay")));
+    assert!(content(&n[0]).starts_with(&chose(&card, "Stay")));
 }

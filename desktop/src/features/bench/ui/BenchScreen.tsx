@@ -207,7 +207,9 @@ function BenchSection({
       ) : (
         <ul className="space-y-3">
           {cards.map((card) => (
-            <li key={card.id}>
+            // A replaced card is a new row: nothing typed or saving on the
+            // card the owner saw carries over to the one that replaced it.
+            <li key={card.cardEventId ?? card.id}>
               <BenchCard
                 card={card}
                 onOther={() => onOther(card)}

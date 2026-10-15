@@ -4,7 +4,7 @@
 use super::answers::{last_query, outbox, reply, tap, ITEM};
 use super::channels::{bound_bench, hex, ASK, X};
 use super::*;
-use crate::bench::commands::{answer_card, cards, plan_answer, AnswerPlan};
+use crate::bench::commands::{answer_card, cards, plan_answer, AnswerPlan, CARD_CHANGED};
 
 fn plan(add: Option<&'static str>, delete: &[&str]) -> AnswerPlan {
     AnswerPlan {
@@ -18,9 +18,13 @@ async fn answer(b: &Bench, option: Option<u8>) -> Vec<nostr::Event> {
     answer_on(b, ITEM, option).await
 }
 
+/// Answered on the card the owner sees: the live one.
 async fn answer_on(b: &Bench, id: &str, option: Option<u8>) -> Vec<nostr::Event> {
     let before = b.posts().len();
-    answer_card(&b.ctx, &b.s, id, option, b.now).await.unwrap();
+    let card = b.card(id).event_id;
+    answer_card(&b.ctx, &b.s, id, &card, option, b.now)
+        .await
+        .unwrap();
     b.posts()[before..]
         .iter()
         .map(|(e, tag)| {
@@ -220,20 +224,21 @@ async fn bench_answer_refuses_what_it_cannot_answer() {
     }
     let posts = b.posts().len();
     let queries = b.relay.queries.lock().unwrap().len();
+    let live = b.card(ITEM).event_id;
     for (id, option, want) in [
         ("orchestrator/nope", Some(0), "no Bench item"),
         ("orchestrator/st", Some(0), "not a pending item"),
-        ("orchestrator/uncarded", Some(0), "no live card"),
-        ("orchestrator/stale", None, "no live card"),
+        ("orchestrator/uncarded", Some(0), CARD_CHANGED),
+        ("orchestrator/stale", None, CARD_CHANGED),
         (ITEM, Some(2), "out of range"),
     ] {
-        let err = answer_card(&b.ctx, &b.s, id, option, b.now)
+        let err = answer_card(&b.ctx, &b.s, id, &live, option, b.now)
             .await
             .unwrap_err();
         assert!(err.contains(want), "{id}: {err}");
     }
     b.s.owner_pubkey = "bb".repeat(32);
-    let err = answer_card(&b.ctx, &b.s, ITEM, Some(0), b.now)
+    let err = answer_card(&b.ctx, &b.s, ITEM, &live, Some(0), b.now)
         .await
         .unwrap_err();
     assert!(err.contains("owner identity changed"), "{err}");

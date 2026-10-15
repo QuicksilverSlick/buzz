@@ -1,0 +1,345 @@
+//! What the owner's keys sign and only that: an answer lands on the card the
+//! owner saw, only the owner's own tap is the owner's word, it names the card
+//! as both apps showed it, goes out once, and is outlived by nothing. Child
+//! of tests.rs so the fake relay and Bench harness are in scope.
+
+use super::answers::{reply, tap, ITEM};
+use super::channels::{
+    admins, ask, bind, bound_bench, content, hex, notices, thread_reply, ASK, X,
+};
+use super::*;
+use crate::bench::commands::{answer_card, CARD_CHANGED};
+
+/// `item` with a live card, id "ab" * 32.
+pub(super) fn carded(mut item: Item) -> Item {
+    item.card = Some(Posted {
+        event_id: "ab".repeat(32),
+        created_at: 0,
+        hash: item.hash.clone(),
+        seeded: 0,
+    });
+    item
+}
+
+/// The owner's own message for `label` on `card`, as it opens.
+fn chose(label: &str, card: &str) -> String {
+    format!(
+        "Quicksilver chose: {label} on card {}. I approve the action that option describes.",
+        &card[..12]
+    )
+}
+
+#[test]
+fn the_owners_word_names_the_card_not_the_item() {
+    let drop = drop_json(&[("options", json!(["Hold", "Merge PR"]))]);
+    let id = "approve-gh-pr-merge-99-admin";
+    let mut item = carded(validate("reset-worker", id, &drop, NOW).unwrap());
+    item.answer = Some(Answer {
+        option: 1,
+        ..Default::default()
+    });
+    assert_eq!(
+        render_owner_route(&item).unwrap(),
+        "The owner chose: Merge PR on card abababababab. \
+         I approve the action that option describes."
+    );
+    // Taken back, it names the card that approval named.
+    let told = Routed {
+        option: None,
+        to: String::new(),
+        event_id: String::new(),
+        at: 0,
+        owner: true,
+        label: Some("Merge PR".to_string()),
+        card: Some("cd".repeat(32)),
+    };
+    let back = render_owner_withdrawal(&item, &told).unwrap();
+    assert!(
+        back.starts_with("The owner withdrew: Merge PR on card cdcdcdcdcdcd. "),
+        "{back}"
+    );
+    assert!(!back.contains(id));
+}
+
+#[test]
+fn options_that_read_the_same_are_refused() {
+    for options in [
+        json!(["Merge", "merge"]),
+        json!(["Stay \u{2014} now", "Stay - now"]),
+        json!(["Ship  it", "Ship it"]),
+        json!(["Hold", "Merge", "HOLD"]),
+    ] {
+        let err = check(&[("options", options.clone())]).unwrap_err();
+        assert!(
+            err.contains("two options read the same"),
+            "{options}: {err}"
+        );
+    }
+    assert!(check(&[("options", json!(["Hold", "Hold off"]))]).is_ok());
+}
+
+#[tokio::test]
+async fn an_answer_lands_only_on_the_card_the_owner_saw() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let seen = b.card(ITEM).event_id;
+    // The writer re-drops between the owner's look and the click: the card
+    // the owner saw is no longer live, then a new one is.
+    b.drop_file(
+        "orchestrator",
+        "relay-choice",
+        &drop_json(&[("body", json!("Now?"))]),
+    );
+    for settled in [1, 3] {
+        b.settle(settled).await;
+        let posts = b.posts().len();
+        let err = answer_card(&b.ctx, &b.s, ITEM, &seen, Some(0), b.now)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CARD_CHANGED);
+        assert_eq!(b.posts().len(), posts);
+    }
+    let live = b.card(ITEM).event_id;
+    assert_ne!(live, seen);
+    // On the card the owner sees now, it answers.
+    let before = b.posts().len();
+    answer_card(&b.ctx, &b.s, ITEM, &live, Some(0), b.now)
+        .await
+        .unwrap();
+    let posted = &b.posts()[before..];
+    assert_eq!(posted.len(), 1);
+    assert_eq!(tag_value(&posted[0].0, "e").as_deref(), Some(live.as_str()));
+}
+
+#[tokio::test]
+async fn a_reply_is_never_signed_as_the_owners_approval() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let root = "ab".repeat(32);
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(root))]));
+    b.settle(6).await;
+    let card = b.card(ASK);
+    // From the phone, naming only the thread's root: it counts for the
+    // newest card there, which may not be the card the owner read.
+    let two = thread_reply(&b.ctx.owner, &root, "2", card.created_at + 1, &[]);
+    reply(&b, &[&list, &two]);
+    b.tick().await.unwrap();
+    let a = b.s.items[ASK].answer.clone().unwrap();
+    assert_eq!((a.option, a.source), (1, AnswerSource::Reply));
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
+    assert!(content(&n[0]).starts_with(&format!("Bench answer · {ASK}\n")));
+    // A tap on the card itself is the owner's word.
+    let keep = tap(
+        &b.ctx.owner,
+        &card.event_id,
+        OPTION_EMOJI[1],
+        card.created_at + 2,
+    );
+    reply(&b, &[&list, &two, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(content(&n[0]), chose("Keep the old one", &card.event_id));
+}
+
+#[tokio::test]
+async fn a_channel_no_longer_ready_routes_nothing() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    // Past the settle, the channel's recheck refuses it: its taps go unread,
+    // so its answer is not routed either.
+    let shared = admins(&b, &b.relay.keys.clone(), &[&hex(&p.craig)]);
+    reply(&b, &[&shared, &keep]);
+    b.now += 600;
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(b.s.channels[X].refused.is_some());
+    assert!(notices(&b, before).is_empty());
+    // Ready again, it goes.
+    reply(&b, &[&list, &keep]);
+    b.now += 60;
+    b.settle(3).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose("Keep the old one", &card));
+}
+
+#[tokio::test]
+async fn an_owners_notice_is_signed_once() {
+    let (mut b, _p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    // As the service saves after every tick: state.json, and the one before
+    // it in state.prev.json.
+    for _ in 0..2 {
+        save_state(&b.root, &b.s, &mut String::new()).unwrap();
+    }
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    let signed = |b: &Bench| -> Vec<String> {
+        let owner = json!(b.owner_hex());
+        let n = notices(b, before);
+        let mine = n.iter().filter(|n| n["pubkey"] == owner);
+        mine.map(|n| n["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let first = signed(&b);
+    assert_eq!(first.len(), 1);
+    // Killed before that tick's save, the reply lost or not: the next run
+    // sends that same event again.
+    b.s = load_state(&b.root).0;
+    let sent = b.s.items[ASK].owner_sent.clone().unwrap();
+    assert_eq!(sent.event.id.to_hex(), first[0]);
+    b.settle(2).await;
+    // With state.json unreadable, the fallback does too.
+    std::fs::write(b.root.join("state.json"), "{").unwrap();
+    b.s = load_state(&b.root).0;
+    b.settle(2).await;
+    // Down past the relay's window, which refuses the old time before it
+    // would answer duplicate: a lookup finds it, no second signature.
+    b.s = load_state(&b.root).0;
+    b.now += 3600;
+    reply(&b, &[&list, &keep, &sent.event]);
+    b.settle(3).await;
+    assert_eq!(signed(&b), vec![first[0].clone(); 3]);
+    let item = &b.s.items[ASK];
+    assert!(item.owner_sent.is_none());
+    let routed = item.routed.clone().unwrap();
+    assert!(routed.owner && routed.event_id == first[0]);
+}
+
+#[tokio::test]
+async fn an_agent_key_in_members_txt_is_never_the_owners() {
+    let (mut b, p, list) = bound_bench().await;
+    let agent = hex(&p.agent);
+    let members = format!("{}\n{agent}\n", "cd".repeat(32));
+    std::fs::write(b.root.join("members.txt"), members).unwrap();
+    let card = b.card(ASK).event_id;
+    let merge = tap(&p.agent, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    let err = b.tick().await.unwrap_err();
+    assert!(err.contains("members.txt") && err.contains(&agent), "{err}");
+    assert!(b.s.items[ASK].answer.is_none());
+    assert!(!b.s.owner_keys.contains(&agent));
+    assert!(b.s.owner_keys.contains(&"cd".repeat(32)));
+}
+
+/// The owner keeps the old email on the first card, then the writer asks
+/// again: the new card, after the owner's notice went out.
+async fn asked_again() -> (Bench, super::channels::People, nostr::Event, String, String) {
+    let (mut b, p, list) = bound_bench().await;
+    let old = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &old, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert_eq!(notices(&b, before).len(), 1);
+    let again = ask(&[("body", json!("Shorter still?"))]);
+    b.drop_file("reset-worker", "welcome", &again);
+    b.settle(3).await;
+    let new = b.card(ASK).event_id;
+    assert_ne!(new, old);
+    // Asking again withdraws nothing.
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(notices(&b, before).is_empty());
+    (b, p, list, old, new)
+}
+
+#[tokio::test]
+async fn a_re_ask_keeps_the_owners_approval_until_replaced() {
+    let (mut b, _p, list, _old, new) = asked_again().await;
+    let before = b.posts().len();
+    // The same option again approves nothing twice ...
+    let keep = tap(&b.ctx.owner, &new, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    assert!(notices(&b, before).is_empty());
+    // ... and another replaces it in the owner's words.
+    let send = tap(&b.ctx.owner, &new, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &send]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(
+        content(&n[0]),
+        chose("Send the new email", &new)
+            + "\nThis replaces the earlier answer: Keep the old one. Do not act on that one; \
+               undo what was done for it if it conflicts."
+    );
+}
+
+#[tokio::test]
+async fn a_re_ask_answered_by_craig_takes_back_the_owners_approval() {
+    let (mut b, p, list, old, new) = asked_again().await;
+    let send = tap(&p.craig, &new, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &send]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(3).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 2);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert!(
+        content(&n[0]).starts_with(&format!(
+            "Quicksilver withdrew: Keep the old one on card {}. ",
+            &old[..12]
+        )),
+        "{}",
+        content(&n[0])
+    );
+    assert_eq!(n[1]["pubkey"], json!(b.writer_hex()));
+    assert!(content(&n[1]).contains(" by Craig (decider). "));
+}
+
+#[tokio::test]
+async fn the_owner_authorizing_craigs_answer_is_the_owners_word() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let craig = tap(&p.craig, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &craig]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
+    // The owner taps the same option to authorize it: the agent hears so in
+    // the owner's own word, and it replaces nothing.
+    let mine = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &craig, &mine]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(3).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(content(&n[0]), chose("Send the new email", &card));
+}

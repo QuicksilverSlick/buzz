@@ -174,9 +174,11 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
         };
     }
     let (s, _) = load_state(root);
-    let owner_set: Vec<String> = std::iter::once(s.owner_pubkey.clone())
-        .chain(super::read_members(root))
-        .collect();
+    // As the last tick resolved them: members.txt less any agent key.
+    let owner_set = match s.owner_keys.as_slice() {
+        [] => vec![s.owner_pubkey.clone()],
+        keys => keys.to_vec(),
+    };
     let items = s.items.values().map(|i| card(i, &owner_set)).collect();
     BenchCards {
         enabled: true,
@@ -229,15 +231,21 @@ pub(crate) fn plan_answer(
     }
 }
 
-/// bench_answer's relay half. Reads the owner's own reactions on the live
-/// card, in the card's channel, with the poll's /query, and plans against
-/// them alone: the owner's answer always wins, so nothing else needs
-/// outranking. The add goes before the deletes, so a failed delete never
-/// loses the new answer.
+/// What the owner is told when the card they answered is no longer the live
+/// one: a re-drop may have changed its action or options since they looked.
+pub(crate) const CARD_CHANGED: &str = "This card changed - look again";
+
+/// bench_answer's relay half. Answers only the card the owner was shown
+/// (`card_event_id`, the snapshot's cardEventId), and only while it is still
+/// the live card. Reads the owner's own reactions on it, in the card's
+/// channel, with the poll's /query, and plans against them alone: the
+/// owner's answer always wins, so nothing else needs outranking. The add
+/// goes before the deletes, so a failed delete never loses the new answer.
 pub(crate) async fn answer_card(
     ctx: &Ctx<'_>,
     s: &BenchState,
     item_id: &str,
+    card_event_id: &str,
     option: Option<u8>,
     now: u64,
 ) -> Result<(), String> {
@@ -248,10 +256,10 @@ pub(crate) async fn answer_card(
     if item.kind != ItemKind::Pending {
         return Err(format!("{item_id} is not a pending item"));
     }
-    let card = live_card(item)
-        .ok_or_else(|| format!("{item_id} has no live card yet"))?
-        .event_id
-        .clone();
+    let card = match live_card(item) {
+        Some(c) if c.event_id == card_event_id => c.event_id.clone(),
+        _ => return Err(CARD_CHANGED.to_string()),
+    };
     let n = item.options.len().min(OPTION_EMOJI.len());
     let chosen = option.map(usize::from);
     if let Some(i) = chosen.filter(|i| *i >= n) {
@@ -301,11 +309,13 @@ async fn remove_reaction(ctx: &Ctx<'_>, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `option`: Some(i) answers with option i (0-based), None clears the answer.
-/// The Bench relay and keys, never the app's active community.
+/// `option`: Some(i) answers with option i (0-based), None clears the answer,
+/// on the card `card_event_id` names. The Bench relay and keys, never the
+/// app's active community.
 #[tauri::command]
 pub(crate) async fn bench_answer(
     item_id: String,
+    card_event_id: String,
     option: Option<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -327,5 +337,5 @@ pub(crate) async fn bench_answer(
         access: Vec::new(),
     };
     let now = nostr::Timestamp::now().as_secs();
-    answer_card(&ctx, &s, &item_id, option, now).await
+    answer_card(&ctx, &s, &item_id, &card_event_id, option, now).await
 }

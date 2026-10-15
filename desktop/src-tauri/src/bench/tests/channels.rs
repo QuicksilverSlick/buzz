@@ -304,10 +304,13 @@ async fn craig_answers_and_the_owner_overrides() {
     assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
     assert_eq!(
         content(&n[0]),
-        "Quicksilver chose: Keep the old one on card reset-worker/welcome. \
-         I approve the action that option describes.\n\
-         This replaces the earlier answer: Send the new email. Do not act on that one; \
-         undo what was done for it if it conflicts."
+        format!(
+            "Quicksilver chose: Keep the old one on card {}. \
+             I approve the action that option describes.\n\
+             This replaces the earlier answer: Send the new email. Do not act on that one; \
+             undo what was done for it if it conflicts.",
+            &card[..12]
+        )
     );
     assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
     assert_eq!(tags(&n[0], "e"), [json!(["e", card, "", "reply"])]);
@@ -859,8 +862,9 @@ async fn the_owners_word_stands_across_taps_and_other() {
     assert_eq!(
         content(&n[0]),
         format!(
-            "Quicksilver chose: Keep the old one on card {ASK}. \
-             I approve the action that option describes."
+            "Quicksilver chose: Keep the old one on card {}. \
+             I approve the action that option describes.",
+            &card[..12]
         )
     );
 
