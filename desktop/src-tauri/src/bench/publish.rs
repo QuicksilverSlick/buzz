@@ -12,7 +12,8 @@ use super::{
 use crate::events;
 
 /// Twice the relay's +-900 s created_at window: past it the relay refuses an
-/// event's time before it would answer duplicate, so only a lookup can tell.
+/// event's time before it would answer duplicate, so only a lookup can tell
+/// (and sooner, by the relay's clock: `resend_owner`).
 const OWNER_RESEND_SECS: u64 = 1800;
 
 /// A kind 9 carrying its `client` marker; the p tags only for whom it pings
@@ -63,10 +64,11 @@ async fn post_message(
 
 /// An owner's notice that may not have reached the relay (a timeout, a lost
 /// reply, a restart): sent again as that same event, never signed afresh.
-/// Once its time is too old for the relay, or its card is gone, a lookup by
-/// id says whether it landed; if not, it never can, and the next tick signs
-/// one afresh. Either way `owner_sent` clears, and `routed` lands if the
-/// relay has it.
+/// Once its time is too old for the relay, or the card it replies to is
+/// gone, a lookup by id says whether it landed; if not, it never can, and
+/// the next tick signs one afresh. Either way `owner_sent` clears, and
+/// `routed` lands if the relay has it. The item's own card is never
+/// forgotten here: after a re-ask it is not the card this event replies to.
 async fn resend_owner(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -76,12 +78,14 @@ async fn resend_owner(
     now: u64,
 ) -> Result<(), String> {
     let ev = &sent.event;
-    let (mut told, mut gone) = (false, false);
+    let mut told = false;
     if now < ev.created_at.as_secs() + OWNER_RESEND_SECS {
         match submit(ctx, ev, &ctx.owner, None).await {
             Ok(_) => told = true,
-            // Its card is gone; whether it landed first, the lookup says.
-            Err(e) if e.contains("not found") => gone = true,
+            // Its card is gone, or its time is past the relay's own clock's
+            // window (buzz-relay MAX_TIMESTAMP_DRIFT_SECS, checked before
+            // duplicate): whether it landed first, the lookup says.
+            Err(e) if e.contains("not found") || e.contains("too far from server time") => {}
             Err(e) => return Err(e),
         }
     }
@@ -103,8 +107,6 @@ async fn resend_owner(
     if told {
         i.routed = Some(sent.routed);
         s.board_dirty |= top && ch == s.channel_id;
-    } else if gone {
-        forget_card(s, id);
     }
     Ok(())
 }
@@ -188,6 +190,9 @@ fn bad_thread(e: &str) -> bool {
 /// once per Drop and card format; it is edited to record an answer and, once
 /// closed out, to become a receipt. Only a card nobody engaged with is ever
 /// deleted. Every post made once a card's own id is known links its thread.
+/// An owner's notice that fails to go again lands in `failed`, for
+/// lastError, and the rest goes on.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn publish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -196,6 +201,7 @@ pub(super) async fn publish(
     hhmm: &str,
     routes: &BTreeMap<String, String>,
     owner_set: &[String],
+    failed: &mut Vec<String>,
 ) -> Result<(), String> {
     // (a) The live cards: pending + current + unanswered by severity, in a
     // channel ready for them; an answered card counts against MAX_CARDS (the
@@ -330,7 +336,9 @@ pub(super) async fn publish(
             if !spend(budget, 1) {
                 return Ok(());
             }
-            resend_owner(ctx, s, &id, &ch, sent, now).await?;
+            if let Err(e) = resend_owner(ctx, s, &id, &ch, sent, now).await {
+                failed.push(format!("{id}: the owner's notice did not go again: {e}"));
+            }
             continue;
         }
         let card = live_card(&item)
@@ -363,12 +371,18 @@ pub(super) async fn publish(
             // that way and now withdrawn or not the owner's tap is taken back
             // that way first, as a withdrawal (the other answer follows next
             // tick). Anything else, or text that fails the checks again, is
-            // the writer's.
+            // the writer's. One told before a re-ask still stands beside the
+            // same answer on the new card: only a different one takes it back.
             let mine = item::owner_route(&item, owner_set);
+            let label = item
+                .answer
+                .as_ref()
+                .and_then(|a| item.options.get(a.option));
+            let stands = |r: &item::Routed| r.stands() && r.label.as_ref() == label;
             let taken_back = item
                 .routed
                 .as_ref()
-                .filter(|r| r.owner && mine.is_none())
+                .filter(|r| r.owner && mine.is_none() && !stands(r))
                 .and_then(|r| item::render_owner_withdrawal(&item, r));
             let answer = item.answer.as_ref().filter(|_| taken_back.is_none());
             let want = answer.map(|a| a.option);

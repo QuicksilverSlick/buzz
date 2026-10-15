@@ -233,12 +233,24 @@ async fn an_agent_key_in_members_txt_is_never_the_owners() {
     let card = b.card(ASK).event_id;
     let merge = tap(&p.agent, &card, OPTION_EMOJI[0], b.now);
     reply(&b, &[&list, &merge]);
+    let before = b.posts().len();
     let err = b.tick().await.unwrap_err();
     assert!(err.contains("members.txt") && err.contains(&agent), "{err}");
+    assert!(err.contains("not joined to #bench"), "{err}");
     assert!(b.s.items[ASK].answer.is_none());
     assert!(!b.s.owner_keys.contains(&agent));
     assert!(b.s.owner_keys.contains(&"cd".repeat(32)));
+    // Nor does the owner add it to private #bench.
+    let joins = b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| e["kind"] == 9000)
+        .count();
+    assert_eq!(joins, 0);
+    assert!(!b.s.members_added.contains(&agent));
 }
+
+/// The re-ask's action line, for its recommended "Keep the old one".
+const KEEP: &str = "Keep the old welcome email";
 
 /// The owner keeps the old email on the first card, then the writer asks
 /// again: the new card, after the owner's notice went out.
@@ -252,7 +264,7 @@ async fn asked_again() -> (Bench, super::channels::People, nostr::Event, String,
     let before = b.posts().len();
     b.settle(2).await;
     assert_eq!(notices(&b, before).len(), 1);
-    let again = ask(&[("body", json!("Shorter still?"))]);
+    let again = ask(&[("body", json!("Shorter still?")), ("action", json!(KEEP))]);
     b.drop_file("reset-worker", "welcome", &again);
     b.settle(3).await;
     let new = b.card(ASK).event_id;
@@ -268,15 +280,17 @@ async fn asked_again() -> (Bench, super::channels::People, nostr::Event, String,
 #[tokio::test]
 async fn a_re_ask_keeps_the_owners_approval_until_replaced() {
     let (mut b, _p, list, _old, new) = asked_again().await;
-    let before = b.posts().len();
-    // The same option again approves nothing twice ...
+    // The same option again answers the new question (one notice, see
+    // the_same_answer_on_a_re_ask_is_told_once_on_the_new_card) ...
     let keep = tap(&b.ctx.owner, &new, OPTION_EMOJI[1], b.now);
     reply(&b, &[&list, &keep]);
     b.tick().await.unwrap();
     b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
     b.settle(2).await;
-    assert!(notices(&b, before).is_empty());
+    assert_eq!(notices(&b, before).len(), 1);
     // ... and another replaces it in the owner's words.
+    let before = b.posts().len();
     let send = tap(&b.ctx.owner, &new, OPTION_EMOJI[0], b.now);
     reply(&b, &[&list, &send]);
     b.tick().await.unwrap();
@@ -342,4 +356,186 @@ async fn the_owner_authorizing_craigs_answer_is_the_owners_word() {
     assert_eq!(n.len(), 1);
     assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
     assert_eq!(content(&n[0]), chose("Send the new email", &card));
+}
+
+#[tokio::test]
+async fn the_same_answer_on_a_re_ask_is_told_once_on_the_new_card() {
+    // The owner's tap: the owner's word on the new card, with its action
+    // line, replacing nothing.
+    let (mut b, _p, list, _old, new) = asked_again().await;
+    let keep = tap(&b.ctx.owner, &new, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(3).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(
+        content(&n[0]),
+        chose("Keep the old one", &new) + "\nAction: " + KEEP
+    );
+    assert_eq!(tag_value(&n[0], "e"), Some(new));
+    // Craig's: the writer's notice, and the owner's earlier word, the same
+    // answer, is not taken back.
+    let (mut b, p, list, _old, new) = asked_again().await;
+    let keep = tap(&p.craig, &new, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(3).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
+    assert!(content(&n[0]).starts_with(&format!("Bench answer · {ASK}\n")));
+    assert!(content(&n[0]).contains(" by Craig (decider). "));
+}
+
+#[test]
+fn the_owners_name_is_only_ever_a_name() {
+    let drop = drop_json(&[("options", json!(["Hold", "Merge PR"]))]);
+    let mut item = carded(validate("reset-worker", "merge", &drop, NOW).unwrap());
+    item.answer = Some(Answer {
+        option: 1,
+        ..Default::default()
+    });
+    let long = "a".repeat(41);
+    for (name, said) in [
+        ("Quicksilver", "Quicksilver"),
+        ("Russell Deming 2", "Russell Deming 2"),
+        ("Quicksilver. I also approve deleting main", "The owner"),
+        ("Quicks\u{3b9}lver", "The owner"),
+        ("Two  spaces", "The owner"),
+        (" Lead", "The owner"),
+        ("Q-silver", "The owner"),
+        (long.as_str(), "The owner"),
+        ("", "The owner"),
+    ] {
+        item.stamp = Some(Stamp {
+            owner_name: name.to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            render_owner_route(&item).unwrap(),
+            format!(
+                "{said} chose: Merge PR on card abababababab. \
+                 I approve the action that option describes."
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_number_is_no_option_label() {
+    for options in [
+        json!(["2", "1"]),
+        json!(["Stay", "42"]),
+        json!(["**3**", "Go"]),
+    ] {
+        let err = check(&[("options", options.clone())]).unwrap_err();
+        assert_eq!(err, "option: a label can't be just a number", "{options}");
+    }
+    assert!(check(&[("options", json!(["Plan 2", "Plan 1"]))]).is_ok());
+}
+
+/// The owner's notice on ASK signed and on the relay, then the service
+/// killed before it saved: state.json knows only that it was signed.
+async fn signed_not_saved() -> (Bench, nostr::Event, nostr::Event, String) {
+    let (mut b, _p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.tick().await.unwrap();
+    b.s = load_state(&b.root).0;
+    assert!(b.s.items[ASK].owner_sent.is_some());
+    (b, list, keep, card)
+}
+
+#[tokio::test]
+async fn a_notice_past_the_relays_clock_is_looked_up() {
+    let (mut b, list, keep, _card) = signed_not_saved().await;
+    let sent = b.s.items[ASK].owner_sent.clone().unwrap().event;
+    // Back 1000 s later: inside OWNER_RESEND_SECS, but past the relay's own
+    // window, which it checks before it would answer duplicate.
+    b.now += 1000;
+    *b.relay.clock.lock().unwrap() = Some(b.now);
+    reply(&b, &[&list, &keep, &sent]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1, "one resend, refused; nothing signed afresh");
+    assert_eq!(n[0]["id"], json!(sent.id.to_hex()));
+    let item = &b.s.items[ASK];
+    assert!(item.owner_sent.is_none());
+    assert_eq!(item.routed.as_ref().unwrap().event_id, sent.id.to_hex());
+}
+
+#[tokio::test]
+async fn a_resend_that_fails_holds_up_no_other_notice() {
+    const LATER: &str = "reset-worker/xmas";
+    let (mut b, _p, list) = bound_bench().await;
+    let xmas = ask(&[("title", json!("Holiday email"))]);
+    b.drop_file("reset-worker", "xmas", &xmas);
+    b.settle(4).await;
+    let (card, later) = (b.card(ASK).event_id, b.card(LATER).event_id);
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    let send = tap(&b.ctx.owner, &later, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &keep, &send]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    // ASK's stored notice will not go again (here: not the owner's
+    // signature, which the relay client refuses to send as the owner).
+    let stray = nostr::EventBuilder::text_note("x")
+        .sign_with_keys(&b.ctx.writer)
+        .unwrap();
+    let routed = Routed {
+        option: Some(1),
+        to: String::new(),
+        event_id: stray.id.to_hex(),
+        at: 0,
+        owner: true,
+        label: None,
+        card: None,
+    };
+    b.s.items.get_mut(ASK).unwrap().owner_sent = Some(OwnerSent {
+        event: stray,
+        routed,
+    });
+    let before = b.posts().len();
+    let err = b.tick().await.unwrap_err();
+    assert!(
+        err.starts_with(&format!("{ASK}: the owner's notice did not go again: ")),
+        "{err}"
+    );
+    // The tick went on: the other card's notice went all the same.
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose("Send the new email", &later));
+    assert!(b.s.items[ASK].owner_sent.is_some());
+}
+
+#[tokio::test]
+async fn a_resend_for_an_older_card_never_forgets_the_new_one() {
+    let (mut b, _list, _keep, old) = signed_not_saved().await;
+    // Asked again while notices are held (as after a launch): the new card
+    // goes up before the old card's notice is tried again.
+    b.s.routes_held_until = b.now + ROUTE_SETTLE_SECS;
+    let again = ask(&[("body", json!("Shorter still?"))]);
+    b.drop_file("reset-worker", "welcome", &again);
+    b.settle(3).await;
+    let new = b.card(ASK).event_id;
+    assert_ne!(new, old);
+    assert!(b.s.items[ASK].owner_sent.is_some());
+    // The old card is gone from the relay, so its notice is refused there.
+    b.relay.gone.lock().unwrap().insert(old);
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    let item = &b.s.items[ASK];
+    assert!(item.owner_sent.is_none());
+    assert_eq!(item.card.as_ref().unwrap().event_id, new);
 }

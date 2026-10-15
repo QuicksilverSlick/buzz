@@ -801,6 +801,8 @@ struct Relay {
     keys: Keys,
     /// A /query for the admin lists (kind 39001) fails with a 500.
     admins_down: Mutex<bool>,
+    /// Its clock once set: an event over 900 s off is refused, first.
+    clock: Mutex<Option<u64>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -834,6 +836,11 @@ async fn fake_events(
                 "message": "You must be a relay member to access this relay",
             })),
         );
+    }
+    let clock = *r.clock.lock().unwrap();
+    if clock.is_some_and(|t| ev["created_at"].as_u64().unwrap().abs_diff(t) > 900) {
+        let error = json!({ "error": "invalid: event timestamp too far from server time" });
+        return (StatusCode::BAD_REQUEST, Json(error));
     }
     let kind = ev["kind"].as_u64().unwrap();
     let h = tag_value(&ev, "h").unwrap_or_default();
@@ -947,6 +954,7 @@ impl Bench {
             gone: Mutex::new(HashSet::new()),
             keys: Keys::generate(),
             admins_down: Mutex::new(false),
+            clock: Mutex::new(None),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));

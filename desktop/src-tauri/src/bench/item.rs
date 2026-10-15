@@ -515,12 +515,14 @@ pub(crate) fn validate(
     for o in &d.options {
         valid_text(o, OPTION_MAX, "option")?;
         // Printed through plain_text: an emoji-only option would leave the
-        // owner a bare "1." beside its keycap.
-        if !plain_text(o, usize::MAX)
-            .bytes()
-            .any(|b| b.is_ascii_alphanumeric())
-        {
+        // owner a bare "1." beside its keycap, and a bare number reads as
+        // another option's ("chose: 1", a reply "1").
+        let plain = plain_text(o, usize::MAX);
+        if !plain.bytes().any(|b| b.is_ascii_alphanumeric()) {
             return Err("option: no plain letters or digits".to_string());
+        }
+        if plain.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("option: a label can't be just a number".to_string());
         }
     }
     // As printed and as a reply names them (`answer_option`), each option

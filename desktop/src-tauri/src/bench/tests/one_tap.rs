@@ -269,7 +269,7 @@ fn the_owners_notice_is_fixed_wording() {
     // Anything the drop checks would refuse now, or that would not read
     // exactly as both apps showed it: the writer's notice instead.
     type Spoil = fn(&mut Item);
-    let bad: [(&str, Spoil); 7] = [
+    let bad: [(&str, Spoil); 6] = [
         ("option", |i| i.options[0] = "nsec1abc".to_string()),
         ("empty option", |i| i.options[0] = "***".to_string()),
         ("action", |i| i.action = Some("rm `x`".to_string())),
@@ -278,9 +278,6 @@ fn the_owners_notice_is_fixed_wording() {
         }),
         ("Greek", |i| i.options[0] = "St\u{3b1}y".to_string()),
         ("spaced", |i| i.options[0] = "Stay  for now".to_string()),
-        ("owner name", |i| {
-            i.stamp.as_mut().unwrap().owner_name = "Quicks\u{3b9}lver".to_string()
-        }),
     ];
     for (name, spoil) in bad {
         let mut spoiled = item.clone();

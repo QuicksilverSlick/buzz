@@ -416,8 +416,8 @@ fn carry_card(
     }
     // Asked again, what the route target was told (or may have been, as an
     // owner's notice not yet on the relay) still stands, from the earlier
-    // card: another answer here replaces it in the owner's words, the same
-    // one approves nothing twice (`route_due`).
+    // card. Any answer here is a new one (`route_due`); only a different
+    // one replaces or takes it back.
     if asking {
         let stands = |r: &item::Routed| item::Routed {
             option: None,
@@ -681,7 +681,8 @@ fn owner_keys(
     let why = match out.as_slice() {
         [] => Ok(()),
         _ => Err(format!(
-            "members.txt lists agent keys, which never count as yours: {}",
+            "members.txt lists agent keys, which never count as yours and are not joined \
+             to #bench as yours: {}",
             out.join(", ")
         )),
     };
@@ -773,16 +774,18 @@ fn spend(budget: &mut usize, n: usize) -> bool {
     }
 }
 
-/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per member and #bench
-/// route target (owner). Each step is retried every tick until its flag is
-/// set. The tag-free kind 0 goes first so a refused writer leaves no
-/// half-built channel behind. Route targets join to read their notices; they
-/// never go into members.txt, so they never answer.
+/// kind 0 canary (writer) -> 9007 (owner) -> 9000 per owner's key
+/// (`owner_keys`: members.txt less agent keys) and #bench route target
+/// (owner). Each step is retried every tick until its flag is set. The
+/// tag-free kind 0 goes first so a refused writer leaves no half-built
+/// channel behind. Route targets join to read their notices; they never go
+/// into members.txt, so they never answer.
 async fn bootstrap(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     budget: &mut usize,
     now: u64,
+    owner_set: &[String],
     targets: &[String],
 ) -> Result<bool, String> {
     let ch = channel_id(&s.owner_pubkey);
@@ -804,9 +807,12 @@ async fn bootstrap(
         post_as_owner(ctx, create).await?;
         s.channel_created = true;
     }
-    let joining = std::iter::once(writer_hex.clone())
-        .chain(read_members(&ctx.root))
-        .chain(targets.iter().cloned());
+    let members = owner_set.iter().filter(|k| **k != s.owner_pubkey);
+    let joining = std::iter::once(&writer_hex)
+        .chain(members)
+        .chain(targets)
+        .cloned()
+        .collect::<Vec<_>>();
     for hex in joining {
         if s.members_added.contains(&hex) {
             continue;
@@ -1320,7 +1326,7 @@ pub(crate) async fn tick(
         .map(|(_, to)| to.clone())
         .collect();
     let mut budget = MAX_POSTS_PER_TICK;
-    if !bootstrap(ctx, s, &mut budget, now, &bench_targets).await? {
+    if !bootstrap(ctx, s, &mut budget, now, &owner_set, &bench_targets).await? {
         return done;
     }
     if let Some(r) = &roles {
@@ -1341,8 +1347,21 @@ pub(crate) async fn tick(
         &owner_set,
         &routes,
     );
-    publish::publish(ctx, s, &mut budget, now, hhmm, &routes, &owner_set).await?;
+    let mut failed = Vec::new();
+    publish::publish(
+        ctx,
+        s,
+        &mut budget,
+        now,
+        hhmm,
+        &routes,
+        &owner_set,
+        &mut failed,
+    )
+    .await?;
+    let failed = (!failed.is_empty()).then(|| failed.join("; "));
     done.and(cut.map_or(Ok(()), Err))
+        .and(failed.map_or(Ok(()), Err))
 }
 
 /// Who each managed agent takes instructions from, as this build enforces it.

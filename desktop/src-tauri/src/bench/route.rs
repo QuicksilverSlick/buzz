@@ -35,6 +35,13 @@ pub(crate) struct Routed {
     pub card: Option<String>,
 }
 
+impl Routed {
+    /// Told on the card before a re-ask (`carry_card`), and it still stands.
+    pub(crate) fn stands(&self) -> bool {
+        self.option.is_none() && self.label.is_some()
+    }
+}
+
 /// An owner's notice signed and maybe not on the relay yet, on disk before
 /// it is first sent (`publish`), so a lost reply, a crash or an older state
 /// file only ever sends this same event again, never a second approval.
@@ -50,17 +57,15 @@ pub(crate) struct OwnerSent {
 /// it is not the one it was last told; or the owner's message told it and
 /// it is someone else's now; or it may go out as the owner's own message
 /// (`owner_route`) and the last notice was not one. A clear that was never
-/// routed owes nothing; a re-tap of the told option is no change, and nor
-/// is choosing again the answer a re-ask carried over.
+/// routed owes nothing and a re-tap of the told option is no change, but a
+/// re-ask is a new question: any answer on its card is news, the same one
+/// as before too, or the agent that asked waits for good.
 pub(crate) fn route_due(item: &Item, now: u64, owner_set: &[String]) -> bool {
     let want = item.answer.as_ref().map(|a| a.option);
     let told = item.routed.as_ref();
     let changed = match told {
-        None => want.is_some(),
-        Some(r) if r.option.is_none() && r.label.is_some() => want
-            .and_then(|w| item.options.get(w))
-            .is_some_and(|l| r.label.as_ref() != Some(l)),
-        Some(r) => r.option != want,
+        Some(r) if !r.stands() => r.option != want,
+        _ => want.is_some(),
     };
     let owner = told.is_some_and(|r| r.owner);
     let theirs = owner && item.answer.as_ref().is_some_and(|a| a.by_name.is_some());
@@ -157,13 +162,17 @@ fn told_label<'a>(item: &'a Item, r: &'a Routed) -> Option<&'a str> {
         .or_else(|| item.options.get(r.option?).map(String::as_str))
 }
 
-/// Who the owner's own message says spoke: roles.json's name for the owner,
-/// only as it prints, else "The owner".
-fn owner_who(item: &Item) -> Option<String> {
-    let name = item.stamp.as_ref().map(|s| s.owner_name.as_str());
-    match name.filter(|n| !n.is_empty()) {
-        Some(n) => exact(n, BOARD_TITLE_MAX).map(str::to_string),
-        None => Some("The owner".to_string()),
+/// Who the owner's own message says spoke: roles.json's name for the owner
+/// if it is shaped like a name (ASCII letters and digits, single spaces
+/// between words, at most 40), so it can never carry a sentence of its
+/// own; else "The owner".
+fn owner_who(item: &Item) -> String {
+    let name = item.stamp.as_ref().map_or("", |s| s.owner_name.as_str());
+    let word = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric());
+    if name.len() <= 40 && name.split(' ').all(word) {
+        name.to_string()
+    } else {
+        "The owner".to_string()
     }
 }
 
@@ -196,7 +205,7 @@ pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
     let a = item.answer.as_ref()?;
     let label = owner_label(item.options.get(a.option)?)?;
     let card = card_name(&super::live_card(item)?.event_id)?;
-    let who = owner_who(item)?;
+    let who = owner_who(item);
     let mut out =
         format!("{who} chose: {label} on card {card}. I approve the action that option describes.");
     if let Some(action) = item.action.as_deref() {
@@ -226,7 +235,7 @@ pub(crate) fn render_owner_withdrawal(item: &Item, told: &Routed) -> Option<Stri
         .as_deref()
         .or_else(|| super::live_card(item).map(|c| c.event_id.as_str()));
     let card = card_name(card?)?;
-    let who = owner_who(item)?;
+    let who = owner_who(item);
     Some(format!(
         "{who} withdrew: {label} on card {card}. I no longer approve the action that option \
          describes. Stop if you have not acted; if you have, say in this thread what to undo. \
