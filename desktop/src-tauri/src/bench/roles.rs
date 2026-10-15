@@ -70,6 +70,30 @@ pub(crate) struct AgentAccess {
     pub allowlist: Vec<String>,
 }
 
+/// Who each managed agent takes instructions from, as this build enforces it.
+pub(super) fn agent_access(
+    records: &[crate::managed_agents::ManagedAgentRecord],
+    owner_only_build: bool,
+) -> Vec<AgentAccess> {
+    use crate::managed_agents::{access_policy, RespondTo};
+    records
+        .iter()
+        .map(|r| {
+            let (mode, list) = access_policy::projected_access_with_policy(r, owner_only_build);
+            AgentAccess {
+                pubkey: r.pubkey.to_ascii_lowercase(),
+                anyone: matches!(mode, RespondTo::Anyone),
+                allowlist: match mode {
+                    RespondTo::Allowlist => {
+                        list.iter().map(|k| k.trim().to_ascii_lowercase()).collect()
+                    }
+                    _ => Vec::new(),
+                },
+            }
+        })
+        .collect()
+}
+
 /// Names print on cards through plain_title: they must survive it.
 fn person_name(s: &str, field: &str) -> Result<(), String> {
     item::valid_text(s, item::NAME_MAX, field)?;

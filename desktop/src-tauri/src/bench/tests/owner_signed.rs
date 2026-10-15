@@ -269,7 +269,7 @@ async fn an_unreadable_roles_json_counts_no_members_txt_key() {
     reply(&b, &[&list, &merge]);
     let before = b.posts().len();
     let err = b.tick().await.unwrap_err();
-    assert!(err.starts_with("roles.json: "), "{err}");
+    assert!(err.starts_with(ROLES_HOLD), "{err}");
     assert!(
         err.contains("no members.txt key counts") && err.contains(&orch),
         "{err}"
@@ -721,4 +721,47 @@ async fn a_lookup_names_the_channel_the_notice_went_to() {
         .filter(|(e, _)| tag_value(e, "client").is_some_and(|c| c.starts_with("bench:board@")))
         .count();
     assert_eq!(boards, 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_roles_json_holds_every_card() {
+    let (mut b, _p, list) = bound_bench().await;
+    // The phone's own key, in members.txt, approves.
+    let phone = Keys::generate();
+    std::fs::write(b.root.join("members.txt"), hex(&phone) + "\n").unwrap();
+    let card = b.card(ASK).event_id;
+    let keep = tap(&phone, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    let owner = json!(b.owner_hex());
+    let signed = |b: &Bench, before| {
+        let n = notices(b, before);
+        n.iter().filter(|n| n["pubkey"] == owner).count()
+    };
+    assert_eq!(signed(&b, before), 1);
+    let answer = b.s.items[ASK].answer.clone();
+    let path = b.root.join(format!("outbox/{ASK}.json"));
+    let file = std::fs::read(&path).unwrap();
+    // Unreadable past a settle: the phone's tap is unread, so it stands.
+    let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
+    std::fs::write(b.root.join("roles.json"), "{").unwrap();
+    let before = b.posts().len();
+    for _ in 0..3 {
+        let err = b.tick().await.unwrap_err();
+        assert!(err.starts_with(ROLES_HOLD), "{err}");
+        b.now += ROUTE_SETTLE_SECS;
+    }
+    assert_eq!(signed(&b, before), 0);
+    assert_eq!(b.s.items[ASK].answer, answer);
+    assert_eq!(std::fs::read(&path).unwrap(), file);
+    // Readable again, the answer is the same: nothing more is signed.
+    std::fs::write(b.root.join("roles.json"), good).unwrap();
+    b.settle(3).await;
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    assert_eq!(signed(&b, before), 0);
+    assert_eq!(b.s.items[ASK].answer, answer);
 }

@@ -53,6 +53,8 @@ const RECOVER_PAGES: usize = 10;
 const REFUSED_TAPS_MAX: usize = 50;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMED_OUT: &str = "submit timed out";
+/// lastError while roles.json does not read, before its error.
+const ROLES_HOLD: &str = "roles.json can't be read, so every card is on hold: ";
 
 /// The debug fence: a debug build may only ever reach a loopback relay. The
 /// host is checked parsed, since `ws://localhost@evil.example` starts fine.
@@ -141,8 +143,9 @@ pub(crate) struct BenchState {
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.
     kept_at: Vec<(String, u64)>,
-    /// Live cards whose owner's page was cut this tick: their answers are
-    /// unread, so nothing expires, restamps, routes, retires or replaces them.
+    /// Live cards whose owner's page was cut this tick, or every item while
+    /// roles.json does not read: their answers are unread, so nothing
+    /// expires, restamps, routes, retires or replaces them.
     held: Vec<String>,
     /// Floor of the monotonic clock for writer events.
     last_created_at: u64,
@@ -1282,8 +1285,8 @@ fn restamp(
 /// One 2 s tick: owner fence, bootstrap, the bound channels' joins and admin
 /// check, recovery, the answer poll (before intake, so a query failure aborts
 /// the tick before any drop is read), intake, expiry, answerers, publish. An
-/// unreadable roles.json, or a cut page of answers, fails the tick only
-/// after publish: #bench and every unscoped card carry on.
+/// unreadable roles.json (every card on hold), or a cut page of answers,
+/// fails the tick only after publish: #bench and new cards carry on.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -1307,7 +1310,7 @@ pub(crate) async fn tick(
     s.writer_pubkey = writer_hex.clone();
     let (roles, roles_err) = match channels::read_roles(&ctx.root) {
         Ok(r) => (r, None),
-        Err(e) => (None, Some(e)),
+        Err(e) => (None, Some(format!("{ROLES_HOLD}{e}"))),
     };
     // The owner's keys: the owner plus the phone's own key in members.txt.
     let (owner_set, not_owner) =
@@ -1339,7 +1342,14 @@ pub(crate) async fn tick(
     if s.needs_rebuild {
         recover(ctx, s, now).await?;
     }
-    let cut = poll_answers(ctx, s, now, &owner_set, &routes).await?;
+    // Whose keys are the owner's is unknown, so no answer may be read as
+    // taken back: every card stands as it is, `held`, until roles.json reads.
+    let cut = if roles_err.is_some() {
+        s.held = s.items.keys().cloned().collect();
+        None
+    } else {
+        poll_answers(ctx, s, now, &owner_set, &routes).await?
+    };
     intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
     expire(s, now);
     restamp(
@@ -1365,30 +1375,6 @@ pub(crate) async fn tick(
     let failed = (!failed.is_empty()).then(|| failed.join("; "));
     done.and(cut.map_or(Ok(()), Err))
         .and(failed.map_or(Ok(()), Err))
-}
-
-/// Who each managed agent takes instructions from, as this build enforces it.
-fn agent_access(
-    records: &[crate::managed_agents::ManagedAgentRecord],
-    owner_only_build: bool,
-) -> Vec<roles::AgentAccess> {
-    use crate::managed_agents::{access_policy, RespondTo};
-    records
-        .iter()
-        .map(|r| {
-            let (mode, list) = access_policy::projected_access_with_policy(r, owner_only_build);
-            roles::AgentAccess {
-                pubkey: r.pubkey.to_ascii_lowercase(),
-                anyone: matches!(mode, RespondTo::Anyone),
-                allowlist: match mode {
-                    RespondTo::Allowlist => {
-                        list.iter().map(|k| k.trim().to_ascii_lowercase()).collect()
-                    }
-                    _ => Vec::new(),
-                },
-            }
-        })
-        .collect()
 }
 
 /// The service loop. state.json (lastTick / lastError / admission) is the
@@ -1461,7 +1447,7 @@ async fn serve(app: tauri::AppHandle) -> Result<(), String> {
                     writer: writer.clone(),
                     root: root.clone(),
                     agents: admitting_agents(&records, &writer_hex, owner_only),
-                    access: agent_access(&records, owner_only),
+                    access: roles::agent_access(&records, owner_only),
                 };
                 let now = nostr::Timestamp::now().as_secs();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();

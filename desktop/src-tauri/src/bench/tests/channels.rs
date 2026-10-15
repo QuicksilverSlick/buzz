@@ -484,7 +484,7 @@ async fn a_route_target_that_answers_is_not_routed() {
     b.now += ROUTE_SETTLE_SECS;
     let before = b.posts().len();
     for _ in 0..2 {
-        assert!(b.tick().await.unwrap_err().starts_with("roles.json: "));
+        assert!(b.tick().await.unwrap_err().starts_with(ROLES_HOLD));
     }
     assert!(notices(&b, before).is_empty());
     assert!(b
@@ -607,9 +607,9 @@ async fn phone_replies_to_a_threaded_card_name_only_its_root() {
 }
 
 #[tokio::test]
-async fn unreadable_roles_hold_scoped_drops_and_cards_go_owner_only() {
+async fn unreadable_roles_hold_scoped_drops_and_every_card() {
     let (mut b, _p, _list) = bound_bench().await;
-    let old = b.card(ASK).event_id;
+    let old = b.card(ASK);
     let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
     std::fs::write(b.root.join("roles.json"), "{not json").unwrap();
     b.drop_file(
@@ -618,23 +618,17 @@ async fn unreadable_roles_hold_scoped_drops_and_cards_go_owner_only() {
         &ask(&[("title", json!("Second"))]),
     );
     // Every tick finishes, then says why.
+    let before = b.posts().len();
     for _ in 0..4 {
         let err = b.tick().await.unwrap_err();
-        assert!(err.starts_with("roles.json: "), "{err}");
+        assert!(err.starts_with(ROLES_HOLD), "{err}");
     }
     assert!(b.root.join("inbox/reset-worker/second.json").exists());
     assert!(!b.s.items.contains_key("reset-worker/second"));
-    // The open card was reposted for the owner alone, and pings him.
-    let new = b.card(ASK).event_id;
-    assert_ne!(new, old);
-    let posts = b.posts();
-    let card = &posts
-        .iter()
-        .find(|(e, _)| e["id"] == new.as_str())
-        .unwrap()
-        .0;
-    assert!(content(card).contains("\nFor: the owner. Tap one number below to answer.\n"));
-    assert_eq!(tags(card, "p"), [json!(["p", b.owner_hex()])]);
+    // The open card stands as it is: not restamped, retired or reposted.
+    assert_eq!(b.card(ASK), old);
+    assert!(!b.s.items[ASK].stamp.as_ref().unwrap().answerers.is_empty());
+    assert!(!b.posts()[before..].iter().any(|(e, _)| e["kind"] == 5));
     // Readable again: the waiting drop is taken.
     std::fs::write(b.root.join("roles.json"), good).unwrap();
     b.tick().await.unwrap();
@@ -669,7 +663,7 @@ async fn a_roster_removal_takes_back_an_answered_card() {
     b.tick().await.unwrap();
     let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
     std::fs::write(b.root.join("roles.json"), "{not json").unwrap();
-    assert!(b.tick().await.unwrap_err().starts_with("roles.json: "));
+    assert!(b.tick().await.unwrap_err().starts_with(ROLES_HOLD));
     assert_eq!(b.s.items[ASK].answer.as_ref().unwrap().by, hex(&p.craig));
     std::fs::write(b.root.join("roles.json"), good).unwrap();
 
