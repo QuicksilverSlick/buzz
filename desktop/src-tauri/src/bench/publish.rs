@@ -262,7 +262,7 @@ pub(super) async fn publish(
                 .push(format!("{id}: route target is an answerer on this card"));
             continue;
         }
-        if now < s.routes_held_until {
+        if now < s.routes_held_until || s.held.contains(&id) {
             continue;
         }
         let card = live_card(&item)
@@ -285,26 +285,36 @@ pub(super) async fn publish(
             if !spend(budget, 1) {
                 return Ok(());
             }
-            let want = item.answer.as_ref().map(|a| a.option);
             let prev = item.routed.as_ref().and_then(|r| r.option);
             let at = item
                 .answer
                 .as_ref()
                 .map_or(item.changed_at, |a| a.answered_at);
             // The owner's own answer goes out as the owner's own message, so
-            // the agent acts on the owner's word. Anyone else's answer, a
-            // withdrawal, or text that fails the checks again is the writer's.
-            let owners = item
+            // the agent acts on the owner's word. One told that way and now
+            // withdrawn or someone else's is taken back that way first, as a
+            // withdrawal (the other answer follows next tick). Anyone else's
+            // answer, any other withdrawal, or text that fails the checks
+            // again is the writer's.
+            let mine = item
                 .answer
                 .as_ref()
-                .filter(|a| owner_set.contains(&a.by))
-                .and_then(|_| item::render_owner_route(&item));
+                .is_some_and(|a| owner_set.contains(&a.by));
+            let taken_back = item
+                .routed
+                .as_ref()
+                .filter(|r| r.owner && !mine)
+                .and_then(|r| item::render_owner_withdrawal(&item, r.option?));
+            let answer = item.answer.as_ref().filter(|_| taken_back.is_none());
+            let want = answer.map(|a| a.option);
+            let owners =
+                taken_back.or_else(|| item::render_owner_route(&item, prev).filter(|_| mine));
             let as_owner = owners.is_some();
             let text =
                 owners.unwrap_or_else(|| item::render_route(&item, prev, &local_hhmm(at)) + &link);
             let n = want.map_or("withdrawn".to_string(), |i| (i + 1).to_string());
             // Who answered, by key, so an agent elsewhere needs no outbox file.
-            let extra = match &item.answer {
+            let extra = match answer {
                 Some(a) if item.scoped() => vec![df_answer([&n, &a.by, &a.reaction_id])?],
                 _ => Vec::new(),
             };
@@ -341,6 +351,7 @@ pub(super) async fn publish(
                 to: to.clone(),
                 event_id,
                 at: now,
+                owner: as_owner && want.is_some(),
             });
         }
         // The person's Other: no settle, a reply is not undone by a tap.
@@ -383,14 +394,15 @@ pub(super) async fn publish(
     // (b) Delete cards that are stale (another Drop, card format or stamp) or
     // no longer wanted, unless someone answered or replied on them or they
     // are a receipt: those stay on the relay for good. A card in a channel
-    // that is not ready waits: its taps are read once it is again.
+    // that is not ready, or `held`, waits: its taps are read once it is again.
     let stale: Vec<(String, String, String)> = s
         .items
         .values()
         .filter_map(|i| {
             let c = i.card.as_ref()?;
             let stale = c.hash != item::card_hash(i) || !wanted.contains(&i.id);
-            let retire = !i.engaged() && i.request.is_none() && stale && channel_ready(s, i);
+            let waits = !channel_ready(s, i) || s.held.contains(&i.id);
+            let retire = !i.engaged() && i.request.is_none() && stale && !waits;
             retire.then(|| (i.id.clone(), card_channel(s, i), c.event_id.clone()))
         })
         .collect();

@@ -7,7 +7,7 @@ use super::*;
 /// The owner's answer, as the owner's own message.
 fn chose(label: &str) -> String {
     format!(
-        "The owner chose: {label} on Relay choice (orchestrator/relay-choice). \
+        "The owner chose: {label} on card orchestrator/relay-choice. \
          I approve the action that option describes."
     )
 }
@@ -30,6 +30,7 @@ fn told(option: Option<usize>) -> Option<Routed> {
         to: "ee".repeat(32),
         event_id: String::new(),
         at: 0,
+        owner: false,
     })
 }
 
@@ -227,6 +228,7 @@ async fn routed_answer_lifecycle() {
             to: agent_hex.clone(),
             event_id: ev["id"].as_str().unwrap().to_string(),
             at: b.now,
+            owner: true,
         })
     );
     assert!(settle_past(&mut b, 2).await.is_empty());
@@ -253,7 +255,12 @@ async fn routed_answer_lifecycle() {
         tag_value(&n[0], "client").unwrap(),
         "bench:route:orchestrator/relay-choice@1"
     );
-    assert_eq!(content(&n[0]), chose("Stay"));
+    assert_eq!(
+        content(&n[0]),
+        chose("Stay")
+            + "\nThis replaces the earlier answer: Move. Do not act on that one; undo what was \
+               done for it if it conflicts."
+    );
 
     // A clear after a notice is a withdrawal, sent once, after the settle.
     reply(&b, &[]);
@@ -266,16 +273,16 @@ async fn routed_answer_lifecycle() {
         tag_value(&n[0], "client").unwrap(),
         "bench:route:orchestrator/relay-choice@withdrawn"
     );
-    // A withdrawal approves nothing: it stays the writer's, and links the
-    // card's thread.
-    assert_eq!(n[0]["pubkey"], json!(b.writer_hex()));
-    assert!(content(&n[0]).starts_with(
-        "Bench answer withdrawn · orchestrator/relay-choice\nCard: Relay choice\nWas: 1. Stay\n"
-    ));
-    assert!(content(&n[0]).ends_with(&format!(
-        "Do not clear the card.{}",
-        thread_line(&b.channel(), &card)
-    )));
+    // The owner's approval is taken back with the owner's own word, so no
+    // approval outlives it.
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    assert_eq!(
+        content(&n[0]),
+        "The owner withdrew: Stay on card orchestrator/relay-choice. I no longer approve the \
+         action that option describes. Stop if you have not acted; if you have, say in this \
+         thread what to undo. Do not clear the card."
+    );
+    assert!(!b.s.items[ITEM].routed.as_ref().unwrap().owner);
 
     // Answered again, then acked by a re-drop: nothing more is ever sent.
     let last = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now + 1);
@@ -441,5 +448,5 @@ async fn a_join_or_a_launch_holds_notices_one_settle() {
     b.tick().await.unwrap();
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert_eq!(content(&n[0]), chose("Stay"));
+    assert!(content(&n[0]).starts_with(&chose("Stay")));
 }

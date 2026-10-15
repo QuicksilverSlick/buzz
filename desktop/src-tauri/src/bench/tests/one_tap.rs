@@ -241,18 +241,18 @@ fn the_owners_notice_is_fixed_wording() {
     });
     let chose = |who: &str, label: &str| {
         format!(
-            "{who} chose: {label} on Relay choice (orchestrator/relay-choice). \
+            "{who} chose: {label} on card orchestrator/relay-choice. \
              I approve the action that option describes."
         )
     };
     assert_eq!(
-        render_owner_route(&item).unwrap(),
+        render_owner_route(&item, None).unwrap(),
         format!("{}\nAction: {MERGE}", chose("The owner", "Move"))
     );
     // Not the recommended option: nothing more.
     item.answer.as_mut().unwrap().option = 0;
     assert_eq!(
-        render_owner_route(&item).unwrap(),
+        render_owner_route(&item, None).unwrap(),
         chose("The owner", "Stay")
     );
     // Named as roles.json names the owner, and the option as the card shows it.
@@ -262,22 +262,20 @@ fn the_owners_notice_is_fixed_wording() {
     });
     item.options[0] = "Stay \u{2014} for now".to_string();
     assert_eq!(
-        render_owner_route(&item).unwrap(),
+        render_owner_route(&item, None).unwrap(),
         chose("Quicksilver", "Stay - for now")
     );
     // Anything the drop checks would refuse now: the writer's notice instead.
     type Spoil = fn(&mut Item);
-    let bad: [(&str, Spoil); 5] = [
-        ("title", |i| i.title = "Relay nostr:npub1x".to_string()),
-        ("title format", |i| i.title = "Relay\u{202E}".to_string()),
-        ("empty title", |i| i.title = "***".to_string()),
+    let bad: [(&str, Spoil); 3] = [
         ("option", |i| i.options[0] = "nsec1abc".to_string()),
+        ("empty option", |i| i.options[0] = "***".to_string()),
         ("action", |i| i.action = Some("rm `x`".to_string())),
     ];
     for (name, spoil) in bad {
         let mut spoiled = item.clone();
         spoil(&mut spoiled);
-        assert_eq!(render_owner_route(&spoiled), None, "{name}");
+        assert_eq!(render_owner_route(&spoiled, None), None, "{name}");
     }
 }
 
@@ -337,7 +335,7 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
     assert_eq!(
         content(&n[0]),
         format!(
-            "Quicksilver chose: Merge PR on Merge PR 711 ({id}). \
+            "Quicksilver chose: Merge PR on card {id}. \
              I approve the action that option describes.\nAction: {MERGE}"
         )
     );
@@ -353,7 +351,8 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
     assert!(item.reply.is_none());
     assert_eq!(item.answer.as_ref().unwrap().reaction_id, merge.id.to_hex());
 
-    // Hold, which is not the recommended option, approves no command.
+    // Hold, which is not the recommended option, approves no command, and
+    // takes back the merge it replaces.
     let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
     reply(&b, &[&list, &notice, &hold]);
     b.tick().await.unwrap();
@@ -365,7 +364,11 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
     assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
     assert_eq!(
         content(&n[0]),
-        format!("Quicksilver chose: Hold on Merge PR 711 ({id}). I approve the action that option describes.")
+        format!(
+            "Quicksilver chose: Hold on card {id}. I approve the action that option describes.\n\
+             This replaces the earlier answer: Merge PR. Do not act on that one; undo what was \
+             done for it if it conflicts."
+        )
     );
 }
 
@@ -377,7 +380,7 @@ async fn text_that_fails_the_checks_goes_out_as_the_writers() {
     let routes = json!({ "orchestrator": hex(&agent) });
     std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
     // Changed in state after the drop checks passed it.
-    b.s.items.get_mut(ITEM).unwrap().title = "Relay nostr:npub1x".to_string();
+    b.s.items.get_mut(ITEM).unwrap().options[1] = "Move nostr:npub1x".to_string();
     let mv = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
     reply(&b, &[&mv]);
     b.tick().await.unwrap();

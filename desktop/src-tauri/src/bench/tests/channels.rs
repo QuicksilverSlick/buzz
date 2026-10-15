@@ -300,12 +300,14 @@ async fn craig_answers_and_the_owner_overrides() {
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
     // The owner's is the owner's own message, in the same thread, to the
-    // same agent.
+    // same agent, and says to undo what Craig's answer started.
     assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
     assert_eq!(
         content(&n[0]),
-        "Quicksilver chose: Keep the old one on Welcome email (reset-worker/welcome). \
-         I approve the action that option describes."
+        "Quicksilver chose: Keep the old one on card reset-worker/welcome. \
+         I approve the action that option describes.\n\
+         This replaces the earlier answer: Send the new email. Do not act on that one; \
+         undo what was done for it if it conflicts."
     );
     assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
     assert_eq!(tags(&n[0], "e"), [json!(["e", card, "", "reply"])]);
@@ -637,7 +639,7 @@ async fn unreadable_roles_hold_scoped_drops_and_cards_go_owner_only() {
 }
 
 /// Rewrites the project's people in roles.json.
-fn edit_people(b: &Bench, f: impl FnOnce(&mut Vec<Value>)) {
+pub(super) fn edit_people(b: &Bench, f: impl FnOnce(&mut Vec<Value>)) {
     let path = b.root.join("roles.json");
     let mut roles: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let people = roles["projects"]["reset"]["people"].as_array_mut().unwrap();
@@ -857,7 +859,7 @@ async fn the_owners_word_stands_across_taps_and_other() {
     assert_eq!(
         content(&n[0]),
         format!(
-            "Quicksilver chose: Keep the old one on Welcome email ({ASK}). \
+            "Quicksilver chose: Keep the old one on card {ASK}. \
              I approve the action that option describes."
         )
     );

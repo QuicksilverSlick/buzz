@@ -49,16 +49,17 @@ fn parent(e: &nostr::Event) -> Option<&str> {
 /// Until when (inclusive) the live card of `item` also takes replies that
 /// name only its thread's root, as Block's phone sends from a thread it
 /// shows from the root: from its card to the next card the Bench has in that
-/// thread, so each such reply counts for one card, the newest before it.
-/// None without a thread, or in one rooted at a card: a reply there is that
-/// card's own.
-// shortcut: a card a re-ask left behind (`kept`) has no time here, so an
-// older card in its thread can take its root replies; keep kept cards'
-// times if threads come to hold several open cards.
+/// thread, kept ones (`kept_at`) included, so each such reply counts for one
+/// card, the newest before it. None without a thread, or in one rooted at a
+/// card: a reply there is that card's own.
+// shortcut: a recovered card publish (c) keeps has no time here, so an
+// older card in its thread can take its root replies; rare (a post state
+// lost), record its thread root from its tags if it comes up.
 pub(crate) fn root_until<'a>(
     item: &Item,
     items: impl IntoIterator<Item = &'a Item>,
     kept: &[String],
+    kept_at: &[(String, u64)],
 ) -> Option<u64> {
     let root = item.reply_to.as_deref()?;
     let after = item.card.as_ref()?.created_at;
@@ -71,6 +72,11 @@ pub(crate) fn root_until<'a>(
         let thread = j.request.as_deref().unwrap_or(j).reply_to.as_deref();
         if thread == Some(root) && c.created_at > after {
             until = until.min(c.created_at);
+        }
+    }
+    for (r, at) in kept_at {
+        if r == root && *at > after {
+            until = until.min(*at);
         }
     }
     (!kept.iter().any(|k| k == root)).then_some(until)

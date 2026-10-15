@@ -581,8 +581,8 @@ fn each_thread_reply_counts_for_one_card() {
     // to a, as the phone sends it from a's thread, is a's alone.
     let (top, inner) = (card(None, a, 10), card(Some(a), b, 20));
     let (ua, ub) = (
-        root_until(&top, [&top, &inner], &[]),
-        root_until(&inner, [&top, &inner], &[]),
+        root_until(&top, [&top, &inner], &[], &[]),
+        root_until(&inner, [&top, &inner], &[], &[]),
     );
     assert_eq!((ua, ub), (None, None));
     let to_b = say("2", 30, &[(a, "root"), (b, "reply")]);
@@ -600,8 +600,8 @@ fn each_thread_reply_counts_for_one_card() {
     // r is the newest card's from before it, and nobody's before the first.
     let (one, two) = (card(Some(r), c1, 40), card(Some(r), c2, 50));
     let (u1, u2) = (
-        root_until(&one, [&one, &two], &[]),
-        root_until(&two, [&one, &two], &[]),
+        root_until(&one, [&one, &two], &[], &[]),
+        root_until(&two, [&one, &two], &[], &[]),
     );
     assert_eq!((u1, u2), (Some(50), Some(u64::MAX)));
     let after = [
@@ -634,7 +634,10 @@ fn each_thread_reply_counts_for_one_card() {
     // Without that window a root reply is nobody's, and a kept card roots
     // its own thread.
     assert_eq!(opt(&two, &say("1", 58, &[(r, "reply")]), None), None);
-    assert_eq!(root_until(&one, [&one], &[r.to_string()]), None);
+    assert_eq!(root_until(&one, [&one], &[r.to_string()], &[]), None);
+    // A card a re-ask kept still ends the window of an older one there.
+    let kept_at = [(r.to_string(), 45), (hex('f'), 41)];
+    assert_eq!(root_until(&one, [&one], &[], &kept_at), Some(45));
 }
 
 #[test]

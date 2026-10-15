@@ -256,6 +256,10 @@ pub(crate) struct Routed {
     pub to: String,
     pub event_id: String,
     pub at: u64,
+    /// The notice was the owner's own message (`render_owner_route`): a
+    /// withdrawal or someone else's answer takes it back the same way first.
+    #[serde(default)]
+    pub owner: bool,
 }
 
 /// The answer a card came back from: the writer asked again after it
@@ -1148,12 +1152,15 @@ pub(crate) fn card_pings(item: &Item, owner_hex: &str, owner_set: &[String]) -> 
 }
 
 /// Whether the route target is owed a notice: the answer has settled and is
-/// not the one it was last told. A clear that was never routed owes nothing;
-/// a re-tap of the told option is no change.
+/// not the one it was last told, or the owner's message told it and it is
+/// someone else's now. A clear that was never routed owes nothing; a re-tap
+/// of the told option is no change.
 pub(crate) fn route_due(item: &Item, now: u64) -> bool {
     let want = item.answer.as_ref().map(|a| a.option);
     let told = item.routed.as_ref().map(|r| r.option);
-    told.map_or(want.is_some(), |t| t != want)
+    let theirs = item.routed.as_ref().is_some_and(|r| r.owner)
+        && item.answer.as_ref().is_some_and(|a| a.by_name.is_some());
+    (told.map_or(want.is_some(), |t| t != want) || theirs)
         && now.saturating_sub(item.changed_at) >= ROUTE_SETTLE_SECS
 }
 
@@ -1224,25 +1231,28 @@ pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
     )
 }
 
+/// An option's label as the card shows it, for the owner's own message;
+/// None if it fails the drop checks again.
+fn owner_label(item: &Item, option: usize) -> Option<String> {
+    let o = item.options.get(option)?;
+    valid_text(o, OPTION_MAX, "option").ok()?;
+    Some(plain_text(o, usize::MAX)).filter(|l| !l.is_empty())
+}
+
 /// The notice for an answer from the owner's own keys, which the Bench posts
 /// from the owner's identity so the agent acts on the owner's word (spec
-/// section 9). Fixed wording around the option label and title as the card
-/// shows them, plus the card's action line when the recommended option was
-/// chosen; None when any of them fails the drop checks again, and the
-/// writer's notice goes instead.
-pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
+/// section 9). Fixed wording around the option labels the card shows and
+/// the item id, never the title (writer text the owner did not choose),
+/// plus the card's action line when the recommended option was chosen.
+/// `prev` is the option the target was last told, which this replaces.
+/// None when any of them fails the drop checks again, and the writer's
+/// notice goes instead.
+pub(crate) fn render_owner_route(item: &Item, prev: Option<usize>) -> Option<String> {
     let a = item.answer.as_ref()?;
-    let option = item.options.get(a.option)?;
-    valid_text(&item.title, TITLE_MAX, "title").ok()?;
-    valid_text(option, OPTION_MAX, "option").ok()?;
-    let label = plain_text(option, usize::MAX);
-    let title = plain_text(&item.title, usize::MAX);
-    if label.is_empty() || title.is_empty() {
-        return None;
-    }
+    let label = owner_label(item, a.option)?;
     let who = owner_name(item).unwrap_or_else(|| "The owner".to_string());
     let mut out = format!(
-        "{who} chose: {label} on {title} ({}). I approve the action that option describes.",
+        "{who} chose: {label} on card {}. I approve the action that option describes.",
         item.id
     );
     if let Some(action) = item.action.as_deref() {
@@ -1251,7 +1261,28 @@ pub(crate) fn render_owner_route(item: &Item) -> Option<String> {
             out.push_str(&format!("\nAction: {action}"));
         }
     }
+    if let Some(p) = prev {
+        out.push_str(&format!(
+            "\nThis replaces the earlier answer: {}. Do not act on that one; undo what was \
+             done for it if it conflicts.",
+            owner_label(item, p)?
+        ));
+    }
     Some(out)
+}
+
+/// The owner's own message taking back the answer `told`, last routed as
+/// `render_owner_route`, now withdrawn or someone else's: so no approval of
+/// the owner's outlives it. Fixed wording around the label, as there.
+pub(crate) fn render_owner_withdrawal(item: &Item, told: usize) -> Option<String> {
+    let who = owner_name(item).unwrap_or_else(|| "The owner".to_string());
+    Some(format!(
+        "{who} withdrew: {} on card {}. I no longer approve the action that option \
+         describes. Stop if you have not acted; if you have, say in this thread what to undo. \
+         Do not clear the card.",
+        owner_label(item, told)?,
+        item.id
+    ))
 }
 
 /// The line that opens a card's thread from its text, for posts made once

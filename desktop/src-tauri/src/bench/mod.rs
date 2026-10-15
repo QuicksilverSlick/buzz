@@ -136,6 +136,12 @@ pub(crate) struct BenchState {
     /// Engaged cards a new question left behind: on the relay for good, never
     /// adopted again by recover (which would retire them as stale).
     kept: Vec<String>,
+    /// Each kept card posted in a thread, as (its root, its created_at): it
+    /// still ends the root-reply window of an older card there.
+    kept_at: Vec<(String, u64)>,
+    /// Live cards whose owner's page was cut this tick: their answers are
+    /// unread, so nothing expires, restamps, routes, retires or replaces them.
+    held: Vec<String>,
     /// Floor of the monotonic clock for writer events.
     last_created_at: u64,
     board: Option<Posted>,
@@ -357,7 +363,12 @@ fn scan_inbox(
 /// new question after an answer or a reply leaves the old card on the relay
 /// as it is and gets a card of its own, which comes back to whoever answered
 /// (`item::Previous`); anything else keeps the card for publish to refresh.
-fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<String>) -> item::Item {
+fn carry_card(
+    old: Option<&item::Item>,
+    mut new: item::Item,
+    kept: &mut Vec<String>,
+    kept_at: &mut Vec<(String, u64)>,
+) -> item::Item {
     let Some(o) = old else { return new };
     let asking = new.kind == item::ItemKind::Pending;
     if !asking && o.card.is_some() && (o.kind == item::ItemKind::Pending || o.request.is_some()) {
@@ -369,8 +380,11 @@ fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<Stri
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
     } else if asking && (o.engaged() || o.request.is_some()) {
-        kept.extend(o.card.as_ref().map(|c| c.event_id.clone()));
         let asked = o.request.as_deref().unwrap_or(o);
+        if let Some(c) = &o.card {
+            kept.push(c.event_id.clone());
+            kept_at.extend(asked.reply_to.clone().map(|r| (r, c.created_at)));
+        }
         let answered = asked.answer.as_ref().and_then(|a| {
             Some(item::Previous {
                 option: a.option,
@@ -391,7 +405,8 @@ fn carry_card(old: Option<&item::Item>, mut new: item::Item, kept: &mut Vec<Stri
 /// Take every readable drop into state (keeping the card of the item it
 /// replaces, see `carry_card`) or reject it in place as
 /// `<stem>.rejected.json`; the writer cleans up its own rejections. A scoped
-/// drop waits while roles.json is unreadable. Returns whether state changed.
+/// drop waits while roles.json is unreadable, and a drop for a `held` card
+/// until its answers are read. Returns whether state changed.
 fn intake(
     s: &mut BenchState,
     root: &Path,
@@ -412,6 +427,7 @@ fn intake(
         });
         let (reason, raw) = match checked {
             Ok(None) => continue,
+            Ok(Some((Ok(item), _))) if s.held.contains(&item.id) => continue,
             Ok(Some((Ok(item), _))) => {
                 let old = s.items.get(&item.id);
                 if old.is_none_or(|o| o.hash != item.hash) {
@@ -419,7 +435,7 @@ fn intake(
                     // rebuilt item carries no answer, so the file goes too,
                     // whether or not state still remembers the answer.
                     let _ = std::fs::remove_file(outbox_path(root, &item.id));
-                    let item = carry_card(old, item, &mut s.kept);
+                    let item = carry_card(old, item, &mut s.kept, &mut s.kept_at);
                     s.items.insert(item.id.clone(), item);
                     changed = true;
                 }
@@ -853,7 +869,8 @@ fn named(
 /// double-applied. The outbox file lands before state records the answer: a
 /// failed write is retried next tick instead of being lost. Ok(Some) says
 /// a page was cut: the cards it covers keep their answers, they are read
-/// again next tick, the tick goes on, and it is lastError.
+/// again next tick, the tick goes on, and it is lastError. A card the
+/// owner's cut page covers is also `held` for the rest of the tick.
 // ponytail: one /query per 2 s tick, two once a live card has answerers,
 // twice that while a card takes its thread root's replies (up to 120/min of
 // the 300/min budget); swap for the live #h tail via
@@ -865,6 +882,7 @@ async fn poll_answers(
     owner_set: &[String],
     routes: &BTreeMap<String, String>,
 ) -> Result<Option<String>, String> {
+    s.held.clear();
     // A channel not ready for cards is not read either: its answers stand.
     let live: Vec<&item::Item> = s
         .items
@@ -887,7 +905,7 @@ async fn poll_answers(
     let rooted: Vec<&item::Item> = live
         .iter()
         .copied()
-        .filter(|i| item::root_until(i, s.items.values(), &s.kept).is_some())
+        .filter(|i| item::root_until(i, s.items.values(), &s.kept, &s.kept_at).is_some())
         .collect();
     let roots: Vec<String> = rooted.iter().filter_map(|i| i.reply_to.clone()).collect();
     let since = rooted
@@ -968,12 +986,16 @@ async fn poll_answers(
     let writer_hex = ctx.writer.public_key().to_hex();
     let hhmm = local_hhmm(now);
     let mut refused = Vec::new();
+    let mut held = Vec::new();
     for id in ids {
-        // The owner's page was cut: everything on this card stands.
+        // The owner's page was cut: everything on this card stands, and it
+        // is `held` until it is read, since an answer may be taken back or a
+        // tap unseen.
         if cut(true, &id) {
+            held.push(id);
             continue;
         }
-        let until = item::root_until(&s.items[&id], s.items.values(), &s.kept);
+        let until = item::root_until(&s.items[&id], s.items.values(), &s.kept, &s.kept_at);
         let item = s.items.get_mut(&id).expect("live id");
         let card = live_card(item).expect("live card").event_id.clone();
         // Their page was cut, so an answer or reply of theirs here may be
@@ -1113,12 +1135,13 @@ async fn poll_answers(
     }
     let over = s.refused_taps.len().saturating_sub(REFUSED_TAPS_MAX);
     s.refused_taps.drain(..over);
+    s.held = held;
     Ok(why)
 }
 
 /// A pending item past its deadline folds off the board: Superseded, so
-/// publish (b) retires its card. Engaged items are left alone, and a
-/// same-hash re-drop cannot revive one: a new deadline is needed.
+/// publish (b) retires its card. Engaged and `held` items are left alone,
+/// and a same-hash re-drop cannot revive one: a new deadline is needed.
 fn expire(s: &mut BenchState, now: u64) {
     for i in s.items.values_mut() {
         let due = i
@@ -1130,19 +1153,20 @@ fn expire(s: &mut BenchState, now: u64) {
             && i.kind == item::ItemKind::Pending
             && i.validity == item::Validity::Current
             && !i.engaged()
+            && !s.held.contains(&i.id)
         {
             i.validity = item::Validity::Superseded;
         }
     }
 }
 
-/// Re-resolve who may answer each open scoped request. An engaged one keeps
-/// the set it was answered under, less anyone the roster no longer lets
-/// answer it (the poll then drops their answer or reply); an unreadable
-/// roster leaves it as it is. A changed stamp changes the card_hash, so
-/// publish (b) reposts a card nobody engaged with and (a2) re-renders any
-/// other, even once its answer or reply was taken back. Agents the writer's
-/// p tag cannot wake are reported.
+/// Re-resolve who may answer each open scoped request. An engaged or `held`
+/// one keeps the set it was answered under, less anyone the roster no
+/// longer lets answer it (the poll then drops their answer or reply); an
+/// unreadable roster leaves it as it is. A changed stamp changes the
+/// card_hash, so publish (b) reposts a card nobody engaged with and (a2)
+/// re-renders any other, even once its answer or reply was taken back.
+/// Agents the writer's p tag cannot wake are reported.
 fn restamp(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -1159,7 +1183,7 @@ fn restamp(
         let target = routes.get(&i.writer).map(String::as_str);
         let fresh = roles::stamp(i, roles, owner_set, &ctx.access, target, &writer_hex);
         i.was_engaged |= i.engaged();
-        if !i.engaged() {
+        if !i.engaged() && !s.held.contains(&i.id) {
             i.stamp = fresh;
         } else if let (Some(st), Some(fresh), false) = (i.stamp.as_mut(), fresh, roles_bad) {
             // Removals only: nobody is silently added to an answered card.
