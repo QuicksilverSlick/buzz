@@ -867,3 +867,48 @@ async fn an_approval_untapped_on_a_forgotten_card_and_closed_out_is_withdrawn_on
     assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
     assert!(b.s.items[ASK].ends.is_none());
 }
+
+#[tokio::test]
+async fn an_approval_re_asked_unseen_and_closed_out_ends_once() {
+    let (mut b, p, list) = bound_bench().await;
+    let old = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &old, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert_eq!(notices(&b, before).len(), 1);
+    // X refused: the re-ask gets no card, then closes out with none, so the
+    // approval told on the old card is still owed its end.
+    let shared = admins(&b, &b.relay.keys.clone(), &[&hex(&p.craig)]);
+    reply(&b, &[&shared, &keep]);
+    b.now += 600;
+    b.settle(2).await;
+    assert!(b.s.channels[X].refused.is_some());
+    let again = ask(&[("body", json!("Shorter still?"))]);
+    b.drop_file("reset-worker", "welcome", &again);
+    b.settle(3).await;
+    let item = &b.s.items[ASK];
+    assert!(item.card.is_none() && item.ends.is_some());
+    close_out(&b);
+    b.settle(3).await;
+    let item = &b.s.items[ASK];
+    assert!(item.request.is_none() && item.ends.is_some());
+    // Ready again: it ends once, on the card it was told on.
+    reply(&b, &[&list, &keep]);
+    b.now += 60;
+    let before = b.posts().len();
+    b.settle(3).await;
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    let owner = json!(b.owner_hex());
+    let n: Vec<Value> = notices(&b, before)
+        .into_iter()
+        .filter(|n| n["pubkey"] == owner)
+        .collect();
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!(content(&n[0]), ended(&old));
+    assert_eq!(tag_value(&n[0], "e"), Some(old));
+    assert!(b.s.items[ASK].ends.is_none());
+}
