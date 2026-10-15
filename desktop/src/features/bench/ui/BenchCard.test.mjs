@@ -550,6 +550,33 @@ test("a receipt shows the request, the answer and the outcome as inert text", as
   assert.equal(screen.queryByRole("button", { name: /^Other: reply/ }), null);
 });
 
+test("a receipt's header shows where the decision stands, not the request's urgency", async () => {
+  const request = card({
+    kind: "pending",
+    severity: "critical",
+    options: ["Merge it", "Hold"],
+    cardEventId: null,
+    recorded: 1,
+  });
+  const receipt = card({
+    kind: "status",
+    state: "blocked",
+    severity: null,
+    options: [],
+    title: "Held",
+    request,
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: receipt, onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  const header = root.firstElementChild.textContent;
+  assert.ok(header.includes("Blocked"), header);
+  assert.ok(!header.includes("Your decision"), header);
+  assert.ok(!header.includes("Pending"), header);
+});
+
 test("a plain card shows its chips, lines, recommendation, action and folded details", async () => {
   const merge =
     "gh pr merge 711 --repo QuicksilverSlick/Metabolic-reset --squash";

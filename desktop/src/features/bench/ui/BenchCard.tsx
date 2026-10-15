@@ -233,7 +233,8 @@ function BenchReceiptCard({
       data-bench-item={card.id}
       data-testid="bench-card"
     >
-      <BenchCardHeader card={request} />
+      {/* The header says where the decision stands now, not what it was. */}
+      <BenchCardHeader card={card} />
       <BenchCardText card={request} />
       {options.length > 0 ? (
         <fieldset
