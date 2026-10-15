@@ -144,15 +144,18 @@ fn thread_of(
 }
 
 /// The owner's approval told on the card `id` re-asked (`item::Item::ends`)
-/// ends there, in the owner's own message (`item::render_owner_ended`),
-/// kept on disk before it goes and only ever sent again as itself, like any
-/// owner's notice. One still unsettled there is settled first, as itself;
-/// then `owner_told` says whether an ending is still owed.
+/// ends there, in the owner's own message (`item::render_owner_ended`), or
+/// (`closed`, the card `id` closed out) is withdrawn there
+/// (`item::render_owner_withdrawal`); kept on disk before it goes and only
+/// ever sent again as itself, like any owner's notice. One still unsettled
+/// there is settled first, as itself; then publish (a3) says whether more
+/// is still owed.
 async fn end_approval(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     id: &str,
     old: &item::Item,
+    closed: bool,
     now: u64,
 ) -> Result<(), String> {
     let ch = card_channel(s, old);
@@ -160,9 +163,13 @@ async fn end_approval(
         return resend_owner(ctx, s, id, true, &ch, sent, now).await;
     }
     let told = old.routed.clone().expect("the owner's approval");
-    let text = item::render_owner_ended(old).ok_or("its card has no name")?;
+    let (text, n) = match closed {
+        true => (item::render_owner_withdrawal(old, &told), "withdrawn"),
+        false => (item::render_owner_ended(old), "ended"),
+    };
+    let text = text.ok_or("its card or option has no name")?;
     let thread = thread_of(old.card.as_ref(), old.reply_to.as_deref())?;
-    let marker = format!("bench:route:{id}@ended");
+    let marker = format!("bench:route:{id}@{n}");
     let ping = [told.to.as_str()];
     let builder = message(ctx, &ch, &text, &ping, thread.as_ref(), marker, Vec::new())?;
     let ev = builder
@@ -420,13 +427,17 @@ pub(super) async fn publish(
             continue;
         }
         // The owner's approval on the card this one re-asked ends there
-        // first: this card's notices wait for it.
+        // first: this card's notices wait for it. On the card this one
+        // closed out (its request is that drop) it stands once settled, as
+        // long as the answer is still the one told.
         if let Some(old) = item.ends.as_deref() {
-            if old.owner_told() {
+            let closed = item.request.as_ref().is_some_and(|r| r.hash == old.hash);
+            let stands = old.owner_sent.is_none() && !item::route_due(old, u64::MAX, owner_set);
+            if old.owner_told() && !(closed && stands) {
                 if !spend(budget, 1) {
                     return Ok(());
                 }
-                if let Err(e) = end_approval(ctx, s, &id, old, now).await {
+                if let Err(e) = end_approval(ctx, s, &id, old, closed, now).await {
                     failed.push(format!("{id}: the owner's approval did not end: {e}"));
                 }
                 continue;

@@ -377,7 +377,8 @@ fn scan_inbox(
 }
 
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
-/// status) of a carded request keeps the card, which becomes its receipt; a
+/// status) of a carded request keeps the card, which becomes its receipt,
+/// and any owner's notice still owed there (`item::Item::ends`); a
 /// new question after an answer, a reply or the owner's word leaves the old
 /// card on the relay as it is and gets a card of its own with nothing told
 /// yet, which comes back to whoever answered (`item::Previous`), and the
@@ -401,6 +402,9 @@ fn carry_card(
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
+        if o.owner_told() {
+            new.ends = Some(Box::new(o.clone()));
+        }
     } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
         let asked = o.request.as_deref().unwrap_or(o);
         if let Some(c) = &o.card {

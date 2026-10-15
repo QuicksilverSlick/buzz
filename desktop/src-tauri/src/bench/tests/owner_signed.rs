@@ -765,3 +765,66 @@ async fn an_unreadable_roles_json_holds_every_card() {
     assert_eq!(signed(&b, before), 0);
     assert_eq!(b.s.items[ASK].answer, answer);
 }
+
+/// The writer closes ASK out: its card becomes the receipt.
+fn close_out(b: &Bench) {
+    let done = ask(&[
+        ("kind", json!("status")),
+        ("state", json!("done")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+        ("to", Value::Null),
+        ("recommend", Value::Null),
+        ("title", json!("Kept the old email")),
+    ]);
+    b.drop_file("reset-worker", "welcome", &done);
+}
+
+#[tokio::test]
+async fn an_approval_untapped_and_closed_out_is_withdrawn_once() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    // Untapped, and closed out inside the settle.
+    reply(&b, &[&list]);
+    b.tick().await.unwrap();
+    close_out(&b);
+    let before = b.posts().len();
+    b.settle(3).await;
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["pubkey"], json!(b.owner_hex()));
+    let withdrew = format!(
+        "Quicksilver withdrew: Keep the old one on card {}. ",
+        &card[..12]
+    );
+    assert!(content(&n[0]).starts_with(&withdrew), "{}", content(&n[0]));
+    assert_eq!(tag_value(&n[0], "e"), Some(card.clone()));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
+    let item = &b.s.items[ASK];
+    assert!(item.ends.is_none() && item.request.is_some());
+    assert_eq!(item.card.as_ref().unwrap().event_id, card);
+}
+
+#[tokio::test]
+async fn a_close_out_settles_the_owners_unsettled_notice_as_itself() {
+    let (mut b, list, keep, _card) = signed_not_saved().await;
+    let sent = b.s.items[ASK].owner_sent.clone().unwrap().event;
+    close_out(&b);
+    reply(&b, &[&list, &keep]);
+    let before = b.posts().len();
+    b.settle(3).await;
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    // Sent again, not signed afresh; the approval it told stands.
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["id"], json!(sent.id.to_hex()));
+    assert!(b.s.items[ASK].ends.is_none());
+}

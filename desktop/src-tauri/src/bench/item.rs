@@ -342,8 +342,11 @@ pub(crate) struct Item {
     #[serde(default)]
     pub owner_sent: Option<OwnerSent>,
     /// The item this re-ask replaced (`carry_card`) while the owner's word
-    /// told on its card is not yet ended there (`render_owner_ended`). This
-    /// item's own notices wait for it, so it never holds one of its own.
+    /// told on its card is not yet ended there (`render_owner_ended`), or
+    /// the one this close-out closed while an owner's notice there is in
+    /// flight or an approval its answer no longer matches is not yet taken
+    /// back (`render_owner_withdrawal`). This item's own notices wait for
+    /// it, so it never holds one of its own.
     #[serde(default)]
     pub ends: Option<Box<Item>>,
 }
