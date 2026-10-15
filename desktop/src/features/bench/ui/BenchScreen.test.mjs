@@ -563,7 +563,7 @@ test("screen: sections depend on who is viewing; receipts are decided", async ()
   // This bare router JSON-quotes search values; the app's does not.
   assert.match(
     decodeURIComponent(router.history.location.search),
-    /^\?thread="?9{64}"?$/,
+    /^\?messageId="?9{64}"?$/,
   );
   cleanup();
 
@@ -648,7 +648,7 @@ test("screen: search narrows every section; Open thread opens the card's thread"
   );
   assert.match(
     decodeURIComponent(router.history.location.search),
-    /^\?thread="?7{64}"?$/,
+    /^\?messageId="?7{64}"?$/,
   );
 
   await act(async () => {

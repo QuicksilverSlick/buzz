@@ -75,7 +75,9 @@ export function BenchScreen() {
     (card: BenchCardData) => {
       const channel = card.channelId ?? benchChannel;
       if (channel && card.cardEventId) {
-        void goChannel(channel, { thread: card.cardEventId });
+        // A message target opens its thread panel even when the card is
+        // older than the loaded timeline; `thread` alone did not.
+        void goChannel(channel, { messageId: card.cardEventId });
       }
     },
     [benchChannel, goChannel],
