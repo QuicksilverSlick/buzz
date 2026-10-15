@@ -123,7 +123,7 @@ test("Bench screen answers a pending card and shows it recorded", async ({
           .map((entry) => entry.payload),
       ),
     )
-    .toEqual([{ itemId: ITEM_ID, option: 1 }]);
+    .toEqual([{ itemId: ITEM_ID, option: 1, cardEventId: "e".repeat(64) }]);
   await expect(card.getByText("Saving...")).toBeVisible();
 
   // The Bench's tick records the owner's keycap; the screen's 3 s poll
