@@ -8,6 +8,7 @@ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { cn } from "@/shared/lib/cn";
 import { truncateNpub } from "@/shared/lib/pubkey";
 import {
+  inlineChipIconClasses,
   MENTION_CHIP_BASE_CLASSES,
   MENTION_CHIP_HOVER_CLASSES,
 } from "@/shared/ui/mentionChip";
@@ -66,7 +67,9 @@ export function useMessageAgentAddressPrefix({
 /**
  * Visible send-state prefix for recipients kept in the composer address tray.
  * Each chip leads with the agent's own avatar, as the tray showed it while
- * composing, so the sent message reads as the same agent.
+ * composing, so the sent message reads as the same agent. An agent with no
+ * image keeps the CSS agent glyph. The avatar never shows initials: chip text
+ * must stay the label, or copy drops the mention (see `InlineChip`).
  */
 export function MessageAgentAddressPrefix({
   profiles,
@@ -83,6 +86,7 @@ export function MessageAgentAddressPrefix({
           profile?.displayName?.trim() ||
           profile?.name?.trim() ||
           truncateNpub(pubkey);
+        const avatarUrl = profile?.avatarUrl ?? null;
         return (
           <React.Fragment key={pubkey}>
             {/* biome-ignore lint/a11y/useValidAriaRole: UserProfilePopover uses role for agent classification, not as an ARIA attribute. */}
@@ -96,20 +100,26 @@ export function MessageAgentAddressPrefix({
                 className={cn(
                   MENTION_CHIP_BASE_CLASSES,
                   MENTION_CHIP_HOVER_CLASSES,
-                  "agent-mention-highlight cursor-pointer gap-[var(--inline-chip-icon-gap)]",
+                  "agent-mention-highlight cursor-pointer",
+                  avatarUrl
+                    ? "gap-[var(--inline-chip-icon-gap)]"
+                    : inlineChipIconClasses("agent"),
                 )}
                 data-mention=""
               >
-                <span aria-hidden="true" className="inline-flex select-none">
-                  <UserAvatar
-                    avatarUrl={profile?.avatarUrl ?? null}
-                    className="h-[1.15em] w-[1.15em]"
-                    displayName={label}
-                    shape="squircle"
-                    size="xs"
-                    testId="message-agent-address-avatar"
-                  />
-                </span>
+                {avatarUrl ? (
+                  <span aria-hidden="true" className="inline-flex select-none">
+                    <UserAvatar
+                      avatarUrl={avatarUrl}
+                      className="h-[1.15em] w-[1.15em]"
+                      displayName={label}
+                      initialsLabel=""
+                      shape="squircle"
+                      size="xs"
+                      testId="message-agent-address-avatar"
+                    />
+                  </span>
+                ) : null}
                 {label}
                 <AgentManagementMarker
                   pubkey={pubkey}

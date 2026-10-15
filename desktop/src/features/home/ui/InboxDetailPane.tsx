@@ -732,8 +732,14 @@ function InboxMessageDetailPane({
                 !isAfterSeparator &&
                 !startsNewMessageGroup(message) &&
                 hasSameMessageAuthor(
-                  { pubkey: previousMessage?.authorPubkey },
-                  { pubkey: message.authorPubkey },
+                  {
+                    pubkey: previousMessage?.authorPubkey,
+                    isWorkflowPost: previousMessage?.isWorkflowPost,
+                  },
+                  {
+                    pubkey: message.authorPubkey,
+                    isWorkflowPost: message.isWorkflowPost,
+                  },
                 ) &&
                 isWithinGroupingWindow(
                   previousMessage?.createdAt,

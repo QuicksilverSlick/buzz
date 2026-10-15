@@ -5,6 +5,7 @@ import { JSDOM } from "jsdom";
 
 const AGENT = "c".repeat(64);
 const AUTHOR = "d".repeat(64);
+const PLAIN_AGENT = "f".repeat(64);
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -33,6 +34,13 @@ const profiles = {
   [AGENT]: {
     displayName: "Agent Ada",
     avatarUrl: "https://example.test/ada.png",
+    nip05Handle: null,
+    ownerPubkey: null,
+    isAgent: true,
+  },
+  [PLAIN_AGENT]: {
+    displayName: "Morgarita",
+    avatarUrl: null,
     nip05Handle: null,
     ownerPubkey: null,
     isAgent: true,
@@ -85,7 +93,7 @@ async function renderRow(inboxMessage) {
         QueryClientProvider,
         { client: queryClient },
         React.createElement(InboxMessageRow, {
-          agentPubkeys: new Set([AGENT]),
+          agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
           canReply: false,
           isFocusHighlightVisible: false,
           message: inboxMessage,
@@ -128,9 +136,32 @@ test("an addressed agent leads the Inbox message with its own avatar", async () 
 
   const avatar = view.getByTestId("message-agent-address-avatar");
   const chip = avatar.closest("[data-mention]");
-  assert.match(chip?.textContent ?? "", /Agent Ada/);
   // The avatar replaces the generic robot glyph.
   assert.doesNotMatch(chip?.className ?? "", /inline-chip-icon-agent/);
+  // jsdom never loads the image, so the fallback shows after its delay. It
+  // must add no initials: chip text is what copy reads back as the label.
+  await view.findByTestId("message-agent-address-avatar-fallback");
+  assert.equal(chip?.textContent, "Agent Ada");
+});
+
+test("an addressed agent with no image keeps the agent glyph and its text", async () => {
+  const { act } = await import("@testing-library/react");
+  const view = await renderRow(
+    message({
+      content: "please check",
+      tags: [
+        ["h", "channel-1"],
+        ["p", PLAIN_AGENT],
+        ["mention", PLAIN_AGENT, "agent-address"],
+      ],
+    }),
+  );
+
+  // Past the avatar fallback delay (200 ms), when initials would appear.
+  await act(() => new Promise((resolve) => setTimeout(resolve, 400)));
+  const chip = view.container.querySelector("[data-mention]");
+  assert.equal(chip?.textContent, "Morgarita");
+  assert.match(chip?.className ?? "", /inline-chip-icon-agent/);
 });
 
 test("a workflow post shows the workflow icon in place of an avatar", async () => {
