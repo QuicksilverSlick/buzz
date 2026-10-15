@@ -428,10 +428,11 @@ pub(super) async fn publish(
         }
         // The owner's approval on the card this one re-asked ends there
         // first: this card's notices wait for it. On the card this one
-        // closed out (its request is that drop) it stands once settled, as
-        // long as the answer is still the one told.
+        // closed out (its request is that drop, or it has no card) it stands
+        // once settled, as long as the answer is still the one told.
         if let Some(old) = item.ends.as_deref() {
-            let closed = item.request.as_ref().is_some_and(|r| r.hash == old.hash);
+            let closed = item.kind != item::ItemKind::Pending
+                && item.request.as_ref().is_none_or(|r| r.hash == old.hash);
             let stands = old.owner_sent.is_none() && !item::route_due(old, u64::MAX, owner_set);
             if old.owner_told() && !(closed && stands) {
                 if !spend(budget, 1) {

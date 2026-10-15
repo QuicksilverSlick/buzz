@@ -828,3 +828,42 @@ async fn a_close_out_settles_the_owners_unsettled_notice_as_itself() {
     assert_eq!(n[0]["id"], json!(sent.id.to_hex()));
     assert!(b.s.items[ASK].ends.is_none());
 }
+
+#[tokio::test]
+async fn an_approval_untapped_on_a_forgotten_card_and_closed_out_is_withdrawn_once() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let keep = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&list, &keep]);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    // Untapped, crowded out past MAX_CARDS, and closed out inside the settle.
+    reply(&b, &[&list]);
+    b.tick().await.unwrap();
+    for i in 0..MAX_CARDS {
+        b.drop_file("orchestrator", &format!("c{i:02}"), &drop_json(&[]));
+    }
+    b.tick().await.unwrap();
+    assert!(b.s.items[ASK].card.is_none());
+    close_out(&b);
+    let before = b.posts().len();
+    b.settle(3).await;
+    b.now += ROUTE_SETTLE_SECS;
+    b.settle(2).await;
+    let owner = json!(b.owner_hex());
+    let n: Vec<Value> = notices(&b, before)
+        .into_iter()
+        .filter(|n| n["pubkey"] == owner)
+        .collect();
+    assert_eq!(n.len(), 1);
+    let withdrew = format!(
+        "Quicksilver withdrew: Keep the old one on card {}. ",
+        &card[..12]
+    );
+    assert!(content(&n[0]).starts_with(&withdrew), "{}", content(&n[0]));
+    // Its card is gone, so it goes top-level.
+    assert_eq!(tag_value(&n[0], "e"), None);
+    assert_eq!(tags(&n[0], "p"), [json!(["p", hex(&p.agent)])]);
+    assert!(b.s.items[ASK].ends.is_none());
+}

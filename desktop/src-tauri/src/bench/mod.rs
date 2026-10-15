@@ -377,13 +377,14 @@ fn scan_inbox(
 }
 
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
-/// status) of a carded request keeps the card, which becomes its receipt,
-/// and any owner's notice still owed there (`item::Item::ends`); a
+/// status) of a carded request keeps the card, which becomes its receipt; a
 /// new question after an answer, a reply or the owner's word leaves the old
 /// card on the relay as it is and gets a card of its own with nothing told
-/// yet, which comes back to whoever answered (`item::Previous`), and the
-/// owner's approval told on the old card ends there (`item::Item::ends`);
-/// anything else keeps the card for publish to refresh.
+/// yet, which comes back to whoever answered (`item::Previous`); anything
+/// else keeps the card for publish to refresh. Each keeps the owner's word
+/// told on the old item, or a notice of the owner's still owed there, to be
+/// ended or withdrawn (`item::Item::ends`), whether its card is there or not
+/// (crowded out, deleted by hand).
 fn carry_card(
     old: Option<&item::Item>,
     mut new: item::Item,
@@ -402,9 +403,6 @@ fn carry_card(
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
-        if o.owner_told() {
-            new.ends = Some(Box::new(o.clone()));
-        }
     } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
         let asked = o.request.as_deref().unwrap_or(o);
         if let Some(c) = &o.card {
@@ -421,12 +419,12 @@ fn carry_card(
             })
         });
         new.previous = answered.or_else(|| o.previous.clone());
-        if o.owner_told() {
-            new.ends = Some(Box::new(o.clone()));
-        }
     } else {
         new.card = o.card.clone();
         new.previous = o.previous.clone().filter(|_| asking);
+    }
+    if o.owner_told() {
+        new.ends = Some(Box::new(o.clone()));
     }
     new
 }
