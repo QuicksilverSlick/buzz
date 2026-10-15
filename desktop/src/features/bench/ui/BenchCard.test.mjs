@@ -596,7 +596,7 @@ test("a plain card shows its chips, lines, recommendation, action and folded det
   ]) {
     assert.ok(screen.getByText(text), text);
   }
-  assert.match(root.textContent, /You chose Hold · \S/);
+  assert.match(root.textContent, /Earlier: Quicksilver chose Hold · \S/);
   assert.ok(
     root.textContent.includes("What changes: The <b>new</b> check goes live."),
   );

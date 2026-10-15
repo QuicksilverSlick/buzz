@@ -972,17 +972,31 @@ test("came back: the answer it came back from", () => {
     byName: null,
     answeredAt: 7,
   };
+  const back = { backToYou: true, previousAnswer: previous };
   assert.equal(benchPreviousAnswerLine(card(), formatTime), null);
   assert.equal(
-    benchPreviousAnswerLine(card({ previousAnswer: previous }), formatTime),
-    "You chose Merge PR · t7",
+    benchPreviousAnswerLine(scoped(back), formatTime),
+    "Earlier: Quicksilver chose Merge PR · t7",
+  );
+  assert.equal(
+    benchPreviousAnswerLine(card(back), formatTime),
+    "Earlier: the owner chose Merge PR · t7",
   );
   assert.equal(
     benchPreviousAnswerLine(
-      card({ previousAnswer: { ...previous, byName: "Craig" } }),
+      scoped({ ...back, previousAnswer: { ...previous, byName: "Craig" } }),
       formatTime,
     ),
-    "Craig chose Merge PR · t7",
+    "Earlier: Craig chose Merge PR · t7",
+  );
+  // Answered again: the service keeps `previous` but the card is no longer
+  // back to you, so only its Recorded line speaks.
+  assert.equal(
+    benchPreviousAnswerLine(
+      scoped({ previousAnswer: previous, backToYou: false, answer: answer() }),
+      formatTime,
+    ),
+    null,
   );
 });
 
@@ -1006,6 +1020,22 @@ test("search: PR numbers match #689, PR 689 and pull links, never 6890", () => {
       query,
     );
   }
+});
+
+test("search: a bare number also matches as a whole number in the text", () => {
+  const cards = [
+    card({ id: "w/reset", title: "Welcome email", project: "28 Day Reset" }),
+    card({
+      id: "w/merge",
+      title: "Merge pull request 689",
+      action: "gh pr merge 689 --repo QuicksilverSlick/Metabolic-reset",
+    }),
+    card({ id: "w/longer", title: "Day 128 of 280" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("28"), ["w/reset"]);
+  assert.deepEqual(ids("689"), ["w/merge"]);
+  assert.deepEqual(ids("#689"), [], "# and PR stay PR numbers only");
 });
 
 test("search: words, names and a receipt's request; empty matches all", () => {
@@ -1054,7 +1084,13 @@ test("search: a date matches the local day a card was updated or answered", () =
     card({ id: "w/other", updatedAt: local(10, 15, 0).toISOString() }),
   ];
   const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
-  for (const query of ["2026-10-14", "Oct 14", "october 14", "oct. 14"]) {
+  for (const query of [
+    "2026-10-14",
+    "Oct 14",
+    "october 14",
+    "oct. 14",
+    "octob 14",
+  ]) {
     assert.deepEqual(
       ids(query),
       ["w/updated", "w/answered", "w/receipt"],
@@ -1064,4 +1100,5 @@ test("search: a date matches the local day a card was updated or answered", () =
   assert.deepEqual(ids("2026-10-15"), ["w/other"]);
   assert.deepEqual(ids("Nov 14"), []);
   assert.deepEqual(ids("Foo 14"), [], "not a month: plain words");
+  assert.deepEqual(ids("octane 14"), [], "a month's letters, then others");
 });

@@ -758,18 +758,21 @@ export function benchPlainView(card: BenchCard): BenchPlainView {
   };
 }
 
-/** "You chose Merge PR · 14:05" ("Craig chose ..."): what a card came back from. */
+/**
+ * "Earlier: Craig chose Merge PR · 14:05": what a card that is back to you
+ * came back from. Null once it is answered again.
+ */
 export function benchPreviousAnswerLine(
   card: BenchCard,
   formatTime: (unixSeconds: number) => string,
 ): string | null {
   const previous = card.previousAnswer;
-  return previous
-    ? dotted(
-        `${previous.byName ?? "You"} chose ${previous.label}`,
-        formatTime(previous.answeredAt),
-      )
-    : null;
+  if (!card.backToYou || !previous) return null;
+  const who = previous.byName ?? card.ownerName ?? "the owner";
+  return dotted(
+    `Earlier: ${who} chose ${previous.label}`,
+    formatTime(previous.answeredAt),
+  );
 }
 
 /** The keycaps the Bench seeds and reads as answers (item.rs OPTION_EMOJI). */
@@ -793,21 +796,25 @@ export function benchDeadlineSeconds(deadline: string | null): number | null {
 }
 
 const MONTHS = [
-  "jan",
-  "feb",
-  "mar",
-  "apr",
+  "january",
+  "february",
+  "march",
+  "april",
   "may",
-  "jun",
-  "jul",
-  "aug",
-  "sep",
-  "oct",
-  "nov",
-  "dec",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
 ];
 
-/** "2026-10-14", "Oct 14" or "october 14" as a test on a local date. */
+/**
+ * "2026-10-14", "Oct 14", "sept 14" or "october 14" as a test on a local
+ * date. A month is three or more letters of its name, so "decision 2" stays
+ * words.
+ */
 function searchDay(query: string): ((date: Date) => boolean) | null {
   const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(query);
   if (iso) {
@@ -816,8 +823,8 @@ function searchDay(query: string): ((date: Date) => boolean) | null {
       date.getMonth() + 1 === Number(iso[2]) &&
       date.getDate() === Number(iso[3]);
   }
-  const named = /^([a-z]{3})[a-z]*\.?\s+(\d{1,2})$/.exec(query);
-  const month = named ? MONTHS.indexOf(named[1]) : -1;
+  const named = /^([a-z]{3,})\.?\s+(\d{1,2})$/.exec(query);
+  const month = named ? MONTHS.findIndex((m) => m.startsWith(named[1])) : -1;
   if (!named || month === -1) return null;
   return (date) =>
     date.getMonth() === month && date.getDate() === Number(named[2]);
@@ -863,17 +870,22 @@ function searchDates(card: BenchCard): Date[] {
 
 /**
  * The Bench search as a card predicate; a receipt matches on its request
- * too. "689", "#689" and "PR 689" match that PR number ("#689", "PR 689",
- * .../pull/689); "2026-10-14" and "Oct 14" also match the local day a card
- * was updated or answered; otherwise every word must be in the card's text,
- * project, writer or names. Empty matches everything.
+ * too. "#689" and "PR 689" match only that PR number ("#689", "PR 689",
+ * .../pull/689); a bare "689" matches it as a whole number anywhere, so "28"
+ * finds "28 Day Reset" and never "6890" or "3,689"; "2026-10-14" and
+ * "Oct 14" also match the local day a card was updated or answered;
+ * otherwise every word must be in the card's text, project, writer or names.
+ * Empty matches everything.
  */
 export function benchSearch(query: string): (card: BenchCard) => boolean {
   const q = query.trim().toLowerCase();
   if (!q) return () => true;
-  const pr = /^(?:pr\s*)?#?(\d+)$/.exec(q);
+  const pr = /^(pr\s*)?(#)?(\d+)$/.exec(q);
   if (pr) {
-    const number = new RegExp(`(?:#|\\bpr\\s*#?|/pull/)${pr[1]}(?!\\d)`);
+    const number =
+      pr[1] || pr[2]
+        ? new RegExp(`(?:#|\\bpr\\s*#?|/pull/)${pr[3]}(?!\\d)`)
+        : new RegExp(`(?<![\\d,.])${pr[3]}(?!\\d)`);
     return (card) => number.test(searchText(card));
   }
   const day = searchDay(q);

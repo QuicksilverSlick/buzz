@@ -23,11 +23,11 @@ export type BenchSections = {
   waitingOnOthers: BenchCard[];
   /** Pending and current with an answer: oldest answer first. */
   answered: BenchCard[];
-  /** Current decisions and every receipt: by area, then order. */
+  /** Current decisions and every receipt not on hold: by area, then order. */
   decided: BenchCard[];
   /**
-   * Current status items on hold (blocked or inactive), next to Decided: a
-   * Hold answer's close-out lands here. By area, then order.
+   * Current status items on hold (blocked or inactive), receipts too, next to
+   * Decided: a Hold answer's close-out lands here. By area, then order.
    */
   held: BenchCard[];
   /** Every other current status item: by area, then order. */
@@ -129,11 +129,15 @@ export function benchSections(
           ? sections.waitingOnOthers
           : sections.needsYou
       ).push(card);
+    } else if (
+      card.kind === "status" &&
+      (card.state === "blocked" || card.state === "inactive")
+    ) {
+      sections.held.push(card);
     } else if (card.kind === "decision" || card.request) {
       sections.decided.push(card);
     } else if (card.kind === "status") {
-      const held = card.state === "blocked" || card.state === "inactive";
-      (held ? sections.held : sections.status).push(card);
+      sections.status.push(card);
     }
   }
   sections.needsYou.sort(byNeed);

@@ -201,21 +201,32 @@ test("sections: the owner sees cards for others apart; receipts are decided", ()
   assert.equal(benchNeedsYouCount(snapshot(items)), 1);
 });
 
-test("sections: blocked and inactive status items are held, next to decided", () => {
+test("sections: blocked and inactive status items are held, receipts too", () => {
   const sections = benchSections(
     snapshot([
       card("w/blocked", { kind: "status", options: [], state: "blocked" }),
       card("w/paused", { kind: "status", options: [], state: "inactive" }),
       card("w/moving", { kind: "status", options: [], state: "in-progress" }),
+      // A Hold answer's close-out: "PR #689 on hold".
       card("w/held-receipt", {
         kind: "status",
         options: [],
         state: "blocked",
         request: card("w/held-receipt"),
       }),
+      card("w/done-receipt", {
+        kind: "status",
+        options: [],
+        state: "done",
+        request: card("w/done-receipt"),
+      }),
     ]),
   );
-  assert.deepEqual(ids(sections.held), ["w/blocked", "w/paused"]);
+  assert.deepEqual(ids(sections.held), [
+    "w/blocked",
+    "w/held-receipt",
+    "w/paused",
+  ]);
   assert.deepEqual(ids(sections.status), ["w/moving"]);
-  assert.deepEqual(ids(sections.decided), ["w/held-receipt"]);
+  assert.deepEqual(ids(sections.decided), ["w/done-receipt"]);
 });
