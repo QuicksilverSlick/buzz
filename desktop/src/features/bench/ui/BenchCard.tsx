@@ -16,6 +16,8 @@ import {
   benchForLabel,
   benchKindLabel,
   benchOptionViews,
+  benchPlainView,
+  benchPreviousAnswerLine,
   benchReceipt,
   benchRecordedLine,
   benchSeverityChip,
@@ -42,8 +44,9 @@ function formatBenchTime(unixSeconds: number): string {
  * was written by an agent, so it renders as plain React text: never
  * markdown, never HTML. Option buttons answer through `bench_answer` with the
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
- * it. `onOther` opens the card's thread, where a reply is the answer. A
- * closed card is its receipt: the question, the answer and the outcome.
+ * it. `onOther` opens the card's thread: Other, where a reply is the
+ * answer, and Open thread, on every card that has one. A closed card is its
+ * receipt: the question, the answer and the outcome.
  */
 export function BenchCard({
   card,
@@ -57,7 +60,7 @@ export function BenchCard({
   onOther?: () => void;
 }) {
   return card.request ? (
-    <BenchReceiptCard card={card} />
+    <BenchReceiptCard card={card} onOther={onOther} />
   ) : (
     <BenchQuestionCard
       card={card}
@@ -202,12 +205,19 @@ function BenchQuestionCard({
           <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
         ) : null}
       </div>
+      <BenchOpenThread card={card} onOpenThread={onOther} />
     </Card>
   );
 }
 
 /** The question as it closed, its answer, then the outcome: inert text. */
-function BenchReceiptCard({ card }: { card: BenchCardData }) {
+function BenchReceiptCard({
+  card,
+  onOther,
+}: {
+  card: BenchCardData;
+  onOther?: () => void;
+}) {
   const receipt = benchReceipt(card, formatBenchTime);
   if (!receipt) return null;
   const { request } = receipt;
@@ -248,7 +258,30 @@ function BenchReceiptCard({ card }: { card: BenchCardData }) {
         <p className="text-xs text-muted-foreground">{receipt.outcomeLine}</p>
         <BenchCardText card={card} />
       </section>
+      <BenchOpenThread card={card} onOpenThread={onOther} />
     </Card>
+  );
+}
+
+/** Hidden until the card has a live (or kept) message to thread on. */
+function BenchOpenThread({
+  card,
+  onOpenThread,
+}: {
+  card: BenchCardData;
+  onOpenThread?: () => void;
+}) {
+  if (!onOpenThread || !card.cardEventId) return null;
+  return (
+    <Button
+      className="-ml-2 mt-1.5 h-7 px-2 text-xs"
+      onClick={onOpenThread}
+      size="sm"
+      type="button"
+      variant="ghost"
+    >
+      Open thread
+    </Button>
   );
 }
 
@@ -258,36 +291,94 @@ function BenchCardHeader({ card }: { card: BenchCardData }) {
   const stateLabel =
     card.kind === "status" ? benchStateLabel(card.state) : null;
   const forLabel = benchForLabel(card);
+  const previous = benchPreviousAnswerLine(card, formatBenchTime);
   const meta = [benchKindLabel(card.kind), card.area, card.writer]
     .filter(Boolean)
     .join(" · ");
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      {severity ? (
-        <Badge variant={severity.variant}>{severity.label}</Badge>
+    <>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {severity ? (
+          <Badge variant={severity.variant}>{severity.label}</Badge>
+        ) : null}
+        {card.backToYou ? <Badge variant="info">Back to you</Badge> : null}
+        {forLabel ? <Badge variant="outline">{forLabel}</Badge> : null}
+        {stateLabel ? <Badge variant="secondary">{stateLabel}</Badge> : null}
+        {validity ? <Badge variant="outline">{validity}</Badge> : null}
+        <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          {meta}
+        </span>
+      </div>
+      {previous ? (
+        <p className="mt-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          {previous}
+        </p>
       ) : null}
-      {forLabel ? <Badge variant="outline">{forLabel}</Badge> : null}
-      {stateLabel ? <Badge variant="secondary">{stateLabel}</Badge> : null}
-      {validity ? <Badge variant="outline">{validity}</Badge> : null}
-      <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">
-        {meta}
-      </span>
-    </div>
+    </>
   );
 }
 
 function BenchCardText({ card }: { card: BenchCardData }) {
   const deadline = benchDeadlineSeconds(card.deadline);
   const links = safeBenchLinks(card.links);
+  const plain = benchPlainView(card);
   return (
     <>
       <p className="mt-1.5 text-message font-semibold text-foreground [overflow-wrap:anywhere]">
         {card.title}
       </p>
+      {plain.chips.length > 0 ? (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {plain.chips.map((chip) => (
+            <Badge
+              className="max-w-full [overflow-wrap:anywhere]"
+              key={chip.label}
+              variant={chip.variant}
+            >
+              {chip.label}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+      {plain.lines.map((line) => (
+        <p
+          className="mt-1 text-sm text-foreground/90 [overflow-wrap:anywhere]"
+          key={line.label}
+        >
+          <span className="font-medium text-foreground">{line.label}:</span>{" "}
+          {line.text}
+        </p>
+      ))}
       {card.body ? (
         <p className="mt-1 whitespace-pre-wrap text-message text-foreground/90 [overflow-wrap:anywhere]">
           {card.body}
         </p>
+      ) : null}
+      {plain.recommended ? (
+        <p className="mt-1.5 text-sm text-foreground/90 [overflow-wrap:anywhere]">
+          {plain.recommended}
+        </p>
+      ) : null}
+      {plain.action ? (
+        <p
+          className="mt-1.5 text-xs text-muted-foreground [overflow-wrap:anywhere]"
+          data-testid="bench-card-action"
+        >
+          {plain.action.lead}{" "}
+          <code className="rounded bg-muted px-1 py-0.5 font-mono text-foreground">
+            {plain.action.command}
+          </code>
+        </p>
+      ) : null}
+      {plain.details ? (
+        <details className="mt-1.5 text-sm">
+          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+            Details
+          </summary>
+          <p className="mt-1 whitespace-pre-wrap text-foreground/90 [overflow-wrap:anywhere]">
+            {plain.details}
+          </p>
+        </details>
       ) : null}
       {card.deadline ? (
         <p className="mt-1.5 text-xs text-muted-foreground">

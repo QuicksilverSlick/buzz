@@ -53,6 +53,31 @@ export type BenchReply = {
   at: number;
   hhmm: string;
 };
+export type BenchRisk = "low" | "medium" | "high";
+export type BenchUndo = "easy" | "hard" | "impossible";
+export type BenchConfidence = "high" | "medium" | "low";
+/** The drop's plain-language layout; every part is optional. */
+export type BenchPlain = {
+  whatChanges?: string | null;
+  askedBy?: string | null;
+  risk?: BenchRisk | null;
+  undo?: BenchUndo | null;
+  reach?: string | null;
+  ifYouWait?: string | null;
+  /** How sure the writer is of `recommend`. */
+  confidence?: BenchConfidence | null;
+  /** One line: why `recommend`. */
+  why?: string | null;
+  /** Folded on the card. */
+  details?: string | null;
+};
+/** The answer a card that came back was answered with; 0-based option. */
+export type BenchPreviousAnswer = {
+  option: number;
+  label: string;
+  byName: string | null;
+  answeredAt: number;
+};
 
 export type BenchCard = {
   id: string;
@@ -90,6 +115,13 @@ export type BenchCard = {
   reply: BenchReply | null;
   /** A receipt: the question as it closed; this card is its outcome. */
   request: BenchCard | null;
+  // Absent on snapshots from before plain cards.
+  plain?: BenchPlain | null;
+  /** The exact command the writer runs on the recommended option. */
+  action?: string | null;
+  /** Re-dropped after an answer, and waiting again. */
+  backToYou?: boolean;
+  previousAnswer?: BenchPreviousAnswer | null;
 };
 
 export type BenchSnapshot = {
@@ -644,6 +676,102 @@ export function benchReceipt(
   };
 }
 
+export type BenchPlainChip = {
+  label: string;
+  variant: "destructive" | "warning" | "secondary" | "outline";
+};
+
+export type BenchPlainView = {
+  /** Risk, undo and reach. */
+  chips: BenchPlainChip[];
+  /** What changes, asked by, if you wait. */
+  lines: Array<{ label: string; text: string }>;
+  /** "Recommended: 2. Hold · high confidence · why". */
+  recommended: string | null;
+  details: string | null;
+  /** `lead` is "If you choose Hold:", or "Action:" with no recommendation. */
+  action: { lead: string; command: string } | null;
+};
+
+const RISK_CHIPS: Record<BenchRisk, BenchPlainChip> = {
+  high: { label: "High risk", variant: "destructive" },
+  medium: { label: "Medium risk", variant: "warning" },
+  low: { label: "Low risk", variant: "secondary" },
+};
+
+const UNDO_LABELS: Record<BenchUndo, string> = {
+  easy: "Easy to undo",
+  hard: "Hard to undo",
+  impossible: "Can't be undone",
+};
+
+const CONFIDENCE_LABELS: Record<BenchConfidence, string> = {
+  high: "high confidence",
+  medium: "medium confidence",
+  low: "low confidence",
+};
+
+function filled(text: string | null | undefined): string | null {
+  return text?.trim() || null;
+}
+
+/** The plain-language parts a card shows; all empty without plain or action. */
+export function benchPlainView(card: BenchCard): BenchPlainView {
+  const plain = card.plain ?? {};
+  const chips: BenchPlainChip[] = [];
+  if (plain.risk && Object.hasOwn(RISK_CHIPS, plain.risk)) {
+    chips.push(RISK_CHIPS[plain.risk]);
+  }
+  const undo = lookup(UNDO_LABELS, plain.undo);
+  if (undo) chips.push({ label: undo, variant: "outline" });
+  const reach = filled(plain.reach);
+  if (reach) chips.push({ label: `Reach: ${reach}`, variant: "outline" });
+  const lines = (
+    [
+      ["What changes", plain.whatChanges],
+      ["Asked by", plain.askedBy],
+      ["If you wait", plain.ifYouWait],
+    ] as const
+  ).flatMap(([label, value]) => {
+    const text = filled(value);
+    return text ? [{ label, text }] : [];
+  });
+  const pick =
+    card.recommend === null ? undefined : card.options[card.recommend - 1];
+  const why = filled(plain.why);
+  const confidence = lookup(CONFIDENCE_LABELS, plain.confidence);
+  const command = filled(card.action);
+  return {
+    chips,
+    lines,
+    recommended:
+      pick !== undefined && (why || confidence)
+        ? dotted(`Recommended: ${card.recommend}. ${pick}`, confidence, why)
+        : null,
+    details: filled(plain.details),
+    action: command
+      ? {
+          lead: pick === undefined ? "Action:" : `If you choose ${pick}:`,
+          command,
+        }
+      : null,
+  };
+}
+
+/** "You chose Merge PR · 14:05" ("Craig chose ..."): what a card came back from. */
+export function benchPreviousAnswerLine(
+  card: BenchCard,
+  formatTime: (unixSeconds: number) => string,
+): string | null {
+  const previous = card.previousAnswer;
+  return previous
+    ? dotted(
+        `${previous.byName ?? "You"} chose ${previous.label}`,
+        formatTime(previous.answeredAt),
+      )
+    : null;
+}
+
 /** The keycaps the Bench seeds and reads as answers (item.rs OPTION_EMOJI). */
 const BENCH_OPTION_KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
 
@@ -662,6 +790,101 @@ export function benchDeadlineSeconds(deadline: string | null): number | null {
   if (!deadline) return null;
   const ms = Date.parse(deadline);
   return Number.isFinite(ms) ? Math.floor(ms / 1_000) : null;
+}
+
+const MONTHS = [
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "may",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "oct",
+  "nov",
+  "dec",
+];
+
+/** "2026-10-14", "Oct 14" or "october 14" as a test on a local date. */
+function searchDay(query: string): ((date: Date) => boolean) | null {
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(query);
+  if (iso) {
+    return (date) =>
+      date.getFullYear() === Number(iso[1]) &&
+      date.getMonth() + 1 === Number(iso[2]) &&
+      date.getDate() === Number(iso[3]);
+  }
+  const named = /^([a-z]{3})[a-z]*\.?\s+(\d{1,2})$/.exec(query);
+  const month = named ? MONTHS.indexOf(named[1]) : -1;
+  if (!named || month === -1) return null;
+  return (date) =>
+    date.getMonth() === month && date.getDate() === Number(named[2]);
+}
+
+/** A card and, for a receipt, its request: the parts search looks at. */
+function searchParts(card: BenchCard): BenchCard[] {
+  return card.request ? [card, card.request] : [card];
+}
+
+function searchText(card: BenchCard): string {
+  return searchParts(card)
+    .flatMap((c) => [
+      c.id,
+      c.title,
+      c.body,
+      c.area,
+      c.writer,
+      c.project,
+      c.decidedBy,
+      c.ownerName,
+      c.recommender,
+      c.answer?.byName,
+      c.reply?.byName,
+      c.previousAnswer?.byName,
+      c.action,
+      ...Object.values(c.plain ?? {}),
+      ...c.answerers.map((a) => a.name),
+      ...c.options,
+      ...c.links.flatMap((link) => [link.label, link.url]),
+    ])
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+}
+
+function searchDates(card: BenchCard): Date[] {
+  return searchParts(card)
+    .flatMap((c) => [benchDeadlineSeconds(c.updatedAt), c.answer?.answeredAt])
+    .filter((at) => typeof at === "number")
+    .map((at) => new Date(at * 1_000));
+}
+
+/**
+ * The Bench search as a card predicate; a receipt matches on its request
+ * too. "689", "#689" and "PR 689" match that PR number ("#689", "PR 689",
+ * .../pull/689); "2026-10-14" and "Oct 14" also match the local day a card
+ * was updated or answered; otherwise every word must be in the card's text,
+ * project, writer or names. Empty matches everything.
+ */
+export function benchSearch(query: string): (card: BenchCard) => boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return () => true;
+  const pr = /^(?:pr\s*)?#?(\d+)$/.exec(q);
+  if (pr) {
+    const number = new RegExp(`(?:#|\\bpr\\s*#?|/pull/)${pr[1]}(?!\\d)`);
+    return (card) => number.test(searchText(card));
+  }
+  const day = searchDay(q);
+  const words = q.split(/\s+/);
+  return (card) => {
+    const text = searchText(card);
+    return (
+      words.every((word) => text.includes(word)) ||
+      (day !== null && searchDates(card).some(day))
+    );
+  };
 }
 
 type IntervalApi = {

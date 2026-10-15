@@ -1,7 +1,10 @@
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import type { BenchCard as BenchCardData } from "@/features/bench/lib/benchCards";
+import {
+  type BenchCard as BenchCardData,
+  benchSearch,
+} from "@/features/bench/lib/benchCards";
 import {
   type BenchSections,
   benchLastTickSeconds,
@@ -11,6 +14,7 @@ import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCards } from "@/features/bench/useBenchCards";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
+import { Input } from "@/shared/ui/input";
 import { PageHeader, SectionHeader } from "@/shared/ui/PageHeader";
 
 type SectionKey = Exclude<keyof BenchSections, "retiring">;
@@ -36,6 +40,7 @@ const SECTIONS: ReadonlyArray<{
     empty: "Nothing you answered is waiting on an agent.",
   },
   { key: "decided", title: "Decided", empty: "No decisions yet." },
+  { key: "held", title: "Held", empty: "Nothing is on hold." },
   {
     key: "status",
     title: "Where things stand",
@@ -52,12 +57,15 @@ function errorText(error: unknown): string {
  * else, what is answered and waiting on an agent, what was decided, and where
  * things stand. Cards answer through `bench_answer`, which uses the Bench's
  * own relay and keys, so the screen works whichever community is active.
- * Other opens the card's thread, where a reply is the answer.
+ * Other and Open thread open the card's thread, where a reply is the answer.
+ * Search narrows every section at once.
  */
 export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
   const { goChannel } = useAppNavigation();
+  const [query, setQuery] = React.useState("");
+  const matches = React.useMemo(() => benchSearch(query), [query]);
   const sections = React.useMemo(
     () => benchSections(snapshot, viewerPubkey),
     [snapshot, viewerPubkey],
@@ -114,10 +122,17 @@ export function BenchScreen() {
             </p>
           ) : null}
         </div>
+        <Input
+          aria-label="Search the Bench"
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search by title, PR number, project, name or date"
+          type="search"
+          value={query}
+        />
         {SECTIONS.map((section) => (
           <BenchSection
-            cards={sections[section.key]}
-            empty={section.empty}
+            cards={sections[section.key].filter(matches)}
+            empty={query.trim() ? "No matching cards." : section.empty}
             key={section.key}
             onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}

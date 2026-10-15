@@ -9,6 +9,9 @@
  *   click on the recorded option sends `option: null` (undo).
  * - A command error shows inline; read-only cards send nothing.
  * - The row hook matches only the live card signed by the writer key.
+ * - Plain fields show as chips and lines, the action as the command one tap
+ *   approves, details folded; a card without them renders as before.
+ * - Open thread shows on every card that has a thread.
  */
 
 import assert from "node:assert/strict";
@@ -545,4 +548,125 @@ test("a receipt shows the request, the answer and the outcome as inert text", as
     ["https://github.com/x/y/pull/9"],
   );
   assert.equal(screen.queryByRole("button", { name: /^Other: reply/ }), null);
+});
+
+test("a plain card shows its chips, lines, recommendation, action and folded details", async () => {
+  const merge =
+    "gh pr merge 711 --repo QuicksilverSlick/Metabolic-reset --squash";
+  let view;
+  await act(async () => {
+    view = render(
+      wrap(
+        benchCard({
+          card: scoped({
+            options: ["Merge PR", "Hold"],
+            recommend: 1,
+            plain: {
+              risk: "high",
+              undo: "hard",
+              reach: "3,089 members",
+              whatChanges: "The <b>new</b> check goes live.",
+              askedBy: "Reset Worker",
+              ifYouWait: "Members keep the old check.",
+              confidence: "high",
+              why: "CI is green.",
+              details: "Full notes **here**",
+            },
+            action: merge,
+            backToYou: true,
+            previousAnswer: {
+              option: 1,
+              label: "Hold",
+              byName: null,
+              answeredAt: 1,
+            },
+          }),
+          onOther: () => {},
+        }),
+      ),
+    );
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  for (const text of [
+    "Back to you",
+    "High risk",
+    "Hard to undo",
+    "Reach: 3,089 members",
+    "Recommended: 1. Merge PR · high confidence · CI is green.",
+  ]) {
+    assert.ok(screen.getByText(text), text);
+  }
+  assert.match(root.textContent, /You chose Hold · \S/);
+  assert.ok(
+    root.textContent.includes("What changes: The <b>new</b> check goes live."),
+  );
+  assert.equal(root.querySelector("b"), null, "plain text stays inert");
+  assert.ok(root.textContent.includes("Asked by: Reset Worker"));
+  assert.ok(
+    root.textContent.includes("If you wait: Members keep the old check."),
+  );
+  const action = screen.getByTestId("bench-card-action");
+  assert.equal(action.textContent, `If you choose Merge PR: ${merge}`);
+  assert.equal(action.querySelector("code").textContent, merge);
+  const details = root.querySelector("details");
+  assert.equal(details.open, false, "details start folded");
+  assert.equal(details.querySelector("summary").textContent, "Details");
+  assert.ok(details.textContent.includes("Full notes **here**"));
+});
+
+test("a card without plain fields shows none of them", async () => {
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: scoped({ recommend: 1 }) })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  assert.equal(root.querySelector("details"), null);
+  assert.equal(screen.queryByTestId("bench-card-action"), null);
+  assert.equal(screen.queryByText("Back to you"), null);
+  assert.doesNotMatch(root.textContent, /risk|chose|What changes/);
+});
+
+test("Open thread is on question, status and receipt cards with a thread", async () => {
+  const thread = () => screen.queryByRole("button", { name: "Open thread" });
+  const receipt = card({
+    kind: "status",
+    options: [],
+    state: "done",
+    request: scoped({ cardEventId: null }),
+  });
+  for (const shown of [
+    card(),
+    card({ kind: "status", options: [], state: "blocked" }),
+    receipt,
+  ]) {
+    let opened = 0;
+    await act(async () => {
+      render(
+        wrap(
+          benchCard({
+            card: shown,
+            onOther: () => {
+              opened += 1;
+            },
+          }),
+        ),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(thread());
+    });
+    assert.equal(opened, 1, shown.kind);
+    cleanup();
+  }
+  for (const props of [
+    { card: card({ cardEventId: null }), onOther: () => {} },
+    { card: { ...receipt, cardEventId: null }, onOther: () => {} },
+    { card: card() },
+  ]) {
+    await act(async () => {
+      render(wrap(benchCard(props)));
+    });
+    assert.equal(thread(), null);
+    cleanup();
+  }
 });

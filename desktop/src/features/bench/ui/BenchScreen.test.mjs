@@ -3,8 +3,10 @@
  * `BenchScreen` and `BenchSidebarEntry` mounted against a mocked Tauri IPC
  * boundary.
  *
- * - The screen shows four sections in the board's order, each with its own
- *   empty copy, plus the last update time and a visible lastError line.
+ * - The screen shows the board's sections in its order, plus Held next to
+ *   Decided, each with its own empty copy, the last update time and a
+ *   visible lastError line.
+ * - Search narrows every section; Open thread opens the card's thread.
  * - Answering from the screen sends `bench_answer` and the card moves to
  *   "Answered, waiting for action" once the snapshot records it.
  * - Only the owner's identity gets live option buttons.
@@ -249,6 +251,7 @@ test("screen: board-order sections, counts, empty copy and the error line", asyn
       "Waiting on others",
       "Answered, waiting for action",
       "Decided",
+      "Held",
       "Where things stand",
     ],
   );
@@ -258,9 +261,11 @@ test("screen: board-order sections, counts, empty copy and the error line", asyn
   assert.deepEqual(cardIds(screen.getByTestId("bench-section-answered")), [
     "w/answered",
   ]);
-  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), [
+  // Blocked is on hold: next to Decided, not under Where things stand.
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-held")), [
     "w/status",
   ]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
   const decided = screen.getByTestId("bench-section-decided");
   assert.deepEqual(cardIds(decided), []);
   assert.ok(within(decided).getByText("No decisions yet."));
@@ -374,6 +379,7 @@ test("screen: disabled, unreadable and not-yet-ticked Benches say so", async () 
     "No card is waiting on anyone else.",
     "Nothing you answered is waiting on an agent.",
     "No decisions yet.",
+    "Nothing is on hold.",
     "No status updates yet.",
   ]) {
     assert.ok(screen.getByText(copy), copy);
@@ -537,5 +543,69 @@ test("sidebar: the badge leaves out cards waiting on others", async () => {
   });
   await waitFor(() =>
     assert.equal(screen.getByTestId("sidebar-bench-count").textContent, "1"),
+  );
+});
+
+test("screen: search narrows every section; Open thread opens the card's thread", async () => {
+  serveIdentity(OWNER);
+  serveSnapshot(
+    snapshot([
+      card("w/merge", { title: "Merge PR 689?" }),
+      card("w/held", {
+        kind: "status",
+        options: [],
+        state: "blocked",
+        title: "#689 on hold",
+        cardEventId: "7".repeat(64),
+      }),
+      card("w/other", { title: "Rotate the keys" }),
+      card("w/posting", { kind: "status", options: [], cardEventId: null }),
+    ]),
+  );
+  await act(async () => {
+    render(wrap(createElement(BenchScreen)));
+  });
+  const search = await waitFor(() =>
+    screen.getByRole("searchbox", { name: "Search the Bench" }),
+  );
+  await act(async () => {
+    fireEvent.change(search, { target: { value: "#689" } });
+  });
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-needsYou")), [
+    "w/merge",
+  ]);
+  const held = screen.getByTestId("bench-section-held");
+  assert.deepEqual(cardIds(held), ["w/held"]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-status")), []);
+  assert.ok(
+    within(screen.getByTestId("bench-section-decided")).getByText(
+      "No matching cards.",
+    ),
+  );
+
+  // A status card's thread is in #bench: the snapshot's channel.
+  await act(async () => {
+    fireEvent.click(within(held).getByRole("button", { name: "Open thread" }));
+  });
+  await waitFor(() =>
+    assert.equal(
+      router.history.location.pathname,
+      "/channels/8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10",
+    ),
+  );
+  assert.match(
+    decodeURIComponent(router.history.location.search),
+    /^\?thread="?7{64}"?$/,
+  );
+
+  await act(async () => {
+    fireEvent.change(search, { target: { value: "" } });
+  });
+  const status = screen.getByTestId("bench-section-status");
+  assert.deepEqual(cardIds(status), ["w/posting"]);
+  assert.equal(
+    within(status).queryByRole("button", { name: "Open thread" }),
+    null,
+    "no thread before the card is posted",
   );
 });

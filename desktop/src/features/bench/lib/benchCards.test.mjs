@@ -12,9 +12,12 @@ import {
   benchEligible,
   benchForLabel,
   benchOptionViews,
+  benchPlainView,
+  benchPreviousAnswerLine,
   benchReceipt,
   benchRecordedLine,
   benchRowState,
+  benchSearch,
   benchSeverityChip,
   benchStateLabel,
   benchValidityLabel,
@@ -859,4 +862,206 @@ test("receipt: the request, the answer or Other reply, and the outcome", () => {
     "Answered: 2. Hold · t99",
     "a legacy request names no one",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Plain cards, cards that came back, and search
+// ---------------------------------------------------------------------------
+
+test("plain: nothing to show without plain fields or an action", () => {
+  for (const extra of [{}, { plain: null, action: null }, { plain: {} }]) {
+    assert.deepEqual(benchPlainView(card({ recommend: 2, ...extra })), {
+      chips: [],
+      lines: [],
+      recommended: null,
+      details: null,
+      action: null,
+    });
+  }
+});
+
+test("plain: risk, undo and reach chips; the lines in order; details", () => {
+  const view = benchPlainView(
+    card({
+      recommend: 2,
+      plain: {
+        risk: "high",
+        undo: "impossible",
+        reach: " 3,089 members ",
+        ifYouWait: "The old email keeps going out.",
+        whatChanges: "Every member gets the new welcome email.",
+        askedBy: "Reset Worker",
+        details: "Line one\nLine two",
+      },
+    }),
+  );
+  assert.deepEqual(view.chips, [
+    { label: "High risk", variant: "destructive" },
+    { label: "Can't be undone", variant: "outline" },
+    { label: "Reach: 3,089 members", variant: "outline" },
+  ]);
+  assert.deepEqual(view.lines, [
+    { label: "What changes", text: "Every member gets the new welcome email." },
+    { label: "Asked by", text: "Reset Worker" },
+    { label: "If you wait", text: "The old email keeps going out." },
+  ]);
+  assert.equal(view.details, "Line one\nLine two");
+  assert.equal(
+    view.recommended,
+    null,
+    "no why or confidence: the button says it",
+  );
+  const chips = (plain) => benchPlainView(card({ plain })).chips;
+  assert.deepEqual(chips({ risk: "medium" }), [
+    { label: "Medium risk", variant: "warning" },
+  ]);
+  assert.deepEqual(chips({ risk: "low", undo: "easy" }), [
+    { label: "Low risk", variant: "secondary" },
+    { label: "Easy to undo", variant: "outline" },
+  ]);
+  assert.deepEqual(chips({ risk: "toString", undo: "hard", reach: "  " }), [
+    { label: "Hard to undo", variant: "outline" },
+  ]);
+  assert.deepEqual(
+    benchPlainView(
+      card({ plain: { whatChanges: " ", askedBy: "Orchestrator" } }),
+    ).lines,
+    [{ label: "Asked by", text: "Orchestrator" }],
+  );
+});
+
+test("plain: the recommended line, and what one tap approves", () => {
+  const merge =
+    "gh pr merge 711 --repo QuicksilverSlick/Metabolic-reset --squash";
+  const view = benchPlainView(
+    card({
+      options: ["Merge PR", "Hold"],
+      recommend: 1,
+      plain: { confidence: "high", why: "CI is green and Craig asked for it." },
+      action: merge,
+    }),
+  );
+  assert.equal(
+    view.recommended,
+    "Recommended: 1. Merge PR · high confidence · CI is green and Craig asked for it.",
+  );
+  assert.deepEqual(view.action, {
+    lead: "If you choose Merge PR:",
+    command: merge,
+  });
+  assert.equal(
+    benchPlainView(card({ recommend: 2, plain: { confidence: "low" } }))
+      .recommended,
+    "Recommended: 2. Hold · low confidence",
+  );
+  // No (or an out-of-range) recommendation: no line; the action stands alone.
+  for (const recommend of [null, 3]) {
+    const alone = benchPlainView(
+      card({ recommend, plain: { why: "because" }, action: merge }),
+    );
+    assert.equal(alone.recommended, null);
+    assert.deepEqual(alone.action, { lead: "Action:", command: merge });
+  }
+});
+
+test("came back: the answer it came back from", () => {
+  const formatTime = (s) => `t${s}`;
+  const previous = {
+    option: 0,
+    label: "Merge PR",
+    byName: null,
+    answeredAt: 7,
+  };
+  assert.equal(benchPreviousAnswerLine(card(), formatTime), null);
+  assert.equal(
+    benchPreviousAnswerLine(card({ previousAnswer: previous }), formatTime),
+    "You chose Merge PR · t7",
+  );
+  assert.equal(
+    benchPreviousAnswerLine(
+      card({ previousAnswer: { ...previous, byName: "Craig" } }),
+      formatTime,
+    ),
+    "Craig chose Merge PR · t7",
+  );
+});
+
+test("search: PR numbers match #689, PR 689 and pull links, never 6890", () => {
+  const cards = [
+    card({ id: "w/hash", title: "#689 on hold" }),
+    card({ id: "w/pr", body: "Merge PR 689 now?" }),
+    card({
+      id: "w/link",
+      links: [
+        { label: "Pull request", url: "https://github.com/x/y/pull/689" },
+      ],
+    }),
+    card({ id: "w/longer", title: "#6890 and PR 1689" }),
+    card({ id: "w/members", title: "Reach 3,689 members" }),
+  ];
+  for (const query of ["689", "#689", "PR 689", "pr#689", " 689 "]) {
+    assert.deepEqual(
+      cards.filter(benchSearch(query)).map((c) => c.id),
+      ["w/hash", "w/pr", "w/link"],
+      query,
+    );
+  }
+});
+
+test("search: words, names and a receipt's request; empty matches all", () => {
+  const craig = { pk: CRAIG, name: "Craig", role: "decider", agent: false };
+  const cards = [
+    card({ id: "w/reset", project: "reset", writer: "reset-worker" }),
+    card({ id: "w/craig", answerers: [craig], title: "Welcome email" }),
+    card({
+      id: "w/receipt",
+      kind: "status",
+      title: "Sent it",
+      request: card({ id: "w/receipt", title: "Send the new welcome email?" }),
+    }),
+    card({ id: "w/agent", recommender: "Orchestrator" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("RESET"), ["w/reset"]);
+  assert.deepEqual(ids("reset-worker"), ["w/reset"]);
+  assert.deepEqual(ids("craig"), ["w/craig"]);
+  assert.deepEqual(ids("welcome email"), ["w/craig", "w/receipt"]);
+  assert.deepEqual(ids("email welcome"), ["w/craig", "w/receipt"]);
+  assert.deepEqual(ids("orchestrator"), ["w/agent"]);
+  assert.deepEqual(ids("welcome rocket"), []);
+  assert.equal(ids("").length, 4);
+  assert.equal(ids("   ").length, 4);
+});
+
+test("search: a date matches the local day a card was updated or answered", () => {
+  const local = (month, day, hour) => new Date(2026, month - 1, day, hour);
+  const at = (date) => Math.floor(date.getTime() / 1_000);
+  const cards = [
+    card({ id: "w/updated", updatedAt: local(10, 14, 12).toISOString() }),
+    card({
+      id: "w/answered",
+      updatedAt: local(10, 1, 12).toISOString(),
+      answer: answer({ answeredAt: at(local(10, 14, 23)) }),
+    }),
+    card({
+      id: "w/receipt",
+      updatedAt: local(10, 20, 12).toISOString(),
+      request: card({
+        updatedAt: local(10, 2, 12).toISOString(),
+        answer: answer({ answeredAt: at(local(10, 14, 9)) }),
+      }),
+    }),
+    card({ id: "w/other", updatedAt: local(10, 15, 0).toISOString() }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  for (const query of ["2026-10-14", "Oct 14", "october 14", "oct. 14"]) {
+    assert.deepEqual(
+      ids(query),
+      ["w/updated", "w/answered", "w/receipt"],
+      query,
+    );
+  }
+  assert.deepEqual(ids("2026-10-15"), ["w/other"]);
+  assert.deepEqual(ids("Nov 14"), []);
+  assert.deepEqual(ids("Foo 14"), [], "not a month: plain words");
 });

@@ -25,7 +25,12 @@ export type BenchSections = {
   answered: BenchCard[];
   /** Current decisions and every receipt: by area, then order. */
   decided: BenchCard[];
-  /** Current status items: by area, then order. */
+  /**
+   * Current status items on hold (blocked or inactive), next to Decided: a
+   * Hold answer's close-out lands here. By area, then order.
+   */
+  held: BenchCard[];
+  /** Every other current status item: by area, then order. */
   status: BenchCard[];
   /** Stale or superseded items. The board folds them; so does the screen. */
   retiring: number;
@@ -86,6 +91,7 @@ const EMPTY_SECTIONS: BenchSections = {
   waitingOnOthers: [],
   answered: [],
   decided: [],
+  held: [],
   status: [],
   retiring: 0,
 };
@@ -104,6 +110,7 @@ export function benchSections(
     waitingOnOthers: [],
     answered: [],
     decided: [],
+    held: [],
     status: [],
     retiring: 0,
   };
@@ -125,13 +132,15 @@ export function benchSections(
     } else if (card.kind === "decision" || card.request) {
       sections.decided.push(card);
     } else if (card.kind === "status") {
-      sections.status.push(card);
+      const held = card.state === "blocked" || card.state === "inactive";
+      (held ? sections.held : sections.status).push(card);
     }
   }
   sections.needsYou.sort(byNeed);
   sections.waitingOnOthers.sort(byNeed);
   sections.answered.sort(byAnswerTime);
   sections.decided.sort(byArea);
+  sections.held.sort(byArea);
   sections.status.sort(byArea);
   return sections;
 }
