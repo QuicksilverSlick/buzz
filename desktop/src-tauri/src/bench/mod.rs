@@ -648,11 +648,13 @@ fn read_members(root: &Path) -> Vec<String> {
 /// Bench knows (managed agents, routes.json targets, roles.json writers and
 /// agents, its own writer): agents run as this OS user and can write
 /// members.txt. Only a separate OS user for agents truly keeps them out.
-/// Err names each key left out, for lastError.
+/// While roles.json is unreadable its agents are unknown, so no members.txt
+/// key counts. Err names each key left out, for lastError.
 fn owner_keys(
     ctx: &Ctx<'_>,
     owner: &str,
     roles: Option<&roles::Roles>,
+    roles_bad: bool,
 ) -> (Vec<String>, Result<(), String>) {
     let targets: BTreeMap<String, String> = std::fs::read_to_string(ctx.root.join("routes.json"))
         .ok()
@@ -676,10 +678,15 @@ fn owner_keys(
     let (out, members): (Vec<String>, Vec<String>) = read_members(&ctx.root)
         .into_iter()
         .filter(|m| m != owner)
-        .partition(|m| agents.contains(m));
+        .partition(|m| roles_bad || agents.contains(m));
     let set = std::iter::once(owner.to_string()).chain(members).collect();
     let why = match out.as_slice() {
         [] => Ok(()),
+        _ if roles_bad => Err(format!(
+            "roles.json is unreadable, so which keys are agents is unknown: no members.txt \
+             key counts as yours or joins #bench until it reads: {}",
+            out.join(", ")
+        )),
         _ => Err(format!(
             "members.txt lists agent keys, which never count as yours and are not joined \
              to #bench as yours: {}",
@@ -1311,9 +1318,13 @@ pub(crate) async fn tick(
         Err(e) => (None, Some(e)),
     };
     // The owner's keys: the owner plus the phone's own key in members.txt.
-    let (owner_set, not_owner) = owner_keys(ctx, &s.owner_pubkey, roles.as_ref());
+    let (owner_set, not_owner) =
+        owner_keys(ctx, &s.owner_pubkey, roles.as_ref(), roles_err.is_some());
     s.owner_keys = owner_set.clone();
-    let done = roles_err.clone().map_or(Ok(()), Err).and(not_owner);
+    let why: Vec<String> = roles_err.iter().cloned().chain(not_owner.err()).collect();
+    let done = (!why.is_empty())
+        .then(|| why.join("; "))
+        .map_or(Ok(()), Err);
     let (routes, unroutable) = read_routes(&ctx.root, &ctx.agents, &owner_set, &writer_hex);
     s.unroutable = unroutable;
     // Route targets join only their own writer's channels: a bound folder's

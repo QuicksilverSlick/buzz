@@ -249,6 +249,40 @@ async fn an_agent_key_in_members_txt_is_never_the_owners() {
     assert!(!b.s.members_added.contains(&agent));
 }
 
+#[tokio::test]
+async fn an_unreadable_roles_json_counts_no_members_txt_key() {
+    let (mut b, p, list) = bound_bench().await;
+    // The Orchestrator, an agent only roles.json names, writes its key into
+    // members.txt and breaks roles.json.
+    let orch = hex(&p.orch);
+    std::fs::write(b.root.join("members.txt"), format!("{orch}\n")).unwrap();
+    std::fs::write(b.root.join("roles.json"), "{").unwrap();
+    let card = b.card(ASK).event_id;
+    let merge = tap(&p.orch, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&list, &merge]);
+    let before = b.posts().len();
+    let err = b.tick().await.unwrap_err();
+    assert!(err.starts_with("roles.json: "), "{err}");
+    assert!(
+        err.contains("no members.txt key counts") && err.contains(&orch),
+        "{err}"
+    );
+    assert_eq!(b.s.owner_keys, [b.owner_hex()]);
+    b.now += ROUTE_SETTLE_SECS;
+    for _ in 0..3 {
+        let _ = b.tick().await;
+    }
+    // Its tap is not the owner's word, and it never joins #bench as his.
+    let owner = json!(b.owner_hex());
+    assert!(!notices(&b, before).iter().any(|n| n["pubkey"] == owner));
+    let joins = b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| e["kind"] == 9000 && tag_value(e, "p") == Some(orch.clone()))
+        .count();
+    assert_eq!(joins, 0);
+    assert!(!b.s.members_added.contains(&orch));
+}
+
 /// The re-ask's action line, for its recommended "Keep the old one".
 const KEEP: &str = "Keep the old welcome email";
 

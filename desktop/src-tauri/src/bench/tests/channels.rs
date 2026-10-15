@@ -15,7 +15,7 @@ pub(super) struct People {
     /// Reset Worker: writes the folder and is its route target.
     pub(super) agent: Keys,
     /// An agent decider: never an answerer on a needs-you card.
-    orch: Keys,
+    pub(super) orch: Keys,
 }
 
 pub(super) fn hex(k: &Keys) -> String {
