@@ -579,3 +579,54 @@ async fn a_resend_for_an_older_card_never_forgets_the_new_one() {
     assert!(item.owner_sent.is_none());
     assert_eq!(item.card.as_ref().unwrap().event_id, new);
 }
+
+#[tokio::test]
+async fn a_lookup_names_the_channel_the_notice_went_to() {
+    let (mut b, p, list) = bound_bench().await;
+    // ASK's stored notice went top-level to #bench, not to ASK's channel,
+    // and is past the window: only a lookup can tell it landed.
+    let bench = uuid::Uuid::parse_str(&b.channel()).unwrap();
+    let ev = crate::events::build_message_with_client_tags(
+        bench,
+        "x",
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        "http://127.0.0.1:1",
+        &[],
+    )
+    .unwrap()
+    .custom_created_at(nostr::Timestamp::from(b.now - 3600))
+    .sign_with_keys(&b.ctx.owner)
+    .unwrap();
+    let routed = Routed {
+        option: None,
+        to: hex(&p.agent),
+        event_id: ev.id.to_hex(),
+        at: 0,
+        owner: false,
+        label: None,
+        card: None,
+    };
+    b.s.items.get_mut(ASK).unwrap().owner_sent = Some(OwnerSent {
+        event: ev.clone(),
+        routed,
+    });
+    reply(&b, &[&list, &ev]);
+    b.now += ROUTE_SETTLE_SECS;
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    let item = &b.s.items[ASK];
+    assert!(item.owner_sent.is_none());
+    assert_eq!(item.routed.as_ref().unwrap().event_id, ev.id.to_hex());
+    // A top-level notice in #bench is newer than the board: it goes again.
+    let boards = b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| tag_value(e, "client").is_some_and(|c| c.starts_with("bench:board@")))
+        .count();
+    assert_eq!(boards, 1);
+}

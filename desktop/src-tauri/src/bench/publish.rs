@@ -65,10 +65,11 @@ async fn post_message(
 /// An owner's notice that may not have reached the relay (a timeout, a lost
 /// reply, a restart): sent again as that same event, never signed afresh.
 /// Once its time is too old for the relay, or the card it replies to is
-/// gone, a lookup by id says whether it landed; if not, it never can, and
-/// the next tick signs one afresh. Either way `owner_sent` clears, and
-/// `routed` lands if the relay has it. The item's own card is never
-/// forgotten here: after a re-ask it is not the card this event replies to.
+/// gone, a lookup by id in the channel it went to (its h tag, else `ch`)
+/// says whether it landed; if not, it never can, and the next tick signs one
+/// afresh. Either way `owner_sent` clears, and `routed` lands if the relay
+/// has it. The item's own card is never forgotten here: after a re-ask it
+/// is not the card this event replies to.
 async fn resend_owner(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -78,6 +79,11 @@ async fn resend_owner(
     now: u64,
 ) -> Result<(), String> {
     let ev = &sent.event;
+    let h = ev.tags.iter().find_map(|t| match t.as_slice() {
+        [k, v, ..] if k == "h" => Some(v.as_str()),
+        _ => None,
+    });
+    let ch = h.unwrap_or(ch).to_string();
     let mut told = false;
     if now < ev.created_at.as_secs() + OWNER_RESEND_SECS {
         match submit(ctx, ev, &ctx.owner, None).await {
