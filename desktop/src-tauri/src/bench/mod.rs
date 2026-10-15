@@ -431,7 +431,7 @@ fn carry_card(
 
 /// Take every readable drop into state (keeping the card of the item it
 /// replaces, see `carry_card`) or reject it in place as
-/// `<stem>.rejected.json`; the writer cleans up its own rejections. A scoped
+/// `<stem>.rejected.json`; the writer cleans up its own rejections. Every
 /// drop waits while roles.json is unreadable, and a drop for a `held` card
 /// until its answers are read. Returns whether state changed.
 fn intake(
@@ -441,21 +441,20 @@ fn intake(
     roles: Option<&roles::Roles>,
     roles_bad: bool,
 ) -> bool {
+    // Which folders are bound, and who may scope cards, is unknown.
+    if roles_bad {
+        return false;
+    }
     let mut changed = false;
     for (path, writer, stem, raw) in scan_inbox(root, SystemTime::now()) {
         let checked = raw.map(|raw| {
             let item = item::validate(&writer, &stem, &raw, now_iso);
-            // Who may scope cards is unknown: the drop waits for roles.json.
-            if roles_bad && item.as_ref().is_ok_and(item::Item::scoped) {
-                return None;
-            }
             let item = item.and_then(|mut i| roles::bind(&mut i, roles).map(|()| i));
-            Some((item, raw))
+            (item, raw)
         });
         let (reason, raw) = match checked {
-            Ok(None) => continue,
-            Ok(Some((Ok(item), _))) if s.held.contains(&item.id) => continue,
-            Ok(Some((Ok(item), _))) => {
+            Ok((Ok(item), _)) if s.held.contains(&item.id) => continue,
+            Ok((Ok(item), _)) => {
                 let old = s.items.get(&item.id);
                 if old.is_none_or(|o| o.hash != item.hash) {
                     // The hash-change re-drop is the writer's ack: the
@@ -469,7 +468,7 @@ fn intake(
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            Ok(Some((Err(reason), raw))) => (reason, Some(raw)),
+            Ok((Err(reason), raw)) => (reason, Some(raw)),
             Err(reason) => (reason, None),
         };
         let rejected = path.with_file_name(format!("{stem}.rejected.json"));
@@ -1287,8 +1286,8 @@ fn restamp(
 /// One 2 s tick: owner fence, bootstrap, the bound channels' joins and admin
 /// check, recovery, the answer poll (before intake, so a query failure aborts
 /// the tick before any drop is read), intake, expiry, answerers, publish. An
-/// unreadable roles.json (every card on hold), or a cut page of answers,
-/// fails the tick only after publish: #bench and new cards carry on.
+/// unreadable roles.json (every card and drop on hold), or a cut page of
+/// answers, fails the tick only after publish: #bench carries on.
 pub(crate) async fn tick(
     ctx: &Ctx<'_>,
     s: &mut BenchState,

@@ -635,6 +635,36 @@ async fn unreadable_roles_hold_scoped_drops_and_every_card() {
     assert!(b.s.items.contains_key("reset-worker/second"));
 }
 
+#[tokio::test]
+async fn unreadable_roles_hold_unscoped_drops_too() {
+    let (mut b, _p, _list) = bound_bench().await;
+    let good = std::fs::read_to_string(b.root.join("roles.json")).unwrap();
+    std::fs::write(b.root.join("roles.json"), "{not json").unwrap();
+    // Unscoped, from the bound folder: with no binding read, a #bench card.
+    let plain = drop_json(&[("title", json!("Plain drop"))]);
+    b.drop_file("reset-worker", "plain", &plain);
+    let before = b.posts().len();
+    for _ in 0..3 {
+        let err = b.tick().await.unwrap_err();
+        assert!(err.starts_with(ROLES_HOLD), "{err}");
+    }
+    assert!(b.root.join("inbox/reset-worker/plain.json").exists());
+    assert!(!b.s.items.contains_key("reset-worker/plain"));
+    assert!(!b.posts()[before..]
+        .iter()
+        .any(|(e, _)| content(e).contains("Plain drop")));
+    // Readable again: refused, as any bound folder's unscoped drop.
+    std::fs::write(b.root.join("roles.json"), good).unwrap();
+    b.tick().await.unwrap();
+    let rejected = b.root.join("inbox/reset-worker/plain.rejected.json");
+    let rejected = std::fs::read_to_string(rejected).unwrap();
+    assert!(
+        rejected.contains("bound folder: project is required"),
+        "{rejected}"
+    );
+    assert!(!b.s.items.contains_key("reset-worker/plain"));
+}
+
 /// Rewrites the project's people in roles.json.
 pub(super) fn edit_people(b: &Bench, f: impl FnOnce(&mut Vec<Value>)) {
     let path = b.root.join("roles.json");
