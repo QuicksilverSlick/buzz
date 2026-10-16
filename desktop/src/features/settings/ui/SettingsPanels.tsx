@@ -31,6 +31,7 @@ import type { SoundName, SoundSlot } from "@/features/notifications/lib/sound";
 import { CommunityMembersSettingsCard } from "@/features/community-members/ui/CommunityMembersSettingsCard";
 import { CustomEmojiSettingsCard } from "@/features/custom-emoji/ui/CustomEmojiSettingsCard";
 import { LocalArchiveSettingsCard } from "@/features/local-archive/ui/LocalArchiveSettingsCard";
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import { cn } from "@/shared/lib/cn";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { Badge } from "@/shared/ui/badge";
@@ -236,10 +237,13 @@ export const settingsSections: SettingsSectionDescriptor[] = [
   },
 ];
 
+/** "buzz-dark" reads "Dreamforge Dark"; the theme ids stay as they are. */
 function formatThemeLabel(name: string): string {
   return name
     .split("-")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .map((w) =>
+      w === "buzz" ? PRODUCT_NAME : w.charAt(0).toUpperCase() + w.slice(1),
+    )
     .join(" ");
 }
 
