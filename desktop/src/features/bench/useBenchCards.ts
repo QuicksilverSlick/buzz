@@ -11,6 +11,7 @@ import {
   type BenchCards,
   type BenchMessageRef,
   type BenchRowState,
+  type BenchSnapshot,
   benchRowState,
   createPollGroup,
   enabledBenchSnapshot,
@@ -119,6 +120,19 @@ export function useBenchNeedsYouCount(): number | null {
     ...benchCardsQueryOptions,
     select: benchNeedsYouCount,
     refetchInterval: BENCH_SIDEBAR_POLL_MS,
+  });
+  return data ?? null;
+}
+
+/**
+ * The snapshot for surfaces that only label things (the Inbox), or null
+ * while the Bench is off or unread. No poll of its own: it is as fresh as
+ * the sidebar badge's 15 s timer or an open Bench screen keeps the cache.
+ */
+export function useBenchSnapshot(): BenchSnapshot | null {
+  const { data } = useQuery({
+    ...benchCardsQueryOptions,
+    select: enabledBenchSnapshot,
   });
   return data ?? null;
 }
