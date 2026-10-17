@@ -2,6 +2,9 @@
 """latest.json for the Tauri updater; used by .github/workflows/dreamforge-desktop-release.yml.
 
   release-latest-json.py --check VERSION ENDPOINT     exit 1 unless VERSION is plain x.y.z and newer than the published feed
+  release-latest-json.py --next ENDPOINT FLOOR [RELEASED...]
+                                                      print one patch above the feed and RELEASED, never below FLOOR
+  release-latest-json.py --live VERSION ENDPOINT      exit 1 unless the public feed serves VERSION and its files download
   release-latest-json.py --pubkey PUB_FILE VERSION PLATFORM=SIG_FILE=URL [...]
                                                       print latest.json, one triple per platform;
                                                       refuses a signature made by any key but PUB_FILE's
@@ -43,6 +46,48 @@ def check(version, current):
     if current is not None and new <= parse(current):
         sys.exit(f"{version} is not newer than the published {current}")
     return f"ok: {version} > {current or 'nothing published yet'}"
+
+
+def next_version(current, floor, released=()):
+    """One patch above everything published or released, and never below floor."""
+    known = [parse(v) for v in [current, *released] if v]
+    major, minor, patch = max(known, default=(0, 0, 0))
+    return ".".join(map(str, max((major, minor, patch + 1), parse(floor))))
+
+
+PLATFORMS = {"darwin-aarch64", "darwin-x86_64", "windows-x86_64"}
+
+
+def feed_problems(feed, version):
+    platforms = feed.get("platforms") or {}
+    problems = [] if feed.get("version") == version else [f"version is {feed.get('version')!r}, not {version}"]
+    if set(platforms) != PLATFORMS:
+        problems.append(f"platforms are {sorted(platforms)}, not {sorted(PLATFORMS)}")
+    for name, entry in sorted(platforms.items()):
+        if not (entry.get("signature") or "").strip() or not entry.get("url"):
+            problems.append(f"{name} has no signature or url")
+    return problems
+
+
+def downloads(url):
+    # One byte, not HEAD: the release redirect is a signed GET URL that refuses HEAD.
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"Range": "bytes=0-0"}), timeout=60) as resp:
+            return resp.status in (200, 206) and len(resp.read(1)) == 1
+    except (urllib.error.URLError, TimeoutError):
+        return False
+
+
+def live(version, endpoint):
+    """What installed apps see: the public feed names VERSION and every file it names downloads."""
+    with urllib.request.urlopen(endpoint, timeout=30) as resp:
+        feed = json.load(resp)
+    problems = feed_problems(feed, version)
+    if not problems:
+        problems = [f"{name} does not download" for name, e in sorted(feed["platforms"].items()) if not downloads(e["url"])]
+    if problems:
+        sys.exit("live feed: " + "; ".join(problems))
+    return f"ok: the live feed serves {version} for {', '.join(sorted(feed['platforms']))}"
 
 
 def triple(arg):
@@ -105,6 +150,22 @@ def selftest():
     for bad in ("", "garbage", "1.2", "0.5.21-rc.1"):  # validated even before anything is published
         assert refuses(check, bad, None), bad
 
+    assert next_version("0.5.30", "0.5.36") == "0.5.36"  # the floor clears test builds above the feed
+    assert next_version("0.5.36", "0.5.36") == "0.5.37"
+    assert next_version("0.5.36", "0.5.36", ["0.5.36", "0.5.40"]) == "0.5.41"  # a tag can lead the feed
+    assert next_version("0.9.9", "0.0.1") == "0.9.10"  # numeric, not lexical
+    assert next_version(None, "0.5.36") == "0.5.36"
+    assert refuses(next_version, "0.5.30", "0.5")
+    assert refuses(next_version, "0.5.30", "0.5.36", ["v0.5.31"])
+
+    good = {"version": "0.5.36", "platforms": {p: {"signature": "s", "url": "https://x/" + p} for p in PLATFORMS}}
+    assert feed_problems(good, "0.5.36") == []
+    assert feed_problems(good, "0.5.37")
+    assert feed_problems({**good, "platforms": {"darwin-aarch64": good["platforms"]["darwin-aarch64"]}}, "0.5.36")
+    unsigned = {**good, "platforms": {**good["platforms"], "windows-x86_64": {"signature": " ", "url": "https://x/w"}}}
+    assert feed_problems(unsigned, "0.5.36") == ["windows-x86_64 has no signature or url"]
+    assert feed_problems({}, "0.5.36")
+
     m = manifest("0.5.21", [("windows-x86_64", "sig\n", "https://x/y.exe"), ("darwin-aarch64", "s2", "https://x/a.tar.gz")])
     assert m["platforms"] == {
         "windows-x86_64": {"signature": "sig", "url": "https://x/y.exe"},
@@ -146,6 +207,10 @@ def main(argv):
         return selftest()
     if argv[:1] == ["--check"] and len(argv) == 3:
         return print(check(argv[1], published_version(argv[2])))
+    if argv[:1] == ["--next"] and len(argv) >= 3:
+        return print(next_version(published_version(argv[1]), argv[2], argv[3:]))
+    if argv[:1] == ["--live"] and len(argv) == 3:
+        return print(live(argv[1], argv[2]))
     if argv[:1] == ["--pubkey"] and len(argv) >= 4:
         with open(argv[1], encoding="ascii") as f:
             key_id = keynum(f.read(), argv[1])
