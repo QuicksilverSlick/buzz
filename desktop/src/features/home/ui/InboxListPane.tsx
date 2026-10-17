@@ -9,28 +9,45 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
+import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import {
   getInboxTypeLabel,
   type InboxFilter,
   type InboxItem,
   type InboxTypeLabel,
 } from "@/features/home/lib/inbox";
+import {
+  type InboxItemType,
+  classifyInboxItem,
+  inboxProjects,
+} from "@/features/home/lib/inboxClass";
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
 import { hasRenderedVideoAttachment } from "@/features/messages/lib/videoReviewContext";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { InboxFilterMenu } from "@/features/home/ui/InboxFilterMenu";
+import {
+  INBOX_TYPE_META,
+  InboxItemPreview,
+  inboxRowLabel,
+  inboxRowStripe,
+} from "@/features/home/ui/InboxItemPreview";
 import {
   DraftsPanel,
   type DraftViewItem,
 } from "@/features/messages/ui/DraftsPanel";
 import { WorkflowAvatar } from "@/features/messages/ui/WorkflowAvatar";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
+import { useProjectsQuery } from "@/features/projects/hooks";
+import type { ProjectColor } from "@/features/projects/lib/projectColors";
 import type { Reminder } from "@/features/reminders/lib/reminderTypes";
 import { isDue } from "@/features/reminders/lib/reminderFilters";
 import {
   RemindersPanel,
   useReminderSources,
 } from "@/features/reminders/ui/RemindersPanel";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import type { Channel } from "@/shared/api/types";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -80,29 +97,57 @@ const INBOX_HEADER_ICON_BUTTON_CLASS =
 const INBOX_PANE_RIGHT_DIVIDER_CLASS =
   "after:pointer-events-none after:absolute after:inset-y-0 after:right-0 after:z-40 after:w-px after:bg-border/35 after:content-['']";
 
+/**
+ * `type` colors the label and leads it with the type's icon; the project
+ * chip leads with a dot in the project's color.
+ */
 function InboxLabel({
   isDone,
-  isActionRequired,
   label,
+  project = null,
+  projectColor = null,
+  type,
 }: {
   isDone: boolean;
-  isActionRequired: boolean;
   label: InboxTypeLabel;
+  project?: string | null;
+  projectColor?: ProjectColor | null;
+  type?: InboxItemType;
 }) {
+  const meta = type ? INBOX_TYPE_META[type] : null;
+  const Icon = meta?.icon;
   return (
     <div
       className={cn(
         MESSAGE_MARKDOWN_CLASS,
         "mt-0 flex min-h-[var(--inline-chip-min-height)] min-w-0 items-center gap-1.5 text-2xs leading-3 group-hover/inbox-item:pr-[6.75rem] group-focus-within/inbox-item:pr-[6.75rem]",
-        isActionRequired && !isDone
-          ? "font-medium text-amber-600/80 dark:text-amber-300/80"
-          : isDone
-            ? "font-normal text-muted-foreground/70"
-            : "font-medium text-muted-foreground/80",
+        isDone ? "font-normal" : "font-medium",
+        meta?.text ??
+          (isDone ? "text-muted-foreground/70" : "text-muted-foreground/80"),
       )}
+      data-inbox-type={type}
       data-inbox-type-label=""
     >
+      {Icon ? <Icon aria-hidden className="h-3 w-3 shrink-0" /> : null}
       <span className="shrink-0">{label.text}</span>
+      {project ? (
+        <span
+          className={cn(
+            MENTION_CHIP_BASE_CLASSES,
+            "inbox-channel-chip min-w-0 shrink gap-1 overflow-hidden",
+          )}
+          data-inbox-project-chip=""
+          data-project-color={projectColor?.id}
+        >
+          {projectColor ? (
+            <span
+              aria-hidden
+              className={cn("size-1.5 shrink-0 rounded-full", projectColor.dot)}
+            />
+          ) : null}
+          <span className="truncate">{project}</span>
+        </span>
+      ) : null}
       {label.channelLabel ? (
         <span
           className={cn(
@@ -193,13 +238,7 @@ function PersonalItemRow({
         <span className="block text-sm font-semibold text-foreground">
           Reminder
         </span>
-        {location ? (
-          <InboxLabel
-            isActionRequired={false}
-            isDone={false}
-            label={location}
-          />
-        ) : null}
+        {location ? <InboxLabel isDone={false} label={location} /> : null}
         <span className="block truncate text-sm text-muted-foreground">
           {preview}
         </span>
@@ -215,6 +254,8 @@ type InboxListPaneProps = {
   activeReminderEventIds?: ReadonlySet<string>;
   agentPubkeys?: ReadonlySet<string>;
   activeDraftCount: number;
+  /** For the hover preview's channel description. */
+  channels?: ReadonlyArray<Pick<Channel, "description" | "id">>;
   draftItems: DraftViewItem[];
   doneSet: ReadonlySet<string>;
   filter: InboxFilter;
@@ -245,6 +286,7 @@ export function InboxListPane({
   activeReminderEventIds,
   agentPubkeys,
   activeDraftCount,
+  channels,
   draftItems,
   doneSet,
   filter,
@@ -294,6 +336,21 @@ export function InboxListPane({
     [inboxRows, isMixedInboxView],
   );
   const reminderSources = useReminderSources(reminders);
+  const benchSnapshot = useBenchSnapshot();
+  const { data: projects } = useProjectsQuery();
+  const viewerAgents = useViewerAgentPubkeys();
+  const viewerPubkey = useIdentityQuery().data?.pubkey;
+  const projectChips = React.useMemo(
+    () => inboxProjects(projects ?? [], viewerPubkey, viewerAgents),
+    [projects, viewerAgents, viewerPubkey],
+  );
+  const channelDescriptions = React.useMemo(
+    () =>
+      new Map(
+        (channels ?? []).map((channel) => [channel.id, channel.description]),
+      ),
+    [channels],
+  );
   const unreadVisibleItemCount = React.useMemo(
     () =>
       items.reduce((count, item) => count + (doneSet.has(item.id) ? 0 : 1), 0),
@@ -324,6 +381,7 @@ export function InboxListPane({
       : isReopening
         ? "Reopening…"
         : "Open in channel";
+    const inboxClass = classifyInboxItem(item, benchSnapshot, projectChips);
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =
@@ -360,7 +418,10 @@ export function InboxListPane({
       >
         <button
           aria-label={`Open inbox item from ${item.senderLabel}`}
-          className="absolute inset-0 z-0 block w-full border-l border-l-transparent text-left"
+          className={cn(
+            "absolute inset-0 z-0 block w-full border-l-2 border-l-transparent text-left",
+            inboxRowStripe(inboxClass),
+          )}
           onClick={() => onSelect(item.id)}
           type="button"
         >
@@ -454,9 +515,11 @@ export function InboxListPane({
                 </span>
               </div>
               <InboxLabel
-                isActionRequired={item.isActionRequired}
                 isDone={isDone}
-                label={typeLabel}
+                label={inboxRowLabel(inboxClass.type, typeLabel)}
+                project={inboxClass.workbench}
+                projectColor={inboxClass.color}
+                type={inboxClass.type}
               />
               {dueReminder ? (
                 <div
@@ -529,7 +592,10 @@ export function InboxListPane({
           </div>
         </div>
 
-        <div className="pointer-events-none absolute right-3 top-2 z-10 flex items-center gap-0.5 rounded-full bg-[var(--inbox-row-highlight-bg)] p-1 opacity-0 transition-opacity duration-150 ease-out group-hover/inbox-item:pointer-events-auto group-hover/inbox-item:opacity-100 group-focus-within/inbox-item:pointer-events-auto group-focus-within/inbox-item:opacity-100">
+        <div
+          className="pointer-events-none absolute right-3 top-2 z-10 flex items-center gap-0.5 rounded-full bg-[var(--inbox-row-highlight-bg)] p-1 opacity-0 transition-opacity duration-150 ease-out group-hover/inbox-item:pointer-events-auto group-hover/inbox-item:opacity-100 group-focus-within/inbox-item:pointer-events-auto group-focus-within/inbox-item:opacity-100"
+          data-inbox-preview-ignore=""
+        >
           {isDone ? (
             <InboxRowActionButton
               label="Mark unread"
@@ -570,7 +636,7 @@ export function InboxListPane({
       </div>
     );
 
-    return (
+    const menu = (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
@@ -610,6 +676,19 @@ export function InboxListPane({
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
+    );
+
+    return (
+      <InboxItemPreview
+        channelDescription={
+          channelDescriptions.get(item.item.channelId ?? "")?.trim() || null
+        }
+        inboxClass={inboxClass}
+        item={item}
+        label={typeLabel}
+      >
+        {menu}
+      </InboxItemPreview>
     );
   };
 

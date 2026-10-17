@@ -707,6 +707,7 @@ export function HomeView({
               activeReminderEventIds={activeReminderEventIds}
               agentPubkeys={inboxAgentPubkeys}
               activeDraftCount={activeDraftCount}
+              channels={channels}
               draftItems={draftItems}
               doneSet={effectiveDoneSet}
               dueReminderCount={dueReminderCount}

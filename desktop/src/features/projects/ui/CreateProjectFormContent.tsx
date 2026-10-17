@@ -1,8 +1,12 @@
 import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 
+import { useProjectsQuery } from "@/features/projects/hooks";
+import { nextProjectColor } from "@/features/projects/lib/projectColors";
 import type { CreateProjectInput } from "@/features/projects/useCreateProject";
 import { CreateProjectFormSettings } from "@/features/projects/ui/CreateProjectFormSettings";
+import { ProjectColorPicker } from "@/features/projects/ui/ProjectColorPicker";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import { useCreateProjectFormSettings } from "@/features/projects/ui/useCreateProjectFormSettings";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -35,14 +39,19 @@ export function CreateProjectFormContent({
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
+  const [pickedColor, setPickedColor] = React.useState<string | null>(null);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const settings = useCreateProjectFormSettings(active, setDescription);
+  const { data: projects } = useProjectsQuery(active);
+  const ownerPubkey = useIdentityQuery().data?.pubkey;
+  const color = pickedColor ?? nextProjectColor(projects ?? [], ownerPubkey).id;
 
   React.useEffect(() => {
     if (!active) return;
     setName(initialName);
     setDescription("");
     setErrorMessage(null);
+    setPickedColor(null);
 
     const timerId = globalThis.setTimeout(() => {
       nameInputRef.current?.focus();
@@ -60,6 +69,7 @@ export function CreateProjectFormContent({
       await onCreate({
         name: trimmedName,
         description: description.trim() || undefined,
+        color,
         channelVisibility: settings.channelVisibility,
         projectVisibility: settings.projectVisibility,
         agents: settings.buildAgents(),
@@ -178,6 +188,13 @@ export function CreateProjectFormContent({
             />
           </div>
         </div>
+
+        <ProjectColorPicker
+          disabled={isCreating}
+          name="create-project-color"
+          onChange={setPickedColor}
+          value={color}
+        />
 
         <CreateProjectFormSettings disabled={isCreating} {...settings} />
 

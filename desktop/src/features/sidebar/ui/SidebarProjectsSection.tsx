@@ -23,6 +23,7 @@ import {
   useDeleteProjectMutation,
   useProjectsQuery,
 } from "@/features/projects/hooks";
+import { projectColorOf } from "@/features/projects/lib/projectColors";
 import { listProjectChildChannels } from "@/features/projects/lib/projectRelatedChannels";
 import { canDeleteProject } from "@/features/projects/projectDeletion";
 import { useProjectOwnerProfiles } from "@/features/projects/useProjectOwnerProfiles";
@@ -587,6 +588,7 @@ function SidebarProjectRow({
 }) {
   const shareLink = projectShareLink(project);
   const hasChildren = childCount > 0;
+  const color = projectColorOf(project);
 
   return (
     <ContextMenu>
@@ -604,6 +606,11 @@ function SidebarProjectRow({
             type="button"
           >
             <ProjectChannelIcon className={cn(!isActive && "opacity-80")} />
+            <span
+              aria-hidden
+              className={cn("size-2 shrink-0 rounded-full", color.dot)}
+              data-project-color={color.id}
+            />
             <SidebarMenuLabel className={cn(!isActive && "opacity-80")}>
               {project.name}
             </SidebarMenuLabel>

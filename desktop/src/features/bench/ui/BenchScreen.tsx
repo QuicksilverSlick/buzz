@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import {
   type BenchCard as BenchCardData,
   benchSearch,
@@ -10,12 +11,26 @@ import {
   benchLastTickSeconds,
   benchSections,
 } from "@/features/bench/lib/benchScreen";
+import {
+  BENCH_TABS,
+  type BenchTab,
+  WORKBENCHES,
+  cardWorkbench,
+  workbenchColor,
+  workbenchCounts,
+  workbenchLabel,
+  workbenchSnapshot,
+} from "@/features/bench/lib/workbenches";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCards } from "@/features/bench/useBenchCards";
+import { useProjectsQuery } from "@/features/projects/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { cn } from "@/shared/lib/cn";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import { Input } from "@/shared/ui/input";
 import { PageHeader, SectionHeader } from "@/shared/ui/PageHeader";
+import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 
 type SectionKey = Exclude<keyof BenchSections, "retiring">;
 
@@ -48,6 +63,14 @@ const SECTIONS: ReadonlyArray<{
   },
 ];
 
+/** The last tab on this device; All the first time or if unreadable. */
+const BENCH_TAB_KEY = "buzz.bench.workbench.v1";
+
+function readBenchTab(): BenchTab {
+  const saved = getStorageItem(BENCH_TAB_KEY);
+  return BENCH_TABS.find((tab) => tab.id === saved)?.id ?? "all";
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -58,17 +81,35 @@ function errorText(error: unknown): string {
  * things stand. Cards answer through `bench_answer`, which uses the Bench's
  * own relay and keys, so the screen works whichever community is active.
  * Other and Open thread open the card's thread, where a reply is the answer.
- * Search narrows every section at once.
+ * Project tabs (All, 28 Day Reset, Dreamforge, and Other when it has
+ * cards) narrow the board first; search then narrows every section at once.
+ * The sidebar badge still counts every project.
  */
 export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
+  const { data: projects } = useProjectsQuery();
+  const viewerAgents = useViewerAgentPubkeys();
   const { goChannel } = useAppNavigation();
   const [query, setQuery] = React.useState("");
   const matches = React.useMemo(() => benchSearch(query), [query]);
-  const sections = React.useMemo(
-    () => benchSections(snapshot, viewerPubkey),
+  const [savedTab, setSavedTab] = React.useState(readBenchTab);
+  const counts = React.useMemo(
+    () => (snapshot ? workbenchCounts(snapshot, viewerPubkey) : null),
     [snapshot, viewerPubkey],
+  );
+  const tabs = BENCH_TABS.filter(
+    (t) => t.id !== "other" || (counts?.other.cards ?? 0) > 0,
+  );
+  // A saved Other tab that has emptied shows All, and comes back with cards.
+  const tab = tabs.some((t) => t.id === savedTab) ? savedTab : "all";
+  const sections = React.useMemo(
+    () =>
+      benchSections(
+        snapshot ? workbenchSnapshot(snapshot, tab) : null,
+        viewerPubkey,
+      ),
+    [snapshot, tab, viewerPubkey],
   );
   const benchChannel = snapshot?.channelId ?? "";
   const openThread = React.useCallback(
@@ -100,6 +141,62 @@ export function BenchScreen() {
     const lastTick = benchLastTickSeconds(snapshot.lastTick);
     content = (
       <>
+        <Tabs
+          onValueChange={(value) => {
+            const next = value as BenchTab;
+            setSavedTab(next);
+            setStorageItem(BENCH_TAB_KEY, next);
+          }}
+          value={tab}
+        >
+          <TabsList
+            aria-label="Projects"
+            className="h-auto flex-wrap justify-start"
+          >
+            {tabs.map(({ id, label }) => {
+              const count = counts?.[id];
+              const workbench = WORKBENCHES.find((w) => w.id === id);
+              const color = workbench
+                ? workbenchColor(
+                    workbench,
+                    projects ?? [],
+                    viewerPubkey,
+                    viewerAgents,
+                  )
+                : null;
+              return (
+                <TabsTrigger
+                  className="gap-1.5"
+                  data-testid={`bench-tab-${id}`}
+                  key={id}
+                  value={id}
+                >
+                  {color ? (
+                    <span
+                      aria-hidden
+                      className={cn("size-2 shrink-0 rounded-full", color.dot)}
+                      data-project-color={color.id}
+                    />
+                  ) : null}
+                  {label}
+                  <span className="font-normal tabular-nums text-muted-foreground">
+                    {count?.cards ?? 0}
+                  </span>
+                  {count && count.needsYou > 0 ? (
+                    <span className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                      <span aria-hidden className="text-muted-foreground">
+                        ·{" "}
+                      </span>
+                      {count.needsYou === 1
+                        ? "1 needs you"
+                        : `${count.needsYou} need you`}
+                    </span>
+                  ) : null}
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
+        </Tabs>
         <div className="space-y-1 text-sm" data-testid="bench-status">
           <p className="text-muted-foreground" data-testid="bench-last-update">
             {lastTick === null
@@ -138,6 +235,7 @@ export function BenchScreen() {
             key={section.key}
             onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}
+            showProject={tab === "all"}
             testId={`bench-section-${section.key}`}
             title={section.title}
             viewerPubkey={viewerPubkey}
@@ -180,6 +278,7 @@ function BenchSection({
   empty,
   onOther,
   ownerPubkey,
+  showProject,
   testId,
   title,
   viewerPubkey,
@@ -188,6 +287,8 @@ function BenchSection({
   empty: string;
   onOther: (card: BenchCardData) => void;
   ownerPubkey: string | null;
+  /** The All tab names each card's project; a project tab already does. */
+  showProject: boolean;
   testId: string;
   title: string;
   viewerPubkey: string | undefined;
@@ -216,6 +317,9 @@ function BenchSection({
                 card={card}
                 onOther={() => onOther(card)}
                 ownerPubkey={ownerPubkey}
+                projectLabel={
+                  showProject ? workbenchLabel(cardWorkbench(card)) : undefined
+                }
                 viewerPubkey={viewerPubkey}
               />
             </li>

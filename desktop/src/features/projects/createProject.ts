@@ -30,6 +30,8 @@ import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 export type CreateProjectInput = {
   name: string;
   description?: string;
+  /** A `PROJECT_COLORS` id; omitted, the project shows its d-tag's color. */
+  color?: string;
   channelVisibility?: ChannelVisibility;
   projectVisibility?: ProjectListingVisibility;
   agents?: readonly CreateChannelManagedAgentInput[];
@@ -275,6 +277,7 @@ export async function createProject(
   }
 
   const templates = buildProjectBootstrapTemplates({
+    color: input.color,
     description: input.description,
     name: input.name,
     ownerPubkey: identity.pubkey,

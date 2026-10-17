@@ -2,14 +2,12 @@ import { Plus } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
-import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useUsersBatchQuery } from "@/features/profile/hooks";
-import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import type { Project } from "@/features/projects/hooks";
 import { useAddProjectChannelMutation } from "@/features/projects/useAddProjectChannel";
 import { CreateChannelDialog } from "@/features/sidebar/ui/CreateChannelDialog";
 import { Button } from "@/shared/ui/button";
+import { useProjectEditAccess } from "./useProjectEditAccess";
 
 export function ProjectChannelManagement({
   identityPubkey,
@@ -21,25 +19,10 @@ export function ProjectChannelManagement({
   const { goChannel } = useAppNavigation();
   const [createOpen, setCreateOpen] = React.useState(false);
   const createMutation = useAddProjectChannelMutation();
-  const ownerProfileQuery = useUsersBatchQuery([project.owner], {
-    enabled: Boolean(identityPubkey),
-  });
-  const projectOwnerProfile =
-    ownerProfileQuery.data?.profiles[project.owner.toLowerCase()];
-  const projectOwnerIsManaged = useIsManagedAgent(project.owner) === true;
-  const viewerIsProjectOwner =
-    identityPubkey?.toLowerCase() === project.owner.toLowerCase();
-  const viewerOwnsProjectAgent = ownsAuthorAgent(
-    projectOwnerProfile,
+  const { canEdit, ownerControlAgentPubkey } = useProjectEditAccess(
+    project,
     identityPubkey,
   );
-  const canEdit =
-    !project.legacy &&
-    (viewerIsProjectOwner || projectOwnerIsManaged || viewerOwnsProjectAgent);
-  const ownerControlAgentPubkey =
-    viewerOwnsProjectAgent && !projectOwnerIsManaged && !viewerIsProjectOwner
-      ? project.owner
-      : undefined;
 
   return (
     <>

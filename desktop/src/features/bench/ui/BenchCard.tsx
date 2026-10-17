@@ -53,19 +53,27 @@ export function BenchCard({
   ownerPubkey,
   viewerPubkey,
   onOther,
+  projectLabel,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
   viewerPubkey?: string;
   onOther?: () => void;
+  /** Leads the muted line: the Bench screen's All tab names the project. */
+  projectLabel?: string;
 }) {
   return card.request ? (
-    <BenchReceiptCard card={card} onOther={onOther} />
+    <BenchReceiptCard
+      card={card}
+      onOther={onOther}
+      projectLabel={projectLabel}
+    />
   ) : (
     <BenchQuestionCard
       card={card}
       onOther={onOther}
       ownerPubkey={ownerPubkey}
+      projectLabel={projectLabel}
       viewerPubkey={viewerPubkey}
     />
   );
@@ -76,11 +84,13 @@ function BenchQuestionCard({
   ownerPubkey,
   viewerPubkey,
   onOther,
+  projectLabel,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
   viewerPubkey?: string;
   onOther?: () => void;
+  projectLabel?: string;
 }) {
   const { interactive, readOnlyReason } = benchCardMode(
     card,
@@ -153,7 +163,7 @@ function BenchQuestionCard({
       data-bench-item={card.id}
       data-testid="bench-card"
     >
-      <BenchCardHeader card={card} />
+      <BenchCardHeader card={card} projectLabel={projectLabel} />
       <BenchCardText card={card} />
       {overrides ? (
         <p className="mt-2.5 text-xs text-muted-foreground">
@@ -219,9 +229,11 @@ function BenchQuestionCard({
 function BenchReceiptCard({
   card,
   onOther,
+  projectLabel,
 }: {
   card: BenchCardData;
   onOther?: () => void;
+  projectLabel?: string;
 }) {
   const receipt = benchReceipt(card, formatBenchTime);
   if (!receipt) return null;
@@ -234,7 +246,7 @@ function BenchReceiptCard({
       data-testid="bench-card"
     >
       {/* The header says where the decision stands now, not what it was. */}
-      <BenchCardHeader card={card} />
+      <BenchCardHeader card={card} projectLabel={projectLabel} />
       <BenchCardText card={request} />
       {options.length > 0 ? (
         <fieldset
@@ -291,14 +303,20 @@ function BenchOpenThread({
   );
 }
 
-function BenchCardHeader({ card }: { card: BenchCardData }) {
+function BenchCardHeader({
+  card,
+  projectLabel,
+}: {
+  card: BenchCardData;
+  projectLabel?: string;
+}) {
   const severity = benchSeverityChip(card.severity);
   const validity = benchValidityLabel(card.validity);
   const stateLabel =
     card.kind === "status" ? benchStateLabel(card.state) : null;
   const forLabel = benchForLabel(card);
   const previous = benchPreviousAnswerLine(card, formatBenchTime);
-  const meta = [benchKindLabel(card.kind), card.area, card.writer]
+  const meta = [projectLabel, benchKindLabel(card.kind), card.area, card.writer]
     .filter(Boolean)
     .join(" · ");
   return (

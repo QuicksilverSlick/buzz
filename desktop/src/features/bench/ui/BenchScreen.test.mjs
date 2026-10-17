@@ -662,3 +662,136 @@ test("screen: search narrows every section; Open thread opens the card's thread"
     "no thread before the card is posted",
   );
 });
+
+const TAB_KEY = "buzz.bench.workbench.v1";
+
+function tabText(id) {
+  return screen.getByTestId(`bench-tab-${id}`).textContent;
+}
+
+function shownCardIds(container) {
+  return [...container.querySelectorAll("[data-testid='bench-card']")]
+    .map((node) => node.getAttribute("data-bench-item"))
+    .sort();
+}
+
+const PROJECT_ITEMS = [
+  card("orchestrator/ask", { writer: "orchestrator" }),
+  card("claude-ai/ship", { writer: "claude-ai", severity: "critical" }),
+  card("claude-ai/done", {
+    writer: "claude-ai",
+    kind: "status",
+    options: [],
+    state: "done",
+  }),
+];
+
+test("tabs: counts and need-you per project; a project tab shows only its cards", async () => {
+  dom.window.localStorage.clear();
+  serveIdentity(OWNER);
+  serveSnapshot(snapshot(PROJECT_ITEMS));
+  let view;
+  await act(async () => {
+    view = render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() => screen.getByTestId("bench-tab-all"));
+
+  assert.equal(tabText("all"), "All3· 2 need you");
+  assert.equal(tabText("reset"), "28 Day Reset1· 1 needs you");
+  assert.equal(tabText("dreamforge"), "Dreamforge2· 1 needs you");
+  // Every card has a project, so there is no Other tab.
+  assert.equal(screen.queryByTestId("bench-tab-other"), null);
+  assert.equal(
+    screen.getByTestId("bench-tab-all").getAttribute("aria-selected"),
+    "true",
+  );
+  assert.deepEqual(shownCardIds(view.container), [
+    "claude-ai/done",
+    "claude-ai/ship",
+    "orchestrator/ask",
+  ]);
+  // All names each card's project on its muted line.
+  assert.ok(
+    screen.getByText("28 Day Reset · Pending · release · orchestrator"),
+  );
+
+  await act(async () => {
+    fireEvent.mouseDown(screen.getByTestId("bench-tab-reset"));
+  });
+  assert.deepEqual(shownCardIds(view.container), ["orchestrator/ask"]);
+  assert.deepEqual(cardIds(screen.getByTestId("bench-section-needsYou")), [
+    "orchestrator/ask",
+  ]);
+  assert.equal(dom.window.localStorage.getItem(TAB_KEY), "reset");
+  // A project tab already says the project.
+  assert.ok(screen.getByText("Pending · release · orchestrator"));
+  // The All tab still counts every project.
+  assert.equal(tabText("all"), "All3· 2 need you");
+});
+
+test("tabs: the last tab comes back; Other shows only with cards", async () => {
+  dom.window.localStorage.setItem(TAB_KEY, "dreamforge");
+  serveIdentity(OWNER);
+  serveSnapshot(snapshot(PROJECT_ITEMS));
+  let view;
+  await act(async () => {
+    view = render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() =>
+    assert.equal(
+      screen.getByTestId("bench-tab-dreamforge").getAttribute("aria-selected"),
+      "true",
+    ),
+  );
+  assert.deepEqual(shownCardIds(view.container), [
+    "claude-ai/done",
+    "claude-ai/ship",
+  ]);
+  cleanup();
+
+  // A saved Other that has no cards shows All, and keeps the choice.
+  dom.window.localStorage.setItem(TAB_KEY, "other");
+  serveSnapshot(snapshot(PROJECT_ITEMS));
+  await act(async () => {
+    view = render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() => screen.getByTestId("bench-tab-all"));
+  assert.equal(screen.queryByTestId("bench-tab-other"), null);
+  assert.equal(
+    screen.getByTestId("bench-tab-all").getAttribute("aria-selected"),
+    "true",
+  );
+  assert.equal(dom.window.localStorage.getItem(TAB_KEY), "other");
+  cleanup();
+
+  serveSnapshot(snapshot([...PROJECT_ITEMS, card("stranger/ask")]));
+  await act(async () => {
+    view = render(wrap(createElement(BenchScreen)));
+  });
+  await waitFor(() =>
+    assert.equal(
+      screen.getByTestId("bench-tab-other").getAttribute("aria-selected"),
+      "true",
+    ),
+  );
+  assert.equal(tabText("other"), "Other1· 1 needs you");
+  assert.deepEqual(shownCardIds(view.container), ["stranger/ask"]);
+  dom.window.localStorage.clear();
+});
+
+test("sidebar: the badge counts every project whatever tab is saved", async () => {
+  dom.window.localStorage.setItem(TAB_KEY, "reset");
+  serveSnapshot(
+    snapshot([
+      ...PROJECT_ITEMS,
+      card("claude-ai/two", { writer: "claude-ai" }),
+    ]),
+  );
+  await act(async () => {
+    render(sidebarEntry(() => {}));
+  });
+  await waitFor(() =>
+    assert.equal(screen.getByTestId("sidebar-bench-count").textContent, "3"),
+  );
+  dom.window.localStorage.clear();
+});

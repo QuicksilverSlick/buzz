@@ -9,6 +9,7 @@ import {
   Users,
 } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 
 import { presentContextCount } from "@/features/projects/lib/projectHomeSummary";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
@@ -21,12 +22,18 @@ import {
   type Project,
 } from "@/features/projects/hooks";
 import { ProjectChannelIcon } from "@/features/projects/ui/ProjectChannelIcon";
+import {
+  ProjectColorPicker,
+  useQueuedColorSave,
+} from "@/features/projects/ui/ProjectColorPicker";
+import { useSetProjectColorMutation } from "@/features/projects/useSetProjectColor";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import type { EntityLinkTab } from "@/shared/lib/entityLink";
 import { Button } from "@/shared/ui/button";
 import { ProjectChannelManagement } from "./ProjectChannelManagement";
 import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
+import { useProjectEditAccess } from "./useProjectEditAccess";
 import { SECTION_ACTION_VISIBILITY_CLASS } from "@/features/sidebar/ui/sidebarSectionStyles";
 
 const PROJECT_HOME_SIDEBAR_ROW_CLASS =
@@ -174,6 +181,50 @@ function ChannelContextRow({
       data-testid={testId}
     >
       <ContextRowContent icon={<Icon />}>{channel.name}</ContextRowContent>
+    </div>
+  );
+}
+
+/** The project's color; a pick republishes the project, the latest pick wins. */
+function ProjectColorSetting({
+  identityPubkey,
+  project,
+}: {
+  identityPubkey?: string;
+  project: Project;
+}) {
+  const { canEdit, ownerControlAgentPubkey } = useProjectEditAccess(
+    project,
+    identityPubkey,
+  );
+  const { mutateAsync } = useSetProjectColorMutation();
+  const color = useQueuedColorSave(project, (next, target) =>
+    mutateAsync({
+      color: next,
+      ownerControlAgentPubkey,
+      project: target,
+    }).catch((error: unknown) => {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't change the project color.",
+      );
+      throw error;
+    }),
+  );
+  return (
+    <div className="px-2 py-1">
+      <ProjectColorPicker
+        busy={color.saving}
+        disabled={!canEdit}
+        legendClassName="mb-1 text-xs text-sidebar-foreground/70"
+        name={`project-color-${project.id}`}
+        onChange={color.pick}
+        title={
+          canEdit ? undefined : "Only the project owner can change the color"
+        }
+        value={color.value}
+      />
     </div>
   );
 }
@@ -391,6 +442,12 @@ export function ProjectHomeContextPanel({
             None yet
           </p>
         )}
+      </ContextSection>
+      <ContextSection testId="project-home-context-color">
+        <ProjectColorSetting
+          identityPubkey={identityPubkey}
+          project={project}
+        />
       </ContextSection>
     </div>
   );

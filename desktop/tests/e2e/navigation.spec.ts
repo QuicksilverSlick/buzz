@@ -908,6 +908,8 @@ test("direct-message tooltip metadata stays on one physical line", async ({
     .getByTestId("message-input")
     .fill(`DM link buzz://message?channel=${dmChannelId}&id=${dmMessageId}`);
   await page.getByTestId("send-message").click();
+  // #general has members outside the DM, so the send waits for the share choice.
+  await page.getByRole("button", { name: "Send link only" }).click();
 
   const dmLink = page
     .getByTestId("message-row")

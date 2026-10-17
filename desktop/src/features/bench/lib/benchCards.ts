@@ -699,6 +699,15 @@ const RISK_CHIPS: Record<BenchRisk, BenchPlainChip> = {
   low: { label: "Low risk", variant: "secondary" },
 };
 
+/** "High risk", "Medium risk" or "Low risk"; null when unrated. */
+export function benchRiskChip(
+  risk: string | null | undefined,
+): BenchPlainChip | null {
+  return risk && Object.hasOwn(RISK_CHIPS, risk)
+    ? RISK_CHIPS[risk as BenchRisk]
+    : null;
+}
+
 const UNDO_LABELS: Record<BenchUndo, string> = {
   easy: "Easy to undo",
   hard: "Hard to undo",
@@ -719,9 +728,8 @@ function filled(text: string | null | undefined): string | null {
 export function benchPlainView(card: BenchCard): BenchPlainView {
   const plain = card.plain ?? {};
   const chips: BenchPlainChip[] = [];
-  if (plain.risk && Object.hasOwn(RISK_CHIPS, plain.risk)) {
-    chips.push(RISK_CHIPS[plain.risk]);
-  }
+  const risk = benchRiskChip(plain.risk);
+  if (risk) chips.push(risk);
   const undo = lookup(UNDO_LABELS, plain.undo);
   if (undo) chips.push({ label: undo, variant: "outline" });
   const reach = filled(plain.reach);

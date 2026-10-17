@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fromMarkdown } from "mdast-util-from-markdown";
+
 // Import the REAL implementations (the runner strips TS types via
 // test-loader.mjs). Earlier this file inlined stale copies of these functions,
 // which silently drifted from source — the inlined formatImetaMediaLine had no
@@ -503,6 +505,26 @@ test("buildOutgoingMessage: appends media markdown line per attachment, in order
     out.content,
     "hi\n![image](https://b/a.png)\n![video](https://b/v.mp4)",
   );
+});
+
+test("buildOutgoingMessage: an attachment after a blockquote stays out of the quote", () => {
+  const image = {
+    url: "https://b/a.png",
+    type: "image/png",
+    sha256: "x",
+    size: 1,
+    uploaded: 0,
+  };
+  const body = "see this\n\n> Quoted from **Ana** in #ops:\n>\n> the plan";
+  const out = buildOutgoingMessage(body, [image]);
+  assert.equal(out.content, `${body}\n\n![image](https://b/a.png)`);
+  const tree = fromMarkdown(out.content);
+  assert.deepEqual(
+    tree.children.map((node) => node.type),
+    ["paragraph", "blockquote", "paragraph"],
+  );
+  assert.equal(tree.children[2].children[0].type, "image");
+  assert.equal(stripImetaMediaLines(out.content, [image]), body);
 });
 
 test("buildOutgoingMessage: agent snapshot PNG uses the snapshot-card link path", () => {
