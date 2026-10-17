@@ -81,7 +81,7 @@ function BenchCardBlockView({
 const DETAILS_FOLD_CHARS = 280;
 const DETAILS_FOLD_LINES = 4;
 
-export function benchDetailsFolds(text: string): boolean {
+function benchDetailsFolds(text: string): boolean {
   return (
     text.length > DETAILS_FOLD_CHARS ||
     text.split("\n").length > DETAILS_FOLD_LINES
