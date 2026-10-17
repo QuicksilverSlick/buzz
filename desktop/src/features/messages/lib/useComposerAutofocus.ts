@@ -22,11 +22,17 @@ import * as React from "react";
  *    channel, or in-flight send at the moment of mount).
  *  - Skip if focus already lives in another text-entry surface (open
  *    dialog input, search box, etc.) so we don't yank focus from the user.
+ *  - Skip if focus lives in an open popover, menu, or dialog that does not
+ *    contain this composer. A composer can mount after surrounding chrome is
+ *    already interactive (the huddle room header is live before its chat
+ *    pane loads), and taking focus would dismiss a popover the user just
+ *    opened.
  */
 export function useComposerAutofocus(
   focus: () => void,
   draftKey: string | null | undefined,
   disabled: boolean,
+  composerRef: React.RefObject<HTMLElement | null>,
 ) {
   // We read `disabled` at execution time but intentionally don't depend on
   // it — see the comment above.
@@ -48,6 +54,10 @@ export function useComposerAutofocus(
       ) {
         return;
       }
+      const layer = active.closest(
+        '[role="dialog"], [role="alertdialog"], [role="menu"]',
+      );
+      if (layer && !layer.contains(composerRef.current)) return;
     }
     focus();
   }, [draftKey, focus]);
