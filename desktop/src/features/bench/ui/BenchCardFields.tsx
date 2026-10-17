@@ -51,7 +51,9 @@ function BenchCardBlockView({
       {block.kind === "text"
         ? block.text
         : block.fields.map((field, index) => (
-            <React.Fragment key={field.label}>
+            // Positional: a writer line can repeat a label ("Risk: …; Risk: …").
+            // biome-ignore lint/suspicious/noArrayIndexKey: fields are positional
+            <React.Fragment key={`${index}-${field.label}`}>
               {index > 0 ? " · " : null}
               <span className="font-semibold">{field.label}:</span>
               {field.text ? ` ${field.text}` : null}

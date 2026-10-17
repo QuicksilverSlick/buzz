@@ -241,7 +241,7 @@ export function InboxItemPreview({
       <PopoverContent
         align="start"
         aria-label="Preview"
-        className="w-80 p-3"
+        className="max-h-[min(28rem,var(--radix-popover-content-available-height))] w-80 overflow-y-auto overscroll-contain p-3"
         data-testid="inbox-item-preview"
         onCloseAutoFocus={(event) => event.preventDefault()}
         onMouseEnter={clearTimer}
