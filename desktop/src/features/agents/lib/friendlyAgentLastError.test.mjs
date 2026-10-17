@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   friendlyAgentLastError,
   friendlyTurnErrorCopy,
+  latestTurnError,
+  pausedLimitCopy,
   CLI_ACP_INTERNAL_ERROR_COPY,
   MODEL_NOT_FOUND_COPY,
   RELAY_MESH_DENIED_COPY,
@@ -215,7 +217,7 @@ test("friendlyTurnErrorCopy: garbage string code coerces to NaN → string path"
   );
 });
 
-// --- -32603 internal error (Fix #2: CLI-ACP unsupported model hint) ---
+// --- -32603 internal error: bare form has no detail ---
 
 test("code -32603 bare 'Internal error' → cli-acp internal error hint (severity: generic)", () => {
   const result = friendlyAgentLastError("Internal error", -32603);
@@ -315,4 +317,83 @@ test("-32603 does not affect -32001/-32002 classification (regression)", () => {
     severity: "denied",
     copy: MODEL_NOT_FOUND_COPY,
   });
+});
+
+test("bare -32603 copy no longer blames the Codex model", () => {
+  assert.ok(!CLI_ACP_INTERNAL_ERROR_COPY.toLowerCase().includes("codex"));
+  assert.ok(CLI_ACP_INTERNAL_ERROR_COPY.includes("gave no detail"));
+});
+
+// --- usage and spend limits: the harness parks the work ---
+
+const WEEKLY =
+  "Agent reported error (code -32603): Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)";
+
+test("Claude weekly limit (turn frame) → Paused copy in Claude's words", () => {
+  const paused =
+    "Paused: Claude weekly limit · resets Oct 18, 7pm (America/Chicago)";
+  assert.deepEqual(friendlyAgentLastError(WEEKLY, -32603), {
+    severity: "generic",
+    copy: paused,
+  });
+  assert.equal(friendlyTurnErrorCopy(WEEKLY, -32603), paused);
+  assert.equal(friendlyAgentLastError(WEEKLY, null)?.copy, paused);
+});
+
+test("pausedLimitCopy: each limit form → its Paused line; anything else → null", () => {
+  const cases = [
+    [
+      "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+      "Paused: Claude monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+    ],
+    [
+      "Internal error: You've hit your session limit · resets 3:50pm",
+      "Paused: Claude session limit · resets 3:50pm",
+    ],
+    [
+      "Internal error: You're out of extra usage · resets Nov 1",
+      "Paused: Claude: You're out of extra usage · resets Nov 1",
+    ],
+    [
+      "Internal error: You've hit your usage limit. Try again at 9:12 AM. (codexErrorInfo: usageLimitExceeded)",
+      "Paused: Codex usage limit. Try again at 9:12 AM.",
+    ],
+    [
+      "Internal error: API Error: This request would exceed your account's rate limit. Please try again later. (errorKind: rate_limit)",
+      null,
+    ],
+    [
+      'Internal error: stream disconnected (codexErrorInfo: {"httpConnectionFailed":{"httpStatusCode":502}})',
+      null,
+    ],
+    ["Internal error", null],
+    ["model not in registry", null],
+  ];
+  for (const [message, want] of cases) {
+    assert.equal(pausedLimitCopy(message), want, message);
+  }
+});
+
+test("latestTurnError: the newest finished turn decides", () => {
+  const error = (text, code) => ({
+    kind: "turn_error",
+    payload: { outcome: "error", error: text, code },
+  });
+  const done = { kind: "turn_completed", payload: {} };
+  const live = { kind: "turn_liveness", payload: {} };
+  assert.equal(latestTurnError([]), null);
+  assert.deepEqual(latestTurnError([done, error(WEEKLY, -32603), live]), {
+    error: WEEKLY,
+    code: -32603,
+  });
+  assert.equal(latestTurnError([error(WEEKLY, -32603), done]), null);
+  assert.deepEqual(latestTurnError([error("boom", "-32603")]), {
+    error: "boom",
+    code: -32603,
+  });
+  assert.deepEqual(latestTurnError([error("boom", undefined)]), {
+    error: "boom",
+    code: null,
+  });
+  assert.equal(latestTurnError([{ kind: "turn_error", payload: null }]), null);
 });

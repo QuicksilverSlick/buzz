@@ -7,7 +7,7 @@ import {
 } from "@/features/agents/lib/agentCardAvatar";
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
-import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import { useAgentLastError } from "@/features/agents/lib/useAgentLastError";
 import type { AgentAvailabilityReader } from "@/features/agents/lib/useAgentAvailability";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
@@ -288,9 +288,7 @@ function AgentPersonaCard({
   const avatarUrl = agent
     ? resolveAgentCardAvatarUrl(profileQuery.data?.avatarUrl, persona.avatarUrl)
     : persona.avatarUrl;
-  const friendlyError = agent
-    ? friendlyAgentLastError(agent.lastError, agent.lastErrorCode)?.copy
-    : null;
+  const friendlyError = useAgentLastError(agent)?.copy ?? null;
 
   return (
     <AgentIdentityCard
@@ -394,10 +392,7 @@ function StandaloneAgentCard({
   const availability = getAvailability(agent.pubkey);
   const title = agent.name;
   const profileQuery = useUserProfileQuery(agent.pubkey);
-  const friendlyError = friendlyAgentLastError(
-    agent.lastError,
-    agent.lastErrorCode,
-  )?.copy;
+  const friendlyError = useAgentLastError(agent)?.copy;
   const isActive = isManagedAgentActive(agent);
   const opensRuntimeTab = Boolean(friendlyError && !isActive);
 
