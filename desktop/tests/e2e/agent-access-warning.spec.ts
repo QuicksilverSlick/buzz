@@ -149,6 +149,48 @@ test("open agent access explains the available access before save", async ({
     page.getByRole("dialog", { name: "Manage agent access" }),
   ).toBeVisible();
 
+  // Selected people are named, so the owner can tell who to remove; the
+  // self-asserted name never hides the key.
+  const alice = TEST_IDENTITIES.alice.pubkey;
+  const aliceNpub = npubEncode(alice);
+  const aliceShortNpub = `${aliceNpub.slice(0, 8)}…${aliceNpub.slice(-4)}`;
+  const search = page.getByTestId("agent-respond-to-search");
+  await search.fill("alice");
+  await page.getByTestId(`agent-respond-to-result-${alice}`).click();
+  const aliceChip = page.getByTestId(`agent-respond-to-chip-${alice}`);
+  await expect(aliceChip.getByText("alice", { exact: true })).toBeVisible();
+  await expect(aliceChip).not.toContainText("npub");
+  await expect(aliceChip).toHaveAttribute("title", aliceNpub);
+  await expect(
+    aliceChip.getByRole("button", {
+      name: `Remove alice (${aliceShortNpub})`,
+    }),
+  ).toBeVisible();
+  // An unknown key falls back to its short npub.
+  const strangerNpub = npubEncode("c".repeat(64));
+  await search.fill(strangerNpub);
+  await page.getByTestId("agent-respond-to-add-raw-pubkey").click();
+  const strangerChip = page.getByTestId(
+    `agent-respond-to-chip-${"c".repeat(64)}`,
+  );
+  await expect(
+    strangerChip.getByText(
+      `${strangerNpub.slice(0, 8)}…${strangerNpub.slice(-4)}`,
+      { exact: true },
+    ),
+  ).toBeVisible();
+  // Search finds an already-selected person by display name.
+  await search.fill("alice");
+  await expect(aliceChip).toBeVisible();
+  await expect(strangerChip).toHaveCount(0);
+  await expect(picker.getByText("Already selected.")).toBeVisible();
+  await search.fill("");
+  await expect(strangerChip).toBeVisible();
+  // The remounted chip's initials appear after UserAvatar's fallback delay.
+  await expect(strangerChip.locator("[data-avatar-shape] > *")).toBeVisible();
+  await waitForAnimations(page);
+  await picker.screenshot({ path: `${SHOTS}/selected-people-names.png` });
+
   // Only me shares nothing, so the warning goes away entirely.
   await accessSelect.selectOption("owner-only");
   await expect(warning).toHaveCount(0);

@@ -1,14 +1,20 @@
 import * as React from "react";
 import { AlertTriangle, ChevronDown, Search, X } from "lucide-react";
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import {
+  allowlistChipMatches,
+  allowlistChips,
   mergeAllowlist,
   parsePubkeyInput,
 } from "@/features/agents/lib/respondToAllowlist";
 import { parsePubkeyInput as parseCanonicalPubkey } from "@/shared/lib/nostrUtils";
-import { truncateNpub } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { PubKey } from "@/shared/ui/PubKey";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
-import { useUserSearchQuery } from "@/features/profile/hooks";
+import {
+  useUserSearchQuery,
+  useUsersBatchQuery,
+} from "@/features/profile/hooks";
 import type { RespondToMode, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
@@ -324,6 +330,28 @@ function AllowlistPicker({
 }) {
   const isPersona = variant === "persona";
 
+  // Name chips the way message headers do; a managed agent without a resolved
+  // relay profile still shows its local name.
+  const profilesQuery = useUsersBatchQuery(allowlist);
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const chips = React.useMemo(
+    () =>
+      allowlistChips(
+        allowlist,
+        profilesQuery.data?.profiles,
+        new Map(
+          (managedAgentsQuery.data ?? []).map((agent) => [
+            normalizePubkey(agent.pubkey),
+            agent.name,
+          ]),
+        ),
+      ),
+    [allowlist, managedAgentsQuery.data, profilesQuery.data],
+  );
+  const visibleChips = chips.filter((chip) =>
+    allowlistChipMatches(chip, deferredQuery),
+  );
+
   // Detect if the query is a pubkey (npub or hex) not already in the list;
   // direct entry offers the canonical hex for storage.
   const queryPubkey = parseCanonicalPubkey(deferredQuery);
@@ -373,25 +401,36 @@ function AllowlistPicker({
             value={query}
           />
         </div>
-        {allowlist.length > 0 ? (
+        {visibleChips.length > 0 ? (
           <div className="flex flex-wrap gap-1.5 border-t border-border/70 px-2.5 py-2">
-            {allowlist.map((pubkey) => (
+            {visibleChips.map((chip) => (
               <div
-                className="inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-muted/60 px-2.5 py-1 text-2xs leading-none"
-                data-testid={`agent-respond-to-chip-${pubkey}`}
-                key={pubkey}
+                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/80 bg-muted/60 px-2.5 py-1 text-2xs leading-none"
+                data-testid={`agent-respond-to-chip-${chip.pubkey}`}
+                key={chip.pubkey}
+                title={chip.title ?? undefined}
               >
-                <UserAvatar
-                  avatarUrl={null}
-                  displayName={truncateNpub(pubkey)}
-                  size="xs"
-                />
-                <PubKey pubkey={pubkey} />
+                <span aria-hidden="true" className="flex shrink-0">
+                  <UserAvatar
+                    avatarUrl={chip.avatarUrl}
+                    displayName={chip.label}
+                    shape={chip.isAgent ? "squircle" : "circle"}
+                    size="xs"
+                  />
+                </span>
+                <span className="min-w-0 truncate">{chip.label}</span>
+                {chip.ambiguous ? (
+                  <PubKey
+                    className="text-muted-foreground"
+                    interactive={false}
+                    pubkey={chip.pubkey}
+                  />
+                ) : null}
                 <button
-                  aria-label={`Remove ${truncateNpub(pubkey)}`}
+                  aria-label={`Remove ${chip.accessibleName}`}
                   className="text-muted-foreground transition-colors hover:text-foreground"
                   disabled={disabled}
-                  onClick={() => onRemove(pubkey)}
+                  onClick={() => onRemove(chip.pubkey)}
                   type="button"
                 >
                   <X className="h-4 w-4" />
@@ -462,7 +501,9 @@ function AllowlistPicker({
               </button>
             ) : (
               <p className="px-2 py-1 text-sm text-muted-foreground">
-                No matching users.
+                {visibleChips.length > 0
+                  ? "Already selected."
+                  : "No matching users."}
               </p>
             )}
           </div>

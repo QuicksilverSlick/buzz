@@ -75,3 +75,30 @@ test("primary respond-to copy does not expose implementation jargon", () => {
     assert.doesNotMatch(primaryFieldSource, new RegExp(jargon));
   }
 });
+
+test("selected chips render the resolved name with the key kept nearby", () => {
+  // The owner removes people by name; the self-asserted name never replaces
+  // the key, which stays in the tooltip, the remove button's label, and inline
+  // whenever two chips share a name.
+  assert.match(
+    collapsedSource,
+    /allowlistChips\( allowlist, profilesQuery\.data\?\.profiles,/,
+  );
+  assert.match(collapsedSource, /title=\{chip\.title \?\? undefined\}/);
+  assert.match(
+    collapsedSource,
+    /<span className="[^"]*">\{chip\.label\}<\/span>/,
+  );
+  assert.match(
+    collapsedSource,
+    /\{chip\.ambiguous \? \( <PubKey [^>]*interactive=\{false\} pubkey=\{chip\.pubkey\}/,
+  );
+  assert.match(
+    collapsedSource,
+    /aria-label=\{`Remove \$\{chip\.accessibleName\}`\}/,
+  );
+  assert.match(
+    collapsedSource,
+    /visibleChips = chips\.filter\(\(chip\) => allowlistChipMatches\(chip, deferredQuery\),? \)/,
+  );
+});
