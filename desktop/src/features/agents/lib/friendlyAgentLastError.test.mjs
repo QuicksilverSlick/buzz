@@ -6,6 +6,7 @@ import {
   friendlyTurnErrorCopy,
   latestTurnError,
   pausedLimitCopy,
+  pausedStateCopy,
   CLI_ACP_INTERNAL_ERROR_COPY,
   MODEL_NOT_FOUND_COPY,
   RELAY_MESH_DENIED_COPY,
@@ -409,8 +410,64 @@ test("latestTurnError: a failed turn's own turn_completed, in either order, keep
   assert.deepEqual(latestTurnError([done("t1"), error("t1")]), want);
   assert.deepEqual(latestTurnError([error("t1"), done("t1")]), want);
   // A later turn that succeeded clears it.
+  assert.equal(latestTurnError([done("t1"), error("t1"), done("t2")]), null);
+});
+
+// ── the harness's durable paused state ──────────────────────────────────────
+
+/** The 16 Oct weekly limit, as the harness writes it for the panel. */
+const weeklyPaused = () => ({
+  class: "weekly_limit",
+  text: "You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+  provider: "Claude",
+  state: "BLOCKED",
+  resetsAt: "2026-10-19T00:00:00Z",
+  resumesAt: "2026-10-19T00:02:00Z",
+  since: "2026-10-16T16:52:00Z",
+  expires: "2026-10-19T00:07:00Z",
+});
+
+test("the paused state names the limit and when it resets", () => {
+  const shown = pausedStateCopy(weeklyPaused());
+  assert.equal(shown.severity, "generic");
+  assert.match(shown.copy, /^Paused: Claude weekly limit · resets /);
+  // The reset reads as a local time, not a raw ISO string.
+  assert.ok(!shown.copy.includes("2026-10-19T00:00:00Z"), shown.copy);
+});
+
+test("a spend cap and a lost sign-in say who has to act", () => {
+  const cap = pausedStateCopy({
+    ...weeklyPaused(),
+    class: "spend_cap",
+    resetsAt: null,
+  });
+  assert.equal(cap.severity, "generic");
   assert.equal(
-    latestTurnError([done("t1"), error("t1"), done("t2")]),
+    cap.copy,
+    "Paused: Claude spend cap — the owner has to raise it",
+  );
+
+  const lost = pausedStateCopy({
+    ...weeklyPaused(),
+    class: "sign_in",
+    state: "DOWN",
+    resetsAt: null,
+  });
+  // A lost sign-in needs the owner, so it carries destructive weight.
+  assert.equal(lost.severity, "denied");
+  assert.equal(
+    lost.copy,
+    "Paused: Claude sign-in — the owner has to sign it in again",
+  );
+});
+
+test("an unknown class or an unreadable reset is not shown as paused", () => {
+  assert.equal(
+    pausedStateCopy({ ...weeklyPaused(), class: "rate_limit" }),
     null,
   );
+  assert.equal(pausedStateCopy({ ...weeklyPaused(), class: "" }), null);
+  // A bad reset time drops the clause rather than the whole line.
+  const shown = pausedStateCopy({ ...weeklyPaused(), resetsAt: "soon" });
+  assert.equal(shown.copy, "Paused: Claude weekly limit");
 });

@@ -1,3 +1,5 @@
+import type { FactoryPaused } from "@/shared/api/types";
+
 /**
  * Promote certain machine-readable `lastError` strings to user-facing copy.
  *
@@ -103,6 +105,53 @@ export function pausedLimitCopy(message: string): string | null {
   return hit
     ? `Paused: ${provider} ${text.slice(hit[0].length)}`
     : `Paused: ${provider}: ${text}`;
+}
+
+/**
+ * "Paused: Claude weekly limit · resets Sun 18 Oct 7:00 PM" from the
+ * harness's own durable paused state (buzz-acp `factory::paused_state`).
+ *
+ * This is the panel's signal for most of an outage: the turn frames it would
+ * otherwise read live in a capped window that is trimmed once it fills and
+ * is empty after a restart, while a parked harness never exits and so never
+ * records a `lastError`. The record is already scrubbed and expired-checked
+ * on the Rust side, so it is shown as given.
+ */
+export function pausedStateCopy(
+  paused: FactoryPaused,
+): FriendlyAgentLastError | null {
+  const what = PAUSED_CLASS_COPY[paused.class];
+  if (!what) return null;
+  const label = `${paused.provider} ${what}`;
+  const reset = paused.resetsAt ? shortReset(paused.resetsAt) : null;
+  return {
+    // A spend cap and a lost sign-in need the owner; a timed limit lifts on
+    // its own, so it reads as information rather than a problem to fix.
+    severity: paused.state === "DOWN" ? "denied" : "generic",
+    copy: reset ? `Paused: ${label} · resets ${reset}` : `Paused: ${label}`,
+  };
+}
+
+/** The classes the harness parks work behind, as the panel names them. */
+const PAUSED_CLASS_COPY: Record<string, string> = {
+  weekly_limit: "weekly limit",
+  session_limit: "session limit",
+  usage_limit: "usage limit",
+  spend_cap: "spend cap — the owner has to raise it",
+  sign_in: "sign-in — the owner has to sign it in again",
+};
+
+/** An ISO reset time as the panel shows it: "Sun 18 Oct 7:00 PM", local. */
+function shortReset(iso: string): string | null {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return null;
+  return at.toLocaleString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 /**

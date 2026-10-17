@@ -848,6 +848,7 @@ fn summary_fixture(
         last_exit_code: None,
         last_error: None,
         last_error_code: None,
+        paused: None,
         start_on_app_launch: false,
         auto_restart_on_config_change: false,
         log_path: String::new(),

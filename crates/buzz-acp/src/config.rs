@@ -1242,6 +1242,7 @@ impl Config {
         factory.reporting = crate::factory::Reporting {
             agent: session_title.clone().unwrap_or_else(|| short.clone()),
             short,
+            pubkey: keys.public_key().to_hex(),
             channel: args.factory_channel.as_deref().and_then(|raw| {
                 let parsed = uuid::Uuid::parse_str(raw.trim()).ok();
                 if parsed.is_none() {

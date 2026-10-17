@@ -357,6 +357,16 @@ export type ManagedAgent = {
   lastExitCode: number | null;
   lastError: string | null;
   lastErrorCode: number | null;
+  /**
+   * Why the agent's work is paused behind a provider limit, from the
+   * harness's own durable record. `null` when it is not paused.
+   *
+   * A parked harness keeps running, so `lastError` -- recovered only from a
+   * nonzero exit -- is always empty for this case, and the observer event
+   * window that otherwise carries it is capped, trimmed and gone after a
+   * restart. This is the state that survives both.
+   */
+  paused: FactoryPaused | null;
   logPath: string;
   startOnAppLaunch: boolean;
   autoRestartOnConfigChange: boolean;
@@ -369,6 +379,28 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+};
+
+/**
+ * The harness's paused state (buzz-acp `factory::paused_state`): what stopped
+ * the work, in the provider's own words. Expired records are dropped on the
+ * Rust side, so anything here is current.
+ */
+export type FactoryPaused = {
+  /** `weekly_limit`, `session_limit`, `usage_limit`, `spend_cap`, `sign_in`. */
+  class: string;
+  /** The provider's words, already scrubbed and truncated by the harness. */
+  text: string;
+  /** `Claude`, `Codex`, or the adapter's own name. */
+  provider: string;
+  /** `BLOCKED` while waiting on a limit, `DOWN` when the sign-in is gone. */
+  state: string;
+  /** When the limit lifts, if the provider said. */
+  resetsAt: string | null;
+  /** When the harness next tries. */
+  resumesAt: string | null;
+  since: string;
+  expires: string;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */

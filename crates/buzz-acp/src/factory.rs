@@ -17,6 +17,7 @@ use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
 mod park_budget;
+mod paused_state;
 
 use park_budget::{Budget, Parks};
 
@@ -577,6 +578,9 @@ pub(crate) struct Reporting {
     pub agent: String,
     /// The first 8 hex characters of the agent's pubkey.
     pub short: String,
+    /// The agent's full pubkey hex: how the desktop finds this harness's own
+    /// paused-state file (see [`paused_state`]). An id, never a secret.
+    pub pubkey: String,
     /// The #factory channel STATE records are posted to; `None` logs them
     /// only.
     pub channel: Option<uuid::Uuid>,
@@ -949,6 +953,10 @@ impl Factory {
             None => now + ttl(RECORD_TTL),
         };
         self.reported = Some((self.health, expires));
+        // The desktop's agent panel reads the paused state from a file, not
+        // from the capped observer event window, so it survives the trim and
+        // a restart (spec 4.3, M1 step 5).
+        self.save_paused_state(expires);
         let iso = |t: DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let state = match self.health {
             Health::Operational => "OPERATIONAL",
