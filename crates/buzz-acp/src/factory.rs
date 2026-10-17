@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
-use crate::acp::AcpError;
+use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
 /// What a failed turn means for the work it carried.
@@ -95,34 +95,77 @@ const NEEDS_OWNER: [&str; 8] = [
     "set to $0",
 ];
 
-/// Split a folded `AgentError` message (see `acp::agent_error_from_json`)
-/// into the provider's words and the adapter's `errorKind` and
-/// `codexErrorInfo` markers.
-fn split(message: &str) -> (&str, Option<&str>, Option<&str>) {
+/// The texts that mean a short provider rate limit, as the provider opens
+/// them (spec 3.2, class 5). Anchored like [`LIMIT_PREFIXES`]: a substring
+/// test would let any error that happens to quote one of these — a tool's own
+/// output, a member's message echoed back — escape the retry budget.
+const RATE_PREFIXES: [&str; 3] = [
+    "API Error: This request would exceed your account's rate limit",
+    "API Error: 429",
+    "API Error: Request would exceed your account's rate limit",
+];
+
+/// The texts that mean the sign-in is gone (spec 3.2, class 7), anchored the
+/// same way.
+const AUTH_PREFIXES: [&str; 3] = [
+    "API Error: 401",
+    "API Error: OAuth",
+    "OAuth access token has expired",
+];
+
+/// The provider's own words from a folded `AgentError` message (see
+/// `acp::agent_error_from_json`): the adapter's display markers taken back
+/// off and the JSON-RPC prefix dropped, so the prefix lists match what the
+/// provider actually opened with.
+///
+/// A marker is removed only when it repeats this error's own structured
+/// field, so provider prose that merely ends in `(errorKind: …)` is left
+/// alone — it is text, and text is never evidence of a category.
+pub(crate) fn provider_text<'a>(message: &'a str, error: &AcpError) -> &'a str {
     let mut text = message;
-    let mut marker = |name: &str| {
-        let open = format!(" ({name}: ");
-        let i = text.rfind(&open)?;
-        let value = text[i + open.len()..].strip_suffix(')')?;
-        text = &text[..i];
-        Some(value)
-    };
-    // Appended in this order, so taken off in reverse.
-    let codex = marker("codexErrorInfo");
-    let kind = marker("errorKind");
-    let text = text.strip_prefix("Internal error: ").unwrap_or(text);
-    (text, kind, codex)
+    for (name, value) in [
+        (acp::CODEX_ERROR_INFO_MARKER, codex_error_info(error)),
+        (acp::ERROR_KIND_MARKER, error_kind(error)),
+    ] {
+        if let Some(value) = value {
+            text = text
+                .strip_suffix(&format!(" ({name}: {value})"))
+                .unwrap_or(text);
+        }
+    }
+    text.strip_prefix("Internal error: ").unwrap_or(text)
+}
+
+fn error_kind(error: &AcpError) -> Option<&str> {
+    match error {
+        AcpError::AgentError { error_kind, .. } => error_kind.as_deref(),
+        _ => None,
+    }
+}
+
+fn codex_error_info(error: &AcpError) -> Option<&str> {
+    match error {
+        AcpError::AgentError {
+            codex_error_info, ..
+        } => codex_error_info.as_deref(),
+        _ => None,
+    }
 }
 
 /// Classify a failed turn (spec section 3.3). The adapter's typed failures
-/// (step 7) are not advertised yet, so this reads the folded `data` markers,
-/// then the SDK's limit prefixes, then the sign-in and rate-limit wording.
+/// (step 7) are not advertised yet, so this reads the adapter's own
+/// `errorKind` and `codexErrorInfo` fields, then the SDK's limit prefixes,
+/// then the anchored sign-in and rate-limit openings. Structured fields and
+/// anchored prefixes only: free text in the middle of a message decides
+/// nothing (spec 3.1).
 pub(crate) fn classify(error: &AcpError, now: DateTime<Utc>) -> Failure {
     let message = match error {
         AcpError::AgentError { message, .. } => message.clone(),
         other => other.to_string(),
     };
-    let (text, kind, codex) = split(&message);
+    let text = provider_text(&message, error);
+    let kind = error_kind(error);
+    let codex = codex_error_info(error);
     let known = LIMIT_PREFIXES.iter().any(|p| text.starts_with(p));
     let lower = text.to_ascii_lowercase();
     let owner_must_act = NEEDS_OWNER.iter().any(|w| lower.contains(w));
@@ -138,13 +181,12 @@ pub(crate) fn classify(error: &AcpError, now: DateTime<Utc>) -> Failure {
         kind,
         Some("authentication_failed" | "oauth_org_not_allowed")
     ) || codex == Some("unauthorized")
-        || crate::is_auth_error(error)
+        || AUTH_PREFIXES.iter().any(|p| text.starts_with(p))
     {
         Class::SignIn
     } else if kind == Some("rate_limit")
         || codex == Some("rateLimitExceeded")
-        || lower.contains("exceed your account's rate limit")
-        || text.contains("API Error: 429")
+        || RATE_PREFIXES.iter().any(|p| text.starts_with(p))
     {
         Class::RateLimit
     } else {
@@ -1158,10 +1200,7 @@ mod tests {
     }
 
     fn agent_error(message: &str) -> AcpError {
-        AcpError::AgentError {
-            code: -32603,
-            message: message.to_string(),
-        }
+        AcpError::agent_error(-32603, message)
     }
 
     /// 16 Oct 2026, 16:52 UTC: the first weekly-limit error.
@@ -1170,119 +1209,198 @@ mod tests {
     }
 
     /// Every error the logs and adapters produce, as buzz-acp now records it
-    /// (spec 1.2, 3.2), and its class and slug.
+    /// (spec 1.2, 3.2), and its class and slug. Built from the JSON-RPC error
+    /// object the adapter actually sends, through the same
+    /// `agent_error_from_json` the read loop uses, so the categories under
+    /// test are the ones the adapter really set.
     #[test]
     fn classify_known_errors() {
-        let cases: &[(&str, Class, &str)] = &[
+        let cases: &[(serde_json::Value, Class, &str)] = &[
             (
-                "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "data": {"errorKind": "rate_limit"}}),
                 Class::UsageLimit,
                 "weekly_limit",
             ),
             (
-                "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)"}),
                 Class::UsageLimit,
                 "weekly_limit",
             ),
             (
-                "Internal error: You've hit your session limit · resets 3:50pm",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your session limit · resets 3:50pm"}),
                 Class::UsageLimit,
                 "session_limit",
             ),
             (
-                "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message"}),
                 Class::SpendCap,
                 "spend_cap",
             ),
             (
-                "Internal error: You're out of extra usage · resets Nov 1",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You're out of extra usage · resets Nov 1"}),
                 Class::SpendCap,
                 "spend_cap",
             ),
             (
-                "Internal error: Your org is out of usage · add funds to continue",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: Your org is out of usage · add funds to continue"}),
                 Class::SpendCap,
                 "spend_cap",
             ),
             (
-                "Internal error: API Error: This request would exceed your account's rate limit. Please try again later. (errorKind: rate_limit)",
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: API Error: This request would exceed your account's rate limit. Please try again later.",
+                    "data": {"errorKind": "rate_limit"}}),
+                Class::RateLimit,
+                "rate_limit",
+            ),
+            // No category sent: the provider's own opening words decide.
+            (
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: API Error: 429 too many requests"}),
                 Class::RateLimit,
                 "rate_limit",
             ),
             (
-                "Internal error: API Error: 429 too many requests",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "Request rejected", "errorKind": "rate_limit"}}),
                 Class::RateLimit,
                 "rate_limit",
             ),
             (
-                "Internal error: Request rejected (errorKind: rate_limit)",
-                Class::RateLimit,
-                "rate_limit",
-            ),
-            (
-                "Internal error: credit balance is too low (errorKind: billing_error)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "credit balance is too low", "errorKind": "billing_error"}}),
                 Class::SpendCap,
                 "spend_cap",
             ),
             (
-                "Internal error: Invalid API key (errorKind: authentication_failed)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "Invalid API key", "errorKind": "authentication_failed"}}),
                 Class::SignIn,
                 "sign_in",
             ),
             (
-                "Internal error: org not allowed (errorKind: oauth_org_not_allowed)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "org not allowed", "errorKind": "oauth_org_not_allowed"}}),
                 Class::SignIn,
                 "sign_in",
             ),
             (
-                "API Error: OAuth access token has expired. Re-authenticate to continue.",
+                serde_json::json!({"code": -32000,
+                    "message": "API Error: OAuth access token has expired. Re-authenticate to continue."}),
                 Class::SignIn,
                 "sign_in",
             ),
             (
-                "Internal error: API Error: 401 unauthorized",
+                serde_json::json!({"code": -32603, "message": "Internal error: API Error: 401 unauthorized"}),
                 Class::SignIn,
                 "sign_in",
             ),
             (
-                "Internal error: You've hit your usage limit. Try again at 9:12 AM. (codexErrorInfo: usageLimitExceeded)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "You've hit your usage limit. Try again at 9:12 AM.",
+                             "codexErrorInfo": "usageLimitExceeded"}}),
                 Class::UsageLimit,
                 "usage_limit",
             ),
             (
-                "Internal error: slow down (codexErrorInfo: rateLimitExceeded)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "slow down", "codexErrorInfo": "rateLimitExceeded"}}),
                 Class::RateLimit,
                 "rate_limit",
             ),
             (
-                "Internal error: token revoked (codexErrorInfo: unauthorized)",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "token revoked", "codexErrorInfo": "unauthorized"}}),
                 Class::SignIn,
                 "sign_in",
             ),
-            ("Internal error", Class::Other, "error"),
             (
-                "Internal error: stream disconnected (codexErrorInfo: {\"httpConnectionFailed\":{\"httpStatusCode\":502}})",
+                serde_json::json!({"code": -32603, "message": "Internal error"}),
                 Class::Other,
                 "error",
             ),
             (
-                "Usage credits required for 1M context — turn on usage credits",
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "stream disconnected",
+                             "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}}}),
+                Class::Other,
+                "error",
+            ),
+            (
+                serde_json::json!({"code": -32601,
+                    "message": "Usage credits required for 1M context — turn on usage credits"}),
                 Class::Other,
                 "error",
             ),
         ];
-        for (message, class, slug) in cases {
-            let f = classify(&agent_error(message), oct16());
-            assert_eq!((f.class, f.slug), (*class, *slug), "{message}");
+        for (error, class, slug) in cases {
+            let f = classify(&crate::acp::agent_error_from_json(error), oct16());
+            assert_eq!((f.class, f.slug), (*class, *slug), "{error}");
         }
         let io = AcpError::Io(std::io::Error::other("pipe broke"));
         assert_eq!(classify(&io, oct16()).class, Class::Other);
     }
 
+    /// Only the adapter's own `errorKind` / `codexErrorInfo` fields name a
+    /// class; a message that merely reads like one is text, and text is
+    /// shown, not believed (spec 3.1). codex-acp folds `data.message`
+    /// verbatim, so a provider or tool can put anything in it — and a
+    /// mistaken spend-cap verdict parks a request for the owner and raises a
+    /// Critical card about money that was never spent.
+    #[test]
+    fn classify_trusts_only_the_adapters_own_fields() {
+        let spoofs = [
+            // The defect's own case: no real errorKind, just those words.
+            serde_json::json!({"code": -32603, "message": "Internal error",
+                "data": {"message": "request rejected (errorKind: billing_error)"}}),
+            serde_json::json!({"code": -32603, "message": "Internal error",
+                "data": {"message": "no capacity (codexErrorInfo: usageLimitExceeded)"}}),
+            serde_json::json!({"code": -32603,
+                "message": "Internal error: tool printed \"(errorKind: authentication_failed)\""}),
+            // A rate-limit sentence quoted mid-message is not a rate limit.
+            serde_json::json!({"code": -32603,
+                "message": "Internal error: the run log says API Error: 429 on line 7"}),
+            serde_json::json!({"code": -32603,
+                "message": "Internal error: a doc mentions exceed your account's rate limit"}),
+        ];
+        for spoof in &spoofs {
+            let f = classify(&crate::acp::agent_error_from_json(spoof), oct16());
+            assert_eq!(f.class, Class::Other, "{spoof}");
+            assert!(!f.class.parks(), "{spoof}: must not park");
+        }
+        // The real field, with the same words, is believed.
+        let real = serde_json::json!({"code": -32603, "message": "Internal error",
+            "data": {"message": "request rejected", "errorKind": "billing_error"}});
+        assert_eq!(
+            classify(&crate::acp::agent_error_from_json(&real), oct16()).class,
+            Class::SpendCap
+        );
+        // The marker is still appended for display, and taken back off for
+        // the prefix match, because it repeats the field's own value.
+        let limit = serde_json::json!({"code": -32603,
+            "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+            "data": {"errorKind": "rate_limit"}});
+        let error = crate::acp::agent_error_from_json(&limit);
+        assert!(error.to_string().ends_with("(errorKind: rate_limit)"));
+        assert_eq!(
+            classify(&error, oct16()).text,
+            "You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)"
+        );
+    }
+
     #[test]
     fn classify_keeps_known_text_verbatim_and_scrubs_the_rest() {
         let weekly = classify(
-            &agent_error("Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)"),
+            &crate::acp::agent_error_from_json(&serde_json::json!({"code": -32603,
+                "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                "data": {"errorKind": "rate_limit"}})),
             oct16(),
         );
         assert_eq!(

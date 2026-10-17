@@ -120,8 +120,43 @@ pub enum AcpError {
     Protocol(String),
 
     #[error("Agent reported error (code {code}): {message}")]
-    AgentError { code: i64, message: String },
+    AgentError {
+        code: i64,
+        /// What is shown: the provider's words, with the adapter's `data`
+        /// detail folded in. See [`agent_error_from_json`].
+        message: String,
+        /// claude-agent-acp's `data.errorKind`, exactly as it sent it.
+        ///
+        /// This field, not the message text, is what the failure classifier
+        /// trusts (spec 3.1): provider prose that merely reads like a marker
+        /// must never be promoted to a structured category.
+        error_kind: Option<String>,
+        /// codex-acp's `data.codexErrorInfo`: the string form verbatim, the
+        /// object form as compact JSON. Trusted on the same terms as
+        /// `error_kind`.
+        codex_error_info: Option<String>,
+    },
 }
+
+impl AcpError {
+    /// An [`AcpError::AgentError`] with no adapter `data` categories — the
+    /// shape every caller but [`agent_error_from_json`] produces.
+    pub fn agent_error(code: i64, message: impl Into<String>) -> Self {
+        Self::AgentError {
+            code,
+            message: message.into(),
+            error_kind: None,
+            codex_error_info: None,
+        }
+    }
+}
+
+/// The name of each adapter marker appended to a message for display, in the
+/// order they are appended. The classifier strips them back off for a prefix
+/// match, matching each against the structured field's own value so no
+/// lookalike in provider prose can be taken for one.
+pub(crate) const ERROR_KIND_MARKER: &str = "errorKind";
+pub(crate) const CODEX_ERROR_INFO_MARKER: &str = "codexErrorInfo";
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
 /// preserving the numeric code. When the `message` field is missing or
@@ -130,40 +165,51 @@ pub enum AcpError {
 ///
 /// The adapters put the real cause in `data`: codex-acp leaves the message as
 /// a bare "Internal error" and carries the provider's words in `data.message`
-/// and `data.codexErrorInfo`; claude-agent-acp adds `data.errorKind`. They are
-/// folded into the message, not a new field, because `AgentError { code,
-/// message }` is matched at many call sites. The failure classifier reads the
-/// ` (errorKind: …)` / ` (codexErrorInfo: …)` markers back.
-fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
+/// and `data.codexErrorInfo`; claude-agent-acp adds `data.errorKind`. The
+/// provider's words are folded into the message; the two categories are kept
+/// as their own fields, because text that merely looks like a marker is not
+/// evidence of one. They are still appended to the message for display, so
+/// the activity feed and a recovered log tail read the same as before — but
+/// nothing classifies from that copy.
+pub(crate) fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
     let Some(mut message) = error
         .get("message")
         .and_then(|m| m.as_str())
         .map(str::to_string)
     else {
-        return AcpError::AgentError {
-            code,
-            message: error.to_string(),
-        };
+        return AcpError::agent_error(code, error.to_string());
     };
     let data = error.get("data");
-    let field = |name: &str| data.and_then(|d| d.get(name));
-    if let Some(detail) = field("message").and_then(|m| m.as_str()) {
-        if !detail.is_empty() && !message.contains(detail) {
-            message = format!("{message}: {detail}");
+    let field = |name: &str| match data.and_then(|d| d.get(name)) {
+        Some(serde_json::Value::String(kind)) => Some(kind.clone()),
+        // Structured codexErrorInfo, e.g. {"httpConnectionFailed":{"httpStatusCode":502}}.
+        Some(v @ serde_json::Value::Object(_)) => Some(v.to_string()),
+        _ => None,
+    };
+    if let Some(detail) = data
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .filter(|detail| !detail.is_empty() && !message.contains(*detail))
+    {
+        message = format!("{message}: {detail}");
+    }
+    let error_kind = field(ERROR_KIND_MARKER);
+    let codex_error_info = field(CODEX_ERROR_INFO_MARKER);
+    for (name, value) in [
+        (ERROR_KIND_MARKER, &error_kind),
+        (CODEX_ERROR_INFO_MARKER, &codex_error_info),
+    ] {
+        if let Some(value) = value {
+            message.push_str(&format!(" ({name}: {value})"));
         }
     }
-    for name in ["errorKind", "codexErrorInfo"] {
-        match field(name) {
-            Some(serde_json::Value::String(kind)) => {
-                message.push_str(&format!(" ({name}: {kind})"))
-            }
-            // Structured codexErrorInfo, e.g. {"httpConnectionFailed":{"httpStatusCode":502}}.
-            Some(v @ serde_json::Value::Object(_)) => message.push_str(&format!(" ({name}: {v})")),
-            _ => {}
-        }
+    AcpError::AgentError {
+        code,
+        message,
+        error_kind,
+        codex_error_info,
     }
-    AcpError::AgentError { code, message }
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -1147,7 +1193,7 @@ impl AcpClient {
     pub(crate) fn take_prompt_error_before_drain(&mut self) -> Option<AcpError> {
         self.prompt_error_before_drain
             .take()
-            .map(|(code, message)| AcpError::AgentError { code, message })
+            .map(|(code, message)| AcpError::agent_error(code, message))
     }
 
     /// Most recently observed goose `_meta.goose.activeRunId` from a
@@ -1708,7 +1754,7 @@ impl AcpClient {
             && self.last_prompt_id == Some(expected_id)
         {
             self.last_prompt_id = None;
-            if let Err(AcpError::AgentError { code, message }) = &result {
+            if let Err(AcpError::AgentError { code, message, .. }) = &result {
                 self.prompt_error_before_drain = Some((*code, message.clone()));
             }
         }
@@ -4258,7 +4304,7 @@ mod tests {
         });
         let (mut client, mut stalled) = drop_in_the_exit_drain(error).await;
         match client.take_prompt_error_before_drain() {
-            Some(AcpError::AgentError { code, message }) => {
+            Some(AcpError::AgentError { code, message, .. }) => {
                 assert_eq!(code, -32000);
                 assert_eq!(message, "the agent failed the turn");
             }
@@ -7318,7 +7364,7 @@ sleep 1"#,
         // not be silently truncated to "unknown error" — the full JSON is preserved.
         let error = serde_json::json!({"code": -32000, "data": "quota exceeded"});
         match super::agent_error_from_json(&error) {
-            AcpError::AgentError { code, message } => {
+            AcpError::AgentError { code, message, .. } => {
                 assert_eq!(code, -32000);
                 assert!(
                     message.contains("quota exceeded"),
@@ -7331,7 +7377,9 @@ sleep 1"#,
 
     /// codex-acp sends a bare "Internal error" with the provider's words in
     /// `data.message` (index.js createTurnErrorData); claude-agent-acp sends
-    /// the words in `message` and a category in `data.errorKind`.
+    /// the words in `message` and a category in `data.errorKind`. The words
+    /// are folded into the message for display; each category is kept as its
+    /// own field, which is the only thing the classifier reads.
     #[test]
     fn agent_error_from_json_folds_adapter_data_into_message() {
         let cases = [
@@ -7340,31 +7388,60 @@ sleep 1"#,
                     "message": "You've hit your usage limit. Try again at 9:12 AM.",
                     "codexErrorInfo": "usageLimitExceeded"}}),
                 "Internal error: You've hit your usage limit. Try again at 9:12 AM. (codexErrorInfo: usageLimitExceeded)",
+                None,
+                Some("usageLimitExceeded"),
             ),
             (
                 serde_json::json!({"code": -32603,
                     "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
                     "data": {"errorKind": "rate_limit"}}),
                 "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)",
+                Some("rate_limit"),
+                None,
             ),
             (
                 serde_json::json!({"code": -32603, "message": "Internal error", "data": {
                     "message": "stream disconnected",
                     "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}}}),
                 "Internal error: stream disconnected (codexErrorInfo: {\"httpConnectionFailed\":{\"httpStatusCode\":502}})",
+                None,
+                Some("{\"httpConnectionFailed\":{\"httpStatusCode\":502}}"),
             ),
             // data.message repeating the message is not doubled.
             (
                 serde_json::json!({"code": -32603, "message": "Internal error: boom", "data": {"message": "boom"}}),
                 "Internal error: boom",
+                None,
+                None,
             ),
-            (serde_json::json!({"code": -32603, "message": "Internal error"}), "Internal error"),
+            (
+                serde_json::json!({"code": -32603, "message": "Internal error"}),
+                "Internal error",
+                None,
+                None,
+            ),
+            // `data.message` is the provider's or a tool's text. Words that
+            // look like a marker are left in it and set no field.
+            (
+                serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "request rejected (errorKind: billing_error)"}}),
+                "Internal error: request rejected (errorKind: billing_error)",
+                None,
+                None,
+            ),
         ];
-        for (error, want) in cases {
+        for (error, want, want_kind, want_codex) in cases {
             match super::agent_error_from_json(&error) {
-                AcpError::AgentError { code, message } => {
+                AcpError::AgentError {
+                    code,
+                    message,
+                    error_kind,
+                    codex_error_info,
+                } => {
                     assert_eq!(code, -32603);
                     assert_eq!(message, want);
+                    assert_eq!(error_kind.as_deref(), want_kind, "{error}");
+                    assert_eq!(codex_error_info.as_deref(), want_codex, "{error}");
                 }
                 other => panic!("expected AgentError, got {other:?}"),
             }
@@ -7375,7 +7452,7 @@ sleep 1"#,
     fn agent_error_from_json_uses_message_field_when_present() {
         let error = serde_json::json!({"code": -32001, "message": "auth denied"});
         match super::agent_error_from_json(&error) {
-            AcpError::AgentError { code, message } => {
+            AcpError::AgentError { code, message, .. } => {
                 assert_eq!(code, -32001);
                 assert_eq!(message, "auth denied");
             }

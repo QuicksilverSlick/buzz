@@ -5282,34 +5282,11 @@ fn dispatch_pending(
     dispatched_channels
 }
 
-/// Returns `true` when `error` is a non-retryable authentication failure.
-///
-/// Retrying auth errors is harmful: the token won't self-repair between
-/// attempts, so each retry wastes an attempt slot, delays the visible failure,
-/// and burns the user's context window. Dead-letter immediately and surface a
-/// re-authentication hint instead.
-///
-/// # Classification rationale
-///
-/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
-/// surfaced from the upstream CLI. Two narrow patterns reliably identify
-/// non-transient auth failures observed in the field:
-///
-/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
-///   expired ("OAuth access token has expired. Re-authenticate to continue.").
-///   Specific to the auth-expiry flow; does not appear in unrelated errors.
-/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
-///   the standard auth-failure status and does not arise from network blips.
-///
-/// False positives (misclassifying a transient error as non-retryable) silently
-/// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
-fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
-        return false;
-    };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
-}
+// A lost sign-in is now one of `factory::classify`'s classes
+// (`factory::AUTH_PREFIXES`), which anchors the same two field patterns to the
+// provider's own opening words instead of searching the whole message for
+// them. Its retry rationale is unchanged: the token will not self-repair
+// between attempts, so the work is parked for the owner rather than retried.
 
 /// Thread placement for a batch's terminal failure notice.
 ///
@@ -5709,7 +5686,7 @@ fn handle_prompt_result(
                 }
             } else if matches!(
                 &result.outcome,
-                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
+                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message, .. })
                     if message.contains("model not found")
             ) {
                 // Retrying the same missing model cannot repair its configuration.
@@ -13494,57 +13471,41 @@ mod error_outcome_emission_tests {
         assert!(respawn_tasks.is_empty());
     }
 
-    // ── is_auth_error classification ───────────────────────────────────────
+    // ── lost-sign-in classification ────────────────────────────────────────
 
+    /// The cases `is_auth_error` used to pin, now through the one classifier
+    /// that decides what a failed turn means: both field texts are a lost
+    /// sign-in, and nothing else is — a transport failure and a usage-credit
+    /// error must not be, since a wrong sign-in verdict parks a request for
+    /// the owner instead of retrying it.
     #[test]
-    fn is_auth_error_matches_reauthenticate_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "Re-authenticate variant must be classified as auth error"
-        );
-    }
-
-    #[test]
-    fn is_auth_error_matches_401_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "API Error: 401 variant must be classified as auth error"
-        );
-    }
-
-    #[test]
-    fn is_auth_error_rejects_other_agent_error_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32601,
-            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
-        };
-        assert!(
-            !is_auth_error(&e),
-            "usage-credit error must NOT be classified as auth error"
-        );
-    }
-
-    #[test]
-    fn is_auth_error_rejects_transport_errors() {
-        let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
-        assert!(
-            !is_auth_error(&io),
-            "I/O error must not be classified as auth error"
-        );
-        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
-        assert!(
-            !is_auth_error(&timeout),
-            "WriteTimeout must not be classified as auth error"
-        );
+    fn a_lost_sign_in_is_classified_from_the_providers_opening_words() {
+        let now = chrono::Utc::now();
+        for message in [
+            "API Error: OAuth access token has expired. Re-authenticate to continue.",
+            "Internal error: API Error: 401 OAuth access token has expired.",
+        ] {
+            assert_eq!(
+                factory::classify(&agent_error(message), now).class,
+                factory::Class::SignIn,
+                "{message}"
+            );
+        }
+        for error in [
+            agent_error("Usage credits required for 1M context — turn on usage credits"),
+            acp::AcpError::Io(std::io::Error::other("pipe broke")),
+            acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5)),
+            // The words quoted mid-message are a tool's output, not a 401.
+            agent_error(
+                "Internal error: the test asserted \"API Error: 401\" and Re-authenticate",
+            ),
+        ] {
+            assert_eq!(
+                factory::classify(&error, now).class,
+                factory::Class::Other,
+                "{error:?}"
+            );
+        }
     }
 
     // ── limit and sign-in parking ──────────────────────────────────────────
@@ -13628,10 +13589,14 @@ mod error_outcome_emission_tests {
     }
 
     fn agent_error(message: &str) -> acp::AcpError {
-        acp::AcpError::AgentError {
-            code: -32603,
-            message: message.to_string(),
-        }
+        acp::AcpError::agent_error(-32603, message)
+    }
+
+    /// The error as the read loop builds it from the adapter's JSON-RPC
+    /// error object, so a case that depends on `data.errorKind` or
+    /// `data.codexErrorInfo` really carries that field.
+    fn adapter_error(error: serde_json::Value) -> acp::AcpError {
+        acp::agent_error_from_json(&error)
     }
 
     /// A limit or lost sign-in parks the batch even with the retry budget
@@ -13641,16 +13606,36 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn limit_errors_park_without_spending_the_retry_budget() {
         // The dot turns away while work waits; one short rate limit only slows it.
-        for (message, presence) in [
-            ("Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)", "away"),
-            ("Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage", "away"),
-            ("Internal error: API Error: This request would exceed your account's rate limit. Please try again later.", "online"),
-            ("Internal error: You've hit your usage limit. (codexErrorInfo: usageLimitExceeded)", "away"),
-            ("API Error: 401 OAuth access token has expired. Re-authenticate to continue.", "away"),
+        for (error, presence) in [
+            (
+                adapter_error(serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "data": {"errorKind": "rate_limit"}})),
+                "away",
+            ),
+            (
+                agent_error("Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage"),
+                "away",
+            ),
+            (
+                agent_error("Internal error: API Error: This request would exceed your account's rate limit. Please try again later."),
+                "online",
+            ),
+            (
+                adapter_error(serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "You've hit your usage limit.",
+                             "codexErrorInfo": "usageLimitExceeded"}})),
+                "away",
+            ),
+            (
+                agent_error("API Error: 401 OAuth access token has expired. Re-authenticate to continue."),
+                "away",
+            ),
         ] {
+            let message = error.to_string();
             let config = test_config();
             let (mut queue, channel_id, mut pool, respawn_tasks) =
-                run_failed_turn(&config, agent_error(message), crate::queue::MAX_RETRIES).await;
+                run_failed_turn(&config, error, crate::queue::MAX_RETRIES).await;
             assert_eq!(queue.queued_event_count(channel_id), 1, "{message}: kept");
             assert!(!queue.has_flushable_work(), "{message}: parked, not due yet");
             assert!(queue.next_retry_deadline().is_some(), "{message}: wakes up");
@@ -13790,11 +13775,10 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
-        let auth_error = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: 401 OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
+        let auth_error = acp::AcpError::agent_error(
+            -32000,
+            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+        );
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -13890,10 +13874,7 @@ mod error_outcome_emission_tests {
         };
 
         let raw_error = r#"llm model not found: (gpt-6-astra) 404 Not Found: {"error_code":"NOT_FOUND","message":"'gpt-6-astra' does not exist."}"#;
-        let model_error = AcpError::AgentError {
-            code: -32002,
-            message: raw_error.to_string(),
-        };
+        let model_error = AcpError::agent_error(-32002, raw_error);
         let expected_error = model_error.to_string();
         let observer = ObserverHandle::in_process();
 
@@ -14134,19 +14115,19 @@ mod error_outcome_emission_tests {
     /// standard requeue path so today's behavior is unchanged.
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32000,
-            message: "Usage credits required for 1M context".to_string(),
-        })
+        assert_application_error_is_requeued(acp::AcpError::agent_error(
+            -32000,
+            "Usage credits required for 1M context",
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn non_model_resource_not_found_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32002,
-            message: "Resource not found: session no longer exists".to_string(),
-        })
+        assert_application_error_is_requeued(acp::AcpError::agent_error(
+            -32002,
+            "Resource not found: session no longer exists",
+        ))
         .await;
     }
 

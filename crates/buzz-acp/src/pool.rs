@@ -9557,10 +9557,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         for (signal, expected_reason) in cases {
             let completed = classify_completed_before_control_signal(
                 &ctx,
-                Some(AcpError::AgentError {
-                    code: -32000,
-                    message: "the agent failed the turn".into(),
-                }),
+                Some(AcpError::agent_error(-32000, "the agent failed the turn")),
                 signal.clone(),
                 Some(one_event_batch(Uuid::new_v4())),
             );
