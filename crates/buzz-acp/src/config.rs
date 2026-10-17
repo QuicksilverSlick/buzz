@@ -401,6 +401,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
 
+    /// Claude only: an ordered, `;`-separated pool of `CLAUDE_CONFIG_DIR`
+    /// folders, each signed in to its own subscription (first = primary).
+    /// On a usage or spend limit the agent restarts on the next free login
+    /// and re-runs the same request; it returns to the primary after its
+    /// reset.
+    #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
+    pub claude_account_pool: Option<String>,
+
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
@@ -1190,6 +1198,10 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
+        let factory = crate::factory::FactoryHandle::new(crate::factory::Factory::new(
+            args.claude_account_pool.as_deref(),
+            &agent_command,
+        ));
 
         let config = Config {
             capabilities,
@@ -1246,7 +1258,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
-            factory: Default::default(),
+            factory,
         };
 
         Ok(config)

@@ -3334,11 +3334,14 @@ async fn run_harness(
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
+                let launch_env = config.factory.lock().launch_env(idx, chrono::Utc::now());
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, idx, observer)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -5500,6 +5503,9 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    // Set when a limit handed the batch to another login of the account pool:
+    // the agent restarts on it instead of returning to the pool.
+    let mut restart_on_next_login = false;
     let now = chrono::Utc::now();
     let failure = match &result.outcome {
         PromptOutcome::Error(e) => Some(factory::classify(e, now)),
@@ -5588,21 +5594,49 @@ fn handle_prompt_result(
             } else if let Some(failure) = failure.as_ref().filter(|f| f.class.parks()) {
                 // A usage, spend or rate limit, or a lost sign-in: retrying
                 // cannot fix it and the 10-retry budget would drop the request
-                // long before a weekly limit resets. Park it instead — never
-                // counted, never dropped — and tell the thread once, plainly.
-                let (wait, line) = config.factory.lock().park(&batch.scope, failure, now);
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    class = failure.slug,
-                    provider_text = %failure.text,
-                    wait_secs = wait.as_secs(),
-                    "provider limit — parking batch"
-                );
-                if let Some(line) = line {
-                    spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                // long before a weekly limit resets. Hand it to another login
+                // of the account pool, or park it — never counted, never
+                // dropped — and tell the thread once, plainly.
+                let (plan, account) = {
+                    let mut factory = config.factory.lock();
+                    let account = factory.label(agent_index).to_string();
+                    (
+                        factory.plan(agent_index, &batch.scope, failure, now),
+                        account,
+                    )
+                };
+                match plan {
+                    factory::Plan::HandOff { label, line } => {
+                        tracing::warn!(
+                            channel_id = %batch.channel_id,
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            next_account = %label,
+                            "provider limit — handing batch to the next login"
+                        );
+                        if let Some(line) = line {
+                            spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                        }
+                        queue.requeue_preserve_timestamps(batch);
+                        restart_on_next_login = true;
+                    }
+                    factory::Plan::Park { wait, line } => {
+                        tracing::warn!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            wait_secs = wait.as_secs(),
+                            "provider limit — parking batch"
+                        );
+                        if let Some(line) = line {
+                            spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                        }
+                        queue.park(batch, std::time::Instant::now() + wait);
+                    }
                 }
-                queue.park(batch, std::time::Instant::now() + wait);
             } else if matches!(
                 &result.outcome,
                 PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
@@ -5716,8 +5750,35 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
-            config.factory.lock().on_success();
-            pool.return_agent(result.agent);
+            let back_to_primary = {
+                let mut factory = config.factory.lock();
+                factory.on_success(agent_index);
+                factory.wants_restart(agent_index, now)
+            };
+            if back_to_primary {
+                // An earlier login of the pool (the primary, after its reset)
+                // is free again: restart there between turns.
+                tracing::info!(
+                    agent = agent_index,
+                    "returning to the account pool's preferred login"
+                );
+                let index = result.agent.index;
+                if !spawn_respawn_task(
+                    result.agent,
+                    config,
+                    &mut crash_history[index],
+                    respawn_tx,
+                    respawn_tasks,
+                    observer,
+                ) && pool.live_count() == 0
+                    && !any_respawn_in_flight(crash_history)
+                {
+                    tracing::error!("all agents dead — exiting");
+                    return LoopAction::Exit;
+                }
+            } else {
+                pool.return_agent(result.agent);
+            }
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
@@ -5848,14 +5909,19 @@ fn handle_prompt_result(
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
             };
-            if is_transport_error {
+            if is_transport_error || restart_on_next_login {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
                     error = %e,
-                    "transport/protocol error — respawning agent"
+                    "{}",
+                    if is_transport_error {
+                        "transport/protocol error — respawning agent"
+                    } else {
+                        "provider limit — restarting agent on the next login"
+                    }
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
@@ -5994,13 +6060,14 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let launch_env = config.factory.lock().launch_env(i, chrono::Utc::now());
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -6248,6 +6315,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let launch_env = config.factory.lock().launch_env(index, chrono::Utc::now());
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6259,7 +6327,8 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -6305,11 +6374,13 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
+        let launch_env = startup.factory.lock().launch_env(i, chrono::Utc::now());
+        let spawn_result = AcpClient::spawn_with_env(
             &startup.command,
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
+            &launch_env,
         )
         .await;
         match spawn_result {
@@ -6412,13 +6483,20 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
+    launch_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let mut acp = AcpClient::spawn_with_env(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        launch_env,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -13499,6 +13577,41 @@ mod error_outcome_emission_tests {
             assert!(pool.agents_mut()[0].is_some(), "{message}: agent stays");
             assert!(respawn_tasks.is_empty());
         }
+    }
+
+    /// With an account pool, a weekly limit on the primary re-runs the same
+    /// batch at once: it stays queued and due, and the agent restarts on the
+    /// second login.
+    #[tokio::test]
+    async fn limit_on_the_primary_reruns_the_same_batch_on_the_next_login() {
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let weekly =
+            "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)";
+        let (mut queue, channel_id, mut pool, respawn_tasks) =
+            run_failed_turn(&config, agent_error(weekly), crate::queue::MAX_RETRIES).await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "the same request");
+        assert!(queue.has_flushable_work(), "runs again now, not parked");
+        assert!(pool.agents_mut()[0].is_none(), "the agent restarts");
+        assert_eq!(respawn_tasks.len(), 1);
+        assert_eq!(config.factory.lock().label(0), "two");
+
+        // A sign-in loss with the same pool parks; it never rotates.
+        let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
+            &config,
+            agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            0,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(!queue.has_flushable_work());
+        assert!(pool.agents_mut()[0].is_some());
+        assert!(respawn_tasks.is_empty());
     }
 
     /// An ordinary error still spends the budget and is dropped at the end.

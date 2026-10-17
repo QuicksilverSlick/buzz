@@ -6,7 +6,7 @@
 //! dropping the request. Code sets these states, never an LLM: an agent that
 //! is out of quota cannot report its own outage.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -393,42 +393,233 @@ pub(crate) fn pause_line(failure: &Failure, resumes: DateTime<Utc>) -> String {
     }
 }
 
+/// The thread line when the work moves to another login of the pool.
+pub(crate) fn hand_off_line(label: &str) -> String {
+    format!(
+        "The AI service this agent uses hit its usage limit on one login, so this request is \
+         continuing on {label}. Nothing is lost."
+    )
+}
+
+/// The env var naming a Claude agent's ordered pool of logins: `;`-separated
+/// `CLAUDE_CONFIG_DIR` folders, each signed in to its own subscription, the
+/// first one the primary.
+pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
+
+/// One login of the pool.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Account {
+    /// The `CLAUDE_CONFIG_DIR` folder. Never shown: it holds a user path.
+    dir: String,
+    /// What records and lines call it: the folder's name, never an email or a
+    /// token. `~/.buzz-agents/factory/claude` is `factory`.
+    pub label: String,
+    /// The limit this login last hit, until it lifts.
+    pub limited: Option<Limit>,
+}
+
+/// A limit one login of the pool hit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Limit {
+    pub until: DateTime<Utc>,
+    pub slug: &'static str,
+    pub text: String,
+}
+
+/// What to do with a batch that failed on a limit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Plan {
+    /// Run the same batch again at once, on another login of the pool: the
+    /// agent restarts on it, and context is rebuilt from the relay as on
+    /// every turn.
+    HandOff { label: String, line: Option<String> },
+    /// Keep the batch until `wait` has passed.
+    Park {
+        wait: Duration,
+        line: Option<String>,
+    },
+}
+
 /// Harness-wide failure state, shared through [`Config`](crate::config::Config).
 #[derive(Debug, Default)]
 pub(crate) struct Factory {
+    /// The account pool; empty when none is configured, which is exactly the
+    /// single-login behaviour.
+    accounts: Vec<Account>,
+    /// Which login each agent slot was last started on.
+    started_on: HashMap<usize, usize>,
     /// Consecutive rate-limit failures, for the backoff. A real answer clears it.
     rate_streak: u32,
-    /// Scopes already told about this pause, so a probe that fails again does
-    /// not post a second line (once per item per incident, spec 7.4).
-    told: HashSet<SessionScope>,
+    /// Scopes already told about this pause or hand-off, so a probe that fails
+    /// again does not post a second line (once per item per incident, 7.4).
+    told: HashSet<(SessionScope, bool)>,
 }
 
 impl Factory {
-    /// Park `scope` on `failure`: how long it waits, and the thread line to
-    /// post if this scope has not been told yet. Short rate limits stay quiet
-    /// until the third in a row.
-    pub(crate) fn park(
+    /// The harness's factory state. `pool` is [`ACCOUNT_POOL_ENV`]; it only
+    /// applies to the Claude adapter, whose login it switches.
+    pub(crate) fn new(pool: Option<&str>, agent_command: &str) -> Self {
+        let dirs: Vec<&str> = pool
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .collect();
+        let claude = matches!(
+            crate::config::normalize_agent_command_identity(agent_command).as_str(),
+            "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode"
+        );
+        if !dirs.is_empty() && !claude {
+            tracing::warn!("{ACCOUNT_POOL_ENV} is set but the agent is not Claude — ignoring it");
+        }
+        let accounts = dirs
+            .into_iter()
+            .filter(|_| claude)
+            .map(|dir| Account {
+                dir: dir.to_string(),
+                label: account_label(dir),
+                limited: None,
+            })
+            .collect();
+        Self {
+            accounts,
+            ..Self::default()
+        }
+    }
+
+    /// The first login not known to be limited.
+    fn preferred(&self, now: DateTime<Utc>) -> Option<usize> {
+        self.accounts
+            .iter()
+            .position(|a| a.limited.as_ref().is_none_or(|l| l.until <= now))
+    }
+
+    /// Env for starting agent `slot`: the preferred login's folder, and an
+    /// empty `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
+    /// folder's own login. Empty without a pool. When every login is limited
+    /// it starts on the one that frees up first.
+    pub(crate) fn launch_env(&mut self, slot: usize, now: DateTime<Utc>) -> Vec<(String, String)> {
+        let Some(soonest) = (0..self.accounts.len())
+            .min_by_key(|&i| self.accounts[i].limited.as_ref().map(|l| l.until))
+        else {
+            return Vec::new();
+        };
+        let i = self.preferred(now).unwrap_or(soonest);
+        self.started_on.insert(slot, i);
+        vec![
+            ("CLAUDE_CONFIG_DIR".into(), self.accounts[i].dir.clone()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
+        ]
+    }
+
+    /// The label of the login `slot` runs on; `default` without a pool.
+    pub(crate) fn label(&self, slot: usize) -> &str {
+        self.started_on
+            .get(&slot)
+            .and_then(|&i| self.accounts.get(i))
+            .map_or("default", |a| &a.label)
+    }
+
+    /// Decide what happens to `scope`'s batch after agent `slot` failed on
+    /// `failure`. A usage or spend limit marks the slot's login limited and
+    /// hands the batch to the next free login; with no pool, or every login
+    /// limited, the batch parks until the first one frees up. Other limits
+    /// never rotate. Each scope is told once per incident; short rate limits
+    /// stay quiet until the third in a row.
+    pub(crate) fn plan(
         &mut self,
+        slot: usize,
         scope: &SessionScope,
         failure: &Failure,
         now: DateTime<Utc>,
-    ) -> (Duration, Option<String>) {
+    ) -> Plan {
         if failure.class == Class::RateLimit {
             self.rate_streak += 1;
         }
-        let wait = park_for(failure, now, self.rate_streak);
+        let mut wait = park_for(failure, now, self.rate_streak);
+        if matches!(failure.class, Class::UsageLimit | Class::SpendCap) && !self.accounts.is_empty()
+        {
+            let on = self.started_on.get(&slot).copied().unwrap_or(0);
+            self.accounts[on].limited = Some(Limit {
+                until: now + chrono::Duration::from_std(wait).unwrap_or_default(),
+                slug: failure.slug,
+                text: failure.text.clone(),
+            });
+            if let Some(next) = self.preferred(now) {
+                let label = self.accounts[next].label.clone();
+                let line = self
+                    .told
+                    .insert((scope.clone(), true))
+                    .then(|| hand_off_line(&label));
+                return Plan::HandOff { label, line };
+            }
+            wait = self
+                .accounts
+                .iter()
+                .filter_map(|a| a.limited.as_ref())
+                .filter_map(|l| (l.until - now).to_std().ok())
+                .min()
+                .unwrap_or(wait);
+        }
         let worth_a_line = failure.class != Class::RateLimit || self.rate_streak >= 3;
-        let line = (worth_a_line && self.told.insert(scope.clone())).then(|| {
+        let line = (worth_a_line && self.told.insert((scope.clone(), false))).then(|| {
             let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
             pause_line(failure, resumes)
         });
-        (wait, line)
+        Plan::Park { wait, line }
     }
 
-    /// A real answer ends the incident.
-    pub(crate) fn on_success(&mut self) {
+    /// A real answer from agent `slot` ends the incident and proves its login.
+    pub(crate) fn on_success(&mut self, slot: usize) {
         self.rate_streak = 0;
         self.told.clear();
+        if let Some(&i) = self.started_on.get(&slot) {
+            self.accounts[i].limited = None;
+        }
+    }
+
+    /// Whether agent `slot` should restart on another login now: a login
+    /// earlier in the pool (the primary, after its reset) is free again.
+    pub(crate) fn wants_restart(&self, slot: usize, now: DateTime<Utc>) -> bool {
+        match (self.preferred(now), self.started_on.get(&slot)) {
+            (Some(p), Some(&on)) => p != on,
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+}
+
+/// A pool folder's name for records: the last path component, or its parent
+/// when that is just `claude` / `.claude`. Lower-case `[a-z0-9-]` only.
+fn account_label(dir: &str) -> String {
+    let mut parts = dir
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .filter(|p| !p.is_empty());
+    let last = parts.next().unwrap_or("account");
+    let name = match last.to_ascii_lowercase().as_str() {
+        "claude" | ".claude" => parts.next().unwrap_or(last),
+        _ => last,
+    };
+    let label: String = name
+        .trim_start_matches('.')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if label.is_empty() {
+        "account".to_string()
+    } else {
+        label
     }
 }
 
@@ -437,6 +628,10 @@ impl Factory {
 pub(crate) struct FactoryHandle(Arc<Mutex<Factory>>);
 
 impl FactoryHandle {
+    pub(crate) fn new(factory: Factory) -> Self {
+        Self(Arc::new(Mutex::new(factory)))
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, Factory> {
         self.0
             .lock()
@@ -697,30 +892,178 @@ mod tests {
     #[test]
     fn factory_tells_each_scope_once_per_incident() {
         let mut factory = Factory::default();
-        let scope = SessionScope::Conversation {
-            channel_id: uuid::Uuid::new_v4(),
+        let scope = scope();
+        let weekly = weekly();
+        let Plan::Park { line, .. } = factory.plan(0, &scope, &weekly, oct16()) else {
+            panic!("no pool parks");
         };
-        let weekly = classify(
-            &agent_error("Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)"),
-            oct16(),
-        );
-        let (_, first) = factory.park(&scope, &weekly, oct16());
-        let line = first.expect("first park posts a line");
+        let line = line.expect("first park posts a line");
         assert_eq!(
             line,
             "Paused: the AI service this agent uses hit its usage limit. Your request is saved and \
              nothing is lost. It resumes about Sun 18 Oct 7:02 PM CT."
         );
         assert!(!line.contains("weekly limit"), "D8: no provider wording");
-        assert_eq!(factory.park(&scope, &weekly, oct16()).1, None);
-        factory.on_success();
-        assert!(factory.park(&scope, &weekly, oct16()).1.is_some());
+        assert_eq!(park_line(&mut factory, &weekly), None);
+        factory.on_success(0);
+        assert!(park_line(&mut factory, &weekly).is_some());
 
         // Short rate limits stay quiet until the third in a row.
         let mut factory = Factory::default();
         let rate = classify(&agent_error("Internal error: API Error: 429"), oct16());
-        assert_eq!(factory.park(&scope, &rate, oct16()).1, None);
-        assert_eq!(factory.park(&scope, &rate, oct16()).1, None);
-        assert!(factory.park(&scope, &rate, oct16()).1.is_some());
+        assert_eq!(park_line(&mut factory, &rate), None);
+        assert_eq!(park_line(&mut factory, &rate), None);
+        assert!(park_line(&mut factory, &rate).is_some());
+    }
+
+    fn scope() -> SessionScope {
+        SessionScope::Conversation {
+            channel_id: uuid::Uuid::from_u128(7),
+        }
+    }
+
+    fn weekly() -> Failure {
+        classify(
+            &agent_error("Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)"),
+            oct16(),
+        )
+    }
+
+    fn park_line(factory: &mut Factory, failure: &Failure) -> Option<String> {
+        match factory.plan(0, &scope(), failure, oct16()) {
+            Plan::Park { line, .. } => line,
+            other => panic!("expected a park, got {other:?}"),
+        }
+    }
+
+    const POOL: &str = r"C:\Users\PC owner\.buzz-agents\factory\claude; C:\Users\PC owner\.buzz-agents\account-test\claude ;";
+
+    fn pool() -> Factory {
+        Factory::new(Some(POOL), "claude-agent-acp")
+    }
+
+    fn env(dir: &str) -> Vec<(String, String)> {
+        vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new()),
+        ]
+    }
+
+    const FACTORY_DIR: &str = r"C:\Users\PC owner\.buzz-agents\factory\claude";
+    const SECOND_DIR: &str = r"C:\Users\PC owner\.buzz-agents\account-test\claude";
+
+    #[test]
+    fn pool_parses_folders_and_labels_them_by_name() {
+        let factory = pool();
+        let labels: Vec<_> = factory
+            .accounts()
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        assert_eq!(labels, ["factory", "account-test"]);
+        assert_eq!(account_label("/home/me/.claude"), "me");
+        assert_eq!(account_label("/srv/Claude Two/"), "claude-two");
+        // Only the Claude adapter switches logins.
+        assert!(Factory::new(Some(POOL), "codex-acp").accounts().is_empty());
+        let mut none = Factory::new(None, "claude-agent-acp");
+        assert!(
+            none.launch_env(0, oct16()).is_empty(),
+            "no pool: today's env"
+        );
+        assert_eq!(none.label(0), "default");
+    }
+
+    /// A weekly limit on the primary hands the same batch to the second
+    /// login, whose folder login is used (empty PC-wide token).
+    #[test]
+    fn limit_on_the_primary_hands_off_to_the_next_login() {
+        let mut factory = pool();
+        assert_eq!(factory.launch_env(0, oct16()), env(FACTORY_DIR));
+        let plan = factory.plan(0, &scope(), &weekly(), oct16());
+        let Plan::HandOff { label, line } = plan else {
+            panic!("expected a hand-off, got {plan:?}");
+        };
+        assert_eq!(label, "account-test");
+        let line = line.expect("the thread is told once");
+        assert_eq!(
+            line,
+            "The AI service this agent uses hit its usage limit on one login, so this request is \
+             continuing on account-test. Nothing is lost."
+        );
+        assert!(!line.contains("Users"), "no folder paths");
+        // The restart lands on the second login, and the primary's limit is kept.
+        assert_eq!(factory.launch_env(0, oct16()), env(SECOND_DIR));
+        assert_eq!(factory.label(0), "account-test");
+        let limit = factory.accounts()[0].limited.clone().unwrap();
+        assert_eq!(limit.slug, "weekly_limit");
+        assert_eq!(limit.until, at(2026, 10, 19, 0, 2));
+        assert_eq!(
+            limit.text,
+            "You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)"
+        );
+    }
+
+    #[test]
+    fn every_login_limited_parks_until_the_first_frees_up() {
+        let mut factory = pool();
+        factory.launch_env(0, oct16());
+        factory.plan(0, &scope(), &weekly(), oct16());
+        factory.launch_env(0, oct16());
+        let spend = classify(
+            &agent_error("Internal error: You've hit your monthly spend limit · raise it"),
+            oct16(),
+        );
+        let plan = factory.plan(0, &scope(), &spend, oct16());
+        assert_eq!(
+            plan,
+            Plan::Park {
+                wait: PROBE_EVERY,
+                line: Some(pause_line(&spend, oct16() + chrono::Duration::minutes(30))),
+            }
+        );
+        // The probe restarts on the login that frees up first: the spend cap's.
+        let later = oct16() + chrono::Duration::minutes(31);
+        assert_eq!(factory.launch_env(0, later), env(SECOND_DIR));
+    }
+
+    #[test]
+    fn rate_limits_and_sign_in_never_rotate() {
+        for message in [
+            "Internal error: API Error: 429",
+            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+        ] {
+            let mut factory = pool();
+            factory.launch_env(0, oct16());
+            let failure = classify(&agent_error(message), oct16());
+            assert!(
+                matches!(
+                    factory.plan(0, &scope(), &failure, oct16()),
+                    Plan::Park { .. }
+                ),
+                "{message}"
+            );
+            assert!(factory.accounts().iter().all(|a| a.limited.is_none()));
+            assert_eq!(factory.launch_env(0, oct16()), env(FACTORY_DIR));
+        }
+    }
+
+    #[test]
+    fn returns_to_the_primary_after_its_reset() {
+        let mut factory = pool();
+        factory.launch_env(0, oct16());
+        factory.plan(0, &scope(), &weekly(), oct16());
+        factory.launch_env(0, oct16());
+        factory.on_success(0);
+        assert!(
+            !factory.wants_restart(0, oct16()),
+            "the primary is still limited"
+        );
+        let after_reset = at(2026, 10, 19, 0, 3);
+        assert!(factory.wants_restart(0, after_reset));
+        assert_eq!(factory.launch_env(0, after_reset), env(FACTORY_DIR));
+        assert!(!factory.wants_restart(0, after_reset));
+        // A real answer on a login clears its record.
+        factory.on_success(0);
+        assert!(factory.accounts()[0].limited.is_none());
     }
 }

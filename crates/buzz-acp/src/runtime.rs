@@ -57,6 +57,8 @@ pub(crate) struct PoolStartup {
     pub(crate) model: Option<String>,
     pub(crate) effort_level: Option<String>,
     pub(crate) observer: Option<observer::ObserverHandle>,
+    /// Picks each slot's login from the account pool.
+    pub(crate) factory: crate::factory::FactoryHandle,
 }
 
 impl PoolStartup {
@@ -70,6 +72,7 @@ impl PoolStartup {
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
+            factory: config.factory.clone(),
         }
     }
 }
