@@ -153,6 +153,28 @@ export function useChannelLinks() {
     setChannelSelectedIndex(0);
   }, []);
 
+  /**
+   * Whether the list is open for the latest text. While the query debounce is
+   * pending the list can still show a query the user has typed past; close it
+   * so Enter/Tab reach the composer instead of overwriting the newer text.
+   */
+  const revalidateOpen = React.useCallback(() => {
+    if (!isChannelOpen) return false;
+    if (
+      debounceTimerRef.current === null ||
+      detectPrefixQuery(
+        "#",
+        latestValueRef.current,
+        latestCursorRef.current,
+        knownNamesLowerRef.current,
+      )
+    ) {
+      return true;
+    }
+    clearChannels();
+    return false;
+  }, [clearChannels, isChannelOpen]);
+
   const handleChannelKeyDown = React.useCallback(
     (
       event: React.KeyboardEvent,
@@ -216,6 +238,7 @@ export function useChannelLinks() {
     insertChannel,
     isChannelOpen,
     knownChannelNames,
+    revalidateOpen,
     updateChannelQuery,
   };
 }

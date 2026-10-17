@@ -4576,6 +4576,46 @@ test("keyboard navigation selects mention with Enter", async ({ page }) => {
   await expect(input).toHaveText("@bob ");
 });
 
+test("Enter after typing past an open mention sends the typed text", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("@bo");
+  await expect(autocomplete(page).getByText("bob")).toBeVisible();
+
+  // Faster than the query debounce: the list still shows "bob" when Enter
+  // lands, but the text no longer holds an `@` query to complete.
+  const typed = ` thanks ${Date.now()}`;
+  await input.pressSequentially(typed);
+  await input.press("Enter");
+
+  await expect(input).toBeEmpty();
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    `@bo${typed}`,
+  );
+});
+
+test("Enter picks an open channel suggestion", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("see #genera");
+  await expect(
+    page
+      .getByTestId("message-composer")
+      .getByRole("button", { name: "#general" }),
+  ).toBeVisible();
+  await input.press("Enter");
+
+  await expect(input).toHaveText("see #general ");
+});
+
 test("Escape dismisses autocomplete dropdown", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();

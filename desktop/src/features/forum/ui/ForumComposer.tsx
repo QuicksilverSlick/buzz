@@ -446,6 +446,15 @@ function ForumComposerVisit({
   );
 
   // ── Keyboard handling ───────────────────────────────────────────────
+  // Capture phase, before the Enter (submit) binding: see MessageComposer.
+  const handleEditorKeyDownCapture = React.useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Enter" && event.key !== "Tab") return;
+      const open = [mentions.revalidateOpen(), channelLinks.revalidateOpen()];
+      isAutocompleteOpenRef.current = open.some(Boolean);
+    },
+    [mentions.revalidateOpen, channelLinks.revalidateOpen],
+  );
   const handleEditorKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       const channelResult = channelLinks.handleChannelKeyDown(event);
@@ -692,6 +701,7 @@ function ForumComposerVisit({
             <div
               className="rich-text-composer max-h-32 overflow-y-auto"
               onKeyDown={handleEditorKeyDown}
+              onKeyDownCapture={handleEditorKeyDownCapture}
             >
               <EditorContent editor={richText.editor} />
             </div>

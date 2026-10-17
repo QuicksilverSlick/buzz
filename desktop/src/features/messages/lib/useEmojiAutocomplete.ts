@@ -214,6 +214,19 @@ export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
     setSuggestions([]);
   }, []);
 
+  /** Whether the list is open for the latest text: see useChannelLinks. */
+  const revalidateOpen = React.useCallback(() => {
+    if (!isEmojiAutocompleteOpen) return false;
+    if (
+      debounceTimerRef.current === null ||
+      detectEmojiQuery(latestValueRef.current, latestCursorRef.current)
+    ) {
+      return true;
+    }
+    clearEmojis();
+    return false;
+  }, [clearEmojis, isEmojiAutocompleteOpen]);
+
   const handleEmojiKeyDown = React.useCallback(
     (
       event: React.KeyboardEvent,
@@ -274,6 +287,7 @@ export function useEmojiAutocomplete(customEmoji: CustomEmoji[] = []) {
     handleEmojiKeyDown,
     insertEmoji,
     isEmojiAutocompleteOpen,
+    revalidateOpen,
     updateEmojiQuery,
   };
 }

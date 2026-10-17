@@ -832,6 +832,27 @@ export function useMentions(
       setSelectedNames: setSelectedMentionNames,
       setSelectedAgentNames: setSelectedAgentMentionNames,
     });
+  /**
+   * Whether the list is open for the latest text: see useChannelLinks. A
+   * picker opened from the mention button has no `@` query and stays open.
+   */
+  const revalidateOpen = React.useCallback(() => {
+    if (!isMentionOpen) return false;
+    if (
+      debounceTimerRef.current === null ||
+      mentionPickerOriginRef.current === "explicit" ||
+      detectPrefixQuery(
+        "@",
+        latestValueRef.current,
+        latestCursorRef.current,
+        searchableNamesLowerRef.current,
+      )
+    ) {
+      return true;
+    }
+    cancelMentionAutocomplete();
+    return false;
+  }, [cancelMentionAutocomplete, isMentionOpen]);
   const handleMentionKeyDown = React.useCallback(
     (
       event: React.KeyboardEvent,
@@ -950,6 +971,7 @@ export function useMentions(
     openMentionPicker,
     registerMentionPubkey,
     restoreDraftMentionRefs,
+    revalidateOpen,
     settlePendingMentionBindings: pasteBinding.settlePendingMentionBindings,
     suggestions,
     fetchMoreSuggestions,

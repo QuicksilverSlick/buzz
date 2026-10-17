@@ -719,6 +719,25 @@ function MessageComposerImpl({
     },
     [submitMessage],
   );
+  // Capture phase: runs before ProseMirror's Enter (submit) binding reads
+  // isAutocompleteOpenRef, so a list left on a query the user typed past
+  // cannot claim Enter/Tab and overwrite the newer text.
+  const handleEditorKeyDownCapture = React.useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Enter" && event.key !== "Tab") return;
+      const open = [
+        mentions.revalidateOpen(),
+        channelLinks.revalidateOpen(),
+        emojiAutocomplete.revalidateOpen(),
+      ];
+      isAutocompleteOpenRef.current = open.some(Boolean);
+    },
+    [
+      mentions.revalidateOpen,
+      channelLinks.revalidateOpen,
+      emojiAutocomplete.revalidateOpen,
+    ],
+  );
   // Tiptap handles formatting shortcuts (⌘B, ⌘I, etc.) natively.
   // Plain Enter → submit is now handled inside the Tiptap `submitOnEnter`
   // extension (fires before ProseMirror's splitBlock). This wrapper only
@@ -949,6 +968,7 @@ function MessageComposerImpl({
               data-testid="message-input-scroll"
               ref={composerScrollRef}
               onKeyDown={handleEditorKeyDown}
+              onKeyDownCapture={handleEditorKeyDownCapture}
             >
               <EditorContent editor={richText.editor} />
             </div>
