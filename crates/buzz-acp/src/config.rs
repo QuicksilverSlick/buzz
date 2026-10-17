@@ -414,6 +414,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_FACTORY_CHANNEL")]
     pub factory_channel: Option<String>,
 
+    /// The Bench folder whose inbox gets the owner's Critical cards (spend
+    /// cap, lost sign-in, dropped request). Default `~/.dreamforge/bench`;
+    /// no cards are written while the folder does not exist.
+    #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
+    pub factory_bench_dir: Option<PathBuf>,
+
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
@@ -1220,6 +1226,13 @@ impl Config {
                 }
                 parsed
             }),
+            bench: args
+                .factory_bench_dir
+                .or_else(|| {
+                    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+                    home.map(|h| PathBuf::from(h).join(".dreamforge").join("bench"))
+                })
+                .filter(|dir| dir.is_dir()),
         };
         let factory = crate::factory::FactoryHandle::new(factory);
 

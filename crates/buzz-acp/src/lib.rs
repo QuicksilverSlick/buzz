@@ -5479,6 +5479,16 @@ fn retries_spent_notice(outcome: &PromptOutcome) -> String {
     )
 }
 
+/// The owner's Critical card for a request the harness gave up on.
+fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
+    if let Some(last) = batch.events.last() {
+        config
+            .factory
+            .lock()
+            .dropped(batch.channel_id, &last.event.id.to_hex(), why);
+    }
+}
+
 /// Log the STATE record when the harness's health changed, and post it to
 /// #factory when one is configured (spec 4.2). Never into a work thread.
 fn report_factory_state(config: &Config, rest: &relay::RestClient) {
@@ -5563,6 +5573,11 @@ fn handle_prompt_result(
     if let Some(f) = failure.as_ref().filter(|f| !f.class.parks()) {
         config.factory.lock().on_error(agent_index, f, now);
     }
+    // Why a request was given up on, for the owner's card: the provider's
+    // (scrubbed) words, or the state for a timeout or a crash.
+    let why = failure
+        .as_ref()
+        .map_or_else(|| failure_reason_text(&result.outcome), |f| f.text.clone());
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -5615,6 +5630,7 @@ fn handle_prompt_result(
                     content,
                     owner_mentions(config.agent_owner.as_deref()),
                 );
+                card_dropped(config, &batch, &why);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -5640,6 +5656,7 @@ fn handle_prompt_result(
                         content,
                         owner_mentions(config.agent_owner.as_deref()),
                     );
+                    card_dropped(config, &dead, &why);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
@@ -5712,6 +5729,7 @@ fn handle_prompt_result(
                     content,
                     owner_mentions(config.agent_owner.as_deref()),
                 );
+                card_dropped(config, &batch, &why);
             } else if let Some(dead) = queue.requeue(batch) {
                 // The raw error stays in the log above; what reaches the
                 // channel names the state, not the mechanism.
@@ -5721,6 +5739,7 @@ fn handle_prompt_result(
                     retries_spent_notice(&result.outcome),
                     owner_mentions(config.agent_owner.as_deref()),
                 );
+                card_dropped(config, &dead, &why);
             }
         } else {
             tracing::debug!(
@@ -6030,8 +6049,11 @@ fn recover_panicked_agent(
         if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
+                // panic path has no outcome to report, so no thread notice,
+                // but a dropped request still reaches the owner.
+                if let Some(dead) = queue.requeue(batch) {
+                    card_dropped(config, &dead, "the agent crashed on it every time");
+                }
                 tracing::warn!("requeued batch for panicked agent {i}");
             } else {
                 tracing::debug!(
@@ -13688,6 +13710,40 @@ mod error_outcome_emission_tests {
             "online",
             "retrying, not parked"
         );
+    }
+
+    /// A request dropped after its retries reaches the owner as a Critical
+    /// card linking it (spec 8.6).
+    #[tokio::test]
+    async fn a_dropped_request_raises_a_card() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        let (queue, channel_id, _, _) = run_failed_turn(
+            &config,
+            agent_error("Internal error: boom in /home/me/repo"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 0, "dead-lettered");
+        let inbox = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let cards: Vec<_> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(cards.len(), 1);
+        let card: serde_json::Value = serde_json::from_str(&cards[0]).unwrap();
+        assert!(card["body"]
+            .as_str()
+            .unwrap()
+            .contains("gave up on a request: boom in [path]."));
+        assert!(card["links"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("buzz://message?channel={channel_id}&id=")));
     }
 
     /// The thread is never told nothing was changed: a tool may have run

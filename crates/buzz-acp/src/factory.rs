@@ -7,6 +7,7 @@
 //! is out of quota cannot report its own outage.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -401,6 +402,45 @@ pub(crate) fn hand_off_line(label: &str) -> String {
     )
 }
 
+/// Whether `s` passes the Bench's card text rules (`bench/item.rs`
+/// `valid_text`): no control or format characters, no secret-shaped or
+/// autolink words. The Bench refuses a card that fails them, so such text is
+/// left off the card instead.
+fn card_safe(s: &str) -> bool {
+    let format_char = |c: char| {
+        (c.is_control() && c != '\n' && c != '\t')
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    };
+    let lower = s.to_lowercase();
+    // Assembled, as the Bench does, to keep the source word scan confined.
+    let encrypted = ["ncrypt", "sec1"].concat();
+    !s.chars().any(format_char)
+        && !["nsec1", "nostr:", "www.", encrypted.as_str()]
+            .iter()
+            .any(|n| lower.contains(n))
+}
+
+/// The agent as a card names it: its display name, or its short id when the
+/// name breaks the card rules.
+fn card_name(name: &str, short: &str) -> String {
+    if card_safe(name) { name } else { short }.to_string()
+}
+
+fn card_quote(provider: &str, text: &str) -> String {
+    if card_safe(text) {
+        format!("{provider} said: \"{text}\".")
+    } else {
+        format!("{provider}'s words can't be shown here; they are in the agent log.")
+    }
+}
+
 /// The env var naming a Claude agent's ordered pool of logins: `;`-separated
 /// `CLAUDE_CONFIG_DIR` folders, each signed in to its own subscription, the
 /// first one the primary.
@@ -463,8 +503,10 @@ const RECORD_TTL: Duration = Duration::from_secs(20 * 60);
 /// A parked state's record outlives its next try by this much, so the try
 /// can finish and refresh it.
 const RECORD_SLACK: Duration = Duration::from_secs(5 * 60);
+/// The Bench inbox folder every harness drops its cards in.
+pub(crate) const CARD_WRITER: &str = "factory";
 
-/// Who a harness speaks for in STATE records: names and ids only,
+/// Who a harness speaks for in STATE records and cards: names and ids only,
 /// never an email, a token or a path.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Reporting {
@@ -475,6 +517,9 @@ pub(crate) struct Reporting {
     /// The #factory channel STATE records are posted to; `None` logs them
     /// only.
     pub channel: Option<uuid::Uuid>,
+    /// The Bench folder cards are dropped in; `None` when the Bench never ran
+    /// on this PC, so no cards are written.
+    pub bench: Option<PathBuf>,
 }
 
 /// Harness-wide failure state, shared through [`Config`](crate::config::Config).
@@ -498,6 +543,8 @@ pub(crate) struct Factory {
     incident: Option<String>,
     /// The last record's state and expiry.
     reported: Option<(Health, DateTime<Utc>)>,
+    /// Cards dropped this incident.
+    carded: HashSet<String>,
     /// The account pool; empty when none is configured, which is exactly the
     /// single-login behaviour.
     accounts: Vec<Account>,
@@ -549,7 +596,8 @@ impl Factory {
         }
     }
 
-    /// Move to `health`. Leaving Operational opens an incident.
+    /// Move to `health`. Leaving Operational opens an incident; coming back
+    /// ends its cards' dedupe, so the next incident cards again.
     fn set_health(&mut self, health: Health, now: DateTime<Utc>) {
         if health == self.health {
             return;
@@ -559,6 +607,7 @@ impl Factory {
         }
         if health == Health::Operational {
             self.failure = None;
+            self.carded.clear();
         }
         self.since = Some(now);
         self.health = health;
@@ -654,6 +703,11 @@ impl Factory {
             _ => Health::Degraded,
         };
         self.set_health(health, now);
+        match failure.class {
+            Class::SpendCap => self.limit_card(failure, true),
+            Class::SignIn => self.limit_card(failure, false),
+            _ => {}
+        }
         Plan::Park { wait, line }
     }
 
@@ -816,6 +870,116 @@ impl Factory {
             (Health::Degraded, ..) => {
                 format!("{who} hit an error and is retrying it (up to 10 tries).")
             }
+        }
+    }
+
+    /// The spend-cap or sign-in card (spec 3.2, rows 2 and 7): the work
+    /// stopped and only the owner can lift it.
+    fn limit_card(&mut self, failure: &Failure, spend_cap: bool) {
+        let who = card_name(self.who(), &self.reporting.short);
+        let provider = self.provider_name();
+        let (what, title, then) = if spend_cap {
+            (
+                "spend-cap",
+                format!("{provider} spend cap reached"),
+                "the cap is raised",
+            )
+        } else {
+            (
+                "sign-in",
+                format!("{who} lost its {provider} sign-in"),
+                "it is signed in again",
+            )
+        };
+        // The time is in the text so a later incident is a new card, not
+        // the same Drop the Bench already holds.
+        let since = chicago_label(self.since.unwrap_or_else(Utc::now));
+        let body = format!(
+            "{who} stopped on login {} at {since}. {} Its requests are parked, not dropped.",
+            self.account(),
+            card_quote(&provider, &failure.text)
+        );
+        let links = if spend_cap && self.provider == "claude" {
+            serde_json::json!([
+                {"label": "Claude usage settings", "url": "https://claude.ai/settings/usage"}
+            ])
+        } else {
+            serde_json::json!([])
+        };
+        let wait = format!(
+            "It checks every 30 minutes and resumes by itself once {then}. Tapping Seen changes \
+             nothing else."
+        );
+        let id = format!("{}-{what}", self.reporting.short);
+        self.card(&id, &title, &body, &wait, links);
+    }
+
+    /// A dropped request is never silent (spec 8.6): a Critical card naming
+    /// why, with a link to the request. `event_id` is its last event's hex id.
+    pub(crate) fn dropped(&mut self, channel_id: uuid::Uuid, event_id: &str, why: &str) {
+        let who = card_name(self.who(), &self.reporting.short);
+        let why = if card_safe(why) {
+            why
+        } else {
+            "the reason can't be shown here; it is in the agent log"
+        };
+        let body = format!(
+            "{who} gave up on a request: {why}. The request is not saved, so whoever sent it \
+             needs to send it again. Some of the work may already be done, so check where \
+             things stand first."
+        );
+        let id = format!(
+            "{}-dropped-{}",
+            self.reporting.short,
+            event_id.get(..12).unwrap_or(event_id)
+        );
+        let link = format!("buzz://message?channel={channel_id}&id={event_id}");
+        self.card(
+            &id,
+            &format!("{who} dropped a request"),
+            &body,
+            "Nothing happens by itself: the request stays dropped.",
+            serde_json::json!([{"label": "Open request", "url": link}]),
+        );
+    }
+
+    /// Drop a Critical, needs-you card in the Bench inbox (spec 7.1) in the
+    /// Bench's drop format, once per id per incident. Written beside its name
+    /// and renamed into place, so the Bench never reads half a file.
+    fn card(
+        &mut self,
+        id: &str,
+        title: &str,
+        body: &str,
+        if_you_wait: &str,
+        links: serde_json::Value,
+    ) {
+        let Some(bench) = self.reporting.bench.clone() else {
+            return;
+        };
+        if !self.carded.insert(id.to_string()) {
+            return;
+        }
+        let drop = serde_json::json!({
+            "id": id,
+            "kind": "pending",
+            "title": title,
+            "body": body,
+            "area": CARD_WRITER,
+            "severity": "critical",
+            "options": ["Seen"],
+            "links": links,
+            "plain": {"ifYouWait": if_you_wait},
+        });
+        let dir = bench.join("inbox").join(CARD_WRITER);
+        let written = std::fs::create_dir_all(&dir).and_then(|()| {
+            let part = dir.join(format!("{id}.json.part"));
+            std::fs::write(&part, drop.to_string())?;
+            std::fs::rename(&part, dir.join(format!("{id}.json")))
+        });
+        match written {
+            Ok(()) => tracing::warn!(card = id, "factory card dropped in the Bench inbox"),
+            Err(e) => tracing::warn!(card = id, "factory card not written: {e}"),
         }
     }
 
@@ -1459,5 +1623,129 @@ mod tests {
         for secret in ["Users", "PC owner", "sk-", ".claude"] {
             assert!(!record.contains(secret), "{secret} in {record}");
         }
+    }
+
+    fn read_card(bench: &std::path::Path, id: &str) -> Option<serde_json::Value> {
+        let path = bench
+            .join("inbox")
+            .join(CARD_WRITER)
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    /// A spend cap and a lost sign-in each drop one Critical card per
+    /// incident, in the Bench's drop format, with the provider's exact words
+    /// and nothing secret; a later incident cards again.
+    #[test]
+    fn limit_cards_once_per_incident() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Support Agent");
+        f.reporting.bench = Some(bench.path().to_path_buf());
+        let spend = classify(
+            &agent_error("Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message"),
+            oct16(),
+        );
+        f.plan(0, &scope(), &spend, oct16());
+        let card = read_card(bench.path(), "ade9d0e2-spend-cap").expect("spend-cap card");
+        assert_eq!(
+            card,
+            serde_json::json!({
+                "id": "ade9d0e2-spend-cap",
+                "kind": "pending",
+                "title": "Claude spend cap reached",
+                "body": "Support Agent stopped on login default at Fri 16 Oct 11:52 AM CT. \
+                         Claude said: \"You've hit your monthly spend limit · raise it at \
+                         claude.ai/settings/usage?from=cc_cli_limit_message\". Its requests \
+                         are parked, not dropped.",
+                "area": "factory",
+                "severity": "critical",
+                "options": ["Seen"],
+                "links": [{"label": "Claude usage settings", "url": "https://claude.ai/settings/usage"}],
+                "plain": {"ifYouWait": "It checks every 30 minutes and resumes by itself once \
+                                        the cap is raised. Tapping Seen changes nothing else."},
+            })
+        );
+        // The 30-minute probe fails again: no second card.
+        std::fs::remove_file(bench.path().join("inbox/factory/ade9d0e2-spend-cap.json")).unwrap();
+        f.plan(0, &scope(), &spend, oct16() + chrono::Duration::minutes(30));
+        assert!(read_card(bench.path(), "ade9d0e2-spend-cap").is_none());
+
+        let sign_in = classify(
+            &agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            oct16(),
+        );
+        f.plan(0, &scope(), &sign_in, oct16());
+        let card = read_card(bench.path(), "ade9d0e2-sign-in").expect("sign-in card");
+        assert_eq!(card["title"], "Support Agent lost its Claude sign-in");
+        assert_eq!(card["links"], serde_json::json!([]));
+
+        // Back to Operational, then a new cap: a new card, with a new time.
+        for _ in 0..ANSWERS_TO_RECOVER {
+            f.on_success(0, oct16());
+        }
+        let later = at(2026, 10, 17, 13, 9);
+        f.plan(0, &scope(), &spend, later);
+        let card = read_card(bench.path(), "ade9d0e2-spend-cap").expect("new incident");
+        assert!(card["body"]
+            .as_str()
+            .unwrap()
+            .contains("at Sat 17 Oct 8:09 AM CT."));
+
+        // Rate limits and usage limits wait by themselves: no card.
+        let none = tempfile::tempdir().unwrap();
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting.bench = Some(none.path().to_path_buf());
+        f.plan(0, &scope(), &weekly(), oct16());
+        f.plan(
+            0,
+            &scope(),
+            &classify(&agent_error("API Error: 429"), oct16()),
+            oct16(),
+        );
+        assert!(!none.path().join("inbox").exists());
+    }
+
+    #[test]
+    fn dropped_card_links_the_request_and_never_shows_unsafe_text() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Reset Worker");
+        f.reporting.bench = Some(bench.path().to_path_buf());
+        let channel = uuid::Uuid::parse_str("6e4730e9-0000-4000-8000-000000000001").unwrap();
+        let event = "ab".repeat(32);
+        f.dropped(
+            channel,
+            &event,
+            "Internal error (the adapter gave no detail)",
+        );
+        let card = read_card(bench.path(), "ade9d0e2-dropped-abababababab").expect("card");
+        assert_eq!(card["title"], "Reset Worker dropped a request");
+        assert_eq!(card["severity"], "critical");
+        assert_eq!(
+            card["links"][0]["url"],
+            format!("buzz://message?channel={channel}&id={event}")
+        );
+        assert!(card["body"].as_str().unwrap().starts_with(
+            "Reset Worker gave up on a request: Internal error (the adapter gave no detail)."
+        ));
+
+        // Text the Bench would refuse is left off, so the card still lands.
+        f.dropped(channel, &"cd".repeat(32), "see www.example.com");
+        let card = read_card(bench.path(), "ade9d0e2-dropped-cdcdcdcdcdcd").expect("card");
+        assert!(!card["body"].as_str().unwrap().contains("www."));
+        assert!(card_safe(
+            "You've hit your weekly limit · resets Oct 18, 7pm"
+        ));
+        for bad in ["a\u{202E}b", "nostr:npub1", "key nsec1x", "tab\u{7}"] {
+            assert!(!card_safe(bad), "{bad:?}");
+        }
+
+        // No Bench on this PC: nothing is written, nothing fails.
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.dropped(channel, &event, "boom");
     }
 }
