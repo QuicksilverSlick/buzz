@@ -29,6 +29,9 @@ let createRootRoute;
 let createRouter;
 let InboxItemPreview;
 let INBOX_PREVIEW_OPEN_DELAY_MS;
+let INBOX_TYPE_META;
+let inboxRowStripe;
+let projectColorById;
 
 const sleep = (ms) =>
   act(() => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -165,8 +168,14 @@ before(async () => {
     createRootRoute,
     createRouter,
   } = await import("@tanstack/react-router"));
-  ({ InboxItemPreview, INBOX_PREVIEW_OPEN_DELAY_MS } = await import(
-    "./InboxItemPreview.tsx"
+  ({
+    InboxItemPreview,
+    INBOX_PREVIEW_OPEN_DELAY_MS,
+    INBOX_TYPE_META,
+    inboxRowStripe,
+  } = await import("./InboxItemPreview.tsx"));
+  ({ projectColorById } = await import(
+    "@/features/projects/lib/projectColors.ts"
   ));
 });
 
@@ -291,4 +300,28 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
     dom.window.document.activeElement?.textContent,
     "Open inbox item",
   );
+});
+
+test("a project's row and chip take its color; a row with none keeps its type's", async () => {
+  const rose = projectColorById("rose");
+  assert.equal(inboxRowStripe({ type: "mention", color: rose }), rose.stripe);
+  assert.equal(
+    inboxRowStripe({ type: "mention", color: null }),
+    INBOX_TYPE_META.mention.stripe,
+  );
+
+  await act(async () => {
+    render(row({ inboxClass: { ...MENTION, color: rose } }));
+  });
+  await act(async () => {
+    fireEvent.keyDown(dom.window.document.body, { key: "Tab" });
+    screen.getByRole("button", { name: "Open inbox item" }).focus();
+  });
+  const chip = preview()?.querySelector("[data-inbox-project-chip]");
+  assert.ok(chip, "the preview shows the project chip");
+  assert.equal(chip.textContent, "Dreamforge");
+  for (const name of rose.text.split(" ")) {
+    assert.ok(chip.classList.contains(name), name);
+  }
+  assert.ok(chip.querySelector(`.${rose.dot}`), "a dot in the project color");
 });

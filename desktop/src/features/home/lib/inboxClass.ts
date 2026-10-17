@@ -1,8 +1,9 @@
 /**
- * What an Inbox row is, for its color, icon and label, and which project it
- * belongs to, for its neutral chip. Types, first match wins: Needs you,
- * Bench, Code, DM, Mention, then Thread (everything else). This only labels
- * rows; the Bench's project tabs never filter the Inbox.
+ * What an Inbox row is, for its icon and label, and which project it
+ * belongs to, for its chip and stripe in that project's color. Types, first
+ * match wins: Needs you, Bench, Code, DM, Mention, then Thread (everything
+ * else). This only labels rows; the Bench's project tabs never filter the
+ * Inbox.
  */
 
 import {
@@ -11,12 +12,20 @@ import {
   indexBenchCards,
 } from "@/features/bench/lib/benchCards";
 import {
+  WORKBENCHES,
+  type Workbench,
   cardWorkbench,
+  projectWorkbench,
   slugWorkbench,
-  workbenchLabel,
+  workbenchColor,
 } from "@/features/bench/lib/workbenches";
 import type { InboxItem } from "@/features/home/lib/inbox";
 import { getProjectInboxReference } from "@/features/home/lib/projectInbox";
+import {
+  fallbackProjectColor,
+  type ProjectColor,
+  projectColorOf,
+} from "@/features/projects/lib/projectColors";
 import { listProjectBoundChannels } from "@/features/projects/lib/projectRelatedChannels";
 import type { Project } from "@/features/projects/projectModels";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -29,55 +38,92 @@ export type InboxItemType =
   | "mention"
   | "thread";
 
+export type ProjectChip = { label: string; color: ProjectColor };
+
 export type InboxClass = {
   type: InboxItemType;
   /** The project chip's text; null shows no chip. */
   workbench: string | null;
+  /** The chip's project color, also the row's stripe; null with no chip. */
+  color: ProjectColor | null;
   /** The Bench card a verified Bench post (or its thread) is. */
   benchCard: BenchCard | null;
 };
 
-/** Channel id to project chip, from the app's Projects. */
-export type ChannelProjects = ReadonlyMap<string, string>;
+/** The app's Projects as Inbox chips. */
+export type InboxProjects = {
+  /** Keyed by channel id (home, related, repository) and repo address. */
+  chips: ReadonlyMap<string, ProjectChip>;
+  workbenches: Readonly<Record<Workbench["id"], ProjectChip>>;
+};
 
-/** A workbench's name when the slug or name names one, else the name. */
-function projectChip(dtag: string, name: string): string {
-  return (slugWorkbench(dtag) ?? slugWorkbench(name))?.label ?? name;
-}
+type ChipProject = Pick<
+  Project,
+  | "color"
+  | "dtag"
+  | "legacy"
+  | "name"
+  | "projectChannelId"
+  | "relatedChannelIds"
+  | "repositories"
+  | "repositoryAddresses"
+>;
 
 /**
- * Every project's home and related channels to that project's chip. A
- * channel bound to two projects keeps the first.
+ * Every project's channels and repositories to its chip: its workbench's
+ * when it names one, else its own name and color. A channel or repository
+ * in two projects keeps the first.
  */
-export function channelProjects(
-  projects: ReadonlyArray<
-    Pick<
-      Project,
-      | "dtag"
-      | "name"
-      | "projectChannelId"
-      | "relatedChannelIds"
-      | "repositories"
-    >
-  >,
-): ChannelProjects {
-  const lookup = new Map<string, string>();
+export function inboxProjects(
+  projects: ReadonlyArray<ChipProject>,
+): InboxProjects {
+  const workbenches = Object.fromEntries(
+    WORKBENCHES.map((w) => [
+      w.id,
+      { label: w.label, color: workbenchColor(w, projects) },
+    ]),
+  ) as Record<Workbench["id"], ProjectChip>;
+  const chips = new Map<string, ProjectChip>();
   for (const project of projects) {
-    const chip = projectChip(project.dtag, project.name);
-    for (const { channelId } of listProjectBoundChannels(project)) {
-      if (!lookup.has(channelId)) lookup.set(channelId, chip);
-    }
+    const workbench = projectWorkbench(project);
+    const chip = workbench
+      ? workbenches[workbench.id]
+      : { label: project.name, color: projectColorOf(project) };
+    const keys = [
+      ...listProjectBoundChannels(project).map((bound) => bound.channelId),
+      ...project.repositoryAddresses,
+    ];
+    for (const key of keys) if (!chips.has(key)) chips.set(key, chip);
   }
-  return lookup;
+  return { chips, workbenches };
 }
 
-/** The repository d-tag of a Buzz Git row ("30617:<owner>:<d-tag>"). */
-export function inboxRepoDtag(item: InboxItem): string | null {
+/** The repository address of a Buzz Git row ("30617:<owner>:<d-tag>"). */
+function inboxRepoAddress(item: InboxItem): string | null {
   for (const event of item.groupItems) {
     const address = getProjectInboxReference(event)?.repoAddress;
-    if (address) return address.split(":").slice(2).join(":");
+    if (address) return address;
   }
   return null;
+}
+
+function addressDtag(address: string): string {
+  return address.split(":").slice(2).join(":");
+}
+
+/** The repository d-tag of a Buzz Git row. */
+export function inboxRepoDtag(item: InboxItem): string | null {
+  const address = inboxRepoAddress(item);
+  return address ? addressDtag(address) : null;
+}
+
+/** A repository no project lists: its workbench's chip, else its d-tag. */
+function repoChip(address: string, projects: InboxProjects): ProjectChip {
+  const dtag = addressDtag(address);
+  const workbench = slugWorkbench(dtag);
+  return workbench
+    ? projects.workbenches[workbench.id]
+    : { label: dtag, color: fallbackProjectColor(dtag) };
 }
 
 const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
@@ -121,10 +167,10 @@ function waitsOnOwner(card: BenchCard | null): boolean {
 export function classifyInboxItem(
   item: InboxItem,
   benchSnapshot: BenchSnapshot | null,
-  channelProject: ChannelProjects,
+  projects: InboxProjects,
 ): InboxClass {
   const benchCard = benchCardOf(item, benchSnapshot);
-  const repo = inboxRepoDtag(item);
+  const repo = inboxRepoAddress(item);
   const type: InboxItemType =
     item.isActionRequired || waitsOnOwner(benchCard)
       ? "needs-you"
@@ -139,13 +185,18 @@ export function classifyInboxItem(
               : "thread";
   const cardBench = benchCard ? cardWorkbench(benchCard) : "other";
   const channelId = item.item.channelId;
-  const workbench =
+  const chip =
     cardBench !== "other"
-      ? workbenchLabel(cardBench)
+      ? projects.workbenches[cardBench]
       : repo
-        ? projectChip(repo, repo)
+        ? (projects.chips.get(repo) ?? repoChip(repo, projects))
         : channelId
-          ? (channelProject.get(channelId) ?? null)
+          ? (projects.chips.get(channelId) ?? null)
           : null;
-  return { type, workbench, benchCard };
+  return {
+    type,
+    workbench: chip?.label ?? null,
+    color: chip?.color ?? null,
+    benchCard,
+  };
 }

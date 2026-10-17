@@ -2,6 +2,7 @@ import {
   KIND_PROJECT_ANNOUNCEMENT,
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
+import { PROJECT_COLOR_TAG, projectColorById } from "./lib/projectColors";
 import { isValidProjectChannelId } from "./projectModels";
 
 export type ProjectEventTemplate = {
@@ -123,6 +124,7 @@ function normalizeProjectAnnouncementInput({
 
 /** Channel-first NIP-MP project: metadata, home channel, optional members. */
 export function buildProjectAnnouncementTemplate({
+  color,
   description,
   name,
   ownerPubkey,
@@ -130,6 +132,7 @@ export function buildProjectAnnouncementTemplate({
   projectVisibility = "listed",
   repositoryAddresses = [],
 }: {
+  color?: string;
   description?: string;
   name: string;
   ownerPubkey: string;
@@ -170,6 +173,10 @@ export function buildProjectAnnouncementTemplate({
   }
   if (projectVisibility === "unlisted") {
     projectTags.push(["buzz-visibility", "unlisted"]);
+  }
+  if (color !== undefined) {
+    if (!projectColorById(color)) throw new Error("Project color is invalid.");
+    projectTags.push([PROJECT_COLOR_TAG, color]);
   }
   for (const address of [...repositoryAddresses].sort()) {
     projectTags.push(["a", address]);
@@ -235,12 +242,14 @@ export function buildDefaultProjectRepositoryTemplate({
 
 /** Home channel + default repository already listed on the project. */
 export function buildProjectBootstrapTemplates({
+  color,
   description,
   name,
   ownerPubkey,
   projectChannelId,
   projectVisibility = "listed",
 }: {
+  color?: string;
   description?: string;
   name: string;
   ownerPubkey: string;
@@ -254,6 +263,7 @@ export function buildProjectBootstrapTemplates({
     projectChannelId,
   });
   const announcement = buildProjectAnnouncementTemplate({
+    color,
     description,
     name,
     ownerPubkey,

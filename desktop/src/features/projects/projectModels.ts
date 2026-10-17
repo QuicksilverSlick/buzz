@@ -4,6 +4,7 @@ import {
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 import { effectiveCloneUrls } from "./lib/projectCloneUrl";
+import { PROJECT_COLOR_TAG, projectColorById } from "./lib/projectColors";
 
 export type Repository = {
   id: string;
@@ -46,6 +47,8 @@ export type Project = {
   repositories: Repository[];
   unavailableRepositoryAddresses?: string[];
   visibility?: "listed" | "unlisted";
+  /** A known `color` tag id; resolve it with `projectColorOf`. */
+  color?: string;
   legacy: boolean;
 };
 
@@ -372,6 +375,11 @@ export function eventToExplicitProject(
       ),
     ),
   ].slice(0, MAX_PROJECT_RELATED_CHANNELS);
+  // The first known color wins: the relay keeps extra `color` tags, so
+  // rejecting them would hide a project the relay accepted.
+  const color = event.tags.find(
+    (tag) => tag[0] === PROJECT_COLOR_TAG && projectColorById(tag[1]),
+  )?.[1];
   return {
     id: projectAddress,
     dtag,
@@ -394,6 +402,7 @@ export function eventToExplicitProject(
       (address) => !repositoriesByAddress.has(address),
     ),
     visibility,
+    ...(color ? { color } : {}),
     legacy: false,
   };
 }

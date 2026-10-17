@@ -36,8 +36,9 @@ export const INBOX_PREVIEW_CLOSE_DELAY_MS = 180;
 
 /**
  * Each Inbox type's icon, label and color. The color is never alone: the
- * icon and label always show with it. Text is 700 light / 400 dark for
- * 4.5:1 contrast; the row's left stripe is the 500 at 70%.
+ * icon and label always show with it. Text is 700 light / 400 dark; the
+ * row's left stripe is the 500 at 70% when the row has no project (a
+ * project's row takes its project's color).
  */
 export const INBOX_TYPE_META: Record<
   InboxItemType,
@@ -80,6 +81,13 @@ export const INBOX_TYPE_META: Record<
     stripe: "border-l-transparent",
   },
 };
+
+/** The row's left stripe: its project's color, else its type's. */
+export function inboxRowStripe(
+  inboxClass: Pick<InboxClass, "color" | "type">,
+): string {
+  return inboxClass.color?.stripe ?? INBOX_TYPE_META[inboxClass.type].stripe;
+}
 
 /**
  * The row's label, led by its type: "Needs you in", "Bench card in", or the
@@ -277,8 +285,23 @@ function PreviewHeader({
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
       <InboxTypeTag type={inboxClass.type} />
       {inboxClass.workbench ? (
-        <span className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground">
-          {inboxClass.workbench}
+        <span
+          className={cn(
+            "inline-flex max-w-full items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-2xs font-medium",
+            inboxClass.color?.text ?? "text-muted-foreground",
+          )}
+          data-inbox-project-chip=""
+        >
+          {inboxClass.color ? (
+            <span
+              aria-hidden
+              className={cn(
+                "size-1.5 shrink-0 rounded-full",
+                inboxClass.color.dot,
+              )}
+            />
+          ) : null}
+          <span className="truncate">{inboxClass.workbench}</span>
         </span>
       ) : null}
       {label.channelLabel ? (

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
 import {
+  WORKBENCHES,
   cardWorkbench,
   slugWorkbench,
+  workbenchColor,
   workbenchCounts,
   workbenchSnapshot,
 } from "./workbenches.ts";
@@ -101,4 +104,33 @@ test("counts per tab: current cards and what needs you; tabs filter items", () =
     ["o/ask", "o/old"],
   );
   assert.equal(workbenchSnapshot(snapshot(items), "all").items.length, 5);
+});
+
+test("a workbench tab takes its project's color, announced projects first", () => {
+  const [reset, dreamforge] = WORKBENCHES;
+  const project = (dtag, name, color, legacy = false) => ({
+    color,
+    dtag,
+    legacy,
+    name,
+  });
+  const projects = [
+    project("reset-notes", "reset-notes", undefined, true),
+    project("garden", "Garden", "blue"),
+    project("program", "28 Day Reset", "lime"),
+  ];
+  assert.equal(workbenchColor(reset, projects).id, "lime");
+  assert.equal(
+    workbenchColor(reset, projects.slice(0, 2)),
+    fallbackProjectColor("reset-notes"),
+  );
+  // Dreamforge with no project of its own: the fixed color of its slug.
+  assert.equal(
+    workbenchColor(dreamforge, projects),
+    fallbackProjectColor("dreamforge"),
+  );
+  assert.equal(
+    workbenchColor(dreamforge, [project("buzz", "buzz", "cyan")]).id,
+    "cyan",
+  );
 });

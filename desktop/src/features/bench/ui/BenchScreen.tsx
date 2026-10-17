@@ -13,14 +13,18 @@ import {
 import {
   BENCH_TABS,
   type BenchTab,
+  WORKBENCHES,
   cardWorkbench,
+  workbenchColor,
   workbenchCounts,
   workbenchLabel,
   workbenchSnapshot,
 } from "@/features/bench/lib/workbenches";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCards } from "@/features/bench/useBenchCards";
+import { useProjectsQuery } from "@/features/projects/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { cn } from "@/shared/lib/cn";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
 import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import { Input } from "@/shared/ui/input";
@@ -83,6 +87,7 @@ function errorText(error: unknown): string {
 export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
+  const { data: projects } = useProjectsQuery();
   const { goChannel } = useAppNavigation();
   const [query, setQuery] = React.useState("");
   const matches = React.useMemo(() => benchSearch(query), [query]);
@@ -148,6 +153,10 @@ export function BenchScreen() {
           >
             {tabs.map(({ id, label }) => {
               const count = counts?.[id];
+              const workbench = WORKBENCHES.find((w) => w.id === id);
+              const color = workbench
+                ? workbenchColor(workbench, projects ?? [])
+                : null;
               return (
                 <TabsTrigger
                   className="gap-1.5"
@@ -155,6 +164,13 @@ export function BenchScreen() {
                   key={id}
                   value={id}
                 >
+                  {color ? (
+                    <span
+                      aria-hidden
+                      className={cn("size-2 shrink-0 rounded-full", color.dot)}
+                      data-project-color={color.id}
+                    />
+                  ) : null}
                   {label}
                   <span className="font-normal tabular-nums text-muted-foreground">
                     {count?.cards ?? 0}

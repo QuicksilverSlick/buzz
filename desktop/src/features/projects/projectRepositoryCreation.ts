@@ -1,6 +1,10 @@
 import type { RelayEvent } from "@/shared/api/types";
 import type { Repository } from "@/features/projects/hooks";
 import {
+  PROJECT_COLOR_TAG,
+  projectColorById,
+} from "@/features/projects/lib/projectColors";
+import {
   isValidProjectChannelId,
   MAX_PROJECT_MEMBERS,
   validateProjectEventEnvelope,
@@ -94,6 +98,28 @@ function buildProjectPatchTemplate({
 }
 
 export { buildProjectPatchTemplate };
+
+/**
+ * The live project head with its `color` tags replaced by one; every other
+ * tag and the content stay as signed.
+ */
+export function buildProjectColorPatchTemplate({
+  color,
+  liveHead,
+}: {
+  color: string;
+  liveHead: RelayEvent;
+}): ProjectEventTemplate {
+  if (!projectColorById(color)) throw new Error("Project color is invalid.");
+  const tags = [
+    ...liveHead.tags
+      .filter((tag) => tag[0] !== PROJECT_COLOR_TAG)
+      .map((tag) => [...tag]),
+    [PROJECT_COLOR_TAG, color],
+  ];
+  validateProjectEventEnvelope(tags, liveHead.content);
+  return { kind: KIND_PROJECT_ANNOUNCEMENT, content: liveHead.content, tags };
+}
 
 export function buildRepositoryChannelBindingTemplate({
   channelId,

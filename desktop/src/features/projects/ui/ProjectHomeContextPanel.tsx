@@ -9,7 +9,9 @@ import {
   Users,
 } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 
+import { projectColorOf } from "@/features/projects/lib/projectColors";
 import { presentContextCount } from "@/features/projects/lib/projectHomeSummary";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
 import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
@@ -21,12 +23,15 @@ import {
   type Project,
 } from "@/features/projects/hooks";
 import { ProjectChannelIcon } from "@/features/projects/ui/ProjectChannelIcon";
+import { ProjectColorPicker } from "@/features/projects/ui/ProjectColorPicker";
+import { useSetProjectColorMutation } from "@/features/projects/useSetProjectColor";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import type { EntityLinkTab } from "@/shared/lib/entityLink";
 import { Button } from "@/shared/ui/button";
 import { ProjectChannelManagement } from "./ProjectChannelManagement";
 import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
+import { useProjectEditAccess } from "./useProjectEditAccess";
 import { SECTION_ACTION_VISIBILITY_CLASS } from "@/features/sidebar/ui/sidebarSectionStyles";
 
 const PROJECT_HOME_SIDEBAR_ROW_CLASS =
@@ -174,6 +179,51 @@ function ChannelContextRow({
       data-testid={testId}
     >
       <ContextRowContent icon={<Icon />}>{channel.name}</ContextRowContent>
+    </div>
+  );
+}
+
+/** The project's color; picking one republishes the project at once. */
+function ProjectColorSetting({
+  identityPubkey,
+  project,
+}: {
+  identityPubkey?: string;
+  project: Project;
+}) {
+  const { canEdit, ownerControlAgentPubkey } = useProjectEditAccess(
+    project,
+    identityPubkey,
+  );
+  const mutation = useSetProjectColorMutation();
+  return (
+    <div className="px-2 py-1">
+      <ProjectColorPicker
+        disabled={!canEdit || mutation.isPending}
+        legendClassName="mb-1 text-xs text-sidebar-foreground/70"
+        name={`project-color-${project.id}`}
+        onChange={(color) =>
+          mutation.mutate(
+            { color, ownerControlAgentPubkey, project },
+            {
+              onError: (error) =>
+                toast.error(
+                  error instanceof Error
+                    ? error.message
+                    : "Couldn't change the project color.",
+                ),
+            },
+          )
+        }
+        title={
+          canEdit ? undefined : "Only the project owner can change the color"
+        }
+        value={
+          mutation.isPending
+            ? mutation.variables.color
+            : projectColorOf(project).id
+        }
+      />
     </div>
   );
 }
@@ -391,6 +441,12 @@ export function ProjectHomeContextPanel({
             None yet
           </p>
         )}
+      </ContextSection>
+      <ContextSection testId="project-home-context-color">
+        <ProjectColorSetting
+          identityPubkey={identityPubkey}
+          project={project}
+        />
       </ContextSection>
     </div>
   );

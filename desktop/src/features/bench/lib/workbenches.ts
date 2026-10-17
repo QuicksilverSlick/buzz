@@ -6,7 +6,13 @@
 
 import type { BenchCard, BenchSnapshot } from "@/features/bench/lib/benchCards";
 import { benchSections } from "@/features/bench/lib/benchScreen";
+import {
+  fallbackProjectColor,
+  type ProjectColor,
+  projectColorOf,
+} from "@/features/projects/lib/projectColors";
 import { projectDtagFromName } from "@/features/projects/projectCreation";
+import type { Project } from "@/features/projects/projectModels";
 import { PRODUCT_NAME } from "@/shared/constants/brand";
 
 export type WorkbenchId = "reset" | "dreamforge" | "other";
@@ -56,6 +62,31 @@ export function slugWorkbench(
       w.slugs.some((known) => s === known || s.startsWith(`${known}-`)),
     ) ?? null
   );
+}
+
+/** The workbench a project's d-tag, else its name, names. */
+export function projectWorkbench(
+  project: Pick<Project, "dtag" | "name">,
+): Workbench | null {
+  return slugWorkbench(project.dtag) ?? slugWorkbench(project.name);
+}
+
+/**
+ * A workbench's color: its project's (an announced one first, then a
+ * repository-only one), else the color a project with its first slug gets.
+ */
+export function workbenchColor(
+  workbench: Workbench,
+  projects: ReadonlyArray<Pick<Project, "color" | "dtag" | "legacy" | "name">>,
+): ProjectColor {
+  const names = (project: (typeof projects)[number]) =>
+    projectWorkbench(project)?.id === workbench.id;
+  const project =
+    projects.find((candidate) => !candidate.legacy && names(candidate)) ??
+    projects.find(names);
+  return project
+    ? projectColorOf(project)
+    : fallbackProjectColor(workbench.slugs[0]);
 }
 
 /** The card's project, else its area, else its writer; else Other. */

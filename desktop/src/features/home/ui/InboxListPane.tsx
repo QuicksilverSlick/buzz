@@ -18,8 +18,8 @@ import {
 } from "@/features/home/lib/inbox";
 import {
   type InboxItemType,
-  channelProjects,
   classifyInboxItem,
+  inboxProjects,
 } from "@/features/home/lib/inboxClass";
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
 import { hasRenderedVideoAttachment } from "@/features/messages/lib/videoReviewContext";
@@ -29,6 +29,7 @@ import {
   INBOX_TYPE_META,
   InboxItemPreview,
   inboxRowLabel,
+  inboxRowStripe,
 } from "@/features/home/ui/InboxItemPreview";
 import {
   DraftsPanel,
@@ -37,6 +38,7 @@ import {
 import { WorkflowAvatar } from "@/features/messages/ui/WorkflowAvatar";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { useProjectsQuery } from "@/features/projects/hooks";
+import type { ProjectColor } from "@/features/projects/lib/projectColors";
 import type { Reminder } from "@/features/reminders/lib/reminderTypes";
 import { isDue } from "@/features/reminders/lib/reminderFilters";
 import {
@@ -93,16 +95,21 @@ const INBOX_HEADER_ICON_BUTTON_CLASS =
 const INBOX_PANE_RIGHT_DIVIDER_CLASS =
   "after:pointer-events-none after:absolute after:inset-y-0 after:right-0 after:z-40 after:w-px after:bg-border/35 after:content-['']";
 
-/** `type` colors the label and leads it with the type's icon. */
+/**
+ * `type` colors the label and leads it with the type's icon; the project
+ * chip leads with a dot in the project's color.
+ */
 function InboxLabel({
   isDone,
   label,
   project = null,
+  projectColor = null,
   type,
 }: {
   isDone: boolean;
   label: InboxTypeLabel;
   project?: string | null;
+  projectColor?: ProjectColor | null;
   type?: InboxItemType;
 }) {
   const meta = type ? INBOX_TYPE_META[type] : null;
@@ -128,7 +135,14 @@ function InboxLabel({
             "inbox-channel-chip min-w-0 shrink overflow-hidden",
           )}
           data-inbox-project-chip=""
+          data-project-color={projectColor?.id}
         >
+          {projectColor ? (
+            <span
+              aria-hidden
+              className={cn("size-1.5 shrink-0 rounded-full", projectColor.dot)}
+            />
+          ) : null}
           <span className="truncate">{project}</span>
         </span>
       ) : null}
@@ -322,8 +336,8 @@ export function InboxListPane({
   const reminderSources = useReminderSources(reminders);
   const benchSnapshot = useBenchSnapshot();
   const { data: projects } = useProjectsQuery();
-  const channelProject = React.useMemo(
-    () => channelProjects(projects ?? []),
+  const projectChips = React.useMemo(
+    () => inboxProjects(projects ?? []),
     [projects],
   );
   const channelDescriptions = React.useMemo(
@@ -363,7 +377,7 @@ export function InboxListPane({
       : isReopening
         ? "Reopening…"
         : "Open in channel";
-    const inboxClass = classifyInboxItem(item, benchSnapshot, channelProject);
+    const inboxClass = classifyInboxItem(item, benchSnapshot, projectChips);
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =
@@ -402,7 +416,7 @@ export function InboxListPane({
           aria-label={`Open inbox item from ${item.senderLabel}`}
           className={cn(
             "absolute inset-0 z-0 block w-full border-l-2 border-l-transparent text-left",
-            INBOX_TYPE_META[inboxClass.type].stripe,
+            inboxRowStripe(inboxClass),
           )}
           onClick={() => onSelect(item.id)}
           type="button"
@@ -500,6 +514,7 @@ export function InboxListPane({
                 isDone={isDone}
                 label={inboxRowLabel(inboxClass.type, typeLabel)}
                 project={inboxClass.workbench}
+                projectColor={inboxClass.color}
                 type={inboxClass.type}
               />
               {dueReminder ? (

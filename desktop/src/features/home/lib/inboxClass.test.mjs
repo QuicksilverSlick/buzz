@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
 import {
-  channelProjects,
   classifyInboxItem,
+  inboxProjects,
   inboxRepoDtag,
 } from "./inboxClass.ts";
 
@@ -14,6 +15,28 @@ const BENCH = "bench-channel";
 const RESET_CHANNEL = "support-shadow";
 const CARD_EVENT = "e".repeat(64);
 const REPO = `30617:${OWNER}:buzz`;
+
+const PROJECTS = [
+  {
+    dtag: "28-day-reset",
+    name: "28 Day Reset",
+    color: "lime",
+    legacy: false,
+    projectChannelId: "reset-home",
+    relatedChannelIds: [RESET_CHANNEL],
+    repositories: [],
+    repositoryAddresses: [],
+  },
+  {
+    dtag: "garden",
+    name: "Garden club",
+    legacy: false,
+    projectChannelId: "garden-home",
+    relatedChannelIds: [],
+    repositories: [{ id: "r", name: "r", channelId: "garden-repo" }],
+    repositoryAddresses: [`30617:${OWNER}:garden-app`],
+  },
+];
 
 function card(id, overrides = {}) {
   return {
@@ -76,7 +99,7 @@ function inboxItem(primary, overrides = {}) {
 }
 
 const marker = (id) => ["client", `bench:card:${id}@0a1b2c`];
-const NONE = new Map();
+const NONE = inboxProjects([]);
 
 test("a signed Bench post is Bench, with its card's project", () => {
   const post = event({
@@ -213,26 +236,47 @@ test("a git item's chip is its repository's project", () => {
 });
 
 test("a channel bound to a project shows that project's chip", () => {
-  const lookup = channelProjects([
-    {
-      dtag: "28-day-reset",
-      name: "28 Day Reset",
-      projectChannelId: "reset-home",
-      relatedChannelIds: [RESET_CHANNEL],
-      repositories: [],
-    },
-    {
-      dtag: "garden",
-      name: "Garden club",
-      projectChannelId: "garden-home",
-      relatedChannelIds: [],
-      repositories: [{ id: "r", name: "r", channelId: "garden-repo" }],
-    },
-  ]);
+  const lookup = inboxProjects(PROJECTS);
   const chip = (channelId) =>
     classifyInboxItem(inboxItem(event({ channelId })), null, lookup).workbench;
   assert.equal(chip(RESET_CHANNEL), "28 Day Reset");
   assert.equal(chip("reset-home"), "28 Day Reset");
   assert.equal(chip("garden-repo"), "Garden club");
   assert.equal(chip("general"), null);
+});
+
+test("a chip carries its project's color; a row with no project has none", () => {
+  const lookup = inboxProjects(PROJECTS);
+  const color = (item, bench = null) =>
+    classifyInboxItem(inboxItem(item), bench, lookup).color?.id ?? null;
+  const garden = fallbackProjectColor("garden").id;
+
+  assert.equal(color(event({ channelId: RESET_CHANNEL })), "lime");
+  assert.equal(color(event({ channelId: "garden-repo" })), garden);
+  assert.equal(color(event()), null);
+
+  // A Bench card takes its workbench's project color; Dreamforge, with no
+  // project here, the fixed color of its first slug.
+  const post = (id) =>
+    event({ pubkey: WRITER, channelId: BENCH, tags: [marker(id)] });
+  const cards = snapshot([
+    card("orchestrator/a", { writer: "orchestrator", area: "28-day-reset" }),
+    card("claude-ai/b"),
+  ]);
+  assert.equal(color(post("orchestrator/a"), cards), "lime");
+  assert.equal(
+    color(post("claude-ai/b"), cards),
+    fallbackProjectColor("dreamforge").id,
+  );
+
+  // A git row: the project listing its repository, else the repo's d-tag.
+  const review = event({
+    kind: 1618,
+    tags: [["a", `30617:${OWNER}:garden-app`]],
+  });
+  const reviewClass = classifyInboxItem(inboxItem(review), null, lookup);
+  assert.equal(reviewClass.workbench, "Garden club");
+  assert.equal(reviewClass.color?.id, garden);
+  const notes = event({ kind: 1621, tags: [["a", `30617:${OWNER}:notes`]] });
+  assert.equal(color(notes), fallbackProjectColor("notes").id);
 });
