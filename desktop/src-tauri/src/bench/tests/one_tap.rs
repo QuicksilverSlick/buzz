@@ -116,7 +116,7 @@ fn plain_and_action_pass_the_drop_checks() {
 
 // ── the card text ───────────────────────────────────────────────────────
 
-const HEAD: &str = "🔴 · dreamforge · orchestrator\n**Relay choice**\n\nStay or move?\n";
+const HEAD: &str = "🔴 · Dreamforge · orchestrator\n**Relay choice**\n\nStay or move?\n";
 const OPTIONS: &str = "\n1. Stay\n2. Move\n";
 
 #[test]
@@ -130,10 +130,13 @@ fn plain_lines_follow_the_summary_in_order() {
         render_card(&item, "14:05"),
         format!(
             "{HEAD}\n\
-             What changes: Merges PR 711 into main\n\
-             Asked by: Reset Worker\n\
-             Risk: Low · Undo: Easy · Reach: Every member\n\
-             If you wait: The fix waits a day\n\
+             **What changes:** Merges PR 711 into main\n\
+             \n\
+             **Asked by:** Reset Worker\n\
+             \n\
+             **Risk:** Low · **Undo:** Easy · **Reach:** Every member\n\
+             \n\
+             **If you wait:** The fix waits a day\n\
              {OPTIONS}\nTap one number below to answer.\nas of 14:05"
         )
     );
@@ -142,7 +145,7 @@ fn plain_lines_follow_the_summary_in_order() {
     assert_eq!(
         render_card(&item, "14:05"),
         format!(
-            "{HEAD}\nUndo: Impossible\n{OPTIONS}\nTap one number below to answer.\nas of 14:05"
+            "{HEAD}\n**Undo:** Impossible\n{OPTIONS}\nTap one number below to answer.\nas of 14:05"
         )
     );
     // The recommendation's confidence and reason, then what one tap approves.
@@ -156,9 +159,9 @@ fn plain_lines_follow_the_summary_in_order() {
     ])
     .unwrap();
     assert!(render_card(&item, "14:05").ends_with(&format!(
-        "{OPTIONS}\nFor: the owner. Tap one number below to answer.\n\
-         Recommended: 2 (orchestrator) (high confidence) - Moving costs a day\n\
-         If you choose Move: {MERGE}\nas of 14:05\nOr reply in this thread."
+        "\n\n**Recommended:** 2 (orchestrator) (high confidence) - Moving costs a day\n\
+         If you choose Move: {MERGE}\n{OPTIONS}\nFor: the owner. Tap one number below to answer.\n\
+         as of 14:05\nOr reply in this thread."
     )));
 }
 
@@ -328,7 +331,7 @@ async fn the_owners_tap_goes_out_as_the_owners_own_message() {
         .0;
     assert!(
         content(posted).contains(&format!(
-            "\nRecommended: 1 (Reset Worker)\nIf you choose Merge PR: {MERGE}\nas of 14:05\n"
+            "\n\n**Recommended:** 1 (Reset Worker)\nIf you choose Merge PR: {MERGE}\n\n1. Merge PR\n"
         )),
         "{}",
         content(posted)
@@ -437,7 +440,7 @@ async fn an_answered_card_asked_again_comes_back_to_whoever_answered() {
     assert_eq!(tag_value(posted, "h").as_deref(), Some(X));
     assert!(
         content(posted)
-            .starts_with("Back to you\n🟠 · dreamforge · reset-worker\n**Welcome email**\n"),
+            .starts_with("Back to you\n🟠 · 28 Day Reset · reset-worker\n**Welcome email**\n"),
         "{}",
         content(posted)
     );

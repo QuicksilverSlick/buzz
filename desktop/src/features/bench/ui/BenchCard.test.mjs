@@ -9,12 +9,14 @@
  *   click on the recorded option sends `option: null` (undo).
  * - A command error shows inline; read-only cards send nothing.
  * - The row hook matches only the live card signed by the writer key.
- * - Plain fields show as chips and lines, the action as the command one tap
- *   approves, details folded; a card without them renders as before.
+ * - Plain fields and labels a writer typed show as bold-labelled fields in
+ *   the phone's order, the action as the command one tap approves, details
+ *   apart (long ones folded); a card without them renders as before.
  * - Open thread shows on every card that has a thread.
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
@@ -104,6 +106,13 @@ function benchCard(props) {
 
 function answerCalls() {
   return ipcCalls.filter((c) => c.cmd === "bench_answer").map((c) => c.args);
+}
+
+/** The bold field labels a card shows, in order. */
+function labels(root) {
+  return [...root.querySelectorAll("p > span.font-semibold")].map(
+    (span) => span.textContent,
+  );
 }
 
 function optionButton(name) {
@@ -619,26 +628,95 @@ test("a plain card shows its chips, lines, recommendation, action and folded det
     "High risk",
     "Hard to undo",
     "Reach: 3,089 members",
-    "Recommended: 1. Merge PR · high confidence · CI is green.",
   ]) {
     assert.ok(screen.getByText(text), text);
   }
   assert.match(root.textContent, /Earlier: Quicksilver chose Hold · \S/);
-  assert.ok(
-    root.textContent.includes("What changes: The <b>new</b> check goes live."),
-  );
   assert.equal(root.querySelector("b"), null, "plain text stays inert");
-  assert.ok(root.textContent.includes("Asked by: Reset Worker"));
+  // The phone's order, each label bold with its colon, each its own line.
+  const fields = [
+    "What changes: The <b>new</b> check goes live.",
+    "Asked by: Reset Worker",
+    "High risk",
+    "If you wait: Members keep the old check.",
+    "Recommended: 1. Merge PR · high confidence · CI is green.",
+  ];
+  const at = fields.map((text) => root.textContent.indexOf(text));
   assert.ok(
-    root.textContent.includes("If you wait: Members keep the old check."),
+    at.every((i, n) => i !== -1 && (n === 0 || i > at[n - 1])),
+    String(at),
   );
+  assert.deepEqual(labels(root), [
+    "What changes:",
+    "Asked by:",
+    "If you wait:",
+    "Recommended:",
+  ]);
   const action = screen.getByTestId("bench-card-action");
   assert.equal(action.textContent, `If you choose Merge PR: ${merge}`);
   assert.equal(action.querySelector("code").textContent, merge);
-  const details = root.querySelector("details");
-  assert.equal(details.open, false, "details start folded");
-  assert.equal(details.querySelector("summary").textContent, "Details");
-  assert.ok(details.textContent.includes("Full notes **here**"));
+  // Details apart, under a rule; short ones never fold.
+  const details = screen.getByTestId("bench-card-details");
+  assert.equal(details.textContent, "DetailsFull notes **here**");
+  assert.equal(details.querySelector("button"), null);
+  assert.equal(details.querySelector(".line-clamp-4"), null);
+});
+
+test("labels a writer typed read as fields; long details fold behind Show more", async () => {
+  const vector = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../../src-tauri/src/bench/card_layout_vectors.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const long = "Every check passed on head a30d88a. ".repeat(12);
+  let view;
+  await act(async () => {
+    view = render(
+      wrap(
+        benchCard({
+          card: card({
+            ...vector.drop,
+            writer: "orchestrator",
+            body: `Stay or move?\nWhat happened: not a label\n${vector.drop.body} ${long}`,
+          }),
+          projectLabel: "28 Day Reset",
+        }),
+      ),
+    );
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  // The header names the project once, by name.
+  const header = root.firstElementChild.textContent;
+  assert.ok(header.endsWith("Pending · 28 Day Reset · orchestrator"), header);
+  assert.ok(!header.includes("28-day-reset"), header);
+  // The same labels as the phone's text, in order; Details goes apart.
+  assert.deepEqual(
+    labels(root),
+    vector.labels.filter((l) => l !== "Details").map((l) => `${l}:`),
+  );
+  assert.ok(root.textContent.includes("What happened: not a label"));
+  assert.ok(
+    root.textContent.includes(
+      "Risk: Low · Undo: Easy · Reach: administrators using Production.",
+    ),
+  );
+  const details = screen.getByTestId("bench-card-details");
+  const text = details.querySelector("p:nth-of-type(2)");
+  assert.ok(text.textContent.startsWith("PR #758 changes 1 file"));
+  assert.ok(text.classList.contains("line-clamp-4"), "long details fold");
+  const toggle = screen.getByRole("button", { name: "Show more" });
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-controls"), text.id);
+  await act(async () => {
+    fireEvent.click(toggle);
+  });
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(toggle.textContent, "Show less");
+  assert.ok(!text.classList.contains("line-clamp-4"));
 });
 
 test("a card without plain fields shows none of them", async () => {
@@ -647,7 +725,8 @@ test("a card without plain fields shows none of them", async () => {
     view = render(wrap(benchCard({ card: scoped({ recommend: 1 }) })));
   });
   const root = view.container.querySelector("[data-testid='bench-card']");
-  assert.equal(root.querySelector("details"), null);
+  assert.equal(screen.queryByTestId("bench-card-details"), null);
+  assert.deepEqual(labels(root), []);
   assert.equal(screen.queryByTestId("bench-card-action"), null);
   assert.equal(screen.queryByText("Back to you"), null);
   assert.doesNotMatch(root.textContent, /risk|chose|What changes/);

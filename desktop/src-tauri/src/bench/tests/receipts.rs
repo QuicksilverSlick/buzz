@@ -63,7 +63,7 @@ async fn close_out_edits_the_card_into_a_receipt() {
     let request = item.request.as_ref().unwrap();
     let at = &request.answer.as_ref().unwrap().hhmm;
     assert!(
-        receipt.starts_with("🔴 · dreamforge · orchestrator\n**Relay choice**\n"),
+        receipt.starts_with("🔴 · Dreamforge · orchestrator\n**Relay choice**\n"),
         "{receipt}"
     );
     assert!(

@@ -943,7 +943,7 @@ test("plain: the recommended line, and what one tap approves", () => {
   );
   assert.equal(
     view.recommended,
-    "Recommended: 1. Merge PR · high confidence · CI is green and Craig asked for it.",
+    "1. Merge PR · high confidence · CI is green and Craig asked for it.",
   );
   assert.deepEqual(view.action, {
     lead: "If you choose Merge PR:",
@@ -952,7 +952,7 @@ test("plain: the recommended line, and what one tap approves", () => {
   assert.equal(
     benchPlainView(card({ recommend: 2, plain: { confidence: "low" } }))
       .recommended,
-    "Recommended: 2. Hold · low confidence",
+    "2. Hold · low confidence",
   );
   // No (or an out-of-range) recommendation: no line; the action stands alone.
   for (const recommend of [null, 3]) {

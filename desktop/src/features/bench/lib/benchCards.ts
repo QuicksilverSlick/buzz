@@ -686,7 +686,7 @@ export type BenchPlainView = {
   chips: BenchPlainChip[];
   /** What changes, asked by, if you wait. */
   lines: Array<{ label: string; text: string }>;
-  /** "Recommended: 2. Hold · high confidence · why". */
+  /** The Recommended field: "2. Hold · high confidence · why". */
   recommended: string | null;
   details: string | null;
   /** `lead` is "If you choose Hold:", or "Action:" with no recommendation. */
@@ -754,7 +754,7 @@ export function benchPlainView(card: BenchCard): BenchPlainView {
     lines,
     recommended:
       pick !== undefined && (why || confidence)
-        ? dotted(`Recommended: ${card.recommend}. ${pick}`, confidence, why)
+        ? dotted(`${card.recommend}. ${pick}`, confidence, why)
         : null,
     details: filled(plain.details),
     action: command

@@ -4,6 +4,7 @@ import test from "node:test";
 import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
 import {
   classifyInboxItem,
+  inboxCardPost,
   inboxProjects,
   inboxRepoDtag,
 } from "./inboxClass.ts";
@@ -206,6 +207,36 @@ test("a reply in a card's thread is that card's, by the card's own event id", ()
   );
   assert.equal(result.type, "bench");
   assert.equal(result.workbench, "Dreamforge");
+});
+
+test("only the card's own post shows as the card; a reply in its thread shows as itself", () => {
+  const bench = snapshot([card("claude-ai/ship", { cardEventId: CARD_EVENT })]);
+  const post = inboxItem(
+    event({
+      pubkey: WRITER,
+      channelId: BENCH,
+      tags: [marker("claude-ai/ship")],
+    }),
+  );
+  const reply = inboxItem(
+    event({ channelId: BENCH, tags: [["e", CARD_EVENT, "", "root"]] }),
+    { conversationId: CARD_EVENT },
+  );
+  const cardOf = (item) =>
+    inboxCardPost(item, classifyInboxItem(item, bench, NONE));
+  assert.equal(cardOf(post)?.id, "claude-ai/ship");
+  assert.equal(cardOf(reply), null);
+  // Another card's marker on the shown event is not this card's post.
+  const other = inboxItem(
+    event({
+      pubkey: WRITER,
+      channelId: BENCH,
+      tags: [marker("claude-ai/other")],
+    }),
+    { conversationId: CARD_EVENT },
+  );
+  assert.equal(cardOf(other), null);
+  assert.equal(inboxCardPost(post, { benchCard: null }), null);
 });
 
 test("precedence: needs action beats everything; then Code, DM, Mention, Thread", () => {

@@ -824,7 +824,7 @@ fn render_card_summary_is_its_own_inert_paragraph() {
         assert_eq!(
             paras[..3],
             [
-                "🔴 · dreamforge · orchestrator\n**Relay choice**",
+                "🔴 · Dreamforge · orchestrator\n**Relay choice**",
                 prose(body).as_str(),
                 "1. Stay\n2. Move"
             ]

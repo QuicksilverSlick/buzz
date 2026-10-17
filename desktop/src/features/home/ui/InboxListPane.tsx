@@ -10,6 +10,7 @@ import {
 import * as React from "react";
 
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { BenchCardSnippet } from "@/features/bench/ui/BenchCardFields";
 import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
 import {
@@ -21,6 +22,7 @@ import {
 import {
   type InboxItemType,
   classifyInboxItem,
+  inboxCardPost,
   inboxProjects,
 } from "@/features/home/lib/inboxClass";
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
@@ -383,6 +385,7 @@ export function InboxListPane({
         ? "Reopening…"
         : "Open in channel";
     const inboxClass = classifyInboxItem(item, benchSnapshot, projectChips);
+    const cardPost = inboxCardPost(item, inboxClass);
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =
@@ -581,13 +584,17 @@ export function InboxListPane({
                     : "font-semibold text-foreground",
                 )}
               >
-                <VideoReviewCommentMarkdown
-                  className="inbox-preview-markdown text-inherit"
-                  content={item.preview}
-                  interactive={false}
-                  mentionNames={item.mentionNames}
-                  videoReviewCommentRootId={videoReviewCommentRootId}
-                />
+                {cardPost ? (
+                  <BenchCardSnippet card={cardPost} />
+                ) : (
+                  <VideoReviewCommentMarkdown
+                    className="inbox-preview-markdown text-inherit"
+                    content={item.preview}
+                    interactive={false}
+                    mentionNames={item.mentionNames}
+                    videoReviewCommentRootId={videoReviewCommentRootId}
+                  />
+                )}
               </div>
             </div>
           </div>

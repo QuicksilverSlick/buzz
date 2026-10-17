@@ -180,6 +180,23 @@ function benchCardOf(
     : null;
 }
 
+/**
+ * The row's card when the row shows the card's own post, which carries its
+ * marker; a reply in its thread is not the card.
+ */
+export function inboxCardPost(
+  item: InboxItem,
+  inboxClass: Pick<InboxClass, "benchCard">,
+): BenchCard | null {
+  const card = inboxClass.benchCard;
+  const marker = item.item.tags.find(
+    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
+  )?.[1];
+  return card && marker && CARD_MARKER.exec(marker)?.[1] === card.id
+    ? card
+    : null;
+}
+
 function waitsOnOwner(card: BenchCard | null): boolean {
   return (
     card?.kind === "pending" && card.validity === "current" && !card.answer
