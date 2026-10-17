@@ -39,6 +39,21 @@ ignore = [
     # Keep the exact NetEQ pin and the wrapper ban below together. Re-audit or
     # remove this exception when NetEQ removes/updates the unused dependency.
     { id = "RUSTSEC-2026-0293", reason = "unused dependency of audited, exactly pinned neteq 0.8.3; no Rust references to ringbuf; other consumers forbidden by bans.deny" },
+    # zip < 9 (0367 SUID bits kept, 0368 symlinks escaping the destination, 0369 permissions
+    # applied through symlinks): all three are in ZipArchive::extract / ZipStreamReader::extract.
+    # Our only zip readers extract entry by entry with enclosed_name() and plain file writes:
+    # desktop managed_node.rs extract_managed_node_zip (zip 8.6, direct) and mesh-llm v0.76.2
+    # plugin-manager archive.rs / system autoupdate release_fetch.rs (root lockfile). Remove when
+    # the desktop moves to zip 9 and mesh-llm does too.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() paths unused; desktop and mesh-llm extract per entry via enclosed_name()" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() paths unused; desktop and mesh-llm extract per entry via enclosed_name()" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() paths unused; desktop and mesh-llm extract per entry via enclosed_name()" },
+    # zvariant / zvariant_derive / zbus_names: unmaintained, "no safe upgrade" (zbus issue 2043).
+    # Linux-only D-Bus stack via notify-rust, tauri notification/opener/single-instance plugins
+    # and the secret-service keyring store.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
 ]
 
 [licenses]
