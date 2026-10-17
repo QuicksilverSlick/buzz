@@ -2,6 +2,7 @@ import { Link2 } from "lucide-react";
 import type * as React from "react";
 
 import { Button } from "@/shared/ui/button";
+import { Markdown } from "@/shared/ui/markdown";
 
 const NAMED_LIMIT = 3;
 
@@ -14,7 +15,8 @@ export function formatShareNames(names: readonly string[]): string {
 
 /**
  * Inline "share with agent" prompt above the composer (owner-approved 16
- * Oct). It shows the quote it would send, so nothing goes out unseen;
+ * Oct). It shows the quote it would send, rendered as it will read, so
+ * nothing goes out unseen;
  * Escape dismisses it and the send stays unsent.
  */
 export function ComposerShareLinkPrompt({
@@ -65,12 +67,17 @@ export function ComposerShareLinkPrompt({
       >
         Send link only
       </Button>
-      <blockquote
-        className="max-h-24 w-full overflow-y-auto whitespace-pre-wrap break-words border-l-2 border-border pl-2 text-xs"
+      {/* The quote as the message will show it: the messages' own safe renderer. */}
+      <div
+        className="max-h-24 w-full overflow-y-auto break-words"
         data-testid="share-link-quote"
       >
-        {prompt.quote.replace(/^> ?/gm, "")}
-      </blockquote>
+        <Markdown
+          className="text-xs text-muted-foreground"
+          content={prompt.quote}
+          interactive={false}
+        />
+      </div>
     </div>
   );
 }

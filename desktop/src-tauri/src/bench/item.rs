@@ -881,7 +881,10 @@ fn state_name(s: StatusState) -> &'static str {
 /// the fence, which the phone draws as unwrapped monospace, and the summary
 /// left in it is hard-wrapped. 4: the summary leaves the fence, a grey code
 /// box on the phone, for its own paragraph of prose(). Scoped cards and
-/// receipts came without a bump: no unscoped card's text changed.
+/// receipts came without a bump: no unscoped card's text changed. Bold
+/// field labels, their blank lines and the header's project name came
+/// without one too: the old text reads fine, and a card takes the new one
+/// when it is next posted or edited.
 pub(crate) const CARD_FORMAT: u32 = 4;
 
 /// The version a card is posted and tagged at: `<Drop hash>.<CARD_FORMAT>`,
@@ -927,7 +930,6 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
         if item.answer.is_none() {
             out.push_str(&format!(" {tap}"));
         }
-        out.push_str(&recommended(item));
     } else if pending && item.answer.is_none() {
         out.push_str(&format!("\n{tap}"));
     }
@@ -958,7 +960,6 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
 /// close-out drop as its Outcome, appended so the question is never lost.
 fn render_receipt(request: &Item, outcome: &Item, hhmm: &str) -> String {
     let mut out = card_head(request);
-    out.push_str(&recommended(request));
     // An answer recorded before step 1 has no time of its own.
     let by = |name: Option<&str>, at: &str| {
         let mut s = String::new();
@@ -994,7 +995,7 @@ fn render_receipt(request: &Item, outcome: &Item, hhmm: &str) -> String {
     }
     if !outcome.body.trim().is_empty() {
         out.push_str("\n\n");
-        out.push_str(&prose(&summary(&outcome.body)));
+        out.push_str(&super::plain::body(&summary(&outcome.body)));
         out.push('\n');
     }
     for l in &outcome.links {
@@ -1020,17 +1021,18 @@ fn for_line(item: &Item) -> String {
     format!("For: {} or {owner}.", names.join(", "))
 }
 
-fn recommended(item: &Item) -> String {
-    let Some(n) = item.recommend else {
-        return String::new();
-    };
+fn recommended(item: &Item) -> Option<String> {
+    let n = item.recommend?;
     let who = item
         .stamp
         .as_ref()
         .and_then(|s| s.recommender.as_deref())
         .map_or(item.writer.clone(), plain_title);
     let tail = super::plain::recommended_tail(item, n);
-    format!("\nRecommended: {n} ({who}){tail}")
+    Some(super::plain::bold(
+        "Recommended",
+        &format!("{n} ({who}){tail}"),
+    ))
 }
 
 /// The owner's name from roles.json, if it named one.
@@ -1070,36 +1072,34 @@ pub(crate) fn answerer_text(
     }
 }
 
-/// The request as a card shows it: marker line, the title in bold, the
-/// summary as its own paragraph of prose() (agent text stays inert), the
-/// plain-language lines (`plain::lines`), the options as a numbered list,
-/// then the validated deadline and links so the
-/// phone can open them. Everything but the summary and the url goes through
-/// plain_text.
+/// The request as a card shows it: marker, project (else area) and writer,
+/// the title in bold, then paragraphs: the summary (`plain::body`: prose()
+/// with its labels bold, agent text inert), the plain-language fields
+/// (`plain::lines`) and the recommendation; then the options as a numbered
+/// list, the validated deadline and links so the phone can open them.
+/// Everything but the summary and the url goes through plain_text.
 fn card_head(item: &Item) -> String {
-    let mut out = format!(
-        "{} \u{b7} {} \u{b7} {}",
-        marker(item),
-        item.area,
-        item.writer
-    );
+    let place = super::plain::place(item.project.as_deref().unwrap_or(&item.area));
+    let mut out = format!("{} \u{b7} {place} \u{b7} {}", marker(item), item.writer);
     let title = plain_text(&item.title, usize::MAX);
     // An empty one would print `****`, a rule on both apps.
     if !title.is_empty() {
         out.push_str(&format!("\n**{title}**"));
     }
+    // Blank lines make each a paragraph of its own on both apps, so nothing
+    // in one pairs with a `*` or `](` on the card's other lines: the phone
+    // matches links and italics across lines, and rewrites each link line's
+    // url to `[url](url)` first.
+    let mut paragraphs = Vec::new();
     if !item.body.trim().is_empty() {
-        // Blank lines make it a paragraph of its own on both apps, so nothing
-        // in it pairs with a `*` or `](` on the card's other lines: the phone
-        // matches links and italics across lines, and rewrites each link
-        // line's url to `[url](url)` first.
-        out.push_str("\n\n");
-        out.push_str(&prose(&summary(&item.body)));
-        out.push('\n');
+        paragraphs.push(super::plain::body(&summary(&item.body)));
     }
-    let plain = super::plain::lines(item);
-    if !plain.is_empty() {
-        out.push_str(&plain);
+    paragraphs.extend(super::plain::lines(item));
+    paragraphs.extend(recommended(item));
+    for p in &paragraphs {
+        out.push_str(&format!("\n\n{p}"));
+    }
+    if !paragraphs.is_empty() {
         out.push('\n');
     }
     if item.kind == ItemKind::Pending {

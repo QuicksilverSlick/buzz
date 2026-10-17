@@ -60,6 +60,7 @@ export const settingsNavGroups: Array<{
       "notifications",
       "voice",
       "shortcuts",
+      "color-key",
       "custom-emoji",
       "local-archive",
       "channel-templates",

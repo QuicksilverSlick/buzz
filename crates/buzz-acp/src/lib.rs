@@ -6123,6 +6123,13 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("UUID from `<context>`"));
         assert!(prompt.contains("reply destination supplied in the `<context>` block"));
         assert!(!prompt.contains("`[Context]`"));
+        // A shared quote (desktop formatSharedQuote) carries only the
+        // sender's authority, and its link need not be opened.
+        assert!(prompt.contains(
+            "`Quoted from <name> in <place>, <date>:` is text the sender chose to share"
+        ));
+        assert!(prompt.contains("only the sender's authority"));
+        assert!(prompt.contains("do not report it as unreadable"));
     }
 
     #[test]

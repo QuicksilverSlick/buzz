@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::item::{plain_text, valid_text, Item};
+use super::item::{plain_text, prose, valid_text, Item};
 
 const PLAIN_MAX: usize = 300;
 const DETAILS_MAX: usize = 3000;
@@ -115,12 +115,12 @@ fn level(l: Level) -> &'static str {
     }
 }
 
-/// The lines under a card's summary, words only like every card line but
-/// the summary: "What changes", "Asked by", risk, undo and reach, "If you
-/// wait". Empty without `plain`, so such a card's text is as it was.
-pub(crate) fn lines(item: &Item) -> String {
+/// The paragraphs after a card's summary, words only like every card line
+/// but the summary: "What changes", "Asked by", risk, undo and reach, "If
+/// you wait", each label bold. None without `plain`.
+pub(crate) fn lines(item: &Item) -> Vec<String> {
     let Some(p) = &item.plain else {
-        return String::new();
+        return Vec::new();
     };
     let undo = p.undo.map(|u| match u {
         Undo::Easy => "Easy",
@@ -128,23 +128,117 @@ pub(crate) fn lines(item: &Item) -> String {
         Undo::Impossible => "Impossible",
     });
     let risk: Vec<String> = [
-        p.risk.map(|r| format!("Risk: {}", level(r))),
-        undo.map(|u| format!("Undo: {u}")),
-        words(&p.reach).map(|r| format!("Reach: {r}")),
+        p.risk.map(|r| bold("Risk", level(r))),
+        undo.map(|u| bold("Undo", u)),
+        words(&p.reach).map(|r| bold("Reach", &r)),
     ]
     .into_iter()
     .flatten()
     .collect();
     [
-        words(&p.what_changes).map(|t| format!("What changes: {t}")),
-        words(&p.asked_by).map(|t| format!("Asked by: {t}")),
-        Some(risk.join(" \u{b7} ")).filter(|r| !r.is_empty()),
-        words(&p.if_you_wait).map(|t| format!("If you wait: {t}")),
+        words(&p.what_changes).map(|t| bold("What changes", &t)),
+        words(&p.asked_by).map(|t| bold("Asked by", &t)),
+        Some(risk.join(RISK_JOIN)).filter(|r| !r.is_empty()),
+        words(&p.if_you_wait).map(|t| bold("If you wait", &t)),
     ]
     .into_iter()
     .flatten()
-    .map(|l| format!("\n{l}"))
     .collect()
+}
+
+/// The labels a writer may type at the start of a line of a body. They
+/// print as the plain fields do: bold, a paragraph each. Only these and only
+/// at a line's start; anything else, mid-line too, stays the writer's text.
+const FIELDS: [&str; 5] = [
+    "What changes",
+    "Asked by",
+    "If you wait",
+    "Recommended",
+    "Details",
+];
+/// One line, as the plain risk, undo and reach print; a line that opens with
+/// one of these takes the others too, each after a "; ".
+const RISK: [&str; 3] = ["Risk", "Undo", "Reach"];
+const RISK_JOIN: &str = " \u{b7} ";
+
+/// Our markdown around a value that is already inert.
+pub(crate) fn bold(label: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("**{label}:**")
+    } else {
+        format!("**{label}:** {value}")
+    }
+}
+
+fn label_at<'a>(line: &'a str, labels: &[&'static str]) -> Option<(&'static str, &'a str)> {
+    labels
+        .iter()
+        .find_map(|&l| Some((l, line.strip_prefix(l)?.strip_prefix(':')?.trim())))
+}
+
+/// "Risk: Low; Undo: Easy; Reach: x" as the plain risk line prints. Its
+/// values go through plain_text: they sit between our `**`s, so none may
+/// carry a `*` of its own.
+fn risk_line(line: &str) -> Option<String> {
+    let (mut label, mut rest) = label_at(line, &RISK)?;
+    let mut parts = Vec::new();
+    loop {
+        let next = rest
+            .match_indices("; ")
+            .find_map(|(i, _)| Some((i, label_at(&rest[i + 2..], &RISK)?)));
+        let Some((i, (next_label, next_rest))) = next else {
+            parts.push(bold(label, &plain_text(rest, usize::MAX)));
+            return Some(parts.join(RISK_JOIN));
+        };
+        parts.push(bold(label, &plain_text(&rest[..i], usize::MAX)));
+        (label, rest) = (next_label, next_rest);
+    }
+}
+
+/// A card's summary: prose() line for line as always, except that a line
+/// opening with a label above prints as the label in bold and its value
+/// through prose(), after a blank line. Lines under it join its paragraph
+/// until a blank line, as in markdown. Nothing of the writer's pairs with our
+/// `**`: they open the line, and prose() leaves no `*` that can close.
+pub(crate) fn body(summary: &str) -> String {
+    let mut out = String::with_capacity(summary.len());
+    let mut after_blank = true;
+    for (i, line) in summary.trim().split('\n').enumerate() {
+        let t = line.trim();
+        let field = risk_line(t)
+            .or_else(|| label_at(t, &FIELDS).map(|(label, value)| bold(label, &prose(value))));
+        if i > 0 {
+            out.push_str(if field.is_some() && !after_blank {
+                "\n\n"
+            } else {
+                "\n"
+            });
+        }
+        after_blank = t.is_empty();
+        out.push_str(&field.unwrap_or_else(|| prose(line)));
+    }
+    out
+}
+
+/// The workbenches the desktop's Bench tabs name (WORKBENCHES in
+/// desktop/src/features/bench/lib/workbenches.ts; keep the two in step).
+const WORKBENCHES: [(&str, &[&str]); 2] = [
+    ("28 Day Reset", &["28-day-reset", "reset"]),
+    ("Dreamforge", &["dreamforge", "buzz"]),
+];
+
+/// A project or area slug as a card's header names it: one equal to a
+/// workbench's slug, or starting with one and a "-", is its name; any
+/// other prints as it is.
+pub(crate) fn place(slug: &str) -> &str {
+    let claims = |known: &&str| {
+        slug.strip_prefix(*known)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    };
+    WORKBENCHES
+        .iter()
+        .find(|(_, slugs)| slugs.iter().any(claims))
+        .map_or(slug, |(name, _)| name)
 }
 
 /// What follows the Recommended line's name: " (high confidence) - <why>",

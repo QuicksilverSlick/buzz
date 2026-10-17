@@ -15,10 +15,14 @@ import {
   benchDeadlineSeconds,
   benchKindLabel,
   benchOptionViews,
-  benchRiskChip,
   benchSeverityChip,
   benchStateLabel,
 } from "@/features/bench/lib/benchCards";
+import { benchCardLayout } from "@/features/bench/lib/benchCardLayout";
+import {
+  BenchCardBlocks,
+  BenchCardDetails,
+} from "@/features/bench/ui/BenchCardFields";
 import type { InboxItem, InboxTypeLabel } from "@/features/home/lib/inbox";
 import {
   type InboxClass,
@@ -320,9 +324,7 @@ function PreviewHeader({
 function BenchPreview({ card }: { card: BenchCard }) {
   const severity = benchSeverityChip(card.severity);
   const state = card.kind === "status" ? benchStateLabel(card.state) : null;
-  const risk = benchRiskChip(card.plain?.risk);
-  const whatChanges = card.plain?.whatChanges?.trim();
-  const body = card.body.split("\n").slice(0, 3).join("\n").trim();
+  const layout = benchCardLayout(card);
   const options = benchOptionViews(
     card,
     INITIAL_BENCH_ANSWER_STATE,
@@ -340,21 +342,13 @@ function BenchPreview({ card }: { card: BenchCard }) {
           <Badge variant={severity.variant}>{severity.label}</Badge>
         ) : null}
         {state ? <Badge variant="secondary">{state}</Badge> : null}
-        {risk ? <Badge variant={risk.variant}>{risk.label}</Badge> : null}
         <span className="text-muted-foreground">
           {benchKindLabel(card.kind)}
         </span>
       </div>
-      {body ? (
-        <p className="line-clamp-3 whitespace-pre-wrap [overflow-wrap:anywhere]">
-          {body}
-        </p>
-      ) : null}
-      {whatChanges ? (
-        <p className="[overflow-wrap:anywhere]">
-          <span className="font-medium text-foreground">What changes:</span>{" "}
-          {whatChanges}
-        </p>
+      <BenchCardBlocks blocks={layout.blocks} clamp />
+      {layout.details ? (
+        <BenchCardDetails text={layout.details} toggle={false} />
       ) : null}
       {options.length > 0 ? (
         <ol className="space-y-0.5">

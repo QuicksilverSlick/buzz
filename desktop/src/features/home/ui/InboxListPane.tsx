@@ -10,7 +10,9 @@ import {
 import * as React from "react";
 
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { BenchCardSnippet } from "@/features/bench/ui/BenchCardFields";
 import { useBenchSnapshot } from "@/features/bench/useBenchCards";
+import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
 import {
   getInboxTypeLabel,
   type InboxFilter,
@@ -20,6 +22,7 @@ import {
 import {
   type InboxItemType,
   classifyInboxItem,
+  inboxCardPost,
   inboxProjects,
 } from "@/features/home/lib/inboxClass";
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
@@ -382,6 +385,7 @@ export function InboxListPane({
         ? "Reopening…"
         : "Open in channel";
     const inboxClass = classifyInboxItem(item, benchSnapshot, projectChips);
+    const cardPost = inboxCardPost(item, inboxClass);
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =
@@ -580,13 +584,17 @@ export function InboxListPane({
                     : "font-semibold text-foreground",
                 )}
               >
-                <VideoReviewCommentMarkdown
-                  className="inbox-preview-markdown text-inherit"
-                  content={item.preview}
-                  interactive={false}
-                  mentionNames={item.mentionNames}
-                  videoReviewCommentRootId={videoReviewCommentRootId}
-                />
+                {cardPost ? (
+                  <BenchCardSnippet card={cardPost} />
+                ) : (
+                  <VideoReviewCommentMarkdown
+                    className="inbox-preview-markdown text-inherit"
+                    content={item.preview}
+                    interactive={false}
+                    mentionNames={item.mentionNames}
+                    videoReviewCommentRootId={videoReviewCommentRootId}
+                  />
+                )}
               </div>
             </div>
           </div>
@@ -702,7 +710,8 @@ export function InboxListPane({
       <TopChromeInsetHeader flush transparent>
         <div className="px-5 py-2">
           <div className="flex min-h-9 w-full min-w-0 items-center justify-between gap-3">
-            <div className="order-2 ml-auto flex shrink-0 items-center justify-end">
+            <div className="order-2 ml-auto flex shrink-0 items-center justify-end gap-1">
+              <ColorKeyButton firstRunTip />
               <Popover>
                 <PopoverTrigger asChild>
                   <button

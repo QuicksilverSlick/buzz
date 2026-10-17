@@ -712,7 +712,7 @@ test("tabs: counts and need-you per project; a project tab shows only its cards"
   ]);
   // All names each card's project on its muted line.
   assert.ok(
-    screen.getByText("28 Day Reset · Pending · release · orchestrator"),
+    screen.getByText("Pending · 28 Day Reset · release · orchestrator"),
   );
 
   await act(async () => {

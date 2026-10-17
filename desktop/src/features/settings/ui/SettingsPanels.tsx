@@ -13,6 +13,7 @@ import {
   MessagesSquare,
   MonitorCog,
   Moon,
+  Palette,
   ServerCog,
   Smartphone,
   Smile,
@@ -28,6 +29,7 @@ import type {
   NotificationSettings,
 } from "@/features/notifications/hooks";
 import type { SoundName, SoundSlot } from "@/features/notifications/lib/sound";
+import { ColorKeySettingsCard } from "@/features/color-key/ui/ColorKey";
 import { CommunityMembersSettingsCard } from "@/features/community-members/ui/CommunityMembersSettingsCard";
 import { CustomEmojiSettingsCard } from "@/features/custom-emoji/ui/CustomEmojiSettingsCard";
 import { LocalArchiveSettingsCard } from "@/features/local-archive/ui/LocalArchiveSettingsCard";
@@ -92,6 +94,7 @@ export type SettingsSection =
   | "compute"
   | "appearance"
   | "shortcuts"
+  | "color-key"
   | "hosted-communities"
   | "community-members"
   | "relay-admin"
@@ -112,6 +115,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "compute",
   "appearance",
   "shortcuts",
+  "color-key",
   "hosted-communities",
   "community-members",
   "relay-admin",
@@ -198,6 +202,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "shortcuts",
     label: "Shortcuts",
     icon: Keyboard,
+  },
+  {
+    value: "color-key",
+    label: "Color key",
+    icon: Palette,
   },
   {
     value: "hosted-communities",
@@ -846,6 +855,8 @@ export function renderSettingsSection(
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
+    case "color-key":
+      return <ColorKeySettingsCard />;
     case "hosted-communities":
       return <HostedCommunitiesSettingsCard />;
     case "community-members":

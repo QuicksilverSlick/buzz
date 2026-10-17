@@ -265,7 +265,11 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
       answer: null,
       recorded: 1,
       recommend: 1,
-      plain: { whatChanges: "Guests get the email", risk: "high" },
+      plain: {
+        whatChanges: "Guests get the email",
+        risk: "high",
+        details: "Short notes.",
+      },
     },
   };
   await act(async () => {
@@ -292,7 +296,21 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
   ]) {
     assert.ok(text.includes(part), part);
   }
-  assert.equal(text.includes("Line four"), false, "first 3 body lines");
+  // The Bench card's layout: bold labels, each block at most 3 lines, the
+  // details apart and clamped with no button to open them.
+  assert.deepEqual(
+    [...shown.querySelectorAll("p > span.font-semibold")].map(
+      (span) => span.textContent,
+    ),
+    ["What changes:"],
+  );
+  const body = [...shown.querySelectorAll("p")].find((p) =>
+    p.textContent.startsWith("Line one"),
+  );
+  assert.ok(body.classList.contains("line-clamp-3"), "3 lines a block");
+  const details = shown.querySelector("[data-testid='bench-card-details']");
+  assert.equal(details.textContent, "DetailsShort notes.");
+  assert.ok(details.querySelector(".line-clamp-4"), "details clamp");
   assert.equal(text.includes("Fifth"), false, "up to 4 options");
   assert.equal(shown.querySelectorAll("button, a").length, 0);
   // Focus stays on the row: the preview takes none.
