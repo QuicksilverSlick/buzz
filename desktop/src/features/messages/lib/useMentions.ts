@@ -711,6 +711,12 @@ export function useMentions(
       }
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      // Close at once, open debounced: see useChannelLinks.updateChannelQuery.
+      if (!activeInlineMention) {
+        setMentionQuery(null);
+        return;
       }
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;

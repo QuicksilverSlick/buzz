@@ -93,14 +93,41 @@ test("cancelling the empty-edit delete keeps the message", async ({ page }) => {
 });
 
 test("a non-empty edit still edits and never deletes", async ({ page }) => {
-  const row = page.locator(`[data-message-id="${OWN_MESSAGE_ID}"]`);
-  await expect(row).toBeVisible({ timeout: 10_000 });
-
-  await openMoreActionsMenu(page, OWN_MESSAGE_ID);
-  await page.getByTestId(`edit-message-${OWN_MESSAGE_ID}`).click();
-  await expect(page.getByTestId("edit-target")).toBeVisible({ timeout: 5_000 });
+  // Edit a message this test sends, not the seeded one: the timeline applies an
+  // edit event only when its target is a real 64-hex event id, so an edit of
+  // "mock-general-welcome" shows only through the save's cache patch, which the
+  // channel's post-subscribe window refresh can overwrite with the original.
+  // Ending on "#general" puts the caret after a channel name in edit mode.
+  const originalMarker = `Original ${Date.now()}`;
   const input = page.getByTestId("message-input");
+  // The trailing space keeps the channel suggestion list closed so Enter sends.
+  await input.fill(`${originalMarker} for #general `);
+  await input.press("Enter");
+  const row = page
+    .getByTestId("message-timeline")
+    .getByTestId("message-row")
+    .filter({ hasText: originalMarker });
+  let messageId = "";
+  await expect
+    .poll(
+      async () =>
+        (messageId = (await row.getAttribute("data-message-id")) ?? ""),
+      {
+        timeout: 10_000,
+      },
+    )
+    .toMatch(/^[0-9a-f]{64}$/);
+
+  await openMoreActionsMenu(page, messageId);
+  await page.getByTestId(`edit-message-${messageId}`).click();
+  await expect(page.getByTestId("edit-target")).toBeVisible({ timeout: 5_000 });
   await expect(input).not.toBeEmpty({ timeout: 5_000 });
+  // The loaded body ends on "#general", so its suggestion list opens. Typing
+  // over it must close it, or Enter picks "#general" instead of saving.
+  const channelSuggestion = page
+    .getByTestId("message-composer")
+    .getByRole("button", { name: "#general" });
+  await expect(channelSuggestion).toBeVisible({ timeout: 5_000 });
   const editedContent = `Edited, not deleted ${Date.now()}`;
 
   await input.click();
@@ -111,11 +138,9 @@ test("a non-empty edit still edits and never deletes", async ({ page }) => {
   // No delete confirmation, edit mode exits, the row survives with new text.
   await expect(page.getByRole("alertdialog")).toHaveCount(0);
   await expect(page.getByTestId("edit-target")).toBeHidden({ timeout: 10_000 });
-  await expect(row).toBeVisible();
-  await expect(page.getByTestId("message-timeline")).toContainText(
-    editedContent,
-  );
+  const editedRow = page.locator(`[data-message-id="${messageId}"]`);
+  await expect(editedRow).toContainText(editedContent);
   await expect(page.getByTestId("message-timeline")).not.toContainText(
-    RENDERED_ORIGINAL_CONTENT,
+    originalMarker,
   );
 });

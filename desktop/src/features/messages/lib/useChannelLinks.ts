@@ -122,6 +122,22 @@ export function useChannelLinks() {
 
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+
+      // Only opening is debounced. A list left open on a query the text no
+      // longer holds still claims Enter/Tab and would overwrite what was just
+      // typed from the old query's start offset.
+      if (
+        !detectPrefixQuery(
+          "#",
+          value,
+          cursorPosition,
+          knownNamesLowerRef.current,
+        )
+      ) {
+        setChannelQuery(null);
+        return;
       }
 
       debounceTimerRef.current = setTimeout(() => {
