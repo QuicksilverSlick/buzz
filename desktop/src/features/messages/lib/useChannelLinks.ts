@@ -153,6 +153,33 @@ export function useChannelLinks() {
     setChannelSelectedIndex(0);
   }, []);
 
+  /**
+   * Bring an open list up to date with the latest text and report whether it
+   * stays open. While the query debounce is pending the list still shows an
+   * older query; run the pending detection now so Enter/Tab neither pick a
+   * suggestion for text the user has typed past nor overwrite it.
+   */
+  const revalidateOpen = React.useCallback(() => {
+    if (!isChannelOpen) return false;
+    if (debounceTimerRef.current === null) return true;
+    clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = null;
+    const channel = detectPrefixQuery(
+      "#",
+      latestValueRef.current,
+      latestCursorRef.current,
+      knownNamesLowerRef.current,
+    );
+    if (!channel) {
+      setChannelQuery(null);
+      return false;
+    }
+    setChannelQuery(channel.query);
+    setChannelStartIndex(channel.startIndex);
+    setChannelSelectedIndex(0);
+    return selectChannelSuggestions(channels, channel.query).length > 0;
+  }, [channels, isChannelOpen]);
+
   const handleChannelKeyDown = React.useCallback(
     (
       event: React.KeyboardEvent,
@@ -216,6 +243,7 @@ export function useChannelLinks() {
     insertChannel,
     isChannelOpen,
     knownChannelNames,
+    revalidateOpen,
     updateChannelQuery,
   };
 }
