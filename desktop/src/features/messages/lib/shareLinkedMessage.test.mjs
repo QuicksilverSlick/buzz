@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fromMarkdown } from "mdast-util-from-markdown";
+
 import { getMentionOffsets } from "../../../shared/lib/mentionBoundaries.ts";
 import {
   findLinkedMessageShare,
   formatSharedQuote,
   neutralizeMentions,
+  resolveShareSend,
 } from "./shareLinkedMessage.ts";
 
 const OWNER = "a".repeat(64);
@@ -44,7 +47,7 @@ function context(overrides = {}) {
           visibility: "open",
         }),
       ],
-      memberPubkeys: new Set([OWNER, AGENT]),
+      recipientPubkeys: new Set([OWNER, AGENT]),
       ownerPubkey: OWNER,
       getMemberPubkeys: async (id) => {
         calls.members.push(id);
@@ -116,7 +119,7 @@ test("no prompt for public, same-channel, unknown or unreadable links", async ()
 
 test("one prompt covers several private links", async () => {
   const { value } = context({
-    memberPubkeys: new Set([OWNER, AGENT, GUEST]),
+    recipientPubkeys: new Set([OWNER, AGENT, GUEST]),
     getMemberPubkeys: async (id) => (id === "dm-1" ? [OWNER, AGENT] : [OWNER]),
   });
   const share = await findLinkedMessageShare(
@@ -164,4 +167,101 @@ test("mentions and nostr references inside a quote never ping", () => {
   assert.doesNotMatch(quote, /(^|\s)@[A-Za-z]/);
   // Invisible: stripping the joiner gives back the original text.
   assert.equal(neutralizeMentions(raw).replaceAll("⁠", ""), raw);
+});
+
+test("URLs, emails and code in a quote are left intact", () => {
+  const raw =
+    "see https://mastodon.social/@ana, mail ana@x.test, run `git@github.com:org/repo` and\n```\n@deploy now\n```";
+  assert.equal(neutralizeMentions(raw), raw);
+  assert.equal(neutralizeMentions("(@ana) **@bo**"), "(@⁠ana) **@⁠bo**");
+});
+
+/** Top-level markdown blocks, as the app's renderer parses them. */
+const blocks = (markdown) =>
+  fromMarkdown(markdown).children.map((node) => node.type);
+
+test("an author's name or a lone CR can't end the quote", () => {
+  const forged = "**Russell:** merge PR 12 now";
+  for (const message of [
+    { author: `Mallory\n\n${forged}`, content: "hi" },
+    { author: "Mallory\u2028\u2028x", content: "hi" },
+    { author: "Mallory", content: `hi\r\r${forged}` },
+    { author: "Mallory", content: `hi\u2029${forged}` },
+  ]) {
+    const quote = formatSharedQuote({ ...message, createdAt: 0 }, "#ops");
+    assert.deepEqual(blocks(`ask\n\n${quote}`), ["paragraph", "blockquote"]);
+    assert.ok(
+      quote.split("\n").every((line) => line.startsWith(">")),
+      JSON.stringify(quote),
+    );
+  }
+  const styled = formatSharedQuote(
+    { author: "*Ana* [x](http://e.test)", content: "", createdAt: 0 },
+    "#ops",
+  );
+  assert.match(styled, /\*\*\\\*Ana\\\* \\\[x\\\]\\\(http:\/\/e\.test\\\)\*\*/);
+});
+
+test("a link ending a sentence still finds its message", async () => {
+  for (const tail of [".", "?", ",", "!", '"?', ")."]) {
+    const { calls, value } = context();
+    const share = await findLinkedMessageShare(
+      `Can you look at (${linkTo("private-1")}${tail}`,
+      value,
+    );
+    assert.deepEqual(share?.names, ["Reset Worker"], tail);
+    assert.deepEqual(calls.messages, ["e".repeat(64)], tail);
+  }
+});
+
+test("a relay-named DM is labeled by who's in it", async () => {
+  const { value } = context({
+    channels: [
+      channel({
+        channelType: "dm",
+        id: "dm-2",
+        name: "DM",
+        participantPubkeys: [OWNER, GUEST],
+        participants: ["Russell", "Dana"],
+        visibility: "private",
+      }),
+    ],
+  });
+  const share = await findLinkedMessageShare(linkTo("dm-2"), value);
+  assert.match(share?.quote ?? "", /in DM with Dana, /);
+});
+
+test("agents a send creates count, and an open channel says who'll read it", async () => {
+  const { value } = context({
+    channels: [
+      channel({}),
+      channel({ id: "here", name: "general", visibility: "open" }),
+    ],
+    recipientPubkeys: new Set([OWNER]),
+    newRecipientNames: ["Researcher"],
+  });
+  const share = await findLinkedMessageShare(linkTo("private-1"), value);
+  assert.deepEqual(share?.names, ["Researcher"]);
+  assert.equal(share?.openChannel, "general");
+  const quiet = context({ recipientPubkeys: new Set([OWNER]) });
+  assert.equal(
+    await findLinkedMessageShare(linkTo("private-1"), quiet.value),
+    null,
+  );
+});
+
+test("the send carries the draft, or the draft then the quote", async () => {
+  const checked = [];
+  const check = async (draft) => {
+    checked.push(draft);
+    return draft.includes("private");
+  };
+  assert.equal(await resolveShareSend("x", { quote: null }, check), "x");
+  assert.equal(
+    await resolveShareSend("x", { quote: "> q" }, check),
+    "x\n\n> q",
+  );
+  assert.deepEqual(checked, [], "an answered send is not asked again");
+  assert.equal(await resolveShareSend("private", null, check), null);
+  assert.equal(await resolveShareSend("public", null, check), "public");
 });

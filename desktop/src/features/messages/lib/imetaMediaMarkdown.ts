@@ -328,7 +328,12 @@ export function buildOutgoingMessage(
   pendingImeta: ReadonlyArray<ImetaMedia>,
   spoileredMediaUrls: ReadonlySet<string> = new Set(),
 ): { content: string; mediaTags: string[][] | undefined } {
-  let content = body;
+  // A media line right under a blockquote would continue it (lazy
+  // continuation), so a blank line ends the quote first.
+  let content =
+    pendingImeta.length > 0 && /^ {0,3}>/.test(body.split("\n").at(-1) ?? "")
+      ? `${body}\n`
+      : body;
   for (const d of pendingImeta) {
     content += formatImetaMediaLine(d, {
       label: d.displayLabel,

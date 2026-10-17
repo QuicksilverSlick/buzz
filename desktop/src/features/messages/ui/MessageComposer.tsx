@@ -28,6 +28,7 @@ import {
 import { useComposerFocusOwnership } from "@/features/messages/lib/useComposerFocusOwnership";
 import { isMentionCodeContext } from "@/features/messages/lib/mentionCodeContext";
 import { useMentions } from "@/features/messages/lib/useMentions";
+import { resolveShareSend } from "@/features/messages/lib/shareLinkedMessage";
 import { getPersistentAgentAudienceScope } from "@/features/messages/lib/persistentAgentAudience";
 import { setKeepMentionedAgentsPinned } from "@/features/messages/lib/autoPinMentionedAgentsPreference";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -262,11 +263,13 @@ function MessageComposerImpl({
   const shareChoiceRef = React.useRef<{ quote: string | null } | null>(null);
   const shareLink = useShareLinkPrompt({
     channelId,
+    draftKey: effectiveDraftKey,
     getComposerRevision,
     mentions,
     ownerPubkey,
     resubmit: (quote) => {
       shareChoiceRef.current = { quote };
+      richText.focus();
       submitMessageRef.current();
     },
   });
@@ -650,10 +653,10 @@ function MessageComposerImpl({
     setIsSubmitLocked(true);
     onPreparingMentionSendChange?.(true);
     try {
-      if (!shareChoice && (await shareLink.check(trimmed))) return;
-      const content = shareChoice?.quote
-        ? `${trimmed}\n\n${shareChoice.quote}`
-        : trimmed;
+      const content = await resolveShareSend(trimmed, shareChoice, (draft) =>
+        shareLink.check(draft, persistentAudience.pubkeys),
+      );
+      if (content === null) return;
       const preparedLinkPreviews = getReadyLinkPreviewTags().some(
         (tag) => tag[1] === "none",
       )
@@ -856,9 +859,13 @@ function MessageComposerImpl({
         />
         <div className="relative flex w-full flex-col gap-0">
           <ComposerShareLinkPrompt
-            names={shareLink.names}
+            onDismiss={() => {
+              shareLink.dismiss();
+              richText.focus();
+            }}
             onIncludeQuote={shareLink.onIncludeQuote}
             onSendLinkOnly={shareLink.onSendLinkOnly}
+            prompt={shareLink.prompt}
           />
           <ComposerReplyEditBanner
             isEditing={editTarget != null}

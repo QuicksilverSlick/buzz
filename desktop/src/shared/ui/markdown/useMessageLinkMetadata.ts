@@ -4,6 +4,7 @@ import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
 import { summarizeMessageLinkContent } from "@/features/messages/lib/messageLinkMetadata";
 import { getEventById } from "@/shared/api/tauri";
 import { getUserProfile } from "@/shared/api/tauriProfiles";
+import type { Profile, RelayEvent } from "@/shared/api/types";
 import { truncateNpub } from "@/shared/lib/pubkey";
 import { isDefinitiveEventNotFound } from "@/shared/lib/eventLookupError";
 
@@ -51,40 +52,62 @@ export function resetMessageLinkMetadataCache() {
   metadataCache.clear();
 }
 
-/** Shared with the composer's share-with-agent quote. */
-export function fetchMessageLinkMetadata(
+export type LoadedMessageLink =
+  | { kind: "ready"; event: RelayEvent; profile: Profile | null }
+  | { kind: "deleted" }
+  | { kind: "unavailable" };
+
+/** The linked event and its author's profile, uncached (the quote reads it fresh). */
+export async function loadMessageLink(
+  link: Pick<ParsedMessageLink, "channelId" | "messageId">,
+): Promise<LoadedMessageLink> {
+  try {
+    const event = await getMessageLinkEvent(link.messageId);
+    const eventChannelId = event.tags.find((tag) => tag[0] === "h")?.[1];
+    if (
+      eventChannelId !== link.channelId ||
+      !PREVIEWABLE_MESSAGE_KINDS.has(event.kind)
+    ) {
+      return { kind: "unavailable" };
+    }
+    const profile = await getUserProfile(event.pubkey).catch(() => null);
+    return { kind: "ready", event, profile };
+  } catch (error) {
+    return isDefinitiveEventNotFound(error)
+      ? { kind: "deleted" }
+      : { kind: "unavailable" };
+  }
+}
+
+export function readyMetadata(
+  event: RelayEvent,
+  profile: Profile | null,
+  content = event.content,
+): CachedMessageLinkMetadata {
+  return {
+    kind: "ready",
+    author:
+      profile?.displayName?.trim() ||
+      profile?.nip05Handle?.trim() ||
+      truncateNpub(event.pubkey),
+    content,
+    createdAt: event.created_at,
+    pubkey: event.pubkey,
+    snippet: summarizeMessageLinkContent(content),
+  };
+}
+
+function fetchMetadata(
   link: Pick<ParsedMessageLink, "channelId" | "messageId">,
 ): Promise<CachedMessageLinkMetadata> {
   const key = `${link.channelId}:${link.messageId}`;
   let request = metadataCache.get(key);
   if (!request) {
-    request = getMessageLinkEvent(link.messageId)
-      .then(async (event) => {
-        const eventChannelId = event.tags.find((tag) => tag[0] === "h")?.[1];
-        if (
-          eventChannelId !== link.channelId ||
-          !PREVIEWABLE_MESSAGE_KINDS.has(event.kind)
-        ) {
-          return { kind: "unavailable" } as const;
-        }
-        const profile = await getUserProfile(event.pubkey).catch(() => null);
-        return {
-          kind: "ready" as const,
-          author:
-            profile?.displayName?.trim() ||
-            profile?.nip05Handle?.trim() ||
-            truncateNpub(event.pubkey),
-          content: event.content,
-          createdAt: event.created_at,
-          pubkey: event.pubkey,
-          snippet: summarizeMessageLinkContent(event.content),
-        };
-      })
-      .catch((error) =>
-        isDefinitiveEventNotFound(error)
-          ? ({ kind: "deleted" } as const)
-          : ({ kind: "unavailable" } as const),
-      );
+    request = loadMessageLink(link).then((loaded) =>
+      loaded.kind === "ready"
+        ? readyMetadata(loaded.event, loaded.profile)
+        : loaded,
+    );
     metadataCache.set(key, request);
     void request.then((result) => {
       if (result.kind === "unavailable" && metadataCache.get(key) === request) {
@@ -114,7 +137,7 @@ export function useMessageLinkMetadata(
       channelId: link.channelId,
       messageId: link.messageId,
     };
-    void fetchMessageLinkMetadata(currentLink).then((metadata) => {
+    void fetchMetadata(currentLink).then((metadata) => {
       if (requestId.current === currentRequest) {
         setResolved({ key, state: metadata });
       }
