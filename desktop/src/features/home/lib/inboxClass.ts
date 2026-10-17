@@ -151,8 +151,34 @@ function repoChip(address: string, projects: InboxProjects): ProjectChip {
 const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
 
 /**
- * The card a row is: one of its events carries the Bench's card marker, the
- * Bench writer key signed it, and it sits in #bench or the card's channel;
+ * The card an event is the post of: it carries the Bench's card marker, the
+ * Bench writer key signed it, and it sits in #bench or the card's channel.
+ */
+function markedCard(
+  event: InboxItem["item"],
+  snapshot: BenchSnapshot | null,
+): BenchCard | null {
+  if (
+    !snapshot?.writerPubkey ||
+    normalizePubkey(event.pubkey) !== normalizePubkey(snapshot.writerPubkey)
+  ) {
+    return null;
+  }
+  const marker = event.tags.find(
+    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
+  )?.[1];
+  const id = marker ? CARD_MARKER.exec(marker)?.[1] : undefined;
+  const card = id ? snapshot.items.find((c) => c.id === id) : undefined;
+  return card &&
+    event.channelId &&
+    (event.channelId === snapshot.channelId ||
+      event.channelId === card.channelId)
+    ? card
+    : null;
+}
+
+/**
+ * The card a row is: one of its events is the card's post (`markedCard`),
  * or the row is the thread of a card the Bench itself posted there. Retired
  * cards count: their old posts are still Bench posts.
  */
@@ -161,23 +187,25 @@ function benchCardOf(
   snapshot: BenchSnapshot | null,
 ): BenchCard | null {
   if (!snapshot?.writerPubkey) return null;
-  const writer = normalizePubkey(snapshot.writerPubkey);
-  const inCardChannel = (card: BenchCard, channelId: string | null) =>
-    Boolean(channelId) &&
-    (channelId === snapshot.channelId || channelId === card.channelId);
   for (const event of [item.item, ...item.groupItems]) {
-    if (normalizePubkey(event.pubkey) !== writer) continue;
-    const marker = event.tags.find(
-      (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
-    )?.[1];
-    const id = marker ? CARD_MARKER.exec(marker)?.[1] : undefined;
-    const card = id ? snapshot.items.find((c) => c.id === id) : undefined;
-    if (card && inCardChannel(card, event.channelId)) return card;
+    const card = markedCard(event, snapshot);
+    if (card) return card;
   }
   const root = indexBenchCards(snapshot).get(item.conversationId);
   return root && item.item.channelId === (root.channelId ?? snapshot.channelId)
     ? root
     : null;
+}
+
+/**
+ * The row's card when the row shows the card's own post; a reply in its
+ * thread is not the card, whatever marker it carries.
+ */
+export function inboxCardPost(
+  item: InboxItem,
+  snapshot: BenchSnapshot | null,
+): BenchCard | null {
+  return markedCard(item.item, snapshot);
 }
 
 function waitsOnOwner(card: BenchCard | null): boolean {

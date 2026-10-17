@@ -180,8 +180,9 @@ async fn a_bound_card_goes_to_its_channel_and_pings_its_answerers() {
     assert_eq!(content(card), render_card(item, "14:05"));
     assert!(
         content(card).ends_with(
-            "For: Craig or Quicksilver (owner). Tap one number below to answer.\n\
-             Recommended: 2 (Reset Worker)\nas of 14:05\nOr reply in this thread."
+            "\n\n**Recommended:** 2 (Reset Worker)\n\n1. Send the new email\n2. Keep the old one\n\n\
+             For: Craig or Quicksilver (owner). Tap one number below to answer.\n\
+             as of 14:05\nOr reply in this thread."
         ),
         "{}",
         content(card)

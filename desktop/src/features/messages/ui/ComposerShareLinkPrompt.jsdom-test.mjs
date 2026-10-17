@@ -6,6 +6,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  RouterContextProvider,
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+} from "@tanstack/react-router";
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -35,15 +42,31 @@ test("shows the quote it would send; Escape dismisses", async () => {
     openChannel: "general",
     quote: "> Quoted from **Dana** in DM with Dana, today:\n>\n> the plan",
   };
+  // The quote renders through Markdown, which reads router and query context.
+  const router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
+  const client = new QueryClient({
+    defaultOptions: { queries: { enabled: false } },
+  });
   try {
     await act(async () =>
       root.render(
-        React.createElement(ComposerShareLinkPrompt, {
-          onDismiss: () => calls.push("dismiss"),
-          onIncludeQuote: () => calls.push("include"),
-          onSendLinkOnly: () => calls.push("link"),
-          prompt,
-        }),
+        React.createElement(
+          RouterContextProvider,
+          { router },
+          React.createElement(
+            QueryClientProvider,
+            { client },
+            React.createElement(ComposerShareLinkPrompt, {
+              onDismiss: () => calls.push("dismiss"),
+              onIncludeQuote: () => calls.push("include"),
+              onSendLinkOnly: () => calls.push("link"),
+              prompt,
+            }),
+          ),
+        ),
       ),
     );
     const alert = container.querySelector('[role="alert"]');
@@ -52,9 +75,13 @@ test("shows the quote it would send; Escape dismisses", async () => {
       alert.textContent,
       /Everyone who can read #general will see it\.$/,
     );
+    // As the message will read: a quote, the name bold, no markdown showing.
+    const quote = container.querySelector('[data-testid="share-link-quote"]');
+    assert.ok(quote.querySelector("blockquote"));
+    assert.equal(quote.querySelector("strong")?.textContent, "Dana");
     assert.equal(
-      container.querySelector('[data-testid="share-link-quote"]').textContent,
-      "Quoted from **Dana** in DM with Dana, today:\n\nthe plan",
+      quote.textContent.trim().replace(/\s+/g, " "),
+      "Quoted from Dana in DM with Dana, today: the plan",
     );
     const [include] = container.querySelectorAll("button");
     include.focus();

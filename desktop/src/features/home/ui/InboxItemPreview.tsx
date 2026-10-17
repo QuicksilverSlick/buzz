@@ -13,12 +13,18 @@ import {
   type BenchCard,
   INITIAL_BENCH_ANSWER_STATE,
   benchDeadlineSeconds,
-  benchKindLabel,
   benchOptionViews,
-  benchRiskChip,
   benchSeverityChip,
   benchStateLabel,
 } from "@/features/bench/lib/benchCards";
+import {
+  benchCardLayout,
+  benchCardMeta,
+} from "@/features/bench/lib/benchCardLayout";
+import {
+  BenchCardBlocks,
+  BenchCardDetails,
+} from "@/features/bench/ui/BenchCardFields";
 import type { InboxItem, InboxTypeLabel } from "@/features/home/lib/inbox";
 import {
   type InboxClass,
@@ -235,7 +241,7 @@ export function InboxItemPreview({
       <PopoverContent
         align="start"
         aria-label="Preview"
-        className="w-80 p-3"
+        className="max-h-[min(28rem,var(--radix-popover-content-available-height))] w-80 overflow-y-auto overscroll-contain p-3"
         data-testid="inbox-item-preview"
         onCloseAutoFocus={(event) => event.preventDefault()}
         onMouseEnter={clearTimer}
@@ -320,9 +326,7 @@ function PreviewHeader({
 function BenchPreview({ card }: { card: BenchCard }) {
   const severity = benchSeverityChip(card.severity);
   const state = card.kind === "status" ? benchStateLabel(card.state) : null;
-  const risk = benchRiskChip(card.plain?.risk);
-  const whatChanges = card.plain?.whatChanges?.trim();
-  const body = card.body.split("\n").slice(0, 3).join("\n").trim();
+  const layout = benchCardLayout(card);
   const options = benchOptionViews(
     card,
     INITIAL_BENCH_ANSWER_STATE,
@@ -332,29 +336,21 @@ function BenchPreview({ card }: { card: BenchCard }) {
   // Agent-written text: plain React text, never markdown or HTML.
   return (
     <div className="mt-2 space-y-1.5 text-xs text-foreground/90">
-      <p className="text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
-        {card.title}
-      </p>
       <div className="flex flex-wrap items-center gap-1.5">
         {severity ? (
           <Badge variant={severity.variant}>{severity.label}</Badge>
         ) : null}
         {state ? <Badge variant="secondary">{state}</Badge> : null}
-        {risk ? <Badge variant={risk.variant}>{risk.label}</Badge> : null}
-        <span className="text-muted-foreground">
-          {benchKindLabel(card.kind)}
+        <span className="min-w-0 text-muted-foreground [overflow-wrap:anywhere]">
+          {benchCardMeta(card)}
         </span>
       </div>
-      {body ? (
-        <p className="line-clamp-3 whitespace-pre-wrap [overflow-wrap:anywhere]">
-          {body}
-        </p>
-      ) : null}
-      {whatChanges ? (
-        <p className="[overflow-wrap:anywhere]">
-          <span className="font-medium text-foreground">What changes:</span>{" "}
-          {whatChanges}
-        </p>
+      <p className="text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
+        {card.title}
+      </p>
+      <BenchCardBlocks blocks={layout.blocks} clamp />
+      {layout.details ? (
+        <BenchCardDetails text={layout.details} toggle={false} />
       ) : null}
       {options.length > 0 ? (
         <ol className="space-y-0.5">

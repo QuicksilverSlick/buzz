@@ -316,44 +316,6 @@ fn summary_cuts_on_a_char_boundary() {
 }
 
 #[test]
-fn render_card_golden() {
-    let item = check(&[
-        ("deadline", json!("2026-09-20T00:00:00Z")),
-        (
-            "links",
-            json!([{"label": "plan", "url": "https://github.com/QuicksilverSlick/buzz"}]),
-        ),
-    ])
-    .unwrap();
-    assert_eq!(
-        render_card(&item, "14:05"),
-        "🔴 · dreamforge · orchestrator\n\
-         **Relay choice**\n\
-         \n\
-         Stay or move?\n\
-         \n\
-         1. Stay\n\
-         2. Move\n\
-         \n\
-         due 2026-09-20T00:00:00Z\n\
-         plan: https://github.com/QuicksilverSlick/buzz\n\
-         Tap one number below to answer.\n\
-         as of 14:05"
-    );
-    let decision = check(&[
-        ("kind", json!("decision")),
-        ("decidedBy", json!("claude")),
-        ("severity", Value::Null),
-        ("options", Value::Null),
-    ])
-    .unwrap();
-    assert_eq!(
-        render_card(&decision, "14:05"),
-        "🧭 · dreamforge · orchestrator\n**Relay choice**\n\nStay or move?\n\nas of 14:05"
-    );
-}
-
-#[test]
 fn render_card_keeps_mentions_inert() {
     // validate() refuses these strings; a card built from state must still
     // show them where neither app resolves them. The title loses its '@';
@@ -1489,6 +1451,7 @@ fn exported_board_drops_all_validate() {
 }
 
 mod answers;
+mod card_layout;
 mod channels;
 mod desktop_cards;
 mod one_tap;

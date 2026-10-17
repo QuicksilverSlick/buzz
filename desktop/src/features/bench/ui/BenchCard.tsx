@@ -14,9 +14,7 @@ import {
   benchCardMode,
   benchDeadlineSeconds,
   benchForLabel,
-  benchKindLabel,
   benchOptionViews,
-  benchPlainView,
   benchPreviousAnswerLine,
   benchReceipt,
   benchRecordedLine,
@@ -25,6 +23,14 @@ import {
   benchValidityLabel,
   safeBenchLinks,
 } from "@/features/bench/lib/benchCards";
+import {
+  benchCardLayout,
+  benchCardMeta,
+} from "@/features/bench/lib/benchCardLayout";
+import {
+  BenchCardBlocks,
+  BenchCardDetails,
+} from "@/features/bench/ui/BenchCardFields";
 import { useBenchAnswer } from "@/features/bench/useBenchCards";
 import { openPopoverLink } from "@/features/messages/lib/openPopoverLink";
 import { cn } from "@/shared/lib/cn";
@@ -316,9 +322,7 @@ function BenchCardHeader({
     card.kind === "status" ? benchStateLabel(card.state) : null;
   const forLabel = benchForLabel(card);
   const previous = benchPreviousAnswerLine(card, formatBenchTime);
-  const meta = [projectLabel, benchKindLabel(card.kind), card.area, card.writer]
-    .filter(Boolean)
-    .join(" · ");
+  const meta = benchCardMeta(card, projectLabel);
   return (
     <>
       <div className="flex flex-wrap items-center gap-1.5">
@@ -345,65 +349,28 @@ function BenchCardHeader({
 function BenchCardText({ card }: { card: BenchCardData }) {
   const deadline = benchDeadlineSeconds(card.deadline);
   const links = safeBenchLinks(card.links);
-  const plain = benchPlainView(card);
+  const layout = benchCardLayout(card);
   return (
     <>
       <p className="mt-1.5 text-message font-semibold text-foreground [overflow-wrap:anywhere]">
         {card.title}
       </p>
-      {plain.chips.length > 0 ? (
-        <div className="mt-1.5 flex flex-wrap gap-1.5">
-          {plain.chips.map((chip) => (
-            <Badge
-              className="max-w-full [overflow-wrap:anywhere]"
-              key={chip.label}
-              variant={chip.variant}
-            >
-              {chip.label}
-            </Badge>
-          ))}
-        </div>
-      ) : null}
-      {plain.lines.map((line) => (
-        <p
-          className="mt-1 text-sm text-foreground/90 [overflow-wrap:anywhere]"
-          key={line.label}
-        >
-          <span className="font-medium text-foreground">{line.label}:</span>{" "}
-          {line.text}
-        </p>
-      ))}
-      {card.body ? (
-        <p className="mt-1 whitespace-pre-wrap text-message text-foreground/90 [overflow-wrap:anywhere]">
-          {card.body}
-        </p>
-      ) : null}
-      {plain.recommended ? (
-        <p className="mt-1.5 text-sm text-foreground/90 [overflow-wrap:anywhere]">
-          {plain.recommended}
-        </p>
-      ) : null}
-      {plain.action ? (
+      <BenchCardBlocks
+        blocks={layout.blocks}
+        className="mt-2 text-message text-foreground/90"
+      />
+      {layout.action ? (
         <p
           className="mt-1.5 text-xs text-muted-foreground [overflow-wrap:anywhere]"
           data-testid="bench-card-action"
         >
-          {plain.action.lead}{" "}
+          {layout.action.lead}{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono text-foreground">
-            {plain.action.command}
+            {layout.action.command}
           </code>
         </p>
       ) : null}
-      {plain.details ? (
-        <details className="mt-1.5 text-sm">
-          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-            Details
-          </summary>
-          <p className="mt-1 whitespace-pre-wrap text-foreground/90 [overflow-wrap:anywhere]">
-            {plain.details}
-          </p>
-        </details>
-      ) : null}
+      {layout.details ? <BenchCardDetails text={layout.details} /> : null}
       {card.deadline ? (
         <p className="mt-1.5 text-xs text-muted-foreground">
           Due {deadline === null ? card.deadline : formatBenchTime(deadline)}

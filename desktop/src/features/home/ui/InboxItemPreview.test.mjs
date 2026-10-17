@@ -265,7 +265,11 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
       answer: null,
       recorded: 1,
       recommend: 1,
-      plain: { whatChanges: "Guests get the email", risk: "high" },
+      plain: {
+        whatChanges: "Guests get the email",
+        risk: "high",
+        details: "Short notes.",
+      },
     },
   };
   await act(async () => {
@@ -284,7 +288,7 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
     "28 Day Reset",
     "Send the week 2 email?",
     "Attention",
-    "High risk",
+    "Risk: High",
     "What changes: Guests get the email",
     "1. Send · Recommended",
     "2. Hold · Answered",
@@ -292,7 +296,34 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
   ]) {
     assert.ok(text.includes(part), part);
   }
-  assert.equal(text.includes("Line four"), false, "first 3 body lines");
+  // The Bench card's layout: bold labels, each block at most 3 lines, the
+  // details apart and clamped with no button to open them.
+  assert.deepEqual(
+    [...shown.querySelectorAll("p > span.font-semibold")].map(
+      (span) => span.textContent,
+    ),
+    ["What changes:", "Risk:"],
+  );
+  // The Bench's header, chip and meta line, then the title: as the card.
+  const meta = [...shown.querySelectorAll("span")].find(
+    (span) => span.textContent === "Pending · 28 Day Reset · orchestrator",
+  );
+  const title = [...shown.querySelectorAll("p")].find(
+    (p) => p.textContent === "Send the week 2 email?",
+  );
+  assert.ok(meta && title, "the header names who it's from");
+  assert.ok(
+    meta.compareDocumentPosition(title) &
+      dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    "the header comes before the title",
+  );
+  const body = [...shown.querySelectorAll("p")].find((p) =>
+    p.textContent.startsWith("Line one"),
+  );
+  assert.ok(body.classList.contains("line-clamp-3"), "3 lines a block");
+  const details = shown.querySelector("[data-testid='bench-card-details']");
+  assert.equal(details.textContent, "DetailsShort notes.");
+  assert.ok(details.querySelector(".line-clamp-4"), "details clamp");
   assert.equal(text.includes("Fifth"), false, "up to 4 options");
   assert.equal(shown.querySelectorAll("button, a").length, 0);
   // Focus stays on the row: the preview takes none.

@@ -1,0 +1,21 @@
+{
+  "note": "One card as the 28 Day Orchestrator writes it: labels typed into the body. tests/card_layout.rs pins the card text the Bench posts; BenchCardLayout.jsdom-test.mjs renders that text with the desktop's markdown and lays the same body out as the Bench screen does.",
+  "drop": {
+    "title": "Which Production change goes first? (PR #758)",
+    "area": "28-day-reset",
+    "severity": "critical",
+    "options": ["Merge it", "Hold"],
+    "body": "What changes: Admins get a *Copy Script* button.\nAsked by: Craig at 9:37 AM CT.\nRisk: Low; Undo: Easy; Reach: administrators using Production.\nIf you wait: Nothing changes.\nRecommended: Hold (high confidence) - the theme work is unfinished.\n\nDetails: PR #758 changes 1 file; see **notes**."
+  },
+  "labels": [
+    "What changes",
+    "Asked by",
+    "Risk",
+    "Undo",
+    "Reach",
+    "If you wait",
+    "Recommended",
+    "Details"
+  ],
+  "text": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nTap one number below to answer.\nas of 14:05"
+}

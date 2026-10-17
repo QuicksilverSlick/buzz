@@ -8,7 +8,8 @@ import {
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { Channel, RelayEvent } from "@/shared/api/types";
-import { KIND_REACTION } from "@/shared/constants/kinds";
+import { KIND_REACTION, KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type UseHomeInboxContextMessagesOptions = {
   channelMessages?: RelayEvent[];
@@ -40,7 +41,18 @@ export function useHomeInboxContextMessages({
   return React.useMemo(() => {
     if (!selectedItem) return [];
 
-    const eventById = new Map(events.map((event) => [event.id, event]));
+    // The relay's own system rows (a DM's dm_created, a join) are JSON for
+    // the timeline's system lines, which hide the kinds they don't know;
+    // here they would show raw. Another key's is that key's message. While
+    // the relay's key is unknown (loading, or its fetch failed) every one
+    // hides: a system kind, never a person's chat, so hiding spoofs nothing.
+    const relay = relaySelfPubkey ? normalizePubkey(relaySelfPubkey) : null;
+    const shown = events.filter(
+      (event) =>
+        event.kind !== KIND_SYSTEM_MESSAGE ||
+        (relay !== null && normalizePubkey(event.pubkey) !== relay),
+    );
+    const eventById = new Map(shown.map((event) => [event.id, event]));
     const contextEventIds = new Set(eventById.keys());
     const contextReactions = [
       ...(channelMessages ?? []),
@@ -54,7 +66,7 @@ export function useHomeInboxContextMessages({
       ? (profiles?.[currentPubkey.toLowerCase()]?.avatarUrl ?? null)
       : null;
     const timelineMessages = formatTimelineMessages(
-      [...events, ...structuralEvents, ...contextReactions],
+      [...shown, ...structuralEvents, ...contextReactions],
       selectedChannel,
       currentPubkey,
       currentUserAvatarUrl,

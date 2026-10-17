@@ -676,42 +676,29 @@ export function benchReceipt(
   };
 }
 
-export type BenchPlainChip = {
-  label: string;
-  variant: "destructive" | "warning" | "secondary" | "outline";
-};
-
 export type BenchPlainView = {
-  /** Risk, undo and reach. */
-  chips: BenchPlainChip[];
+  /** Risk, undo and reach: one line, as the card's text prints them. */
+  risk: Array<{ label: string; text: string }>;
   /** What changes, asked by, if you wait. */
   lines: Array<{ label: string; text: string }>;
-  /** "Recommended: 2. Hold · high confidence · why". */
+  /** The Recommended field: "2. Hold · high confidence · why". */
   recommended: string | null;
   details: string | null;
   /** `lead` is "If you choose Hold:", or "Action:" with no recommendation. */
   action: { lead: string; command: string } | null;
 };
 
-const RISK_CHIPS: Record<BenchRisk, BenchPlainChip> = {
-  high: { label: "High risk", variant: "destructive" },
-  medium: { label: "Medium risk", variant: "warning" },
-  low: { label: "Low risk", variant: "secondary" },
+/** The words bench/plain.rs prints for risk and undo. */
+const RISK_WORDS: Record<BenchRisk, string> = {
+  high: "High",
+  medium: "Medium",
+  low: "Low",
 };
 
-/** "High risk", "Medium risk" or "Low risk"; null when unrated. */
-export function benchRiskChip(
-  risk: string | null | undefined,
-): BenchPlainChip | null {
-  return risk && Object.hasOwn(RISK_CHIPS, risk)
-    ? RISK_CHIPS[risk as BenchRisk]
-    : null;
-}
-
-const UNDO_LABELS: Record<BenchUndo, string> = {
-  easy: "Easy to undo",
-  hard: "Hard to undo",
-  impossible: "Can't be undone",
+const UNDO_WORDS: Record<BenchUndo, string> = {
+  easy: "Easy",
+  hard: "Hard",
+  impossible: "Impossible",
 };
 
 const CONFIDENCE_LABELS: Record<BenchConfidence, string> = {
@@ -727,13 +714,13 @@ function filled(text: string | null | undefined): string | null {
 /** The plain-language parts a card shows; all empty without plain or action. */
 export function benchPlainView(card: BenchCard): BenchPlainView {
   const plain = card.plain ?? {};
-  const chips: BenchPlainChip[] = [];
-  const risk = benchRiskChip(plain.risk);
-  if (risk) chips.push(risk);
-  const undo = lookup(UNDO_LABELS, plain.undo);
-  if (undo) chips.push({ label: undo, variant: "outline" });
-  const reach = filled(plain.reach);
-  if (reach) chips.push({ label: `Reach: ${reach}`, variant: "outline" });
+  const risk = (
+    [
+      ["Risk", lookup(RISK_WORDS, plain.risk)],
+      ["Undo", lookup(UNDO_WORDS, plain.undo)],
+      ["Reach", filled(plain.reach)],
+    ] as const
+  ).flatMap(([label, text]) => (text ? [{ label, text }] : []));
   const lines = (
     [
       ["What changes", plain.whatChanges],
@@ -750,11 +737,11 @@ export function benchPlainView(card: BenchCard): BenchPlainView {
   const confidence = lookup(CONFIDENCE_LABELS, plain.confidence);
   const command = filled(card.action);
   return {
-    chips,
+    risk,
     lines,
     recommended:
       pick !== undefined && (why || confidence)
-        ? dotted(`Recommended: ${card.recommend}. ${pick}`, confidence, why)
+        ? dotted(`${card.recommend}. ${pick}`, confidence, why)
         : null,
     details: filled(plain.details),
     action: command

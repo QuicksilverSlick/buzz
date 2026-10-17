@@ -22,6 +22,7 @@ import {
   workbenchSnapshot,
 } from "@/features/bench/lib/workbenches";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
+import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
 import { useBenchCards } from "@/features/bench/useBenchCards";
 import { useProjectsQuery } from "@/features/projects/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -263,6 +264,7 @@ export function BenchScreen() {
       >
         <div className="mx-auto w-full max-w-3xl space-y-8">
           <PageHeader
+            action={<ColorKeyButton />}
             description="Decisions and status from your agents."
             title="Bench"
           />

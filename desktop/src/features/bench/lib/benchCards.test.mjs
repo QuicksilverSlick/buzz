@@ -871,7 +871,7 @@ test("receipt: the request, the answer or Other reply, and the outcome", () => {
 test("plain: nothing to show without plain fields or an action", () => {
   for (const extra of [{}, { plain: null, action: null }, { plain: {} }]) {
     assert.deepEqual(benchPlainView(card({ recommend: 2, ...extra })), {
-      chips: [],
+      risk: [],
       lines: [],
       recommended: null,
       details: null,
@@ -880,7 +880,7 @@ test("plain: nothing to show without plain fields or an action", () => {
   }
 });
 
-test("plain: risk, undo and reach chips; the lines in order; details", () => {
+test("plain: risk, undo and reach in the card text's words; the lines in order; details", () => {
   const view = benchPlainView(
     card({
       recommend: 2,
@@ -895,10 +895,10 @@ test("plain: risk, undo and reach chips; the lines in order; details", () => {
       },
     }),
   );
-  assert.deepEqual(view.chips, [
-    { label: "High risk", variant: "destructive" },
-    { label: "Can't be undone", variant: "outline" },
-    { label: "Reach: 3,089 members", variant: "outline" },
+  assert.deepEqual(view.risk, [
+    { label: "Risk", text: "High" },
+    { label: "Undo", text: "Impossible" },
+    { label: "Reach", text: "3,089 members" },
   ]);
   assert.deepEqual(view.lines, [
     { label: "What changes", text: "Every member gets the new welcome email." },
@@ -911,16 +911,16 @@ test("plain: risk, undo and reach chips; the lines in order; details", () => {
     null,
     "no why or confidence: the button says it",
   );
-  const chips = (plain) => benchPlainView(card({ plain })).chips;
-  assert.deepEqual(chips({ risk: "medium" }), [
-    { label: "Medium risk", variant: "warning" },
+  const risk = (plain) => benchPlainView(card({ plain })).risk;
+  assert.deepEqual(risk({ risk: "medium" }), [
+    { label: "Risk", text: "Medium" },
   ]);
-  assert.deepEqual(chips({ risk: "low", undo: "easy" }), [
-    { label: "Low risk", variant: "secondary" },
-    { label: "Easy to undo", variant: "outline" },
+  assert.deepEqual(risk({ risk: "low", undo: "easy" }), [
+    { label: "Risk", text: "Low" },
+    { label: "Undo", text: "Easy" },
   ]);
-  assert.deepEqual(chips({ risk: "toString", undo: "hard", reach: "  " }), [
-    { label: "Hard to undo", variant: "outline" },
+  assert.deepEqual(risk({ risk: "toString", undo: "hard", reach: "  " }), [
+    { label: "Undo", text: "Hard" },
   ]);
   assert.deepEqual(
     benchPlainView(
@@ -943,7 +943,7 @@ test("plain: the recommended line, and what one tap approves", () => {
   );
   assert.equal(
     view.recommended,
-    "Recommended: 1. Merge PR · high confidence · CI is green and Craig asked for it.",
+    "1. Merge PR · high confidence · CI is green and Craig asked for it.",
   );
   assert.deepEqual(view.action, {
     lead: "If you choose Merge PR:",
@@ -952,7 +952,7 @@ test("plain: the recommended line, and what one tap approves", () => {
   assert.equal(
     benchPlainView(card({ recommend: 2, plain: { confidence: "low" } }))
       .recommended,
-    "Recommended: 2. Hold · low confidence",
+    "2. Hold · low confidence",
   );
   // No (or an out-of-range) recommendation: no line; the action stands alone.
   for (const recommend of [null, 3]) {

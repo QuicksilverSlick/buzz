@@ -205,3 +205,43 @@ test("a live card hides its keycap pills; other messages keep theirs", async ({
   await expect(pill(cardRow, "1️⃣")).toHaveCount(0);
   await expect(pill(cardRow, "2️⃣")).toHaveCount(0);
 });
+
+test("a card's typed labels read as bold fields; long details fold", async ({
+  page,
+}) => {
+  const snapshot = benchSnapshot(null);
+  if (!snapshot.enabled) throw new Error("the Bench is on");
+  snapshot.items[0] = {
+    ...snapshot.items[0],
+    writer: "orchestrator",
+    area: "28-day-reset",
+    body: [
+      "What changes: Admins get a Copy Script button.",
+      "Asked by: Craig at 9:37 AM CT.",
+      "Risk: Low; Undo: Easy; Reach: administrators.",
+      "",
+      `Details: ${"Every check passed on head a30d88a. ".repeat(12)}`,
+    ].join("\n"),
+  };
+  await installMockBridge(page, { benchCards: snapshot });
+  await page.goto("/");
+  await page.getByTestId("open-bench-view").click();
+  const card = page
+    .getByTestId("bench-section-needsYou")
+    .getByTestId("bench-card");
+  await expect(card).toContainText("Pending · 28 Day Reset · orchestrator");
+  await expect(card).not.toContainText("28-day-reset");
+  const label = card.getByText("What changes:", { exact: true });
+  await expect(label).toHaveCSS("font-weight", "600");
+  await expect(card.getByText("Undo:", { exact: true })).toBeVisible();
+  const details = card.getByTestId("bench-card-details");
+  const more = details.getByRole("button", { name: "Show more" });
+  await expect(more).toHaveAttribute("aria-expanded", "false");
+  const clamped = await details.locator("p").nth(1).boundingBox();
+  await more.click();
+  await expect(
+    details.getByRole("button", { name: "Show less" }),
+  ).toHaveAttribute("aria-expanded", "true");
+  const open = await details.locator("p").nth(1).boundingBox();
+  expect(open?.height ?? 0).toBeGreaterThan(clamped?.height ?? 0);
+});

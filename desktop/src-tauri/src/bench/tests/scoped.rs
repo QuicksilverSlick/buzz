@@ -675,10 +675,13 @@ fn card_pings_follow_the_answerers() {
 
 // ── card and notice text ────────────────────────────────────────────────
 
-const ASK: &str = "🟠 · dreamforge · reset-worker\n\
+// The fixture's area ("dreamforge") is not its project's, so it stays.
+const ASK: &str = "🟠 · 28 Day Reset · dreamforge · reset-worker\n\
                    **Welcome email**\n\
                    \n\
                    Craig asked for a shorter welcome email.\n\
+                   \n\
+                   **Recommended:** 2 (Reset Worker)\n\
                    \n\
                    1. Send the new email\n\
                    2. Keep the old one\n";
@@ -736,7 +739,6 @@ fn scoped_card_says_who_it_is_for() {
         format!(
             "{ASK}\n\
              For: Craig or Quicksilver (owner). Tap one number below to answer.\n\
-             Recommended: 2 (Reset Worker)\n\
              as of 14:05\n\
              Or reply in this thread."
         )
@@ -747,7 +749,6 @@ fn scoped_card_says_who_it_is_for() {
         format!(
             "{ASK}\n\
              For: Craig or Quicksilver (owner).\n\
-             Recommended: 2 (Reset Worker)\n\
              as of 14:05\n\
              Recorded: 2. Keep the old one · Craig · 14:02\n\
              Or reply in this thread."
@@ -778,7 +779,14 @@ fn scoped_card_says_who_it_is_for() {
         answerers: vec![craig(), dana],
     };
     let card = render_card(&item, "14:05");
-    assert!(card.contains("\nFor: Craig, Dana x or the owner. Tap one number below to answer.\nRecommended: 2 (reset-worker)\n"), "{card}");
+    assert!(
+        card.contains("\n\n**Recommended:** 2 (reset-worker)\n\n1. "),
+        "{card}"
+    );
+    assert!(
+        card.contains("\nFor: Craig, Dana x or the owner. Tap one number below to answer.\nas of"),
+        "{card}"
+    );
     // Before the service stamps it, a scoped card is owner-only.
     item.stamp = None;
     assert!(render_card(&item, "14:05").contains("\nFor: the owner. Tap"));
@@ -809,7 +817,6 @@ fn receipt_keeps_the_request_and_adds_the_outcome() {
         render_card(&outcome, "15:10"),
         format!(
             "{ASK}\n\
-             Recommended: 2 (Reset Worker)\n\
              Answered: 2. Keep the old one · Craig · 14:02\n\
              \n\
              Outcome · done · 15:10\n\
@@ -856,7 +863,7 @@ fn receipt_keeps_the_request_and_adds_the_outcome() {
     decision.request = Some(Box::new(legacy));
     assert_eq!(
         render_card(&decision, "15:10"),
-        "🔴 · dreamforge · orchestrator\n\
+        "🔴 · Dreamforge · orchestrator\n\
          **Relay choice**\n\
          \n\
          Stay or move?\n\
