@@ -124,7 +124,7 @@ fn plain_lines_follow_the_summary_in_order() {
     // Without the new fields: today's text, byte for byte.
     let today = format!("{HEAD}{OPTIONS}\nTap one number below to answer.\nas of 14:05");
     assert_eq!(render_card(&check(&[]).unwrap(), "14:05"), today);
-    // Every line, words only; details stay off the phone.
+    // Every line, words only; the details last, as prose.
     let item = check(&[("plain", full_plain())]).unwrap();
     assert_eq!(
         render_card(&item, "14:05"),
@@ -137,6 +137,8 @@ fn plain_lines_follow_the_summary_in_order() {
              **Risk:** Low · **Undo:** Easy · **Reach:** Every member\n\
              \n\
              **If you wait:** The fix waits a day\n\
+             \n\
+             **Details:** The long story, folded on the desktop.\n\
              {OPTIONS}\nTap one number below to answer.\nas of 14:05"
         )
     );
@@ -439,8 +441,9 @@ async fn an_answered_card_asked_again_comes_back_to_whoever_answered() {
         .0;
     assert_eq!(tag_value(posted, "h").as_deref(), Some(X));
     assert!(
-        content(posted)
-            .starts_with("Back to you\n🟠 · 28 Day Reset · reset-worker\n**Welcome email**\n"),
+        content(posted).starts_with(
+            "Back to you\n🟠 · 28 Day Reset · dreamforge · reset-worker\n**Welcome email**\n"
+        ),
         "{}",
         content(posted)
     );

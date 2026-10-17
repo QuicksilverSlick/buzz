@@ -13,12 +13,14 @@ import {
   type BenchCard,
   INITIAL_BENCH_ANSWER_STATE,
   benchDeadlineSeconds,
-  benchKindLabel,
   benchOptionViews,
   benchSeverityChip,
   benchStateLabel,
 } from "@/features/bench/lib/benchCards";
-import { benchCardLayout } from "@/features/bench/lib/benchCardLayout";
+import {
+  benchCardLayout,
+  benchCardMeta,
+} from "@/features/bench/lib/benchCardLayout";
 import {
   BenchCardBlocks,
   BenchCardDetails,
@@ -334,18 +336,18 @@ function BenchPreview({ card }: { card: BenchCard }) {
   // Agent-written text: plain React text, never markdown or HTML.
   return (
     <div className="mt-2 space-y-1.5 text-xs text-foreground/90">
-      <p className="text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
-        {card.title}
-      </p>
       <div className="flex flex-wrap items-center gap-1.5">
         {severity ? (
           <Badge variant={severity.variant}>{severity.label}</Badge>
         ) : null}
         {state ? <Badge variant="secondary">{state}</Badge> : null}
-        <span className="text-muted-foreground">
-          {benchKindLabel(card.kind)}
+        <span className="min-w-0 text-muted-foreground [overflow-wrap:anywhere]">
+          {benchCardMeta(card)}
         </span>
       </div>
+      <p className="text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
+        {card.title}
+      </p>
       <BenchCardBlocks blocks={layout.blocks} clamp />
       {layout.details ? (
         <BenchCardDetails text={layout.details} toggle={false} />

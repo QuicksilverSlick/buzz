@@ -288,7 +288,7 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
     "28 Day Reset",
     "Send the week 2 email?",
     "Attention",
-    "High risk",
+    "Risk: High",
     "What changes: Guests get the email",
     "1. Send · Recommended",
     "2. Hold · Answered",
@@ -302,7 +302,20 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
     [...shown.querySelectorAll("p > span.font-semibold")].map(
       (span) => span.textContent,
     ),
-    ["What changes:"],
+    ["What changes:", "Risk:"],
+  );
+  // The Bench's header, chip and meta line, then the title: as the card.
+  const meta = [...shown.querySelectorAll("span")].find(
+    (span) => span.textContent === "Pending · 28 Day Reset · orchestrator",
+  );
+  const title = [...shown.querySelectorAll("p")].find(
+    (p) => p.textContent === "Send the week 2 email?",
+  );
+  assert.ok(meta && title, "the header names who it's from");
+  assert.ok(
+    meta.compareDocumentPosition(title) &
+      dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    "the header comes before the title",
   );
   const body = [...shown.querySelectorAll("p")].find((p) =>
     p.textContent.startsWith("Line one"),

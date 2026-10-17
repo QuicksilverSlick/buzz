@@ -623,21 +623,15 @@ test("a plain card shows its chips, lines, recommendation, action and folded det
     );
   });
   const root = view.container.querySelector("[data-testid='bench-card']");
-  for (const text of [
-    "Back to you",
-    "High risk",
-    "Hard to undo",
-    "Reach: 3,089 members",
-  ]) {
-    assert.ok(screen.getByText(text), text);
-  }
+  assert.ok(screen.getByText("Back to you"));
   assert.match(root.textContent, /Earlier: Quicksilver chose Hold · \S/);
   assert.equal(root.querySelector("b"), null, "plain text stays inert");
-  // The phone's order, each label bold with its colon, each its own line.
+  // The phone's order, each label bold with its colon, each its own line;
+  // risk, undo and reach on one line as the card's text prints them.
   const fields = [
     "What changes: The <b>new</b> check goes live.",
     "Asked by: Reset Worker",
-    "High risk",
+    "Risk: High · Undo: Hard · Reach: 3,089 members",
     "If you wait: Members keep the old check.",
     "Recommended: 1. Merge PR · high confidence · CI is green.",
   ];
@@ -649,20 +643,71 @@ test("a plain card shows its chips, lines, recommendation, action and folded det
   assert.deepEqual(labels(root), [
     "What changes:",
     "Asked by:",
+    "Risk:",
+    "Undo:",
+    "Reach:",
     "If you wait:",
     "Recommended:",
   ]);
+  for (const chip of ["High risk", "Hard to undo", "Reach: 3,089 members"]) {
+    assert.equal(screen.queryByText(chip), null, chip);
+  }
   const action = screen.getByTestId("bench-card-action");
   assert.equal(action.textContent, `If you choose Merge PR: ${merge}`);
   assert.equal(action.querySelector("code").textContent, merge);
-  // Details apart, under a rule; short ones never fold.
+  // Details apart, under a rule; ones that fit have no button.
   const details = screen.getByTestId("bench-card-details");
   assert.equal(details.textContent, "DetailsFull notes **here**");
   assert.equal(details.querySelector("button"), null);
-  assert.equal(details.querySelector(".line-clamp-4"), null);
 });
 
-test("labels a writer typed read as fields; long details fold behind Show more", async () => {
+/**
+ * jsdom has no layout: every element measures as `lines` lines tall, and a
+ * clamped one shows at most 4 of them. Returns the undo.
+ */
+function measureLines(lines) {
+  const proto = dom.window.HTMLElement.prototype;
+  Object.defineProperty(proto, "scrollHeight", {
+    configurable: true,
+    get: () => lines * 16,
+  });
+  Object.defineProperty(proto, "clientHeight", {
+    configurable: true,
+    get() {
+      return (
+        (this.classList.contains("line-clamp-4") ? Math.min(lines, 4) : lines) *
+        16
+      );
+    },
+  });
+  return () => {
+    delete proto.scrollHeight;
+    delete proto.clientHeight;
+  };
+}
+
+test("long details that fit in four lines offer no Show more", async () => {
+  const restore = measureLines(3);
+  try {
+    await act(async () => {
+      render(
+        wrap(
+          benchCard({
+            card: card({
+              plain: { details: "a fairly long line. ".repeat(16) },
+            }),
+          }),
+        ),
+      );
+    });
+    const details = screen.getByTestId("bench-card-details");
+    assert.equal(details.querySelector("button"), null, "nothing is hidden");
+  } finally {
+    restore();
+  }
+});
+
+test("labels a writer typed read as fields; long details fold behind Show more", async (t) => {
   const vector = JSON.parse(
     readFileSync(
       new URL(
@@ -673,6 +718,7 @@ test("labels a writer typed read as fields; long details fold behind Show more",
     ),
   );
   const long = "Every check passed on head a30d88a. ".repeat(12);
+  t.after(measureLines(9));
   let view;
   await act(async () => {
     view = render(

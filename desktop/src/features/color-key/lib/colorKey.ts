@@ -1,7 +1,4 @@
-import type {
-  BenchChipVariant,
-  BenchPlainChip,
-} from "@/features/bench/lib/benchCards";
+import type { BenchChipVariant } from "@/features/bench/lib/benchCards";
 import type { InboxItemType } from "@/features/home/lib/inboxClass";
 import { INBOX_TYPE_META } from "@/features/home/ui/InboxItemPreview";
 import { projectColorOf } from "@/features/projects/lib/projectColors";
@@ -65,7 +62,7 @@ export const BENCH_KEY_LABELS: ReadonlyArray<{
   chips: ReadonlyArray<{
     label: string;
     /** The Badge it shows as; null for plain text on the card. */
-    variant: BenchChipVariant | BenchPlainChip["variant"] | null;
+    variant: BenchChipVariant | "secondary" | "outline" | null;
   }>;
   meaning: string;
 }> = [
@@ -115,23 +112,12 @@ export const BENCH_KEY_LABELS: ReadonlyArray<{
   },
   {
     chips: [
-      { label: "High risk", variant: "destructive" },
-      { label: "Medium risk", variant: "warning" },
-      { label: "Low risk", variant: "secondary" },
+      { label: "Risk: …", variant: null },
+      { label: "Undo: …", variant: null },
+      { label: "Reach: …", variant: null },
     ],
-    meaning: "How much could go wrong.",
-  },
-  {
-    chips: [
-      { label: "Easy to undo", variant: "outline" },
-      { label: "Hard to undo", variant: "outline" },
-      { label: "Can't be undone", variant: "outline" },
-    ],
-    meaning: "How hard the change is to reverse.",
-  },
-  {
-    chips: [{ label: "Reach: …", variant: "outline" }],
-    meaning: "Who or what the change affects.",
+    meaning:
+      "How much could go wrong, how hard the change is to reverse, and who or what it affects.",
   },
   {
     chips: [{ label: "Recommended", variant: "secondary" }],

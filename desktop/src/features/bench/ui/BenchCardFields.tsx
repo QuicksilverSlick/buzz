@@ -6,7 +6,6 @@ import {
   benchCardLead,
 } from "@/features/bench/lib/benchCardLayout";
 import { cn } from "@/shared/lib/cn";
-import { Badge } from "@/shared/ui/badge";
 
 /**
  * A card's blocks with a gap between each: a field's label bold with its
@@ -45,21 +44,6 @@ function BenchCardBlockView({
   block: BenchCardBlock;
   className?: string;
 }) {
-  if (block.kind === "chips") {
-    return (
-      <div className="flex flex-wrap gap-1.5">
-        {block.chips.map((chip) => (
-          <Badge
-            className="max-w-full [overflow-wrap:anywhere]"
-            key={chip.label}
-            variant={chip.variant}
-          >
-            {chip.label}
-          </Badge>
-        ))}
-      </div>
-    );
-  }
   return (
     <p
       className={cn("whitespace-pre-wrap [overflow-wrap:anywhere]", className)}
@@ -77,22 +61,11 @@ function BenchCardBlockView({
   );
 }
 
-/** Long enough to fold: about four lines of the card's width. */
-const DETAILS_FOLD_CHARS = 280;
-const DETAILS_FOLD_LINES = 4;
-
-function benchDetailsFolds(text: string): boolean {
-  return (
-    text.length > DETAILS_FOLD_CHARS ||
-    text.split("\n").length > DETAILS_FOLD_LINES
-  );
-}
-
 /**
  * Details apart from the decision: a rule, the bold label, the text smaller
- * and muted. Long details fold to 4 lines behind Show more; short ones never
- * fold, so nothing is hidden without a way to show it. `toggle={false}` (the
- * read-only Inbox preview) always clamps and has no button.
+ * and muted, clamped to 4 lines. Show more appears only when the clamp
+ * really hides text, measured at the card's width; `toggle={false}` (the
+ * read-only Inbox preview) clamps with no button.
  */
 export function BenchCardDetails({
   text,
@@ -102,8 +75,21 @@ export function BenchCardDetails({
   toggle?: boolean;
 }) {
   const [open, setOpen] = React.useState(false);
+  const [clipped, setClipped] = React.useState(false);
+  const ref = React.useRef<HTMLParagraphElement>(null);
   const id = React.useId();
-  const folds = toggle && benchDetailsFolds(text);
+  // Measured while clamped; kept while open, so Show less stays.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: text changes what overflows
+  React.useLayoutEffect(() => {
+    const node = ref.current;
+    if (!toggle || open || !node) return;
+    const measure = () => setClipped(node.scrollHeight > node.clientHeight + 1);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [open, text, toggle]);
+  const folds = toggle && (open || clipped);
   return (
     <div
       className="mt-2.5 border-t border-border/70 pt-2"
@@ -113,9 +99,10 @@ export function BenchCardDetails({
       <p
         className={cn(
           "mt-0.5 whitespace-pre-wrap text-xs text-muted-foreground [overflow-wrap:anywhere]",
-          (!toggle || (folds && !open)) && "line-clamp-4",
+          !open && "line-clamp-4",
         )}
         id={id}
+        ref={ref}
       >
         {text}
       </p>

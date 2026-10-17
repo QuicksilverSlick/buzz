@@ -675,7 +675,8 @@ fn card_pings_follow_the_answerers() {
 
 // ── card and notice text ────────────────────────────────────────────────
 
-const ASK: &str = "🟠 · 28 Day Reset · reset-worker\n\
+// The fixture's area ("dreamforge") is not its project's, so it stays.
+const ASK: &str = "🟠 · 28 Day Reset · dreamforge · reset-worker\n\
                    **Welcome email**\n\
                    \n\
                    Craig asked for a shorter welcome email.\n\

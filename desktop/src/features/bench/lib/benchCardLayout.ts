@@ -9,8 +9,8 @@
 
 import {
   type BenchCard,
-  type BenchPlainChip,
   type BenchPlainView,
+  benchKindLabel,
   benchPlainView,
 } from "@/features/bench/lib/benchCards";
 import { slugWorkbench } from "@/features/bench/lib/workbenches";
@@ -20,8 +20,7 @@ export type BenchField = { label: string; text: string };
 export type BenchCardBlock =
   | { kind: "text"; text: string }
   /** One field, or the risk line's: Risk, Undo and Reach on one line. */
-  | { kind: "fields"; fields: BenchField[] }
-  | { kind: "chips"; chips: BenchPlainChip[] };
+  | { kind: "fields"; fields: BenchField[] };
 
 export type BenchCardLayout = {
   blocks: BenchCardBlock[];
@@ -64,7 +63,9 @@ function riskFields(field: BenchField): BenchField[] {
 
 /**
  * The body's paragraphs. A line opening with a label starts a field, and
- * the lines under it join it until a blank line; Details fields go apart.
+ * the lines under it join it until a blank line. Details go apart, and keep
+ * every line and paragraph after them until another label opens a line, so
+ * nothing of theirs lands among the decision fields.
  */
 export function benchBodyBlocks(body: string): {
   blocks: BenchCardBlock[];
@@ -73,10 +74,13 @@ export function benchBodyBlocks(body: string): {
   const blocks: BenchCardBlock[] = [];
   const details: BenchField[] = [];
   let open: { text: string } | null = null;
+  let detail: BenchField | null = null;
+  let blank = false;
   for (const raw of body.split("\n")) {
     const line = raw.trim();
     if (!line) {
-      open = null;
+      if (open !== detail) open = null;
+      blank = true;
       continue;
     }
     const risk = labelAt(line, RISK_LABELS);
@@ -85,17 +89,20 @@ export function benchBodyBlocks(body: string): {
       const fields = riskFields(risk);
       blocks.push({ kind: "fields", fields });
       open = fields[fields.length - 1];
+      detail = null;
     } else if (field) {
       if (field.label === "Details") details.push(field);
       else blocks.push({ kind: "fields", fields: [field] });
       open = field;
+      detail = field.label === "Details" ? field : null;
     } else if (open) {
-      open.text += `\n${line}`;
+      open.text += open.text ? `${blank ? "\n\n" : "\n"}${line}` : line;
     } else {
       const text = { kind: "text" as const, text: line };
       blocks.push(text);
       open = text;
     }
+    blank = false;
   }
   return { blocks, details: details.map((d) => d.text) };
 }
@@ -119,8 +126,8 @@ export function benchCardLayout(card: BenchCard): BenchCardLayout {
       ...body.blocks,
       ...line("What changes"),
       ...line("Asked by"),
-      ...(plain.chips.length > 0
-        ? [{ kind: "chips" as const, chips: plain.chips }]
+      ...(plain.risk.length > 0
+        ? [{ kind: "fields" as const, fields: plain.risk }]
         : []),
       ...line("If you wait"),
       ...fieldBlock("Recommended", plain.recommended),
@@ -141,12 +148,35 @@ export function benchCardLead(card: BenchCard): BenchCardBlock | null {
 }
 
 /**
- * The project (else area) a card's header names: a workbench's name for its
- * slugs ("28-day-reset" is "28 Day Reset"), else the slug as it is.
+ * Where a card's header says it is, as bench/plain.rs `place` prints it:
+ * its project (else area) by its workbench's name ("28-day-reset" is "28 Day
+ * Reset"), else the slug; then the area when it says more ("reset-billing"),
+ * never a slug of the workbench already named.
  */
 export function benchCardPlace(
   card: Pick<BenchCard, "area" | "project">,
-): string {
+): string[] {
   const slug = card.project ?? card.area;
-  return slugWorkbench(slug)?.label ?? slug;
+  const workbench = slugWorkbench(slug);
+  const name = workbench?.label ?? slug;
+  return card.area === name || workbench?.slugs.includes(card.area)
+    ? [name]
+    : [name, card.area];
+}
+
+/**
+ * The header's muted line: the kind, then where the card is, once by name
+ * (never "28 Day Reset" beside "28-day-reset"), then who it is from.
+ */
+export function benchCardMeta(card: BenchCard, projectLabel?: string): string {
+  return [
+    ...new Set([
+      benchKindLabel(card.kind),
+      projectLabel,
+      ...benchCardPlace(card),
+      card.writer,
+    ]),
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }

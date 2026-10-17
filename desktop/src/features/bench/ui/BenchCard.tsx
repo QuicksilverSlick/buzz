@@ -14,7 +14,6 @@ import {
   benchCardMode,
   benchDeadlineSeconds,
   benchForLabel,
-  benchKindLabel,
   benchOptionViews,
   benchPreviousAnswerLine,
   benchReceipt,
@@ -26,7 +25,7 @@ import {
 } from "@/features/bench/lib/benchCards";
 import {
   benchCardLayout,
-  benchCardPlace,
+  benchCardMeta,
 } from "@/features/bench/lib/benchCardLayout";
 import {
   BenchCardBlocks,
@@ -323,17 +322,7 @@ function BenchCardHeader({
     card.kind === "status" ? benchStateLabel(card.state) : null;
   const forLabel = benchForLabel(card);
   const previous = benchPreviousAnswerLine(card, formatBenchTime);
-  // The project once, by name: never "28 Day Reset" beside "28-day-reset".
-  const meta = [
-    ...new Set([
-      benchKindLabel(card.kind),
-      projectLabel,
-      benchCardPlace(card),
-      card.writer,
-    ]),
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  const meta = benchCardMeta(card, projectLabel);
   return (
     <>
       <div className="flex flex-wrap items-center gap-1.5">

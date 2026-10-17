@@ -87,10 +87,19 @@ fn a_label_opens_its_own_paragraph_and_its_value_stays_inert() {
 
 #[test]
 fn the_risk_line_splits_only_at_its_own_labels() {
-    // Its values are words only: they sit between our `**`s.
+    // Its values read as written, through prose(), but no `*` of the
+    // writer's sits between our `**`s: each is a lookalike.
     assert_eq!(
         body("Risk: *High*; Undo: Can't; Reach: 3,089 members; and more"),
-        "**Risk:** High \u{b7} **Undo:** Can't \u{b7} **Reach:** 3,089 members and more"
+        "**Risk:** \u{2217}High\u{2217} \u{b7} **Undo:** Can't \u{b7} **Reach:** 3,089 members; and more"
+    );
+    assert_eq!(
+        body("Risk: Low; Undo: Easy; Reach: <5% of guests"),
+        format!("**Risk:** Low \u{b7} **Undo:** Easy \u{b7} **Reach:** <{F}5% of guests")
+    );
+    assert_eq!(
+        body("Reach: ~40 facilitators / 2 coaches, **all**"),
+        format!("**Reach:** {F}~40 facilitators / 2 coaches, \u{2217}\u{2217}all\u{2217}\u{2217}")
     );
     // Undo and Reach open a risk line of their own too.
     assert_eq!(body("Reach: everyone"), "**Reach:** everyone");
@@ -124,23 +133,59 @@ fn only_whitelisted_labels_at_a_line_start_are_labels() {
 
 #[test]
 fn the_header_names_the_project_never_its_slug() {
-    for (slug, name) in [
-        ("28-day-reset", "28 Day Reset"),
-        ("reset", "28 Day Reset"),
-        ("reset-q4", "28 Day Reset"),
-        ("dreamforge", "Dreamforge"),
-        ("dreamforge-build", "Dreamforge"),
-        ("buzz", "Dreamforge"),
-        ("resetting", "resetting"),
-        ("guest-gate", "guest-gate"),
+    for (project, area, header) in [
+        (None, "28-day-reset", "28 Day Reset"),
+        (None, "reset", "28 Day Reset"),
+        (None, "dreamforge", "Dreamforge"),
+        (None, "buzz", "Dreamforge"),
+        (None, "resetting", "resetting"),
+        (None, "guest-gate", "guest-gate"),
+        (Some("reset"), "28-day-reset", "28 Day Reset"),
+        (Some("acme"), "acme", "acme"),
+        // An area that says more than the project stays.
+        (None, "reset-q4", "28 Day Reset \u{b7} reset-q4"),
+        (None, "buzz-relay", "Dreamforge \u{b7} buzz-relay"),
+        (
+            Some("reset"),
+            "reset-billing",
+            "28 Day Reset \u{b7} reset-billing",
+        ),
+        (Some("acme"), "release", "acme \u{b7} release"),
     ] {
-        assert_eq!(place(slug), name, "{slug}");
+        assert_eq!(place(project, area), header, "{project:?} {area}");
     }
     let card = |o: &[(&str, Value)]| render_card(&check(o).unwrap(), "14:05");
     assert!(card(&[("area", json!("28-day-reset"))])
         .starts_with("\u{1F534} \u{b7} 28 Day Reset \u{b7} orchestrator\n**Relay choice**"));
     assert!(card(&[("area", json!("guest-gate"))])
         .starts_with("\u{1F534} \u{b7} guest-gate \u{b7} orchestrator\n"));
+}
+
+#[test]
+fn plain_details_print_after_the_recommendation_capped_and_inert() {
+    let item = check(&[
+        ("recommend", json!(2)),
+        (
+            "plain",
+            json!({"details": "Checks: **green**\n- 2 files", "why": "safer"}),
+        ),
+    ])
+    .unwrap();
+    let text = render_card(&item, "14:05");
+    assert!(
+        text.contains(&format!(
+            "\n\n**Recommended:** 2 (orchestrator) - safer\n\n\
+             **Details:** Checks:{F} {F}*{F}*green{F}*{F}*\n{F}- 2 files\n\n1. Stay"
+        )),
+        "{text}"
+    );
+    // As long as a summary may be, no longer.
+    let long = check(&[("plain", json!({"details": "a".repeat(3000)}))]).unwrap();
+    let text = render_card(&long, "14:05");
+    assert!(text.contains(&format!("**Details:** {}\u{2026}\n", "a".repeat(400))));
+    // Blank details print nothing.
+    let blank = check(&[("plain", json!({"details": " "}))]).unwrap();
+    assert!(!render_card(&blank, "14:05").contains("Details"));
 }
 
 #[test]

@@ -9,7 +9,6 @@ import test from "node:test";
 
 import {
   benchKindLabel,
-  benchRiskChip,
   benchSeverityChip,
   benchValidityLabel,
 } from "@/features/bench/lib/benchCards.ts";
@@ -145,9 +144,9 @@ test("Bench labels are the ones the Bench prints, in the look it prints them", (
     const { label, variant } = benchSeverityChip(severity);
     assert.equal(chips.get(label), variant, label);
   }
-  for (const risk of ["high", "medium", "low"]) {
-    const { label, variant } = benchRiskChip(risk);
-    assert.equal(chips.get(label), variant, label);
+  // Risk, undo and reach are bold-labelled text, as the card text has them.
+  for (const label of ["Risk: …", "Undo: …", "Reach: …"]) {
+    assert.equal(chips.get(label), null, label);
   }
   for (const kind of ["pending", "decision", "status"]) {
     assert.equal(chips.get(benchKindLabel(kind)), null, kind);
@@ -163,8 +162,10 @@ test("Bench labels are the ones the Bench prints, in the look it prints them", (
     .map((path) => readFileSync(new URL(path, import.meta.url), "utf8"))
     .join("\n");
   for (const label of chips.keys()) {
+    // A field's colon is BenchCardFields' (`{label}:`), not in its name.
     for (const part of label.split(/[…·]/)) {
-      if (part.trim()) assert.ok(source.includes(part.trim()), part);
+      const word = part.trim().replace(/:$/, "");
+      if (word) assert.ok(source.includes(word), part);
     }
   }
 });

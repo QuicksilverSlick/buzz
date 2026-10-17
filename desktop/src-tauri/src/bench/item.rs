@@ -1072,14 +1072,15 @@ pub(crate) fn answerer_text(
     }
 }
 
-/// The request as a card shows it: marker, project (else area) and writer,
-/// the title in bold, then paragraphs: the summary (`plain::body`: prose()
-/// with its labels bold, agent text inert), the plain-language fields
-/// (`plain::lines`) and the recommendation; then the options as a numbered
-/// list, the validated deadline and links so the phone can open them.
+/// The request as a card shows it: marker, place (`plain::place`) and
+/// writer, the title in bold, then paragraphs: the summary (`plain::body`:
+/// prose() with its labels bold, agent text inert), the plain-language
+/// fields (`plain::lines`), the recommendation and the plain details; then
+/// the options as a numbered list, the validated deadline and links so the
+/// phone can open them.
 /// Everything but the summary and the url goes through plain_text.
 fn card_head(item: &Item) -> String {
-    let place = super::plain::place(item.project.as_deref().unwrap_or(&item.area));
+    let place = super::plain::place(item.project.as_deref(), &item.area);
     let mut out = format!("{} \u{b7} {place} \u{b7} {}", marker(item), item.writer);
     let title = plain_text(&item.title, usize::MAX);
     // An empty one would print `****`, a rule on both apps.
@@ -1096,6 +1097,7 @@ fn card_head(item: &Item) -> String {
     }
     paragraphs.extend(super::plain::lines(item));
     paragraphs.extend(recommended(item));
+    paragraphs.extend(super::plain::details(item));
     for p in &paragraphs {
         out.push_str(&format!("\n\n{p}"));
     }
