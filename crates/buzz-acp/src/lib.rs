@@ -5775,6 +5775,21 @@ fn handle_prompt_result(
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
         }
+    } else if let Some(failure) = failure.as_ref().filter(|f| f.class.parks()) {
+        // A heartbeat turn carries no batch, so there is nothing to park and
+        // nobody waiting on one — but the outage is just as real. Record it:
+        // the login is marked limited, health and presence move, the STATE
+        // record falls due and a spend cap or lost sign-in still raises the
+        // owner's card. Only the queue and the thread line are skipped.
+        tracing::warn!(
+            class = failure.slug,
+            provider_text = %failure.text,
+            "provider limit on a turn with no batch — recording the state"
+        );
+        config
+            .factory
+            .lock()
+            .record_limit(agent_index, failure, now);
     }
 
     match &result.source {
@@ -13846,6 +13861,121 @@ mod error_outcome_emission_tests {
                 .starts_with(&format!("buzz://message?channel={channel_id}&id=")),
             "the card links the request"
         );
+    }
+
+    /// A limit that begins while the pool is idle used to leave the dot
+    /// green and #factory silent: `on_error` is skipped for a class that
+    /// parks, and `plan` was only reached through a batch, which a heartbeat
+    /// turn does not carry. The outage stayed invisible until some real
+    /// request happened along and failed.
+    #[tokio::test]
+    async fn a_heartbeat_turn_that_hits_a_limit_still_records_the_state() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        assert_eq!(config.factory.lock().presence(), "online");
+
+        let mut heartbeat_in_flight = true;
+        run_failed_heartbeat(
+            &config,
+            agent_error(
+                "Internal error: You've hit your weekly limit · resets Oct 18, 7pm \
+                 (America/Chicago)",
+            ),
+            &mut heartbeat_in_flight,
+        )
+        .await;
+        assert!(!heartbeat_in_flight);
+        assert_eq!(
+            config.factory.lock().presence(),
+            "away",
+            "the dot is honest about a limit found by a heartbeat"
+        );
+        let record = config
+            .factory
+            .lock()
+            .take_report(chrono::Utc::now())
+            .expect("a STATE record for the outage");
+        assert!(
+            record.contains("state=BLOCKED class=weekly_limit"),
+            "{record}"
+        );
+        assert!(record.contains("You've hit your weekly limit"), "{record}");
+
+        // The two classes only the owner can lift still raise their card.
+        let mut heartbeat_in_flight = true;
+        run_failed_heartbeat(
+            &config,
+            agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            &mut heartbeat_in_flight,
+        )
+        .await;
+        let card = bench
+            .path()
+            .join("inbox")
+            .join(factory::CARD_WRITER)
+            .join("ade9d0e2-sign-in.json");
+        assert!(card.is_file(), "the sign-in card is raised");
+    }
+
+    /// One failed heartbeat turn — no batch, no scope — through
+    /// `handle_prompt_result`.
+    async fn run_failed_heartbeat(
+        config: &Config,
+        error: acp::AcpError,
+        heartbeat_in_flight: &mut bool,
+    ) {
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "heartbeat-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Heartbeat,
+            turn_id: "heartbeat-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: None,
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            config,
+            result,
+            heartbeat_in_flight,
+            &std::collections::HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+        assert_eq!(queue.queued_event_count(uuid::Uuid::nil()), 0);
     }
 
     /// The thread hears that the harness stopped waiting, in the same

@@ -749,6 +749,68 @@ impl Factory {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Plan {
+        let (wait, free) = self.begin_limit(slot, failure, now);
+        if let Some(next) = free {
+            let label = self.accounts[next].label.clone();
+            let line = self
+                .told
+                .insert((scope.clone(), true))
+                .then(|| hand_off_line(&label));
+            self.resumes = None;
+            self.set_health(Health::Degraded, now);
+            return Plan::HandOff { label, line };
+        }
+        // Counted here, not above: a hand-off re-runs the batch at once on
+        // another login, which is not waiting and spends no budget.
+        if let Budget::Spent { why } = self.spend_park_budget(scope, failure, now) {
+            return Plan::DeadLetter { why };
+        }
+        let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
+        self.resumes = Some(resumes);
+        // Three short rate limits in a row are Blocked (short), spec 3.2.
+        let blocked = self.blocked_by(failure);
+        let line = (blocked && self.told.insert((scope.clone(), false)))
+            .then(|| pause_line(failure, resumes));
+        let critical = self.settle_limit(failure, blocked, now);
+        Plan::Park {
+            wait,
+            line,
+            mention_owner: critical && !self.critical_reaches_the_owner(),
+        }
+    }
+
+    /// Record a limit that no batch carried: a heartbeat turn's failure.
+    ///
+    /// The serious half of [`plan`](Self::plan) runs all the same — the
+    /// slot's login is marked limited, health and presence move, the STATE
+    /// record falls due and the spend-cap or sign-in card is raised. Only
+    /// the queue and the thread line are skipped: there is no request to
+    /// park and nobody waiting on one. Without this, a limit that begins
+    /// while the pool is idle left the dot green and #factory silent until
+    /// some real request happened along and failed (spec 2.2, 4.2).
+    pub(crate) fn record_limit(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
+        let (wait, free) = self.begin_limit(slot, failure, now);
+        if free.is_some() {
+            // Another login can take the next request: moving, with a catch.
+            self.resumes = None;
+            self.set_health(Health::Degraded, now);
+            return;
+        }
+        self.resumes = Some(now + chrono::Duration::from_std(wait).unwrap_or_default());
+        let blocked = self.blocked_by(failure);
+        self.settle_limit(failure, blocked, now);
+    }
+
+    /// The first half both paths share: count the rate streak, record who
+    /// and what failed, mark the slot's login limited for a class a login
+    /// can hit, and return how long the wait is plus the free login, if any,
+    /// that could take the work right now.
+    fn begin_limit(
+        &mut self,
+        slot: usize,
+        failure: &Failure,
+        now: DateTime<Utc>,
+    ) -> (Duration, Option<usize>) {
         if failure.class == Class::RateLimit {
             self.rate_streak += 1;
         }
@@ -765,14 +827,7 @@ impl Factory {
                 text: failure.text.clone(),
             });
             if let Some(next) = self.preferred(now) {
-                let label = self.accounts[next].label.clone();
-                let line = self
-                    .told
-                    .insert((scope.clone(), true))
-                    .then(|| hand_off_line(&label));
-                self.resumes = None;
-                self.set_health(Health::Degraded, now);
-                return Plan::HandOff { label, line };
+                return (wait, Some(next));
             }
             wait = self
                 .accounts
@@ -782,24 +837,26 @@ impl Factory {
                 .min()
                 .unwrap_or(wait);
         }
-        // Counted here, not above: a hand-off re-runs the batch at once on
-        // another login, which is not waiting and spends no budget.
-        if let Budget::Spent { why } = self.spend_park_budget(scope, failure, now) {
-            return Plan::DeadLetter { why };
-        }
-        let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
-        self.resumes = Some(resumes);
-        // Three short rate limits in a row are Blocked (short), spec 3.2.
-        let blocked = failure.class != Class::RateLimit || self.rate_streak >= 3;
-        let line = (blocked && self.told.insert((scope.clone(), false)))
-            .then(|| pause_line(failure, resumes));
+        (wait, None)
+    }
+
+    /// Whether this failure stops the work rather than just slowing it:
+    /// three short rate limits in a row are Blocked (short), spec 3.2.
+    fn blocked_by(&self, failure: &Failure) -> bool {
+        failure.class != Class::RateLimit || self.rate_streak >= 3
+    }
+
+    /// The last half both paths share: move health, and raise the owner's
+    /// card for the two classes only they can lift. Returns whether a
+    /// Critical was raised.
+    fn settle_limit(&mut self, failure: &Failure, blocked: bool, now: DateTime<Utc>) -> bool {
         let health = match failure.class {
             Class::SignIn => Health::Down,
             _ if blocked => Health::Blocked,
             _ => Health::Degraded,
         };
         self.set_health(health, now);
-        let critical = match failure.class {
+        match failure.class {
             Class::SpendCap => {
                 self.limit_card(failure, true);
                 true
@@ -809,11 +866,6 @@ impl Factory {
                 true
             }
             _ => false,
-        };
-        Plan::Park {
-            wait,
-            line,
-            mention_owner: critical && !self.critical_reaches_the_owner(),
         }
     }
 
