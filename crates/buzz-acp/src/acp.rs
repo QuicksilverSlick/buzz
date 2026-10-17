@@ -127,12 +127,42 @@ pub enum AcpError {
 /// preserving the numeric code. When the `message` field is missing or
 /// non-string, fall back to the full JSON object so provider-specific
 /// detail (e.g. a `data` field) is not lost.
+///
+/// The adapters put the real cause in `data`: codex-acp leaves the message as
+/// a bare "Internal error" and carries the provider's words in `data.message`
+/// and `data.codexErrorInfo`; claude-agent-acp adds `data.errorKind`. They are
+/// folded into the message, not a new field, because `AgentError { code,
+/// message }` is matched at many call sites. The failure classifier reads the
+/// ` (errorKind: …)` / ` (codexErrorInfo: …)` markers back.
 fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
-    let message = match error.get("message").and_then(|m| m.as_str()) {
-        Some(m) => m.to_string(),
-        None => error.to_string(),
+    let Some(mut message) = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+    else {
+        return AcpError::AgentError {
+            code,
+            message: error.to_string(),
+        };
     };
+    let data = error.get("data");
+    let field = |name: &str| data.and_then(|d| d.get(name));
+    if let Some(detail) = field("message").and_then(|m| m.as_str()) {
+        if !detail.is_empty() && !message.contains(detail) {
+            message = format!("{message}: {detail}");
+        }
+    }
+    for name in ["errorKind", "codexErrorInfo"] {
+        match field(name) {
+            Some(serde_json::Value::String(kind)) => {
+                message.push_str(&format!(" ({name}: {kind})"))
+            }
+            // Structured codexErrorInfo, e.g. {"httpConnectionFailed":{"httpStatusCode":502}}.
+            Some(v @ serde_json::Value::Object(_)) => message.push_str(&format!(" ({name}: {v})")),
+            _ => {}
+        }
+    }
     AcpError::AgentError { code, message }
 }
 
@@ -7296,6 +7326,48 @@ sleep 1"#,
                 );
             }
             other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    /// codex-acp sends a bare "Internal error" with the provider's words in
+    /// `data.message` (index.js createTurnErrorData); claude-agent-acp sends
+    /// the words in `message` and a category in `data.errorKind`.
+    #[test]
+    fn agent_error_from_json_folds_adapter_data_into_message() {
+        let cases = [
+            (
+                serde_json::json!({"code": -32603, "message": "Internal error", "data": {
+                    "message": "You've hit your usage limit. Try again at 9:12 AM.",
+                    "codexErrorInfo": "usageLimitExceeded"}}),
+                "Internal error: You've hit your usage limit. Try again at 9:12 AM. (codexErrorInfo: usageLimitExceeded)",
+            ),
+            (
+                serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "data": {"errorKind": "rate_limit"}}),
+                "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)",
+            ),
+            (
+                serde_json::json!({"code": -32603, "message": "Internal error", "data": {
+                    "message": "stream disconnected",
+                    "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}}}),
+                "Internal error: stream disconnected (codexErrorInfo: {\"httpConnectionFailed\":{\"httpStatusCode\":502}})",
+            ),
+            // data.message repeating the message is not doubled.
+            (
+                serde_json::json!({"code": -32603, "message": "Internal error: boom", "data": {"message": "boom"}}),
+                "Internal error: boom",
+            ),
+            (serde_json::json!({"code": -32603, "message": "Internal error"}), "Internal error"),
+        ];
+        for (error, want) in cases {
+            match super::agent_error_from_json(&error) {
+                AcpError::AgentError { code, message } => {
+                    assert_eq!(code, -32603);
+                    assert_eq!(message, want);
+                }
+                other => panic!("expected AgentError, got {other:?}"),
+            }
         }
     }
 
