@@ -42,6 +42,7 @@ import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposer
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
 import { cn } from "@/shared/lib/cn";
 import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
+import { ComposerShareLinkPrompt } from "./ComposerShareLinkPrompt";
 import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { focusMentionOptionsTrigger } from "./MentionAutocomplete";
 import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
@@ -50,6 +51,7 @@ import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useComposerVoiceNote } from "./useComposerVoiceNote";
 import { useMentionSendFlow } from "./useMentionSendFlow";
+import { useShareLinkPrompt } from "./useShareLinkPrompt";
 import { useAgentAddressLockPicker } from "./useAgentAddressLockPicker";
 import { useAddressMentionPulse } from "./useAddressMentionPulse";
 import { useAlwaysAddressShortcut } from "./useAlwaysAddressShortcut";
@@ -225,6 +227,7 @@ function MessageComposerImpl({
     setIsEmojiPickerOpen(false);
     channelLinks.clearChannels();
     emojiAutocomplete.clearEmojis();
+    shareLink.dismiss();
   }, [effectiveDraftKey]);
   const disabledRef = React.useRef(disabled);
   const isSendingRef = React.useRef(isSending);
@@ -255,6 +258,18 @@ function MessageComposerImpl({
     channelLinks.isChannelOpen ||
     emojiAutocomplete.isEmojiAutocompleteOpen;
   const submitMessageRef = React.useRef<() => void>(() => {});
+  // One-shot: the owner's answer to the share prompt, read by the next send.
+  const shareChoiceRef = React.useRef<{ quote: string | null } | null>(null);
+  const shareLink = useShareLinkPrompt({
+    channelId,
+    getComposerRevision,
+    mentions,
+    ownerPubkey,
+    resubmit: (quote) => {
+      shareChoiceRef.current = { quote };
+      submitMessageRef.current();
+    },
+  });
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
   const formRef = React.useRef<HTMLFormElement>(null);
   const composerOwnsFocus = useComposerFocusOwnership(formRef);
@@ -299,6 +314,7 @@ function MessageComposerImpl({
     onLinkShortcut: () => onLinkShortcutRef.current?.() ?? false,
     onUpdate: ({ cursor, linkPreviewContent, text }) => {
       trackAuthoredContent(text);
+      shareLink.dismiss();
       contentRef.current = text;
       setComposerContentFromText(text);
       setPreviewContent(linkPreviewContent);
@@ -553,6 +569,8 @@ function MessageComposerImpl({
   });
   const submitMessage = React.useCallback(async () => {
     const trimmed = syncComposerContentFromEditor().trim();
+    const shareChoice = shareChoiceRef.current;
+    shareChoiceRef.current = null;
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
       // A live recording must be finished or discarded explicitly; never let an
@@ -632,6 +650,10 @@ function MessageComposerImpl({
     setIsSubmitLocked(true);
     onPreparingMentionSendChange?.(true);
     try {
+      if (!shareChoice && (await shareLink.check(trimmed))) return;
+      const content = shareChoice?.quote
+        ? `${trimmed}\n\n${shareChoice.quote}`
+        : trimmed;
       const preparedLinkPreviews = getReadyLinkPreviewTags().some(
         (tag) => tag[1] === "none",
       )
@@ -651,7 +673,7 @@ function MessageComposerImpl({
         ),
         recoveryDraftKey: effectiveDraftKey,
         spoileredAttachmentUrls,
-        trimmed,
+        trimmed: content,
       });
     } finally {
       isSubmitLockedRef.current = false;
@@ -685,6 +707,7 @@ function MessageComposerImpl({
     onPreparingMentionSendChange,
     persistentAudience.pubkeys,
     isEditSubmissionLocked,
+    shareLink.check,
     effectiveDraftKey,
     mentions.getDraftMentionRefs,
     mentions.restoreDraftMentionRefs,
@@ -832,6 +855,11 @@ function MessageComposerImpl({
           className="absolute inset-x-0 bottom-0 h-5 bg-transparent"
         />
         <div className="relative flex w-full flex-col gap-0">
+          <ComposerShareLinkPrompt
+            names={shareLink.names}
+            onIncludeQuote={shareLink.onIncludeQuote}
+            onSendLinkOnly={shareLink.onSendLinkOnly}
+          />
           <ComposerReplyEditBanner
             isEditing={editTarget != null}
             isEditCancelDisabled={isDeferredEditPending}

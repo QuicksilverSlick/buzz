@@ -28,7 +28,9 @@ async function getMessageLinkEvent(messageId: string) {
 
 type MessageLinkMetadata = {
   author: string;
+  content: string;
   createdAt: number;
+  pubkey: string;
   snippet: string;
 };
 type MessageLinkMetadataState =
@@ -49,7 +51,8 @@ export function resetMessageLinkMetadataCache() {
   metadataCache.clear();
 }
 
-function fetchMetadata(
+/** Shared with the composer's share-with-agent quote. */
+export function fetchMessageLinkMetadata(
   link: Pick<ParsedMessageLink, "channelId" | "messageId">,
 ): Promise<CachedMessageLinkMetadata> {
   const key = `${link.channelId}:${link.messageId}`;
@@ -71,7 +74,9 @@ function fetchMetadata(
             profile?.displayName?.trim() ||
             profile?.nip05Handle?.trim() ||
             truncateNpub(event.pubkey),
+          content: event.content,
           createdAt: event.created_at,
+          pubkey: event.pubkey,
           snippet: summarizeMessageLinkContent(event.content),
         };
       })
@@ -109,7 +114,7 @@ export function useMessageLinkMetadata(
       channelId: link.channelId,
       messageId: link.messageId,
     };
-    void fetchMetadata(currentLink).then((metadata) => {
+    void fetchMessageLinkMetadata(currentLink).then((metadata) => {
       if (requestId.current === currentRequest) {
         setResolved({ key, state: metadata });
       }
