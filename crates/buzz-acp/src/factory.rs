@@ -443,7 +443,10 @@ fn card_quote(provider: &str, text: &str) -> String {
 
 /// The env var naming a Claude agent's ordered pool of logins: `;`-separated
 /// `CLAUDE_CONFIG_DIR` folders, each signed in to its own subscription, the
-/// first one the primary.
+/// first one the primary. An entry may be written `label=folder` to name that
+/// login in records and cards; otherwise the folder's own name is used, and a
+/// folder sitting directly under the home directory is `primary`, never the
+/// OS account name.
 pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
 
 /// One login of the pool.
@@ -451,8 +454,9 @@ pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
 pub(crate) struct Account {
     /// The `CLAUDE_CONFIG_DIR` folder. Never shown: it holds a user path.
     dir: String,
-    /// What records and lines call it: the folder's name, never an email or a
-    /// token. `~/.buzz-agents/factory/claude` is `factory`.
+    /// What records and lines call it: the owner's own `label=`, or the
+    /// folder's name — never an email, a token or the OS account name. A
+    /// `…/factory/claude` folder is `factory`; `~/.claude` is `primary`.
     pub label: String,
     /// The limit this login last hit, until it lifts.
     pub limited: Option<Limit>,
@@ -580,13 +584,29 @@ impl Factory {
         if !dirs.is_empty() && !claude {
             tracing::warn!("{ACCOUNT_POOL_ENV} is set but the agent is not Claude — ignoring it");
         }
+        let mut taken: HashSet<String> = HashSet::new();
         let accounts = dirs
             .into_iter()
             .filter(|_| claude)
-            .map(|dir| Account {
-                dir: dir.to_string(),
-                label: account_label(dir),
-                limited: None,
+            .map(|entry| {
+                let (mut label, dir) = parse_entry(entry);
+                // Two folders can slug to one name — two home-directory
+                // entries both read as `primary` — and a record still has to
+                // say which login it means.
+                if !taken.insert(label.clone()) {
+                    for n in 2.. {
+                        let candidate = format!("{label}-{n}");
+                        if taken.insert(candidate.clone()) {
+                            label = candidate;
+                            break;
+                        }
+                    }
+                }
+                Account {
+                    dir,
+                    label,
+                    limited: None,
+                }
             })
             .collect();
         Self {
@@ -1012,18 +1032,34 @@ impl Factory {
     }
 }
 
-/// A pool folder's name for records: the last path component, or its parent
-/// when that is just `claude` / `.claude`. Lower-case `[a-z0-9-]` only.
-fn account_label(dir: &str) -> String {
-    let mut parts = dir
-        .trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .filter(|p| !p.is_empty());
-    let last = parts.next().unwrap_or("account");
-    let name = match last.to_ascii_lowercase().as_str() {
-        "claude" | ".claude" => parts.next().unwrap_or(last),
-        _ => last,
-    };
+/// The label for a login whose folder name cannot be shown: a home folder is
+/// named after the OS account, and no record may carry that (spec 3.1).
+pub(crate) const PRIMARY_LABEL: &str = "primary";
+
+/// One pool entry: a folder, or `label=folder` when the owner names it.
+/// Naming it is the way to keep the label off the path altogether.
+fn parse_entry(entry: &str) -> (String, String) {
+    match entry.split_once('=') {
+        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
+            (slug(label.trim()), dir.trim().to_string())
+        }
+        _ => (account_label(entry), entry.to_string()),
+    }
+}
+
+/// Whether `s` is a label the owner wrote rather than the head of a path: at
+/// most 32 characters of `[A-Za-z0-9_-]`, so a Windows drive or a `~` entry
+/// never parses as one.
+fn is_plain_label(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Lower-case `[a-z0-9-]` only; `account` when nothing is left.
+fn slug(name: &str) -> String {
     let label: String = name
         .trim_start_matches('.')
         .chars()
@@ -1040,6 +1076,59 @@ fn account_label(dir: &str) -> String {
     } else {
         label
     }
+}
+
+/// A pool folder's name for records: the last path component, or its parent
+/// when that is just `claude` / `.claude`. Never a home folder's own name, so
+/// a login that sits directly under the home directory is [`PRIMARY_LABEL`].
+/// Use the `label=folder` form to name it yourself.
+fn account_label(dir: &str) -> String {
+    let parts: Vec<&str> = dir
+        .trim()
+        .trim_end_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let claude_leaf = parts
+        .last()
+        .is_some_and(|last| matches!(last.to_ascii_lowercase().as_str(), "claude" | ".claude"));
+    // A leaf `claude` folder names no login, so its parent does.
+    let Some(i) = parts.len().checked_sub(if claude_leaf { 2 } else { 1 }) else {
+        return "account".to_string();
+    };
+    if is_home_component(&parts, i) {
+        return PRIMARY_LABEL.to_string();
+    }
+    slug(parts[i])
+}
+
+/// Whether `parts[i]` is a home directory, whose name is the OS account's.
+/// Read from the path itself — a component under `home` or `Users`, a bare
+/// `~`, `/root` — and from this process's own home, so a home directory in an
+/// unusual place is caught too.
+fn is_home_component(parts: &[&str], i: usize) -> bool {
+    let name = parts[i];
+    if name == "~" || name.eq_ignore_ascii_case("%userprofile%") {
+        return true;
+    }
+    if i == 0 && name.eq_ignore_ascii_case("root") {
+        return true;
+    }
+    if i > 0 && matches!(parts[i - 1].to_ascii_lowercase().as_str(), "home" | "users") {
+        return true;
+    }
+    home_folder_name().is_some_and(|home| home.eq_ignore_ascii_case(name))
+}
+
+/// This process's own home folder name.
+fn home_folder_name() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let name = PathBuf::from(home)
+        .file_name()?
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// [`Factory`] behind a lock, so `Config` can carry it to every call site.
@@ -1433,7 +1522,6 @@ mod tests {
             .map(|a| a.label.as_str())
             .collect();
         assert_eq!(labels, ["factory", "account-test"]);
-        assert_eq!(account_label("/home/me/.claude"), "me");
         assert_eq!(account_label("/srv/Claude Two/"), "claude-two");
         // Only the Claude adapter switches logins.
         assert!(Factory::new(Some(POOL), "codex-acp").accounts().is_empty());
@@ -1443,6 +1531,48 @@ mod tests {
             "no pool: today's env"
         );
         assert_eq!(none.label(0), "default");
+    }
+
+    /// A login that sits in the owner's home folder is `primary`: the folder
+    /// is named after the OS account, and spec 3.1 keeps that out of every
+    /// record, label and card. Naming it `label=folder` wins over the path.
+    #[test]
+    fn account_label_never_shows_a_home_folder_name() {
+        let home_shaped = [
+            "~/.claude",
+            "/home/craig/.claude",
+            "/Users/Russell/.claude",
+            "C:/Users/PC owner/.claude",
+            r"C:\Users\PC owner\.claude",
+            r"C:\Users\PC owner",
+            "/root/.claude",
+            "%USERPROFILE%/.claude",
+        ];
+        for dir in home_shaped {
+            assert_eq!(account_label(dir), PRIMARY_LABEL, "{dir}");
+        }
+        // A login in a folder of its own still reads by that folder's name.
+        assert_eq!(account_label("/opt/agents/factory/claude"), "factory");
+        assert_eq!(
+            account_label(r"D:\agents\account-test\claude"),
+            "account-test"
+        );
+
+        // The owner's own label wins, and is not read as a path.
+        let pool = Factory::new(
+            Some(r"owner=C:\Users\PC owner\.claude; /home/craig/.claude ; ~/.claude"),
+            "claude-agent-acp",
+        );
+        let labels: Vec<_> = pool.accounts().iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, ["owner", "primary", "primary-2"]);
+        // The folder itself is still the one the owner wrote.
+        assert_eq!(pool.accounts()[0].dir, r"C:\Users\PC owner\.claude");
+        // Nothing derived from a path carries an account or folder name.
+        for label in &labels[1..] {
+            for leak in ["pc", "craig", "users", "home"] {
+                assert!(!label.contains(leak), "{label} leaks a user folder name");
+            }
+        }
     }
 
     /// A weekly limit on the primary hands the same batch to the second

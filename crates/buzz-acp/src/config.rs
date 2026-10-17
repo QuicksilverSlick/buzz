@@ -405,7 +405,9 @@ pub struct CliArgs {
     /// folders, each signed in to its own subscription (first = primary).
     /// On a usage or spend limit the agent restarts on the next free login
     /// and re-runs the same request; it returns to the primary after its
-    /// reset.
+    /// reset. Write an entry as `label=folder` to name that login in records
+    /// and cards; a folder in the home directory is named `primary`, never
+    /// after the OS account.
     #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
     pub claude_account_pool: Option<String>,
 
