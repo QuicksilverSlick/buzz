@@ -70,3 +70,19 @@ test("a list still on its query keeps Enter while the debounce is pending", asyn
   assert.equal(result.current.isChannelOpen, true);
   cleanup();
 });
+
+// Appending to the channel name quickly ("#general456") still leaves a `#`
+// query, but one no channel matches: the list must close, not pick "general".
+test("a list whose latest query matches nothing closes before Enter", async () => {
+  const { act, cleanup, result } = await openOnOriginal();
+  const typed = "Welcome to #general456";
+  act(() => result.current.updateChannelQuery(typed, typed.length));
+
+  let open;
+  act(() => {
+    open = result.current.revalidateOpen();
+  });
+  assert.equal(open, false);
+  assert.equal(result.current.isChannelOpen, false);
+  cleanup();
+});
