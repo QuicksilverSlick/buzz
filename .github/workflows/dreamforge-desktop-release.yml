@@ -1,19 +1,33 @@
 name: Dreamforge desktop release
 
-# Builds Dreamforge for macOS (Apple Silicon and Intel) and Windows. A manual run
-# with publish=true uploads the installers and latest.json to the rolling release
-# dreamforge-desktop-latest, which installed apps poll for updates. Publishing only
-# works from main. Pull requests touching this file only build; their installers are
-# run artifacts.
+# Builds Dreamforge for macOS (Apple Silicon and Intel) and Windows, and publishes it
+# to the rolling release dreamforge-desktop-latest, which installed apps poll for updates.
+#
+# Publishing is automatic: when CI passes on a push to main, the gate job picks the next
+# version and the commit is built, published, tagged dreamforge-desktop-v<version>, and
+# checked through the public feed. A newer green main cancels a release still building,
+# so a burst of merges ships once, and nothing ships when no file the app is built from
+# changed since the last tag. A manual run (version, publish=true) still works as an
+# override. Pull requests touching this file only build; their installers are run artifacts.
 #
 # Updater signing needs the TAURI_SIGNING_PRIVATE_KEY secret: the minisign key whose
 # public half is desktop/src-tauri/dreamforge-updater.pub, with an empty password.
-# The key only reaches manual runs on main, so it never meets unreviewed code. Other
-# runs still produce installers but no updater archives, and publish refuses.
+# The key only reaches code on main (manual runs on main, and CI-green pushes to main),
+# so it never meets unreviewed code. Other runs still produce installers but no updater
+# archives, and publish refuses.
+#
+# To stop a bad rollout: the publish keeps the previous version's files and its feed as
+# latest.previous.json; upload that file as latest.json to point apps back. Apps that
+# already updated stay on the new version (the updater never downgrades), so the real
+# fix is a newer release.
 #
 # macOS builds are ad-hoc signed and not notarized (no Apple Developer account).
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -30,22 +44,87 @@ on:
       - scripts/release-latest-json.py
 
 concurrency:
-  group: dreamforge-desktop-release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Automatic runs for pushes cancel each other (one release per burst of merges), but
+  # never a manual run, and a CI run for a pull request never cancels a release.
+  group: dreamforge-desktop-release-${{ github.event_name == 'workflow_run' && format('auto-{0}', github.event.workflow_run.event) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
 
 env:
   BUZZ_UPDATER_ENDPOINT: https://github.com/QuicksilverSlick/buzz/releases/download/dreamforge-desktop-latest/latest.json
-  VERSION: ${{ inputs.version }}
-  PUBLISH: ${{ inputs.publish }}
-  HAS_UPDATER_KEY: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+  # ponytail: the lowest version the next automatic release may use. Raise it whenever a
+  # publish=false test build uses a version above the live feed, or testers on that build
+  # never update (the updater only moves to a higher version).
+  VERSION_FLOOR: 0.5.36
+  # Green CI for a push to this repo's main: merged code, never a pull request's.
+  AUTO_RELEASE: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}
+  HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)) }}
 
 jobs:
+  gate:
+    name: Decide what to release
+    if: github.repository == 'QuicksilverSlick/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      publish: ${{ steps.decide.outputs.publish }}
+      sha: ${{ steps.decide.outputs.sha }}
+      version: ${{ steps.decide.outputs.version }}
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ env.SHA }}
+          # History and tags, without file contents: enough to diff against the last release.
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: scripts
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          out() { echo "$1" | tee -a "$GITHUB_OUTPUT"; }
+          # Check each value before writing it: a newline in an input would add outputs of its
+          # own (sha=... would point the signed build at another commit).
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit sha: '$SHA'"; exit 1; }
+          out "sha=$SHA"
+          if [ "$GITHUB_EVENT_NAME" != workflow_run ]; then
+            [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$INPUT_VERSION'"; exit 1; }
+            [[ "${INPUT_PUBLISH:-false}" =~ ^(true|false)$ ]] || { echo "::error::publish must be true or false"; exit 1; }
+            out build=true
+            out "version=$INPUT_VERSION"
+            out "publish=${INPUT_PUBLISH:-false}"
+            exit 0
+          fi
+          skip() { echo "::notice::not releasing $SHA: $1"; out build=false; out publish=false; exit 0; }
+          [ "$AUTO_RELEASE" = true ] || skip "the CI run was not a green push to main"
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          [ "$head" = "$SHA" ] || skip "main has moved on to $head, whose own CI run releases it"
+          tags=$(git tag -l 'dreamforge-desktop-v*' --sort=-v:refname)
+          last=$(echo "$tags" | head -n1)
+          if [ -n "$last" ] && [ -z "$(git diff --name-only --no-renames "$last" "$SHA" -- desktop crates Cargo.toml Cargo.lock scripts preview-features.json .github/workflows/dreamforge-desktop-release.yml)" ]; then
+            skip "no file the app is built from changed since $last"
+          fi
+          # shellcheck disable=SC2086 # one released version per word
+          version=$(python3 scripts/release-latest-json.py --next "$BUZZ_UPDATER_ENDPOINT" "$VERSION_FLOOR" ${tags//dreamforge-desktop-v/})
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::computed version is not plain x.y.z: '$version'"; exit 1; }
+          out build=true
+          out "version=$version"
+          out publish=true
+
   macos:
     name: macOS ${{ matrix.arch }}
-    if: github.repository == 'QuicksilverSlick/buzz'
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
     runs-on: macos-latest
     timeout-minutes: 90
     strategy:
@@ -59,10 +138,13 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      PUBLISH: ${{ needs.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -81,7 +163,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Set version
-        if: github.event_name == 'workflow_dispatch'
+        if: env.VERSION != ''
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$VERSION'"; exit 1; }
           # Fail in minutes, not after the builds, when a publish would be refused.
@@ -96,7 +178,7 @@ jobs:
             [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::publish only from main, not $GITHUB_REF"; exit 1; }
             [ "$HAS_UPDATER_KEY" = true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
           fi
-          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only manual runs on main get it); building without updater artifacts"
+          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only code on main gets it); building without updater artifacts"
           BUZZ_UPDATER_PUBLIC_KEY=$(cat desktop/src-tauri/dreamforge-updater.pub)
           export BUZZ_UPDATER_PUBLIC_KEY
           echo "BUZZ_UPDATER_PUBLIC_KEY=$BUZZ_UPDATER_PUBLIC_KEY" >> "$GITHUB_ENV"
@@ -153,7 +235,8 @@ jobs:
 
   windows:
     name: Windows x64
-    if: github.repository == 'QuicksilverSlick/buzz'
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
@@ -161,10 +244,13 @@ jobs:
         shell: bash
     env:
       TARGET: x86_64-pc-windows-msvc
+      VERSION: ${{ needs.gate.outputs.version }}
+      PUBLISH: ${{ needs.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -183,7 +269,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Set version
-        if: github.event_name == 'workflow_dispatch'
+        if: env.VERSION != ''
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$VERSION'"; exit 1; }
           cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
@@ -195,7 +281,7 @@ jobs:
             [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::publish only from main, not $GITHUB_REF"; exit 1; }
             [ "$HAS_UPDATER_KEY" = true ] || { echo "::error::publish needs the TAURI_SIGNING_PRIVATE_KEY secret"; exit 1; }
           fi
-          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only manual runs on main get it); building without updater artifacts"
+          [ "$HAS_UPDATER_KEY" = true ] || echo "::warning::no updater signing key on this run (only code on main gets it); building without updater artifacts"
           BUZZ_UPDATER_PUBLIC_KEY=$(cat desktop/src-tauri/dreamforge-updater.pub)
           export BUZZ_UPDATER_PUBLIC_KEY
           echo "BUZZ_UPDATER_PUBLIC_KEY=$BUZZ_UPDATER_PUBLIC_KEY" >> "$GITHUB_ENV"
@@ -239,17 +325,21 @@ jobs:
 
   publish:
     name: Publish
-    if: github.repository == 'QuicksilverSlick/buzz' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish
-    needs: [macos, windows]
+    if: needs.gate.outputs.publish == 'true' && github.ref == 'refs/heads/main'
+    needs: [gate, macos, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency: dreamforge-desktop-publish
+    # Each publish is recorded as a deployment; add a required reviewer here to gate it.
+    environment: production
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: dreamforge-desktop-latest
+      SHA: ${{ needs.gate.outputs.sha }}
+      VERSION: ${{ needs.gate.outputs.version }}
     steps:
       - name: Refuse without the updater signing key
         if: env.HAS_UPDATER_KEY != 'true'
@@ -260,6 +350,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          ref: ${{ env.SHA }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -291,19 +382,38 @@ jobs:
           # VERSION is plain x.y.z here: "Write latest.json" refused anything else.
           sed -e "s/{VERSION}/$VERSION/g" -e "s#{BASE}#$BASE#g" scripts/dreamforge-release-notes.md > notes.md
           ! grep -q '[{}]' notes.md || { echo "::error::unfilled placeholder in the release notes"; exit 1; }
-          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --title "Dreamforge $VERSION" --notes-file notes.md
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --target "$SHA" --title "Dreamforge $VERSION" --notes-file notes.md
           gh release upload "$TAG" dist/*.dmg dist/*.app.tar.gz dist/*.exe dist/*.sig --clobber
           # The notes only link files uploaded above, so the page may run ahead of the feed.
           gh release edit "$TAG" --title "Dreamforge $VERSION" --notes-file notes.md
+          # Keep the feed apps run now, so a bad rollout can be pointed back to it.
+          PREV=none
+          if gh release download "$TAG" -p latest.json -O latest.previous.json --clobber; then
+            PREV=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' latest.previous.json)
+            gh release upload "$TAG" latest.previous.json --clobber
+          fi
           # latest.json last, so apps only see the new version once every file it names is uploaded.
           gh release upload "$TAG" latest.json --clobber
           # Live from here, and a rerun would be refused as "not newer": warn, never fail.
-          # Remove the previous version's files: latest.json no longer names them,
-          # and a single set keeps "which file is mine" obvious on the page.
+          # Remove older versions' files: only this version and the previous one stay, so
+          # "which file is mine" stays obvious on the page.
           names=$(gh release view "$TAG" --json assets --jq '.assets[].name') || echo "::warning::could not list release assets; remove old files by hand"
           for name in $names; do
             case "$name" in
-              latest.json|*"_${VERSION}_"*) ;;
+              latest.json|latest.previous.json|*"_${VERSION}_"*|*"_${PREV}_"*) ;;
               *) gh release delete-asset "$TAG" "$name" --yes || echo "::warning::could not delete $name; remove it by hand" ;;
             esac
           done
+
+      - name: Tag the released commit
+        # The record that outlives run logs: git tag -l 'dreamforge-desktop-v*' lists every release.
+        run: gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/dreamforge-desktop-v$VERSION" -f sha="$SHA"
+
+      - name: Check the live feed
+        run: |
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            python3 scripts/release-latest-json.py --live "$VERSION" "$BUZZ_UPDATER_ENDPOINT" && exit 0
+            sleep 30
+          done
+          echo "::error::installed apps would not get $VERSION; to stop the rollout, upload latest.previous.json from the release as latest.json"
+          exit 1

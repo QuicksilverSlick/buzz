@@ -27,4 +27,4 @@ If Windows instead says **Smart App Control blocked an app**, there is no Run an
 
 ### You can ignore the other files
 
-The files ending in `.app.tar.gz` and `.sig`, and `latest.json`, are what Dreamforge downloads by itself to update. The "Source code" links are added by GitHub. You don't need any of them.
+The files ending in `.app.tar.gz` and `.sig`, and `latest.json`, are what Dreamforge downloads by itself to update. Files with an older version number, and `latest.previous.json`, are the previous release, kept in case it is needed again. The "Source code" links are added by GitHub. You don't need any of them.
