@@ -856,10 +856,14 @@ test("assigns distinct agent voices and exposes compact per-agent controls", asy
     '[data-testid="huddle-agent-voice-menu-content"][data-state="open"]',
   );
   await expect(voiceMenu).toBeVisible();
+  // The room header is live before the huddle chat pane loads; the chat
+  // composer mounting under the open popover must not take its focus.
+  await expect(page.getByTestId("message-input")).toBeVisible();
+  const ttsToggle = voiceMenu.getByTestId("huddle-agent-tts-toggle");
+  await expect(ttsToggle).toBeFocused();
   await expect(
     voiceMenu.getByText("Agent text-to-speech", { exact: true }),
   ).toBeVisible();
-  const ttsToggle = voiceMenu.getByTestId("huddle-agent-tts-toggle");
   await expect(ttsToggle).toBeChecked();
   await expect(
     voiceMenu.getByTestId("huddle-agent-voice-selector"),
