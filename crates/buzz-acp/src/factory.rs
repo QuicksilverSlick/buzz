@@ -713,6 +713,11 @@ impl Factory {
 
     /// An ordinary failure (class 18): retried as today, but no longer silent.
     pub(crate) fn on_error(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
+        // Parked work is the bigger story: its cause and resume time stay on
+        // the record.
+        if matches!(self.health, Health::Blocked | Health::Down) {
+            return;
+        }
         self.account = self.label(slot).to_string();
         self.failure = Some(failure.clone());
         self.resumes = None;
@@ -1340,6 +1345,11 @@ mod tests {
         assert_eq!(seen(&f), (Health::Operational, "online"));
         f.plan(0, &scope(), &weekly(), now);
         assert_eq!(seen(&f), (Health::Blocked, "away"));
+        // An ordinary error elsewhere keeps the parked cause and resume time.
+        let resumes = f.resumes;
+        f.on_error(0, &classify(&agent_error("Internal error"), now), now);
+        assert_eq!(f.failure.as_ref().map(|x| x.slug), Some("weekly_limit"));
+        assert_eq!((seen(&f), f.resumes), ((Health::Blocked, "away"), resumes));
         f.on_success(0, now);
         assert_eq!(seen(&f), (Health::Recovering, "online"));
         f.on_success(0, now);

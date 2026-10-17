@@ -5833,6 +5833,7 @@ fn handle_prompt_result(
                     result.agent,
                     config,
                     &mut crash_history[index],
+                    false,
                     respawn_tx,
                     respawn_tasks,
                     observer,
@@ -5877,6 +5878,7 @@ fn handle_prompt_result(
                 result.agent,
                 config,
                 slot_history,
+                true,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
@@ -5917,6 +5919,7 @@ fn handle_prompt_result(
                 result.agent,
                 config,
                 slot_history,
+                true,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
@@ -5997,6 +6000,7 @@ fn handle_prompt_result(
                     result.agent,
                     config,
                     slot_history,
+                    is_transport_error,
                     respawn_tx,
                     respawn_tasks,
                     observer,
@@ -6351,10 +6355,15 @@ fn default_heartbeat_prompt() -> String {
 /// The result comes back through `respawn_tx` so the main loop stays responsive.
 ///
 /// Returns `true` if a respawn task was spawned, `false` if the circuit is open.
+///
+/// `crashed` is false for a planned restart (a switch of account-pool login):
+/// it is not a fault, so it never counts toward the circuit breaker, which
+/// would otherwise open on a pool of four logins limited in a row and exit.
 fn spawn_respawn_task(
     old_agent: OwnedAgent,
     config: &Config,
     slot: &mut SlotCircuit,
+    crashed: bool,
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
@@ -6362,18 +6371,22 @@ fn spawn_respawn_task(
     let index = old_agent.index;
 
     // Circuit breaker: record crash, decide whether to respawn.
-    let delay = match slot.record_crash() {
-        CrashVerdict::CircuitOpen => {
-            tracing::error!(agent = index, "circuit open — not respawning");
-            return false;
-        }
-        CrashVerdict::HalfOpenProbe => {
-            tracing::info!(agent = index, "circuit half-open — probe respawn");
-            Duration::ZERO
-        }
-        CrashVerdict::Respawn(d) => {
-            tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
-            d
+    let delay = if !crashed {
+        Duration::ZERO
+    } else {
+        match slot.record_crash() {
+            CrashVerdict::CircuitOpen => {
+                tracing::error!(agent = index, "circuit open — not respawning");
+                return false;
+            }
+            CrashVerdict::HalfOpenProbe => {
+                tracing::info!(agent = index, "circuit half-open — probe respawn");
+                Duration::ZERO
+            }
+            CrashVerdict::Respawn(d) => {
+                tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
+                d
+            }
         }
     };
 
@@ -13581,8 +13594,10 @@ mod error_outcome_emission_tests {
         queue.set_retry_count_for_test(channel_id, prior_retries);
         let mut heartbeat_in_flight = false;
         let removed_channels = std::collections::HashSet::new();
+        // One crash short of the breaker: a login hand-off that still
+        // restarts the agent proves it was not counted as a crash.
         let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
+            crash_times: vec![std::time::Instant::now(); CIRCUIT_BREAKER_THRESHOLD - 1],
             open_until: None,
             respawn_in_flight: false,
         }];
