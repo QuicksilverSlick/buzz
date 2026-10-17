@@ -5447,6 +5447,18 @@ fn spawn_failure_notice(
 const MAY_BE_DONE: &str =
     "Some of the work may already be done, so check where things stand before sending it again.";
 
+/// The thread's notice for a request given up on after it waited out its
+/// park budget (spec 8.6). Neutral, like the pause line it follows: the
+/// class, the billing state and the provider's words are the owner's, on
+/// their card and in #factory (D8).
+fn park_spent_notice() -> String {
+    format!(
+        "⚠️ The AI service I use stayed unavailable for too long, so I've stopped waiting on \
+         this one rather than hold it indefinitely. {MAY_BE_DONE} Sending it again once the \
+         service is back is the way to pick it up."
+    )
+}
+
 /// The thread's notice for a request dropped after its retries.
 fn retries_spent_notice(outcome: &PromptOutcome) -> String {
     format!(
@@ -5696,6 +5708,29 @@ fn handle_prompt_result(
                             spawn_failure_notice(rest_client, &batch, line, mentions);
                         }
                         queue.park(batch, std::time::Instant::now() + wait);
+                    }
+                    factory::Plan::DeadLetter { why } => {
+                        // The park budget is spent: the limit outlasted what
+                        // the harness can hold. Dropping it silently is the
+                        // failure M1 exists to end, so the owner gets the
+                        // Critical card and the thread is told plainly.
+                        tracing::error!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            "provider limit outlasted the park budget — dead-lettering batch; \
+                             discarding {} events",
+                            batch.events.len(),
+                        );
+                        spawn_failure_notice(
+                            rest_client,
+                            &batch,
+                            park_spent_notice(),
+                            owner_mentions(config.agent_owner.as_deref()),
+                        );
+                        card_dropped(config, &batch, &why);
                     }
                 }
             } else if matches!(
@@ -13530,11 +13565,21 @@ mod error_outcome_emission_tests {
         error: acp::AcpError,
         prior_retries: u32,
     ) -> (EventQueue, uuid::Uuid, AgentPool, tokio::task::JoinSet<()>) {
+        run_failed_turn_for(config, uuid::Uuid::new_v4(), error, prior_retries).await
+    }
+
+    /// As [`run_failed_turn`], for a named channel, so repeated failures can
+    /// be driven through one scope's own state (its park budget).
+    async fn run_failed_turn_for(
+        config: &Config,
+        channel_id: uuid::Uuid,
+        error: acp::AcpError,
+        prior_retries: u32,
+    ) -> (EventQueue, uuid::Uuid, AgentPool, tokio::task::JoinSet<()>) {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
             .unwrap();
-        let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
@@ -13722,6 +13767,101 @@ mod error_outcome_emission_tests {
             "online",
             "retrying, not parked"
         );
+    }
+
+    /// A limit nobody lifts does not park the request forever. Once the
+    /// scope's park budget is spent the batch leaves the queue, the owner
+    /// gets the Critical "dropped a request" card naming the class and the
+    /// provider's own words, the thread is told plainly, and presence goes
+    /// back to online instead of staying stuck at away (spec 8.6).
+    #[tokio::test]
+    async fn a_spend_cap_nobody_raises_dead_letters_once_its_park_budget_is_spent() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        let channel_id = uuid::Uuid::new_v4();
+        let cap = || {
+            agent_error(
+                "Internal error: You've hit your monthly spend limit · raise it at \
+                 claude.ai/settings/usage",
+            )
+        };
+
+        // Every probe but the last parks the same request, untouched.
+        for probe in 0..factory::PARK_MAX_PROBES - 1 {
+            let (queue, _, _, _) =
+                run_failed_turn_for(&config, channel_id, cap(), crate::queue::MAX_RETRIES).await;
+            assert_eq!(
+                queue.queued_event_count(channel_id),
+                1,
+                "probe {probe}: still parked"
+            );
+            assert_eq!(config.factory.lock().presence(), "away", "probe {probe}");
+        }
+
+        let (queue, _, _, _) =
+            run_failed_turn_for(&config, channel_id, cap(), crate::queue::MAX_RETRIES).await;
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "the budget is spent: the request is given up on, not held"
+        );
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "nothing is parked behind the limit any more"
+        );
+        let record = config
+            .factory
+            .lock()
+            .take_report(chrono::Utc::now())
+            .expect("the recovery is reported");
+        assert!(
+            record.contains("state=DEGRADED class=spend_cap"),
+            "{record}"
+        );
+
+        let inbox = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let cards: Vec<serde_json::Value> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| {
+                serde_json::from_str(&std::fs::read_to_string(e.unwrap().path()).unwrap()).unwrap()
+            })
+            .collect();
+        let dropped = cards
+            .iter()
+            .find(|c| c["id"].as_str().is_some_and(|id| id.contains("-dropped-")))
+            .expect("a dropped-request card");
+        let body = dropped["body"].as_str().unwrap();
+        assert_eq!(dropped["severity"], "critical");
+        assert!(body.contains("spending cap was never raised"), "{body}");
+        assert!(body.contains("monthly spend limit"), "{body}");
+        assert!(
+            dropped["links"][0]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("buzz://message?channel={channel_id}&id=")),
+            "the card links the request"
+        );
+    }
+
+    /// The thread hears that the harness stopped waiting, in the same
+    /// neutral words as the pause line it follows, and never that nothing
+    /// was changed (D8, spec 8.6).
+    #[test]
+    fn park_spent_notice_is_neutral_and_never_claims_nothing_changed() {
+        let notice = park_spent_notice();
+        assert!(notice.contains(MAY_BE_DONE));
+        assert!(!notice.to_lowercase().contains("nothing was changed"));
+        for word in ["cap", "billing", "spend", "sign-in", "owner"] {
+            assert!(
+                !notice.to_lowercase().contains(word),
+                "{word} in the partner notice: {notice}"
+            );
+        }
     }
 
     /// A request dropped after its retries reaches the owner as a Critical

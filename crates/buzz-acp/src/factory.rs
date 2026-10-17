@@ -16,6 +16,13 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
+mod park_budget;
+
+use park_budget::{Budget, Parks};
+
+#[cfg(test)]
+pub(crate) use park_budget::PARK_MAX_PROBES;
+
 /// What a failed turn means for the work it carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -520,6 +527,10 @@ pub(crate) enum Plan {
     /// agent restarts on it, and context is rebuilt from the relay as on
     /// every turn.
     HandOff { label: String, line: Option<String> },
+    /// The park budget is spent: give the batch up. The owner gets the
+    /// Critical "dropped a request" card with `why` — the class and the
+    /// provider's own words — and the thread gets its notice (spec 8.6).
+    DeadLetter { why: String },
     /// Keep the batch until `wait` has passed.
     Park {
         wait: Duration,
@@ -607,6 +618,12 @@ pub(crate) struct Factory {
     /// Scopes already told about this pause or hand-off, so a probe that fails
     /// again does not post a second line (once per item per incident, 7.4).
     told: HashSet<(SessionScope, bool)>,
+    /// Each parked scope's budget: waiting is bounded, so a limit nobody
+    /// lifts ends in a dead-letter instead of an endless re-prompt.
+    parks: Parks,
+    /// Set when a park ran out of budget and its batch was given up on, so
+    /// the record says that rather than claiming an ordinary retry.
+    gave_up: bool,
 }
 
 impl Factory {
@@ -720,6 +737,11 @@ impl Factory {
     /// limited, the batch parks until the first one frees up. Other limits
     /// never rotate. Each scope is told once per incident; short rate limits
     /// stay quiet until the third in a row.
+    ///
+    /// Waiting is bounded: once the scope's park budget is spent (see
+    /// [`park_budget`]) the batch is given up on instead, so a limit nobody
+    /// lifts cannot hold a request in memory for days without the person who
+    /// sent it ever hearing that it will not run.
     pub(crate) fn plan(
         &mut self,
         slot: usize,
@@ -732,6 +754,7 @@ impl Factory {
         }
         self.account = self.label(slot).to_string();
         self.failure = Some(failure.clone());
+        self.gave_up = false;
         let mut wait = park_for(failure, now, self.rate_streak);
         if matches!(failure.class, Class::UsageLimit | Class::SpendCap) && !self.accounts.is_empty()
         {
@@ -758,6 +781,11 @@ impl Factory {
                 .filter_map(|l| (l.until - now).to_std().ok())
                 .min()
                 .unwrap_or(wait);
+        }
+        // Counted here, not above: a hand-off re-runs the batch at once on
+        // another login, which is not waiting and spends no budget.
+        if let Budget::Spent { why } = self.spend_park_budget(scope, failure, now) {
+            return Plan::DeadLetter { why };
         }
         let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
         self.resumes = Some(resumes);
@@ -820,6 +848,7 @@ impl Factory {
     pub(crate) fn on_success(&mut self, slot: usize, now: DateTime<Utc>) {
         self.rate_streak = 0;
         self.told.clear();
+        self.clear_parks();
         self.resumes = None;
         self.account = self.label(slot).to_string();
         if let Some(&i) = self.started_on.get(&slot) {
@@ -951,6 +980,10 @@ impl Factory {
                 "{who}'s work is paused until about {}. {saved}",
                 self.resumes
                     .map_or_else(|| "its next check".to_string(), chicago_label)
+            ),
+            (Health::Degraded, ..) if self.gave_up => format!(
+                "{who} waited as long as it could and then gave up on a request; there is a card \
+                 about it. It takes new requests as usual."
             ),
             (Health::Degraded, _, Some(on)) => format!(
                 "{who} is continuing on {} while {} is limited. Nothing is lost.",
