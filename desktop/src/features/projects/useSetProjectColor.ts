@@ -15,13 +15,29 @@ export type SetProjectColorInput = {
 };
 
 /** Republishes the live project head with a new `color` tag. */
-async function setProjectColor({
-  color,
-  ownerControlAgentPubkey,
-  project,
-}: SetProjectColorInput): Promise<Project> {
+export async function setProjectColor(
+  { color, ownerControlAgentPubkey, project }: SetProjectColorInput,
+  {
+    fetchEvents = relayClient.fetchEvents.bind(relayClient),
+    publishOwnedAgentAnnouncements = publishOwnedAgentProjectAnnouncements,
+    publishOwnerAnnouncement = publishProjectOwnerAnnouncement,
+  }: {
+    fetchEvents?: typeof relayClient.fetchEvents;
+    publishOwnedAgentAnnouncements?: typeof publishOwnedAgentProjectAnnouncements;
+    publishOwnerAnnouncement?: typeof publishProjectOwnerAnnouncement;
+  } = {},
+): Promise<Project> {
   const targetOwner = project.owner.toLowerCase();
-  const [liveHead] = await relayClient.fetchEvents({
+  // The agent signs whatever it is sent: only the project's own owner may.
+  if (
+    ownerControlAgentPubkey &&
+    ownerControlAgentPubkey.toLowerCase() !== targetOwner
+  ) {
+    throw new Error(
+      "This project belongs to another owner. Refresh and try again.",
+    );
+  }
+  const [liveHead] = await fetchEvents({
     kinds: [KIND_PROJECT_ANNOUNCEMENT],
     authors: [targetOwner],
     "#d": [project.dtag],
@@ -43,7 +59,7 @@ async function setProjectColor({
     liveHead.created_at + 1,
   );
   if (ownerControlAgentPubkey) {
-    const [projectEvent] = await publishOwnedAgentProjectAnnouncements(
+    const [projectEvent] = await publishOwnedAgentAnnouncements(
       ownerControlAgentPubkey,
       [{ ...template, createdAt }],
     );
@@ -52,9 +68,17 @@ async function setProjectColor({
         "The owner agent updated the project but its response was incomplete. Refresh and try again.",
       );
     }
+    if (
+      projectEvent.pubkey.toLowerCase() !== targetOwner ||
+      projectEvent.tags.find((tag) => tag[0] === "d")?.[1] !== project.dtag
+    ) {
+      throw new Error(
+        "The owner agent published a different project. Refresh and try again.",
+      );
+    }
     return { ...project, color, createdAt: projectEvent.created_at };
   }
-  const publication = await publishProjectOwnerAnnouncement({
+  const publication = await publishOwnerAnnouncement({
     ...template,
     createdAt,
     targetOwner,
@@ -68,7 +92,7 @@ async function setProjectColor({
 export function useSetProjectColorMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: setProjectColor,
+    mutationFn: (input: SetProjectColorInput) => setProjectColor(input),
     onSuccess: (project) => {
       markProjectDataAuthoritative(project, "local-write");
       queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>

@@ -14,35 +14,37 @@ type ColorTarget = Pick<Project, "color" | "dtag" | "id">;
  * save runs waits, replacing any pick already waiting. The radios stay
  * enabled meanwhile, so arrow keys keep focus and move on, and arrowing
  * across the palette publishes twice at most, not once per step. A pick
- * keeps the project it was made on: the same setting reused for another
- * project (a route change) never shows or saves it there.
+ * keeps the project it was made on and that render's `save` (its signer):
+ * the same setting reused for another project (a route change) never shows
+ * it there or saves it through the other project's signing path.
  */
 export function useQueuedColorSave<T extends ColorTarget>(
   target: T,
   save: (color: string, target: T) => Promise<T>,
 ): { pick: (color: string) => void; saving: boolean; value: string } {
-  type Queued = { color: string; target: T };
+  type Queued = { color: string; save: typeof save; target: T };
   const [choice, setChoice] = React.useState<Queued | null>(null);
   const [saving, setSaving] = React.useState(false);
   const busy = React.useRef(false);
   const waiting = React.useRef<Queued | null>(null);
   const pick = (color: string) => {
-    setChoice({ color, target });
+    const queued: Queued = { color, save, target };
+    setChoice(queued);
     if (busy.current) {
-      waiting.current = { color, target };
+      waiting.current = queued;
       return;
     }
     busy.current = true;
     setSaving(true);
     void (async () => {
-      let next: Queued | null = { color, target };
+      let next: Queued | null = queued;
       let saved = target;
       // The project just saved builds on that head; another on its own.
-      const head = (queued: Queued) =>
-        queued.target.id === saved.id ? saved : queued.target;
+      const head = (pending: Queued) =>
+        pending.target.id === saved.id ? saved : pending.target;
       try {
         while (next !== null) {
-          saved = await save(next.color, head(next));
+          saved = await next.save(next.color, head(next));
           next = waiting.current;
           waiting.current = null;
           if (next && next.color === projectColorOf(head(next)).id) next = null;

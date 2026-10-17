@@ -146,7 +146,7 @@ test("arrowing while a save runs keeps focus and saves only the latest pick", as
   }
 });
 
-test("a pick stays on the project it was made on when the setting moves on", async () => {
+test("a pick stays on the project and signer it was made on when the setting moves on", async () => {
   const saves = [];
   let show;
   function Setting() {
@@ -156,9 +156,11 @@ test("a pick stays on the project it was made on when the setting moves on", asy
     });
     const [current, setCurrent] = React.useState("a");
     show = setCurrent;
+    // Like ProjectColorSetting: each render's save closes over its project's signer.
+    const signer = `agent-of-${current}`;
     const color = useQueuedColorSave(projects[current], (next, target) => {
       const done = Promise.withResolvers();
-      saves.push({ color: next, id: target.id, done });
+      saves.push({ color: next, id: target.id, signer, done });
       return done.promise.then(() => {
         const saved = { ...target, color: next };
         setProjects((all) => ({ ...all, [saved.dtag]: saved }));
@@ -191,8 +193,9 @@ test("a pick stays on the project it was made on when the setting moves on", asy
     await act(async () => saves[0].done.resolve());
     await act(async () => saves[1]?.done.resolve());
     assert.deepEqual(
-      saves.map((save) => `${save.color}->${save.id}`),
-      ["red->p:a", "teal->p:b"],
+      saves.map((save) => `${save.color}->${save.id} by ${save.signer}`),
+      ["red->p:a by agent-of-a", "teal->p:b by agent-of-b"],
+      "B's pick is signed on B's path, not A's",
     );
     assert.equal(checked(), "teal");
     await act(async () => show("a"));
