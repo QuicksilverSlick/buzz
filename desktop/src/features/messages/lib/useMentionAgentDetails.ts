@@ -20,7 +20,7 @@ import {
  * edit) refreshes it too, but in its own entry: the shared ["user-profile",
  * pubkey] entry is often seeded from the people list, which carries no About.
  */
-function agentAboutQueryOptions(pubkey: string) {
+export function agentAboutQueryOptions(pubkey: string) {
   return {
     queryKey: ["user-profile", pubkey, "about"],
     queryFn: async () => (await getUserProfile(pubkey)).about,

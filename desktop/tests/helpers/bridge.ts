@@ -801,6 +801,8 @@ async function seedOnboardingCompletionForKnownIdentities(
   await page.addInitScript(
     ({ onboardingPrefix, pubkeys: pubkeysToSeed, relayUrl, welcomePrefix }) => {
       const welcomeScope = encodeURIComponent(relayUrl);
+      // The Inbox's one-time color key tip would cover rows other specs click.
+      window.localStorage.setItem("buzz.color-key.tip.v1", "seen");
       for (const pubkey of pubkeysToSeed) {
         window.localStorage.setItem(`${onboardingPrefix}${pubkey}`, "true");
         window.localStorage.setItem(
