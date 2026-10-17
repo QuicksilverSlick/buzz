@@ -654,6 +654,8 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Harness-wide failure state: classes, parks and who has been told.
+    pub(crate) factory: crate::factory::FactoryHandle,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1244,6 +1246,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            factory: Default::default(),
         };
 
         Ok(config)
@@ -1626,6 +1629,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 

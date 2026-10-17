@@ -9,6 +9,7 @@ mod approval_gate;
 mod config;
 mod edit_routing;
 mod engram_fetch;
+mod factory;
 mod filter;
 mod isolated_execution;
 mod observer;
@@ -5499,6 +5500,11 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    let now = chrono::Utc::now();
+    let failure = match &result.outcome {
+        PromptOutcome::Error(e) => Some(factory::classify(e, now)),
+        _ => None,
+    };
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -5579,6 +5585,24 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
+            } else if let Some(failure) = failure.as_ref().filter(|f| f.class.parks()) {
+                // A usage, spend or rate limit, or a lost sign-in: retrying
+                // cannot fix it and the 10-retry budget would drop the request
+                // long before a weekly limit resets. Park it instead — never
+                // counted, never dropped — and tell the thread once, plainly.
+                let (wait, line) = config.factory.lock().park(&batch.scope, failure, now);
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    class = failure.slug,
+                    provider_text = %failure.text,
+                    wait_secs = wait.as_secs(),
+                    "provider limit — parking batch"
+                );
+                if let Some(line) = line {
+                    spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                }
+                queue.park(batch, std::time::Instant::now() + wait);
             } else if matches!(
                 &result.outcome,
                 PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
@@ -5594,27 +5618,6 @@ fn handle_prompt_result(
                     wasn't found at the provider's endpoint. Open agent settings, select a \
                     different model from the dropdown, and save your changes. Restart the agent \
                     to apply the new configuration, then re-send your request."
-                    .to_string();
-                spawn_failure_notice(
-                    rest_client,
-                    &batch,
-                    content,
-                    owner_mentions(config.agent_owner.as_deref()),
-                );
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I've lost my ability to sign in to the tool I use to do this \
-                    work, so I can't act on this — or anything else — until that's restored. \
-                    Nothing was changed. This isn't something you can fix from here: it needs \
-                    whoever runs this workspace, and I've flagged them on this message."
                     .to_string();
                 spawn_failure_notice(
                     rest_client,
@@ -5713,6 +5716,7 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
+            config.factory.lock().on_success();
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
@@ -10618,6 +10622,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 
@@ -11740,6 +11745,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 
@@ -13381,13 +13387,139 @@ mod error_outcome_emission_tests {
         );
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
+    // ── limit and sign-in parking ──────────────────────────────────────────
 
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
+    /// Run one failed turn for a fresh single-event batch through
+    /// `handle_prompt_result`, with the scope's retry count preset to
+    /// `prior_retries`. Returns the queue and the batch's channel.
+    async fn run_failed_turn(
+        config: &Config,
+        error: acp::AcpError,
+        prior_retries: u32,
+    ) -> (EventQueue, uuid::Uuid, AgentPool, tokio::task::JoinSet<()>) {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        queue.set_retry_count_for_test(channel_id, prior_retries);
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+        (queue, channel_id, pool, respawn_tasks)
+    }
+
+    fn agent_error(message: &str) -> acp::AcpError {
+        acp::AcpError::AgentError {
+            code: -32603,
+            message: message.to_string(),
+        }
+    }
+
+    /// A limit or lost sign-in parks the batch even with the retry budget
+    /// already spent: it is kept, throttled, and its retry count unchanged.
+    /// On 16-17 Oct the same errors burned all 10 retries and dropped two
+    /// requests.
     #[tokio::test]
-    async fn auth_error_dead_letters_immediately_without_requeueing() {
+    async fn limit_errors_park_without_spending_the_retry_budget() {
+        for message in [
+            "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)",
+            "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage",
+            "Internal error: API Error: This request would exceed your account's rate limit. Please try again later.",
+            "Internal error: You've hit your usage limit. (codexErrorInfo: usageLimitExceeded)",
+            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+        ] {
+            let config = test_config();
+            let (mut queue, channel_id, mut pool, respawn_tasks) =
+                run_failed_turn(&config, agent_error(message), crate::queue::MAX_RETRIES).await;
+            assert_eq!(queue.queued_event_count(channel_id), 1, "{message}: kept");
+            assert!(!queue.has_flushable_work(), "{message}: parked, not due yet");
+            assert!(queue.next_retry_deadline().is_some(), "{message}: wakes up");
+            assert_eq!(
+                queue.retry_count_for_test(channel_id),
+                crate::queue::MAX_RETRIES,
+                "{message}: no retry spent"
+            );
+            assert!(pool.agents_mut()[0].is_some(), "{message}: agent stays");
+            assert!(respawn_tasks.is_empty());
+        }
+    }
+
+    /// An ordinary error still spends the budget and is dropped at the end.
+    #[tokio::test]
+    async fn ordinary_errors_still_spend_the_retry_budget() {
+        let config = test_config();
+        let (queue, channel_id, _, _) = run_failed_turn(
+            &config,
+            agent_error("Internal error"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 0, "dead-lettered");
+        let (queue, channel_id, _, _) =
+            run_failed_turn(&config, agent_error("Internal error"), 0).await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "requeued");
+        assert_eq!(queue.retry_count_for_test(channel_id), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_error_parks_instead_of_dropping() {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -13461,17 +13593,9 @@ mod error_outcome_emission_tests {
             &mut tokio::time::Instant::now(),
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
-        assert_eq!(
-            queue.pending_channels(),
-            0,
-            "auth error must dead-letter immediately — batch must not be requeued"
-        );
-        assert_eq!(
-            queue.queued_event_count(channel_id),
-            0,
-            "auth error must dead-letter immediately — no events should be pending"
-        );
+        // Kept for the owner to sign in again, not dropped.
+        assert_eq!(queue.pending_channels(), 1);
+        assert_eq!(queue.queued_event_count(channel_id), 1);
     }
 
     /// Run a model-not-found turn failure for `event` through

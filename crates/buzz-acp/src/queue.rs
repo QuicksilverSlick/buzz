@@ -805,6 +805,30 @@ impl EventQueue {
         None
     }
 
+    /// Park a batch that failed on a usage, spend or rate limit until `until`.
+    ///
+    /// Unlike [`requeue`](Self::requeue) it never counts toward
+    /// [`MAX_RETRIES`] and never dead-letters: waiting cannot be the batch's
+    /// fault, and a weekly limit outlasts the whole retry budget. The batch
+    /// goes back to the front with its timestamps (cancelled carryover
+    /// included), and the scope is throttled until `until`, which arms the
+    /// event loop's retry timer. A batch whose earlier failures were ordinary
+    /// keeps that count; a later real answer clears it via `mark_complete`.
+    ///
+    /// Note: does NOT remove from `in_flight_scopes` — caller must call
+    /// `mark_complete` separately.
+    pub fn park(&mut self, batch: FlushBatch, until: Instant) {
+        let scope = batch.scope.clone();
+        tracing::warn!(
+            channel_id = %batch.channel_id,
+            events = batch.events.len(),
+            wait_secs = until.saturating_duration_since(Instant::now()).as_secs(),
+            "parking batch on a provider limit — no retry budget used"
+        );
+        self.requeue_preserve_timestamps(batch);
+        self.retry_after.insert(scope, until);
+    }
+
     /// Re-queue a **complete** flushed batch preserving original `received_at`
     /// timestamps.
     ///
@@ -1012,6 +1036,14 @@ impl EventQueue {
     #[cfg(test)]
     pub fn set_retry_count_for_test<K: IntoScope>(&mut self, scope: K, count: u32) {
         self.retry_counts.insert(scope.into_scope(), count);
+    }
+
+    #[cfg(test)]
+    pub fn retry_count_for_test<K: IntoScope>(&self, scope: K) -> u32 {
+        self.retry_counts
+            .get(&scope.into_scope())
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop all queued (non-in-flight) events for a channel.
