@@ -973,6 +973,7 @@ impl NormalListenerIngress {
             received_at,
             prompt_tag,
             edit,
+            parked: false,
         });
         QueuedNormalListenerEvent {
             accepted,
@@ -3868,6 +3869,10 @@ async fn run_harness(
                                 "admitted event — resolved session scope"
                             );
                             let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
+                            // A depth cap sheds a parked request only when
+                            // the channel holds nothing else to give up, and
+                            // never silently (spec 8.6).
+                            report_shed_parked(config, &mut queue, Some(&ctx.rest_client));
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -4948,6 +4953,7 @@ mod try_native_steer_fallback_log_tests {
                 received_at: std::time::Instant::now(),
                 prompt_tag: "mention".into(),
                 edit: None,
+                parked: false,
             }),
             "queued event must be accepted before the steer attempt"
         );
@@ -5468,6 +5474,54 @@ fn retries_spent_notice(outcome: &PromptOutcome) -> String {
     )
 }
 
+/// The thread's notice for a parked request a depth cap had to shed.
+fn shed_parked_notice() -> String {
+    format!(
+        "⚠️ This one was waiting for the AI service to be available again, and so much else \
+         came in on this channel meanwhile that I could not keep holding it. {MAY_BE_DONE} \
+         Please send it again."
+    )
+}
+
+/// Dead-letter the parked requests a depth cap had to shed.
+///
+/// A parked batch is exempt from the queue's oldest-first eviction, but a
+/// scope or channel holding nothing else still has to shrink. What it gives
+/// up is a request somebody sent and is waiting on, so it never goes quietly:
+/// the owner gets the Critical card and the thread is told (spec 8.6).
+fn report_shed_parked(
+    config: &Config,
+    queue: &mut EventQueue,
+    rest_client: Option<&relay::RestClient>,
+) {
+    for shed in queue.take_shed_parked() {
+        tracing::error!(
+            channel_id = %shed.channel_id,
+            scope = %shed.scope.telemetry_label(),
+            "queue depth cap shed a parked request — dead-lettering it"
+        );
+        let batch = FlushBatch {
+            channel_id: shed.channel_id,
+            scope: shed.scope.clone(),
+            events: vec![shed.into_batch_event()],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        spawn_failure_notice(
+            rest_client,
+            &batch,
+            shed_parked_notice(),
+            owner_mentions(config.agent_owner.as_deref()),
+        );
+        card_dropped(
+            config,
+            &batch,
+            "it was waiting on the AI service when this channel's queue filled up, and the \
+             queue cannot grow without end",
+        );
+    }
+}
+
 /// The owner's Critical card for a request the harness gave up on.
 fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
     if let Some(last) = batch.events.last() {
@@ -5796,6 +5850,11 @@ fn handle_prompt_result(
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
+
+    // Parking a batch can itself push its channel over the aggregate cap.
+    // Whatever that sheds is somebody's request, so it is dead-lettered
+    // rather than logged (spec 8.6).
+    report_shed_parked(config, queue, rest_client);
 
     // Strip sessions for channels the agent was removed from while this
     // agent was checked out. This covers the gap where invalidate_channel_sessions
@@ -7386,6 +7445,7 @@ mod owner_control_command_tests {
             event: make_event(KIND_STREAM_MESSAGE, "held", None),
             received_at: oldest,
             prompt_tag: "test".into(),
+            parked: false,
         });
         for i in 0..500 {
             queue.push(queue::QueuedEvent {
@@ -7395,6 +7455,7 @@ mod owner_control_command_tests {
                 event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
                 received_at: std::time::Instant::now(),
                 prompt_tag: "test".into(),
+                parked: false,
             });
         }
 
@@ -12565,6 +12626,7 @@ mod error_outcome_emission_tests {
             event,
             received_at: std::time::Instant::now(),
             prompt_tag: "t".into(),
+            parked: false,
         });
         let batch = queue.flush_next().expect("flush thread batch");
         assert!(queue.is_scope_in_flight(&scope));
@@ -13210,6 +13272,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            parked: false,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -13976,6 +14039,87 @@ mod error_outcome_emission_tests {
             &mut tokio::time::Instant::now(),
         );
         assert_eq!(queue.queued_event_count(uuid::Uuid::nil()), 0);
+    }
+
+    /// A parked request a depth cap truly had to shed reaches the owner as a
+    /// Critical card linking it, not as a `warn!` nobody reads (spec 8.6).
+    #[tokio::test]
+    async fn a_parked_request_shed_by_a_depth_cap_raises_a_card() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+
+        // One parked batch, its scope at the cap, and one more event: the
+        // queue has nothing unparked left to give up.
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let keys = nostr::Keys::generate();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let parked = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: (0..crate::queue::MAX_PENDING_PER_SCOPE)
+                .map(|i| BatchEvent {
+                    event: nostr::EventBuilder::new(nostr::Kind::Custom(9), format!("parked-{i}"))
+                        .sign_with_keys(&keys)
+                        .unwrap(),
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                    edit: None,
+                })
+                .collect(),
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let shed_event = parked.events[0].event.id.to_hex();
+        queue.park(
+            parked,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope,
+            event: nostr::EventBuilder::new(nostr::Kind::Custom(9), "one more")
+                .sign_with_keys(&keys)
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            edit: None,
+            parked: false,
+        }));
+
+        report_shed_parked(&config, &mut queue, None);
+
+        let card: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                bench
+                    .path()
+                    .join("inbox")
+                    .join(factory::CARD_WRITER)
+                    .join(format!("ade9d0e2-dropped-{}.json", &shed_event[..12])),
+            )
+            .expect("a card for the shed request"),
+        )
+        .unwrap();
+        assert_eq!(card["severity"], "critical");
+        assert!(
+            card["body"]
+                .as_str()
+                .unwrap()
+                .contains("waiting on the AI service when this channel's queue filled up"),
+            "{}",
+            card["body"]
+        );
+        assert_eq!(
+            card["links"][0]["url"],
+            format!("buzz://message?channel={channel_id}&id={shed_event}")
+        );
+        // The thread's own notice is honest about what may already be done.
+        let notice = shed_parked_notice();
+        assert!(notice.contains(MAY_BE_DONE));
     }
 
     /// The thread hears that the harness stopped waiting, in the same

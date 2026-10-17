@@ -31,7 +31,7 @@ use crate::scope::SessionScope;
 /// thread partition; the channel as a whole is additionally bounded by
 /// [`MAX_PENDING_PER_CHANNEL`] so per-thread partitioning cannot multiply the
 /// total admitted backlog.
-const MAX_PENDING_PER_SCOPE: usize = 500;
+pub(crate) const MAX_PENDING_PER_SCOPE: usize = 500;
 
 /// Aggregate cap on events queued across ALL scopes of a single channel.
 ///
@@ -113,10 +113,17 @@ pub struct QueuedEvent {
     /// admission. `None` for ordinary events and for edits whose original
     /// could not be fetched (routing then falls back to the edit target id).
     pub edit: Option<ResolvedEdit>,
+    /// Set by [`park`](EventQueue::park): this event belongs to a batch
+    /// waiting out a provider limit. Such a batch is exempt from the depth
+    /// caps' oldest-first eviction — it is the oldest thing in the queue by
+    /// construction, and M1's whole point is that a request waiting on a
+    /// limit is not quietly lost (spec 8.1). Cleared whenever the batch
+    /// flushes; `park` sets it again if the limit is still in force.
+    pub parked: bool,
 }
 
 impl QueuedEvent {
-    fn into_batch_event(self) -> BatchEvent {
+    pub(crate) fn into_batch_event(self) -> BatchEvent {
         BatchEvent {
             event: self.event,
             prompt_tag: self.prompt_tag,
@@ -389,6 +396,12 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    /// Parked events a depth cap had to shed because the scope or channel
+    /// held nothing else to give up. Each one is a request somebody sent and
+    /// is waiting on, so it is handed back to the caller to dead-letter
+    /// through the owner's card and a thread notice — never a bare log line
+    /// (spec 8.6). Drained by [`take_shed_parked`](Self::take_shed_parked).
+    shed_parked: Vec<QueuedEvent>,
 }
 
 impl EventQueue {
@@ -412,6 +425,7 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            shed_parked: Vec::new(),
         }
     }
 
@@ -474,20 +488,31 @@ impl EventQueue {
             return false;
         }
         let drops = &mut self.drops;
+        let shed_parked = &mut self.shed_parked;
         let channel_id = event.channel_id;
         let scope = event.scope.clone();
         let queue = self.queues.entry(scope.clone()).or_default();
-        // Enforce per-scope depth cap: drop oldest in this partition.
+        // Enforce per-scope depth cap: drop oldest in this partition, but
+        // step over a parked batch at the front while any ordinary event is
+        // there to give up instead. A parked request has already been
+        // accepted and is waiting on a limit nobody can hurry.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
-            queue.pop_front();
+            let victim = queue.iter().position(|e| !e.parked).unwrap_or(0);
+            let shed = queue.remove(victim);
             drops.queue_depth_cap += 1;
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
                 limit = MAX_PENDING_PER_SCOPE,
                 dropped_total = drops.queue_depth_cap,
+                parked = shed.as_ref().is_some_and(|e| e.parked),
                 "per-scope queue depth cap reached — dropped oldest event"
             );
+            // Nothing but parked events left: it still has to shrink, and
+            // what it gives up is never silent.
+            if let Some(shed) = shed.filter(|e| e.parked) {
+                shed_parked.push(shed);
+            }
         }
         queue.push_back(event);
         // Enforce the aggregate per-channel cap across all scopes so thread
@@ -508,18 +533,37 @@ impl EventQueue {
     /// Drop the globally-oldest queued event(s) across a channel's scopes until
     /// its aggregate depth is within [`MAX_PENDING_PER_CHANNEL`]. Preserves
     /// cross-scope FIFO fairness by always evicting the oldest head event.
+    ///
+    /// A parked batch is passed over while any unparked event in the channel
+    /// can be given up instead: it is the oldest thing in the queue by
+    /// construction (`park` puts it back at the front with its original
+    /// timestamps), so oldest-first would otherwise always pick exactly the
+    /// request that is waiting on a limit. When the whole channel is parked
+    /// the cap still has to be met, and the event it sheds goes to
+    /// [`shed_parked`](Self::shed_parked) for the owner's card.
     fn enforce_channel_cap(&mut self, channel_id: Uuid) {
         while self.channel_event_total(channel_id) > MAX_PENDING_PER_CHANNEL {
-            // Find the channel's scope whose head event is oldest.
-            let victim = self
-                .queues
-                .iter()
-                .filter(|(s, q)| s.channel_id() == channel_id && !q.is_empty())
-                .min_by_key(|(_, q)| q.front().unwrap().received_at)
-                .map(|(s, _)| s.clone());
-            let Some(scope) = victim else { break };
+            // The oldest event the channel can give up: each scope's oldest
+            // unparked event, compared across scopes. Identical to
+            // oldest-head-first when nothing is parked, since the head is
+            // then the oldest unparked event. Only a channel holding nothing
+            // but parked work sheds a parked event.
+            let oldest = |parked: bool| {
+                self.queues
+                    .iter()
+                    .filter(|(s, _)| s.channel_id() == channel_id)
+                    .filter_map(|(s, q)| {
+                        let i = q.iter().position(|e| e.parked == parked)?;
+                        Some((s.clone(), i, q[i].received_at))
+                    })
+                    .min_by_key(|(_, _, at)| *at)
+            };
+            let Some((scope, i, _)) = oldest(false).or_else(|| oldest(true)) else {
+                break;
+            };
+            let mut shed = None;
             if let Some(q) = self.queues.get_mut(&scope) {
-                q.pop_front();
+                shed = q.remove(i);
                 if q.is_empty() {
                     self.queues.remove(&scope);
                 }
@@ -527,9 +571,24 @@ impl EventQueue {
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
+                parked = shed.as_ref().is_some_and(|e| e.parked),
                 "aggregate per-channel queue cap reached — dropped oldest event"
             );
+            if let Some(shed) = shed.filter(|e| e.parked) {
+                self.shed_parked.push(shed);
+            }
         }
+    }
+
+    /// Take the parked requests a depth cap had to shed.
+    ///
+    /// Each one is a request somebody sent and is still waiting on, so the
+    /// caller must dead-letter it: the owner's Critical card through
+    /// `Factory::dropped`, and a line in its thread (spec 8.6). Dropping
+    /// these on the floor with a `warn!` is what M1 exists to stop.
+    #[must_use]
+    pub fn take_shed_parked(&mut self) -> Vec<QueuedEvent> {
+        std::mem::take(&mut self.shed_parked)
     }
 
     /// Try to flush the next batch.
@@ -786,20 +845,13 @@ impl EventQueue {
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
                 edit: be.edit,
+                parked: false,
             });
         }
         // Enforce per-scope cap: trim oldest (back) events if requeue pushed
         // the partition over the limit. Without this, repeated requeue+push
         // cycles can grow the queue unboundedly.
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "requeue overflow — dropped oldest event to enforce cap"
-            );
-        }
+        Self::trim_back(queue, &mut self.shed_parked, channel_id, &scope, "requeue");
         self.retry_after.insert(scope, Instant::now() + delay);
         self.enforce_channel_cap(channel_id);
         None
@@ -825,7 +877,7 @@ impl EventQueue {
             wait_secs = until.saturating_duration_since(Instant::now()).as_secs(),
             "parking batch on a provider limit — no retry budget used"
         );
-        self.requeue_preserve_timestamps(batch);
+        self.restore(batch, true);
         self.retry_after.insert(scope, until);
     }
 
@@ -847,6 +899,14 @@ impl EventQueue {
     /// Does NOT set `retry_after`. Does NOT remove from `in_flight_scopes` —
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
+        self.restore(batch, false);
+    }
+
+    /// [`requeue_preserve_timestamps`](Self::requeue_preserve_timestamps),
+    /// marking each restored event `parked` or not. Only [`park`](Self::park)
+    /// passes `true`: a batch put back because no agent was free is not
+    /// waiting on a limit and claims no exemption from the depth caps.
+    fn restore(&mut self, batch: FlushBatch, parked: bool) {
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
 
@@ -875,19 +935,53 @@ impl EventQueue {
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
                 edit: be.edit,
+                parked,
             });
         }
         // Enforce per-scope cap: trim newest (back) events if over limit.
+        Self::trim_back(
+            queue,
+            &mut self.shed_parked,
+            channel_id,
+            &scope,
+            "requeue_preserve",
+        );
+        self.enforce_channel_cap(channel_id);
+    }
+
+    /// Trim a scope's queue back to [`MAX_PENDING_PER_SCOPE`] from the back
+    /// (the newest events), stepping over a parked batch while anything else
+    /// can go. A queue holding nothing but parked events still has to
+    /// shrink, and what it sheds is handed to `shed` so it reaches the owner
+    /// rather than only the log.
+    fn trim_back(
+        queue: &mut VecDeque<QueuedEvent>,
+        shed: &mut Vec<QueuedEvent>,
+        channel_id: Uuid,
+        scope: &SessionScope,
+        what: &str,
+    ) {
         while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
+            let victim = queue
+                .iter()
+                .rposition(|e| !e.parked)
+                .unwrap_or(queue.len() - 1);
+            let dropped = queue.remove(victim);
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
                 limit = MAX_PENDING_PER_SCOPE,
-                "requeue_preserve overflow — dropped newest event to enforce cap"
+                parked = dropped.as_ref().is_some_and(|e| e.parked),
+                "{what} overflow — dropped an event to enforce cap"
             );
+            match dropped.filter(|e| e.parked) {
+                Some(parked) => shed.push(parked),
+                // `len() > MAX` guarantees a removal, but never loop forever
+                // if that ever stops holding.
+                None if queue.len() > MAX_PENDING_PER_SCOPE => continue,
+                None => {}
+            }
         }
-        self.enforce_channel_cap(channel_id);
     }
 
     /// Requeue a cancelled batch so its events appear as `cancelled_events`
@@ -2763,6 +2857,9 @@ mod reply_route_tests {
 }
 
 #[cfg(test)]
+mod park_eviction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Timestamp};
@@ -2953,6 +3050,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            parked: false,
         }
     }
 
@@ -2965,6 +3063,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now() - age,
             prompt_tag: "test".into(),
+            parked: false,
         }
     }
 
@@ -2987,6 +3086,7 @@ mod tests {
             event,
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            parked: false,
         }
     }
 
@@ -3015,6 +3115,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            parked: false,
         }
     }
 
@@ -4311,6 +4412,7 @@ mod tests {
             event: make_event("old-msg"),
             received_at: old_time,
             prompt_tag: "test".into(),
+            parked: false,
         });
 
         let batch = q.flush_next().expect("flush");
@@ -6984,6 +7086,7 @@ mod tests {
             event: edit_event(target),
             received_at: Instant::now(),
             prompt_tag: "@mention".into(),
+            parked: false,
         }
     }
 
