@@ -4616,6 +4616,33 @@ test("Enter picks an open channel suggestion", async ({ page }) => {
   await expect(input).toHaveText("see #general ");
 });
 
+test("forum composer: Enter after typing past an open channel list posts the typed text", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-watercooler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("watercooler");
+  await page.getByRole("button", { name: "Start a new post..." }).click();
+
+  const input = page.getByTestId("message-input");
+  await input.fill("see #genera");
+  await expect(page.getByRole("button", { name: "#general" })).toBeVisible();
+  const typed = `see #genera later ${Date.now()}`;
+  await input.pressSequentially(typed.slice("see #genera".length));
+  await input.press("Enter");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => [
+        ...(window.__BUZZ_E2E_SIGNED_EVENTS__ ?? []).map((e) => e.content),
+        ...(window.__BUZZ_E2E_COMMAND_LOG__ ?? []).map(
+          (call) => (call.payload as { content?: string }).content,
+        ),
+      ]),
+    )
+    .toContain(typed);
+});
+
 test("Escape dismisses autocomplete dropdown", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
