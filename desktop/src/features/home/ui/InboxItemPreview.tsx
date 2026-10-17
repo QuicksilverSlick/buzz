@@ -128,22 +128,19 @@ function focusVisible(target: EventTarget | null): boolean {
 /**
  * A read-only preview of an Inbox row, beside it: 700 ms after the pointer
  * settles on the row, at once on keyboard focus. Never over the avatar,
- * name, action bar or the selected row; a click, right-click, scroll or
+ * name or action bar; a click, right-click, scroll or
  * Escape closes it until the pointer leaves the row. It takes no focus and
  * holds no buttons or links.
  */
 export function InboxItemPreview({
   channelDescription,
   children,
-  disabled,
   inboxClass,
   item,
   label,
 }: {
   channelDescription: string | null;
   children: React.ReactNode;
-  /** The selected row: its detail pane already shows all of this. */
-  disabled: boolean;
   inboxClass: InboxClass;
   item: InboxItem;
   label: InboxTypeLabel;
@@ -180,11 +177,6 @@ export function InboxItemPreview({
 
   React.useEffect(() => clearTimer, [clearTimer]);
   React.useEffect(() => {
-    if (!disabled) return;
-    clearTimer();
-    setOpen(false);
-  }, [clearTimer, disabled]);
-  React.useEffect(() => {
     if (!open) return;
     // Scroll never bubbles; capture sees the list's and the page's.
     window.addEventListener("scroll", dismiss, true);
@@ -204,7 +196,7 @@ export function InboxItemPreview({
           onBlur={closeSoon}
           onContextMenu={dismiss}
           onFocus={(event) => {
-            if (disabled || ignored(event) || !focusVisible(event.target)) {
+            if (ignored(event) || !focusVisible(event.target)) {
               return;
             }
             clearTimer();
@@ -216,7 +208,7 @@ export function InboxItemPreview({
             closeSoon();
           }}
           onMouseOver={(event) => {
-            if (disabled || dismissed.current) return;
+            if (dismissed.current) return;
             if (ignored(event)) {
               clearTimer();
               setOpen(false);

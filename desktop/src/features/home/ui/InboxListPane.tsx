@@ -664,7 +664,6 @@ export function InboxListPane({
         channelDescription={
           channelDescriptions.get(item.item.channelId ?? "")?.trim() || null
         }
-        disabled={isSelected}
         inboxClass={inboxClass}
         item={item}
         label={typeLabel}

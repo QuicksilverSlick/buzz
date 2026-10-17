@@ -1,7 +1,7 @@
 /**
  * The Inbox hover preview, mounted for real around a row shaped like the
  * Inbox's own: it opens 700 ms after the pointer settles on the row, at once
- * on keyboard focus, never over the avatar or on the selected row, closes on
+ * on keyboard focus, never over the avatar, closes on
  * Escape and click, and holds no buttons or links.
  */
 
@@ -63,7 +63,7 @@ const ITEM = {
 const MENTION = { type: "mention", workbench: "Dreamforge", benchCard: null };
 const LABEL = { text: "Mentioned in", channelLabel: "general" };
 
-function row({ disabled = false, inboxClass = MENTION } = {}) {
+function row({ inboxClass = MENTION } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { gcTime: 0, retry: false } },
   });
@@ -85,7 +85,6 @@ function row({ disabled = false, inboxClass = MENTION } = {}) {
           InboxItemPreview,
           {
             channelDescription: "Where the team talks",
-            disabled,
             inboxClass,
             item: ITEM,
             label: LABEL,
@@ -235,22 +234,6 @@ test("never over the avatar or the action bar, and a click closes it", async () 
     fireEvent.pointerDown(screen.getByTestId("row-text"));
   });
   assert.equal(preview(), null, "a click closes it");
-});
-
-test("the selected row shows no preview", async () => {
-  await act(async () => {
-    render(row({ disabled: true }));
-  });
-  await act(async () => {
-    fireEvent.mouseOver(screen.getByTestId("row-text"));
-  });
-  await sleep(800);
-  assert.equal(preview(), null);
-  await act(async () => {
-    fireEvent.keyDown(dom.window.document.body, { key: "Tab" });
-    screen.getByRole("button", { name: "Open inbox item" }).focus();
-  });
-  assert.equal(preview(), null);
 });
 
 test("keyboard focus opens it at once; a Bench card shows its options inertly", async () => {
