@@ -397,3 +397,20 @@ test("latestTurnError: the newest finished turn decides", () => {
   });
   assert.equal(latestTurnError([{ kind: "turn_error", payload: null }]), null);
 });
+
+test("latestTurnError: a failed turn's own turn_completed, in either order, keeps its error", () => {
+  const error = (turnId) => ({
+    kind: "turn_error",
+    turnId,
+    payload: { error: WEEKLY, code: -32603 },
+  });
+  const done = (turnId) => ({ kind: "turn_completed", turnId, payload: {} });
+  const want = { error: WEEKLY, code: -32603 };
+  assert.deepEqual(latestTurnError([done("t1"), error("t1")]), want);
+  assert.deepEqual(latestTurnError([error("t1"), done("t1")]), want);
+  // A later turn that succeeded clears it.
+  assert.equal(
+    latestTurnError([done("t1"), error("t1"), done("t2")]),
+    null,
+  );
+});

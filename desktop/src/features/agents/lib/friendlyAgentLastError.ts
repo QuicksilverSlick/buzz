@@ -109,26 +109,45 @@ export function pausedLimitCopy(message: string): string | null {
  * The error of the agent's newest finished turn, or null when that turn
  * succeeded. A harness that parks work behind a limit keeps running, so the
  * `lastError` recorded at exit stays empty; the turn frames carry the error.
+ *
+ * A failed turn also ends with its own `turn_completed` (buzz-acp's turn
+ * guard), emitted beside its `turn_error` in either order, so the two are
+ * matched by turn id: only a turn with no error frame succeeded.
  */
 export function latestTurnError(
-  events: readonly { kind: string; payload: unknown }[],
+  events: readonly {
+    kind: string;
+    payload: unknown;
+    turnId?: string | null;
+  }[],
 ): { error: string; code: number | null } | null {
+  // The newest terminal frame decides.
+  let failed: (typeof events)[number] | undefined;
   for (let i = events.length - 1; i >= 0; i--) {
-    const { kind, payload } = events[i];
-    if (kind === "turn_completed") return null;
-    if (kind !== "turn_error") continue;
-    const { error, code } = (payload ?? {}) as {
-      error?: unknown;
-      code?: unknown;
-    };
-    if (typeof error !== "string") return null;
-    const numeric = code == null ? null : Number(code);
-    return {
-      error,
-      code: numeric != null && Number.isFinite(numeric) ? numeric : null,
-    };
+    const { kind, turnId } = events[i];
+    if (kind === "turn_error") {
+      failed = events[i];
+      break;
+    }
+    if (kind === "turn_completed") {
+      failed =
+        turnId == null
+          ? undefined
+          : events.find((e) => e.kind === "turn_error" && e.turnId === turnId);
+      break;
+    }
   }
-  return null;
+  if (!failed) return null;
+  const { error, code } = (failed.payload ?? {}) as {
+    error?: unknown;
+    code?: unknown;
+  };
+  if (typeof error !== "string") return null;
+  const numeric = code == null ? null : Number(code);
+  return {
+    error,
+    code: numeric != null && Number.isFinite(numeric) ? numeric : null,
+  };
 }
 
 function recoverEmbeddedCode(trimmed: string): {
