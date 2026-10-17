@@ -1,4 +1,8 @@
 import { expect, test } from "@playwright/test";
+import {
+  GENERAL_ALICE_EVENT_ID,
+  GENERAL_WELCOME_EVENT_ID,
+} from "@/testing/e2eSeedIds";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
@@ -120,14 +124,14 @@ test.describe("thread unread indicator", () => {
     await installMockBridge(page);
     await page.goto("/");
 
-    // Open general — catch-up adds mock-general-welcome to authoredRootIds
+    // Open general — catch-up adds GENERAL_WELCOME_EVENT_ID to authoredRootIds
     await page.getByTestId("channel-general").click();
     await expect(page.getByTestId("chat-title")).toHaveText("general");
     await waitForMockLiveSubscription(page, "general");
 
     // Emit an initial reply so the thread summary row appears
     await emitMockMessage(page, "general", "First reply to welcome", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: Math.floor(Date.now() / 1000) - 10,
     });
@@ -158,7 +162,7 @@ test.describe("thread unread indicator", () => {
     const base = unreadTimestamp();
     for (let i = 0; i < 3; i++) {
       await emitMockMessage(page, "general", `Unread reply ${i + 1}`, {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.alice.pubkey,
         createdAt: base + i,
       });
@@ -183,7 +187,7 @@ test.describe("thread unread indicator", () => {
 
     // Emit an initial reply so the thread summary appears
     await emitMockMessage(page, "general", "Earlier reply", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: Math.floor(Date.now() / 1000) - 10,
     });
@@ -204,7 +208,7 @@ test.describe("thread unread indicator", () => {
     const base = unreadTimestamp();
     for (let i = 0; i < 2; i++) {
       await emitMockMessage(page, "general", `New reply ${i + 1}`, {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.alice.pubkey,
         createdAt: base + i,
       });
@@ -292,7 +296,7 @@ test.describe("thread unread indicator", () => {
       "general",
       "Kicking off the design",
       {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.alice.pubkey,
         createdAt: past,
       },
@@ -375,12 +379,12 @@ test.describe("thread unread indicator", () => {
     await page.getByTestId("message-thread-head").scrollIntoViewIfNeeded();
     await expect(
       panel.locator(
-        `[data-testid="thread-collapse-rail"][data-thread-head-id="mock-general-welcome"]`,
+        `[data-testid="thread-collapse-rail"][data-thread-head-id="${GENERAL_WELCOME_EVENT_ID}"]`,
       ),
     ).toHaveCount(0);
     await expect(
       panel.locator(
-        `[data-testid="thread-collapse-guide"][data-thread-head-id="mock-general-welcome"]`,
+        `[data-testid="thread-collapse-guide"][data-thread-head-id="${GENERAL_WELCOME_EVENT_ID}"]`,
       ),
     ).toHaveCount(0);
 
@@ -421,7 +425,7 @@ test.describe("thread unread indicator", () => {
     // badge; the leaf sibling proves the panel shows other rows too.
     const past = Math.floor(Date.now() / 1000) - 60;
     const p = await emitMockMessage(page, "general", "Branch parent", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: past,
     });
@@ -431,7 +435,7 @@ test.describe("thread unread indicator", () => {
       createdAt: past + 1,
     });
     await emitMockMessage(page, "general", "Sibling branch at top level", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.charlie.pubkey,
       createdAt: past + 2,
     });
@@ -520,7 +524,7 @@ test.describe("thread unread indicator", () => {
     // in-panel subtree badge starts at a known count.
     const past = Math.floor(Date.now() / 1000) - 60;
     const p = await emitMockMessage(page, "general", "Branch parent", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: past,
     });
@@ -585,7 +589,7 @@ test.describe("thread unread indicator", () => {
     // gain a chronologically EARLIER unread reply; branchNew a LATER one.
     const past = Math.floor(Date.now() / 1000) - 120;
     const branchOld = await emitMockMessage(page, "general", "Older branch", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: past,
     });
@@ -595,7 +599,7 @@ test.describe("thread unread indicator", () => {
       createdAt: past + 1,
     });
     const branchNew = await emitMockMessage(page, "general", "Newer branch", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.charlie.pubkey,
       createdAt: past + 2,
     });
@@ -678,7 +682,7 @@ test.describe("thread unread indicator", () => {
 
     // Read frontier over an initial reply, then close the thread.
     await emitMockMessage(page, "general", "First reply to welcome", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: Math.floor(Date.now() / 1000) - 10,
     });
@@ -695,7 +699,7 @@ test.describe("thread unread indicator", () => {
     const base = unreadTimestamp();
     for (let i = 0; i < 3; i++) {
       await emitMockMessage(page, "general", `Unread reply ${i + 1}`, {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.alice.pubkey,
         createdAt: base + i,
       });
@@ -731,7 +735,7 @@ test.describe("thread unread indicator", () => {
     await expect(page.getByTestId("chat-title")).toHaveText("general");
     await waitForMockLiveSubscription(page, "general");
     await emitMockMessage(page, "general", "First reply to welcome", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: Math.floor(Date.now() / 1000) - 10,
     });
@@ -746,7 +750,7 @@ test.describe("thread unread indicator", () => {
     await page.getByTestId("channel-random").click();
     await expect(page.getByTestId("chat-title")).toHaveText("random");
     await emitMockMessage(page, "general", "Unread reply", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: unreadTimestamp(),
     });
@@ -834,7 +838,7 @@ test.describe("thread unread indicator", () => {
     // Read frontier over an initial reply, then close the thread (same setup as
     // test 01) so the subsequent replies land strictly past the frontier.
     await emitMockMessage(page, "general", "First reply to welcome", {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: Math.floor(Date.now() / 1000) - 10,
     });
@@ -851,7 +855,7 @@ test.describe("thread unread indicator", () => {
     const base = unreadTimestamp();
     for (let i = 0; i < 3; i++) {
       await emitMockMessage(page, "general", `Unread reply ${i + 1}`, {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.alice.pubkey,
         createdAt: base + i,
       });
@@ -877,7 +881,7 @@ test.describe("thread unread indicator", () => {
 
   // Regression guard for the mention-gate + subtree-count fixes. The viewer is
   // a pure MENTION RECIPIENT of a nested reply in a thread they never authored,
-  // participated in, or followed: root `mock-general-alice` (Alice-authored) ->
+  // participated in, or followed: root `GENERAL_ALICE_EVENT_ID` (Alice-authored) ->
   // reply A (Alice) -> reply B (Alice, @-mentions self). This fails pre-fix on
   // TWO independent defects:
   //   1. The badge gate `isNotifiedForThread` had no mention term, so a
@@ -903,13 +907,13 @@ test.describe("thread unread indicator", () => {
     // counts unread — A + B = 2. The emitter derives B's true rootId from A's
     // stored thread reference, so B lands in Alice's thread at depth 2.
     const aliceSummary = page.locator(
-      '[data-thread-head-id="mock-general-alice"]',
+      `[data-thread-head-id="${GENERAL_ALICE_EVENT_ID}"]`,
     );
     await page.getByTestId("channel-random").click();
     await expect(page.getByTestId("chat-title")).toHaveText("random");
     const base = unreadTimestamp();
     const replyA = await emitMockMessage(page, "general", "Reply A (depth 1)", {
-      parentEventId: "mock-general-alice",
+      parentEventId: GENERAL_ALICE_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: base,
     });

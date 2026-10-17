@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 import type { Page } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
@@ -194,8 +195,8 @@ test("opening edit during an immediate photo upload preserves the draft", async 
   await choosePhoto(page);
   await expect(page.getByTestId("upload-progress")).toBeVisible();
 
-  await openMoreActionsMenu(page, "mock-general-welcome");
-  await page.getByTestId("edit-message-mock-general-welcome").click();
+  await openMoreActionsMenu(page, GENERAL_WELCOME_EVENT_ID);
+  await page.getByTestId(`edit-message-${GENERAL_WELCOME_EVENT_ID}`).click();
   // Edit is dispatched by onCloseAutoFocus after Radix unmounts the menu,
   // not by the click itself. Keep the upload held through that handoff.
   await expect(page.getByRole("menu")).toHaveCount(0);
@@ -217,8 +218,8 @@ test("opening edit during an immediate photo upload preserves the draft", async 
   );
 
   // Once settled, the same edit action enters edit mode normally.
-  await openMoreActionsMenu(page, "mock-general-welcome");
-  await page.getByTestId("edit-message-mock-general-welcome").click();
+  await openMoreActionsMenu(page, GENERAL_WELCOME_EVENT_ID);
+  await page.getByTestId(`edit-message-${GENERAL_WELCOME_EVENT_ID}`).click();
   await expect(page.getByTestId("edit-target")).toBeVisible();
 });
 

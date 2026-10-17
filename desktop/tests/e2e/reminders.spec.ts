@@ -1,4 +1,8 @@
 import { expect, test } from "@playwright/test";
+import {
+  GENERAL_ALICE_EVENT_ID,
+  GENERAL_WELCOME_EVENT_ID,
+} from "@/testing/e2eSeedIds";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
@@ -143,7 +147,7 @@ test.describe("reminders", () => {
     const futureTimestamp = Math.floor(Date.now() / 1000) + 3600;
     const reminderContent = JSON.stringify({
       target: {
-        eventId: "mock-general-welcome",
+        eventId: GENERAL_WELCOME_EVENT_ID,
         channelId: "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
         preview: "Welcome to #general",
         authorPubkey: MOCK_PUBKEY,
@@ -177,7 +181,7 @@ test.describe("reminders", () => {
     const pastTimestamp = Math.floor(Date.now() / 1000) - 7200;
     const overdueContent = JSON.stringify({
       target: {
-        eventId: "mock-general-alice",
+        eventId: GENERAL_ALICE_EVENT_ID,
         channelId: "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
         preview: "Hey team — checking in.",
         authorPubkey:
@@ -191,7 +195,7 @@ test.describe("reminders", () => {
     const futureTimestamp = Math.floor(Date.now() / 1000) + 7200;
     const activeContent = JSON.stringify({
       target: {
-        eventId: "mock-general-welcome",
+        eventId: GENERAL_WELCOME_EVENT_ID,
         channelId: "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
         preview: "Welcome to #general",
         authorPubkey: MOCK_PUBKEY,
@@ -231,7 +235,7 @@ test.describe("reminders", () => {
 
 // Phase 2 — author + source at a glance, and click-to-navigate. Both cases
 // seed a reminder targeting Alice's seeded message in #general (event
-// `mock-general-alice`, channel `9a1657ac-…`), so the author resolves to
+// `GENERAL_ALICE_EVENT_ID`, channel `9a1657ac-…`), so the author resolves to
 // "alice" and the channel label to "general" from the live profile/channel
 // queries — no "Unknown channel" fallback.
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
@@ -241,7 +245,7 @@ const ALICE_PUBKEY =
 function aliceReminderContent() {
   return JSON.stringify({
     target: {
-      eventId: "mock-general-alice",
+      eventId: GENERAL_ALICE_EVENT_ID,
       channelId: GENERAL_CHANNEL_ID,
       preview: "Hey team — checking in.",
       authorPubkey: ALICE_PUBKEY,

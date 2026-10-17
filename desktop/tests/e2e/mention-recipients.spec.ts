@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 import { truncateNpub } from "../../src/shared/lib/pubkey";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
@@ -170,7 +171,7 @@ for (const removal of ["delete", "audience-remove", "audience-unpin"]) {
     });
     // Main retains automatic audiences only in threads, never root posts.
     await page.goto(
-      "/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=mock-general-welcome&thread=mock-general-welcome",
+      `/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=${GENERAL_WELCOME_EVENT_ID}&thread=${GENERAL_WELCOME_EVENT_ID}`,
     );
     const composer = page.getByTestId("thread-composer-overlay");
     await expect(composer).toBeVisible();
@@ -808,7 +809,7 @@ for (const selection of ["picker", "automatic"]) {
       searchProfiles: [{ pubkey: pasted, displayName: "Scout" }],
     });
     await page.goto(
-      "/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=mock-general-welcome&thread=mock-general-welcome",
+      `/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=${GENERAL_WELCOME_EVENT_ID}&thread=${GENERAL_WELCOME_EVENT_ID}`,
     );
     const composer = page.getByTestId("thread-composer-overlay");
     const input = composer.getByTestId("message-input");

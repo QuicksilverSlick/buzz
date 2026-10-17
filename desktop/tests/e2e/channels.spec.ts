@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_ALICE_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import {
   KIND_HUDDLE_ENDED,
@@ -3686,7 +3687,7 @@ test("Inbox All never lists drafts and unread-only hides reminders", async ({
           ],
           content: JSON.stringify({
             target: {
-              eventId: "mock-general-alice",
+              eventId: GENERAL_ALICE_EVENT_ID,
               channelId,
               preview: "Due reminder in mixed Inbox",
               authorPubkey: senderPubkey,
@@ -3834,7 +3835,7 @@ test("Inbox All keeps its filter when opening a due reminder", async ({
           ],
           content: JSON.stringify({
             target: {
-              eventId: "mock-general-alice",
+              eventId: GENERAL_ALICE_EVENT_ID,
               channelId,
               preview: "Review the Inbox behavior",
               authorPubkey: pubkey,

@@ -1,4 +1,8 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import {
+  GENERAL_ALICE_EVENT_ID,
+  GENERAL_WELCOME_EVENT_ID,
+} from "@/testing/e2eSeedIds";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
@@ -8,7 +12,7 @@ const CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const RANDOM_CHANNEL_ID = "9dae0116-799b-5071-a0a8-fdd30a91a35d";
 const AGENT_A = "a".repeat(64);
 const AGENT_B = "b".repeat(64);
-const THREAD_ROOT_ID = "mock-general-welcome";
+const THREAD_ROOT_ID = GENERAL_WELCOME_EVENT_ID;
 const KEEP_MENTIONED_AGENTS_PINNED_STORAGE_KEY =
   "buzz.messages.keepMentionedAgentsPinned";
 
@@ -1121,7 +1125,7 @@ test("automatic mentions exist only in thread composers and stay thread-scoped",
     threadComposer(page).getByTestId(`composer-address-lock-${AGENT_B}`),
   ).toBeVisible();
 
-  await openThread(page, "mock-general-alice");
+  await openThread(page, GENERAL_ALICE_EVENT_ID);
   await expect(
     threadComposer(page).getByTestId(`composer-address-lock-${AGENT_B}`),
   ).toHaveCount(0);

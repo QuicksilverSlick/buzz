@@ -35,6 +35,10 @@ import { getAudioMediaLoadSchedulerSnapshot } from "@/features/messages/lib/audi
 import { mockSearchHitMatches } from "./e2eBridgeSearch.ts";
 import { selectMockHistory } from "./e2eBridgeHistory.ts";
 import {
+  GENERAL_ALICE_EVENT_ID,
+  GENERAL_WELCOME_EVENT_ID,
+} from "./e2eSeedIds.ts";
+import {
   createMockSubscription,
   hasMockSubscription,
 } from "./e2eBridgeSubscriptions.ts";
@@ -4756,7 +4760,7 @@ function getMockMessageStore(channelId: string): RelayEvent[] {
     channelId === "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"
       ? [
           {
-            id: "mock-general-welcome",
+            id: GENERAL_WELCOME_EVENT_ID,
             pubkey: DEFAULT_MOCK_IDENTITY.pubkey,
             created_at: Math.floor(Date.now() / 1000) - 120,
             kind: 9,
@@ -4772,7 +4776,7 @@ function getMockMessageStore(channelId: string): RelayEvent[] {
           // in other specs always land after both — preserving
           // `message-row.first()` = welcome and `.last()` = sent.
           {
-            id: "mock-general-alice",
+            id: GENERAL_ALICE_EVENT_ID,
             pubkey: ALICE_PUBKEY,
             created_at: Math.floor(Date.now() / 1000) - 60,
             kind: 9,
@@ -4781,10 +4785,10 @@ function getMockMessageStore(channelId: string): RelayEvent[] {
             sig: "mocksig".repeat(20).slice(0, 128),
           },
           // Reaction-target seed for the custom-emoji reaction guard. Real
-          // 64-hex id so getReactionTargetId() accepts it as a reaction target
-          // (the short-id seeds above can't be reacted to). Backdated after the
-          // other seeds, so it stays at row index >= 2 and never displaces
-          // first()=welcome / nth(1)=alice that other specs rely on.
+          // 64-hex id so getReactionTargetId() accepts it as a reaction target.
+          // Backdated after the other seeds, so it stays at row index >= 2 and
+          // never displaces first()=welcome / nth(1)=alice that other specs
+          // rely on.
           {
             id: REACTION_TARGET_EVENT_ID,
             pubkey: ALICE_PUBKEY,
@@ -10043,7 +10047,7 @@ async function handleSearchMessages(
 
     const mockHits: RawSearchHit[] = [
       {
-        event_id: "mock-general-welcome",
+        event_id: GENERAL_WELCOME_EVENT_ID,
         content: "Welcome to #general",
         kind: 9,
         pubkey: DEFAULT_MOCK_IDENTITY.pubkey,

@@ -1,11 +1,12 @@
 import { expect, type Page, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { installMockBridge } from "../helpers/bridge";
 
 // The mock bridge seeds canvas revisions on the starter #general channel.
 const CANVAS = "# Start here\n\nAsk the Reset Worker when you need a hand.";
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
-const GENERAL_THREAD_ROOT_ID = "mock-general-welcome";
+const GENERAL_THREAD_ROOT_ID = GENERAL_WELCOME_EVENT_ID;
 // The mock's first project uses the "buzz" channel as its home.
 const PROJECT_HOME_CHANNEL_ID = "cf63feec-21bb-5bf0-a2f8-0e4c3de8ec73";
 

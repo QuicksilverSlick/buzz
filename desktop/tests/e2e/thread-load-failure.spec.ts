@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
@@ -61,13 +62,13 @@ async function setThreadRepliesFailing(page: Page, failing: boolean) {
 // so the panel is reliably open before the error-card assertions run.
 async function openWelcomeThread(page: Page) {
   const summary = page.locator(
-    '[data-testid="message-thread-summary"][data-thread-head-id="mock-general-welcome"]',
+    `[data-testid="message-thread-summary"][data-thread-head-id="${GENERAL_WELCOME_EVENT_ID}"]`,
   );
   if (await summary.count()) {
     await summary.first().click();
   } else {
     const root = page.locator(
-      '[data-testid="message-row"][data-message-id="mock-general-welcome"]',
+      `[data-testid="message-row"][data-message-id="${GENERAL_WELCOME_EVENT_ID}"]`,
     );
     await root.hover();
     await root.getByRole("button", { name: "Reply" }).click();
@@ -119,7 +120,7 @@ test.describe("thread load failure", () => {
       ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
         content: "First reply to welcome",
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey,
         createdAt: Math.floor(Date.now() / 1000) - 10,
       });

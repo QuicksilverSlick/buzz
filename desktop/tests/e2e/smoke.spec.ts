@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { SHARED_COMPUTE_LABEL } from "../../src/shared/constants/brand";
 import { installMockBridge, openCreateChannelDialog } from "../helpers/bridge";
@@ -451,11 +452,11 @@ test("ordinary rendered channel link clears a prior search highlight", async ({
   await page.getByTestId("channel-general").click();
   await page.keyboard.press("ControlOrMeta+f");
   await page.getByTestId("search-dialog-input").fill("welcome");
-  await page.getByTestId("search-result-mock-general-welcome").click();
+  await page.getByTestId(`search-result-${GENERAL_WELCOME_EVENT_ID}`).click();
 
   const message = page
     .getByTestId("message-timeline")
-    .locator('[data-message-id="mock-general-welcome"]');
+    .locator(`[data-message-id="${GENERAL_WELCOME_EVENT_ID}"]`);
   await expect(message.locator('[data-search-match="true"]')).toHaveText(
     "Welcome",
   );

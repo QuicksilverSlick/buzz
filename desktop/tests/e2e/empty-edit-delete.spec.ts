@@ -1,11 +1,15 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { installMockBridge } from "../helpers/bridge";
+import { waitForMockChannelHeadReady } from "../helpers/channelHeadReady";
+
+const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 
 // The mock identity's own pre-seeded message in #general (authored by
 // DEFAULT_MOCK_IDENTITY.pubkey in e2eBridge.ts). Editing/deleting one's own
 // message is exactly Sam's workflow: "delete a message by clearing its edit."
-const OWN_MESSAGE_ID = "mock-general-welcome";
+const OWN_MESSAGE_ID = GENERAL_WELCOME_EVENT_ID;
 const RENDERED_ORIGINAL_CONTENT = "Welcome to general";
 
 // Open the more-actions menu for a message row and wait for the menu to mount.
@@ -46,6 +50,39 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
+});
+
+test("the timeline applies edit and delete events for the seeded message", async ({
+  page,
+}) => {
+  await waitForMockChannelHeadReady(page, "general", GENERAL_CHANNEL_ID);
+  const row = page.locator(`[data-message-id="${OWN_MESSAGE_ID}"]`);
+
+  // Both events bypass the UI mutations, so there is no cache patch: the row
+  // changes only if the timeline honours an `e` tag naming the seeded id.
+  const editedContent = `Edited by event ${Date.now()}`;
+  await page.evaluate(
+    (input) =>
+      window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.("edit_message", { input }),
+    {
+      channelId: GENERAL_CHANNEL_ID,
+      eventId: OWN_MESSAGE_ID,
+      content: editedContent,
+    },
+  );
+  await expect(row).toContainText(editedContent);
+
+  await page.evaluate(
+    (eventId) =>
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        kind: 5,
+        content: "",
+        extraTags: [["e", eventId]],
+      }),
+    OWN_MESSAGE_ID,
+  );
+  await expect(row).toBeHidden();
 });
 
 test("clearing an edit to empty prompts to delete, then deletes on confirm", async ({

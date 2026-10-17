@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 import type { Page } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
@@ -175,8 +176,8 @@ test("discards an active recording when entering edit mode", async ({
   await page.getByRole("button", { name: "Record voice note" }).click();
   await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
 
-  await openMoreActionsMenu(page, "mock-general-welcome");
-  await page.getByTestId("edit-message-mock-general-welcome").click();
+  await openMoreActionsMenu(page, GENERAL_WELCOME_EVENT_ID);
+  await page.getByTestId(`edit-message-${GENERAL_WELCOME_EVENT_ID}`).click();
 
   await expect(page.getByTestId("edit-target")).toBeVisible();
   await expect(page.getByTestId("voice-note-recorder")).toHaveCount(0);
@@ -191,8 +192,8 @@ test("editor Enter never saves an edit while a voice note is recording", async (
 
   // Enter edit mode first, then start recording — the mic is available in edit
   // mode, so this is the ordering the recorder submission gate must cover.
-  await openMoreActionsMenu(page, "mock-general-welcome");
-  await page.getByTestId("edit-message-mock-general-welcome").click();
+  await openMoreActionsMenu(page, GENERAL_WELCOME_EVENT_ID);
+  await page.getByTestId(`edit-message-${GENERAL_WELCOME_EVENT_ID}`).click();
   await expect(page.getByTestId("edit-target")).toBeVisible();
   const input = page.getByTestId("message-input");
   await expect(input).not.toBeEmpty();

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
@@ -118,7 +119,7 @@ for (const theme of THEMES) {
     const issueId = "b".repeat(64);
     const links = [
       `buzz://channel/${channelId}`,
-      `buzz://message?channel=${channelId}&id=mock-general-welcome`,
+      `buzz://message?channel=${channelId}&id=${GENERAL_WELCOME_EVENT_ID}`,
       `buzz://issue?id=${issueId}&owner=${owner}&d=buzz-world`,
     ].join(" ");
     const composer = page.getByTestId("message-input");
