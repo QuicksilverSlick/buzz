@@ -409,6 +409,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
     pub claude_account_pool: Option<String>,
 
+    /// The #factory channel (uuid) this harness posts its STATE records to
+    /// when its health changes. Unset: records are logged only.
+    #[arg(long, env = "BUZZ_FACTORY_CHANNEL")]
+    pub factory_channel: Option<String>,
+
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
@@ -1198,10 +1203,25 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
-        let factory = crate::factory::FactoryHandle::new(crate::factory::Factory::new(
-            args.claude_account_pool.as_deref(),
-            &agent_command,
-        ));
+        let session_title = args
+            .session_title
+            .as_deref()
+            .and_then(sanitize_session_title);
+        let mut factory =
+            crate::factory::Factory::new(args.claude_account_pool.as_deref(), &agent_command);
+        let short = keys.public_key().to_hex()[..8].to_string();
+        factory.reporting = crate::factory::Reporting {
+            agent: session_title.clone().unwrap_or_else(|| short.clone()),
+            short,
+            channel: args.factory_channel.as_deref().and_then(|raw| {
+                let parsed = uuid::Uuid::parse_str(raw.trim()).ok();
+                if parsed.is_none() {
+                    tracing::warn!("BUZZ_FACTORY_CHANNEL is not a channel uuid — ignoring it");
+                }
+                parsed
+            }),
+        };
+        let factory = crate::factory::FactoryHandle::new(factory);
 
         let config = Config {
             capabilities,
@@ -1240,10 +1260,7 @@ impl Config {
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
-            session_title: args
-                .session_title
-                .as_deref()
-                .and_then(sanitize_session_title),
+            session_title,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,

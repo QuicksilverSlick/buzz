@@ -458,6 +458,24 @@ pub(crate) enum Health {
 
 /// Real answers in a row that turn Recovering into Operational (spec 2.3).
 const ANSWERS_TO_RECOVER: u32 = 3;
+/// A STATE record with no parked work behind it is current this long.
+const RECORD_TTL: Duration = Duration::from_secs(20 * 60);
+/// A parked state's record outlives its next try by this much, so the try
+/// can finish and refresh it.
+const RECORD_SLACK: Duration = Duration::from_secs(5 * 60);
+
+/// Who a harness speaks for in STATE records: names and ids only,
+/// never an email, a token or a path.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Reporting {
+    /// The agent's display name, or its short id.
+    pub agent: String,
+    /// The first 8 hex characters of the agent's pubkey.
+    pub short: String,
+    /// The #factory channel STATE records are posted to; `None` logs them
+    /// only.
+    pub channel: Option<uuid::Uuid>,
+}
 
 /// Harness-wide failure state, shared through [`Config`](crate::config::Config).
 #[derive(Debug, Default)]
@@ -465,6 +483,21 @@ pub(crate) struct Factory {
     health: Health,
     /// Real answers since Recovering began.
     answers: u32,
+    /// `claude`, `codex`, or the adapter's own name.
+    provider: String,
+    pub(crate) reporting: Reporting,
+    /// The failure behind the current state, for its record.
+    failure: Option<Failure>,
+    /// The login the last turn ran on.
+    account: String,
+    /// When the current state began.
+    since: Option<DateTime<Utc>>,
+    /// When parked work next runs.
+    resumes: Option<DateTime<Utc>>,
+    /// From leaving Operational until back: `inc-<yyyymmdd>-<hhmmss>`.
+    incident: Option<String>,
+    /// The last record's state and expiry.
+    reported: Option<(Health, DateTime<Utc>)>,
     /// The account pool; empty when none is configured, which is exactly the
     /// single-login behaviour.
     accounts: Vec<Account>,
@@ -487,10 +520,16 @@ impl Factory {
             .map(str::trim)
             .filter(|d| !d.is_empty())
             .collect();
+        let identity = crate::config::normalize_agent_command_identity(agent_command);
         let claude = matches!(
-            crate::config::normalize_agent_command_identity(agent_command).as_str(),
+            identity.as_str(),
             "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode"
         );
+        let provider = match identity.as_str() {
+            _ if claude => "claude".to_string(),
+            "codex" | "codex-acp" => "codex".to_string(),
+            _ => identity,
+        };
         if !dirs.is_empty() && !claude {
             tracing::warn!("{ACCOUNT_POOL_ENV} is set but the agent is not Claude — ignoring it");
         }
@@ -505,8 +544,24 @@ impl Factory {
             .collect();
         Self {
             accounts,
+            provider,
             ..Self::default()
         }
+    }
+
+    /// Move to `health`. Leaving Operational opens an incident.
+    fn set_health(&mut self, health: Health, now: DateTime<Utc>) {
+        if health == self.health {
+            return;
+        }
+        if self.health == Health::Operational {
+            self.incident = Some(now.format("inc-%Y%m%d-%H%M%S").to_string());
+        }
+        if health == Health::Operational {
+            self.failure = None;
+        }
+        self.since = Some(now);
+        self.health = health;
     }
 
     /// The first login not known to be limited.
@@ -558,6 +613,8 @@ impl Factory {
         if failure.class == Class::RateLimit {
             self.rate_streak += 1;
         }
+        self.account = self.label(slot).to_string();
+        self.failure = Some(failure.clone());
         let mut wait = park_for(failure, now, self.rate_streak);
         if matches!(failure.class, Class::UsageLimit | Class::SpendCap) && !self.accounts.is_empty()
         {
@@ -573,7 +630,8 @@ impl Factory {
                     .told
                     .insert((scope.clone(), true))
                     .then(|| hand_off_line(&label));
-                self.health = Health::Degraded;
+                self.resumes = None;
+                self.set_health(Health::Degraded, now);
                 return Plan::HandOff { label, line };
             }
             wait = self
@@ -584,24 +642,28 @@ impl Factory {
                 .min()
                 .unwrap_or(wait);
         }
+        let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
+        self.resumes = Some(resumes);
         // Three short rate limits in a row are Blocked (short), spec 3.2.
         let blocked = failure.class != Class::RateLimit || self.rate_streak >= 3;
-        let line = (blocked && self.told.insert((scope.clone(), false))).then(|| {
-            let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
-            pause_line(failure, resumes)
-        });
-        self.health = match failure.class {
+        let line = (blocked && self.told.insert((scope.clone(), false)))
+            .then(|| pause_line(failure, resumes));
+        let health = match failure.class {
             Class::SignIn => Health::Down,
             _ if blocked => Health::Blocked,
             _ => Health::Degraded,
         };
+        self.set_health(health, now);
         Plan::Park { wait, line }
     }
 
     /// An ordinary failure (class 18): retried as today, but no longer silent.
-    pub(crate) fn on_error(&mut self) {
+    pub(crate) fn on_error(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
+        self.account = self.label(slot).to_string();
+        self.failure = Some(failure.clone());
+        self.resumes = None;
         if matches!(self.health, Health::Operational | Health::Recovering) {
-            self.health = Health::Degraded;
+            self.set_health(Health::Degraded, now);
         }
     }
 
@@ -612,6 +674,8 @@ impl Factory {
     pub(crate) fn on_success(&mut self, slot: usize, now: DateTime<Utc>) {
         self.rate_streak = 0;
         self.told.clear();
+        self.resumes = None;
+        self.account = self.label(slot).to_string();
         if let Some(&i) = self.started_on.get(&slot) {
             self.accounts[i].limited = None;
         }
@@ -620,7 +684,7 @@ impl Factory {
         } else {
             Health::Operational
         };
-        self.health = match self.health {
+        let health = match self.health {
             Health::Blocked | Health::Down => {
                 self.answers = 1;
                 Health::Recovering
@@ -635,6 +699,124 @@ impl Factory {
             }
             _ => settled,
         };
+        self.set_health(health, now);
+    }
+
+    /// The STATE record (spec 4.2) when the state changed, or when the last
+    /// record expired while work is still stopped; `None` otherwise, and
+    /// never for a harness that has been fine all along. The first line is
+    /// for machines, the rest for the owner. Names, ids and the provider's
+    /// own (scrubbed) words only: never member text, an email or a token.
+    pub(crate) fn take_report(&mut self, now: DateTime<Utc>) -> Option<String> {
+        let stopped = self.health != Health::Operational;
+        let due = match self.reported {
+            Some((was, expires)) => was != self.health || (stopped && now >= expires),
+            None => stopped,
+        };
+        if !due {
+            return None;
+        }
+        let ttl = |d: Duration| chrono::Duration::from_std(d).unwrap_or_default();
+        let expires = match self.resumes {
+            Some(at) => at.max(now) + ttl(RECORD_SLACK),
+            None => now + ttl(RECORD_TTL),
+        };
+        self.reported = Some((self.health, expires));
+        let iso = |t: DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let state = match self.health {
+            Health::Operational => "OPERATIONAL",
+            Health::Degraded => "DEGRADED",
+            Health::Blocked => "BLOCKED",
+            Health::Down => "DOWN",
+            Health::Recovering => "RECOVERING",
+        };
+        let mut record = format!(
+            "STATE v1 scope=account:{}/{} agent={} state={state}",
+            self.provider,
+            self.account(),
+            self.reporting.short
+        );
+        let failure = self.failure.as_ref().filter(|_| stopped);
+        if let Some(f) = failure {
+            record.push_str(&format!(" class={}", f.slug));
+        }
+        record.push_str(&format!(" since={}", iso(self.since.unwrap_or(now))));
+        if let Some(at) = failure.and_then(|f| f.resets_at) {
+            record.push_str(&format!(" resets={}", iso(at)));
+        }
+        record.push_str(&format!(" expires={}", iso(expires)));
+        if let Some(incident) = &self.incident {
+            record.push_str(&format!(" incident={incident}"));
+        }
+        if let Some(f) = failure {
+            record.push_str(&format!("\n{} said: \"{}\"", self.provider_name(), f.text));
+        }
+        record.push_str(&format!("\nPlain words: {}", self.plain_words(now)));
+        if !stopped {
+            self.incident = None;
+        }
+        Some(record)
+    }
+
+    fn account(&self) -> &str {
+        match self.account.as_str() {
+            "" => "default",
+            label => label,
+        }
+    }
+
+    /// "Claude", "Codex", or the adapter's name with a capital.
+    fn provider_name(&self) -> String {
+        let mut chars = self.provider.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect(),
+            None => "The agent".to_string(),
+        }
+    }
+
+    fn who(&self) -> &str {
+        match self.reporting.agent.as_str() {
+            "" => "This agent",
+            name => name,
+        }
+    }
+
+    /// What the state means for the owner, in one or two sentences.
+    fn plain_words(&self, now: DateTime<Utc>) -> String {
+        let who = self.who();
+        let saved = "Its requests are saved; nothing is lost.";
+        let class = self.failure.as_ref().map(|f| f.class);
+        let standby = self.preferred(now).filter(|&p| p > 0);
+        match (self.health, class, standby) {
+            (Health::Operational, ..) => format!("{who} is working normally again."),
+            (Health::Recovering, ..) => format!(
+                "{who} answered again; {ANSWERS_TO_RECOVER} answers in a row make it fully \
+                 recovered."
+            ),
+            (Health::Down, ..) => format!(
+                "{who} lost its sign-in. Its work is paused until it is signed in again; it \
+                 checks every 30 minutes. {saved}"
+            ),
+            (Health::Blocked, Some(Class::SpendCap), _) => format!(
+                "{who}'s work is paused until the spending cap is raised; it checks every 30 \
+                 minutes. {saved}"
+            ),
+            (Health::Blocked, ..) => format!(
+                "{who}'s work is paused until about {}. {saved}",
+                self.resumes
+                    .map_or_else(|| "its next check".to_string(), chicago_label)
+            ),
+            (Health::Degraded, _, Some(on)) => format!(
+                "{who} is continuing on {} while {} is limited. Nothing is lost.",
+                self.accounts[on].label, self.accounts[0].label
+            ),
+            (Health::Degraded, Some(Class::RateLimit), None) => {
+                format!("{who} is slowed by a rate limit and tries again shortly.")
+            }
+            (Health::Degraded, ..) => {
+                format!("{who} hit an error and is retrying it (up to 10 tries).")
+            }
+        }
     }
 
     /// The presence dot: "away" while work is parked behind a limit or a lost
@@ -1014,7 +1196,7 @@ mod tests {
         assert_eq!(seen(&f), (Health::Blocked, "away"));
 
         let mut f = Factory::default();
-        f.on_error();
+        f.on_error(0, &classify(&agent_error("Internal error"), now), now);
         assert_eq!(seen(&f), (Health::Degraded, "online"));
         f.on_success(0, now);
         assert_eq!(seen(&f), (Health::Operational, "online"));
@@ -1181,5 +1363,101 @@ mod tests {
         // A real answer on a login clears its record.
         factory.on_success(0, oct16());
         assert!(factory.accounts()[0].limited.is_none());
+    }
+
+    fn reporting(agent: &str) -> Reporting {
+        Reporting {
+            agent: agent.to_string(),
+            short: "ade9d0e2".to_string(),
+            ..Reporting::default()
+        }
+    }
+
+    /// The 16 Oct weekly limit as a STATE record (spec 4.2): one machine
+    /// line, the provider's exact words, plain words. Re-posted only when
+    /// the state changes or the last record expired while still stopped.
+    #[test]
+    fn state_record_on_each_change() {
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Reset Worker");
+        assert_eq!(f.take_report(oct16()), None, "fine all along: nothing");
+        f.plan(0, &scope(), &weekly(), oct16());
+        assert_eq!(
+            f.take_report(oct16()).as_deref(),
+            Some(
+                "STATE v1 scope=account:claude/default agent=ade9d0e2 state=BLOCKED \
+                 class=weekly_limit since=2026-10-16T16:52:00Z resets=2026-10-19T00:00:00Z \
+                 expires=2026-10-19T00:07:00Z incident=inc-20261016-165200\n\
+                 Claude said: \"You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)\"\n\
+                 Plain words: Reset Worker's work is paused until about Sun 18 Oct 7:02 PM CT. \
+                 Its requests are saved; nothing is lost."
+            )
+        );
+        // Another scope parked in the same incident: no new record.
+        f.plan(0, &scope(), &weekly(), oct16());
+        assert_eq!(f.take_report(oct16()), None);
+        // The probe after the reset fails again: the expired record is renewed.
+        let probe = at(2026, 10, 19, 0, 8);
+        f.plan(0, &scope(), &weekly(), probe);
+        assert!(f
+            .take_report(probe)
+            .is_some_and(|r| r.contains("state=BLOCKED")));
+
+        let answers: Vec<Option<String>> = (0..3)
+            .map(|_| {
+                f.on_success(0, probe);
+                f.take_report(probe)
+            })
+            .collect();
+        let first = answers[0].as_deref().unwrap();
+        assert!(
+            first.contains("state=RECOVERING class=weekly_limit"),
+            "{first}"
+        );
+        assert_eq!(answers[1], None, "still recovering");
+        assert_eq!(
+            answers[2].as_deref(),
+            Some(
+                "STATE v1 scope=account:claude/default agent=ade9d0e2 state=OPERATIONAL \
+                 since=2026-10-19T00:08:00Z expires=2026-10-19T00:28:00Z \
+                 incident=inc-20261016-165200\n\
+                 Plain words: Reset Worker is working normally again."
+            )
+        );
+        assert_eq!(f.take_report(probe), None);
+    }
+
+    /// An unknown error is Degraded at its first failure (spec 3.2, class
+    /// 18), scrubbed; a hand-off names both logins by folder name only.
+    #[test]
+    fn state_record_for_retries_and_hand_off_keeps_secrets_out() {
+        let mut f = Factory::new(None, "codex-acp");
+        f.reporting = reporting("Orchestrator");
+        let error = classify(
+            &agent_error(r"Internal error: read C:\Users\PC owner\.codex\auth.json token sk-abc"),
+            oct16(),
+        );
+        f.on_error(0, &error, oct16());
+        let record = f.take_report(oct16()).unwrap();
+        assert!(record.starts_with(
+            "STATE v1 scope=account:codex/default agent=ade9d0e2 state=DEGRADED class=error"
+        ));
+        assert!(record.contains("Codex said: \"read [path] [path] token [token]\""));
+        assert!(record.ends_with("Orchestrator hit an error and is retrying it (up to 10 tries)."));
+
+        let mut f = pool();
+        f.reporting = reporting("Reset Worker");
+        f.launch_env(0, oct16());
+        f.plan(0, &scope(), &weekly(), oct16());
+        let record = f.take_report(oct16()).unwrap();
+        assert!(record.starts_with(
+            "STATE v1 scope=account:claude/factory agent=ade9d0e2 state=DEGRADED class=weekly_limit"
+        ));
+        assert!(record.ends_with(
+            "Reset Worker is continuing on account-test while factory is limited. Nothing is lost."
+        ));
+        for secret in ["Users", "PC owner", "sk-", ".claude"] {
+            assert!(!record.contains(secret), "{secret} in {record}");
+        }
     }
 }

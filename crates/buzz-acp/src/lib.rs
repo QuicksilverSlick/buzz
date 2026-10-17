@@ -4134,6 +4134,7 @@ async fn run_harness(
                         }
                     }));
                 }
+                report_factory_state(config, &ctx.rest_client);
                 if drain_ready_join_results(
                     &mut pool,
                     &mut queue,
@@ -5464,6 +5465,36 @@ fn spawn_failure_notice(
     });
 }
 
+/// The harness cannot tell whether a tool already ran in a failed turn, so a
+/// notice never claims nothing was changed (spec 8.6).
+const MAY_BE_DONE: &str =
+    "Some of the work may already be done, so check where things stand before sending it again.";
+
+/// The thread's notice for a request dropped after its retries.
+fn retries_spent_notice(outcome: &PromptOutcome) -> String {
+    format!(
+        "⚠️ I tried this several times and couldn't get through it — {}. I've stopped rather \
+         than keep failing quietly. {MAY_BE_DONE} This one needs a person to look at it.",
+        failure_reason_text(outcome)
+    )
+}
+
+/// Log the STATE record when the harness's health changed, and post it to
+/// #factory when one is configured (spec 4.2). Never into a work thread.
+fn report_factory_state(config: &Config, rest: &relay::RestClient) {
+    let Some(record) = config.factory.lock().take_report(chrono::Utc::now()) else {
+        return;
+    };
+    let channel = config.factory.lock().reporting.channel;
+    tracing::warn!(posted = channel.is_some(), "factory {record}");
+    if let Some(channel) = channel {
+        let rest = rest.clone();
+        tokio::spawn(async move {
+            pool::post_notice(&rest, channel, &ThreadTags::default(), &record, &[]).await;
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -5529,8 +5560,8 @@ fn handle_prompt_result(
         PromptOutcome::Error(e) => Some(factory::classify(e, now)),
         _ => None,
     };
-    if failure.as_ref().is_some_and(|f| !f.class.parks()) {
-        config.factory.lock().on_error();
+    if let Some(f) = failure.as_ref().filter(|f| !f.class.parks()) {
+        config.factory.lock().on_error(agent_index, f, now);
     }
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
@@ -5574,10 +5605,10 @@ fn handle_prompt_result(
                     "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
-                let content = "⚠️ I couldn't finish this one. I worked on it for a long \
-                    stretch without getting closer, so I stopped rather than keep going — \
-                    nothing was changed. Send it again if you'd like me to try once more."
-                    .to_string();
+                let content = format!(
+                    "⚠️ I couldn't finish this one. I worked on it for a long stretch without \
+                     getting closer, so I stopped rather than keep going. {MAY_BE_DONE}"
+                );
                 spawn_failure_notice(
                     rest_client,
                     &batch,
@@ -5597,11 +5628,12 @@ fn handle_prompt_result(
                     "hard-cap timeout with recent activity — requeueing for retry"
                 );
                 if let Some(dead) = queue.requeue(batch) {
-                    let content = "⚠️ I tried this several times and couldn't get through it, \
-                        so I've stopped rather than keep failing quietly. Nothing was changed. \
-                        Sending it again is unlikely to help on its own — this one needs a person \
-                        to look at it."
-                        .to_string();
+                    let content = format!(
+                        "⚠️ I tried this several times and couldn't get through it, so I've \
+                         stopped rather than keep failing quietly. {MAY_BE_DONE} Sending it \
+                         again is unlikely to help on its own — this one needs a person to look \
+                         at it."
+                    );
                     spawn_failure_notice(
                         rest_client,
                         &dead,
@@ -5683,16 +5715,10 @@ fn handle_prompt_result(
             } else if let Some(dead) = queue.requeue(batch) {
                 // The raw error stays in the log above; what reaches the
                 // channel names the state, not the mechanism.
-                let reason = failure_reason_text(&result.outcome);
-                let content = format!(
-                    "⚠️ I tried this several times and couldn't get through it — {reason}. \
-                     I've stopped rather than keep failing quietly, and nothing was changed. \
-                     This one needs a person to look at it."
-                );
                 spawn_failure_notice(
                     rest_client,
                     &dead,
-                    content,
+                    retries_spent_notice(&result.outcome),
                     owner_mentions(config.agent_owner.as_deref()),
                 );
             }
@@ -13599,6 +13625,11 @@ mod error_outcome_emission_tests {
             assert!(pool.agents_mut()[0].is_some(), "{message}: agent stays");
             assert!(respawn_tasks.is_empty());
             assert_eq!(config.factory.lock().presence(), presence, "{message}");
+            let record = config.factory.lock().take_report(chrono::Utc::now());
+            assert!(
+                record.is_some_and(|r| r.starts_with("STATE v1 scope=account:")),
+                "{message}: one STATE record"
+            );
         }
     }
 
@@ -13657,6 +13688,15 @@ mod error_outcome_emission_tests {
             "online",
             "retrying, not parked"
         );
+    }
+
+    /// The thread is never told nothing was changed: a tool may have run
+    /// before the failure (spec 8.6).
+    #[test]
+    fn dropped_notice_never_claims_nothing_changed() {
+        let notice = retries_spent_notice(&PromptOutcome::Error(agent_error("Internal error")));
+        assert!(!notice.to_lowercase().contains("nothing was changed"));
+        assert!(notice.contains(MAY_BE_DONE));
     }
 
     #[tokio::test]
