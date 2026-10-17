@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import {
   KIND_HUDDLE_ENDED,
@@ -11,7 +12,7 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 const HUDDLE_CHANNEL_ID = "11111111-1111-4111-8111-111111111111";
 const HUDDLE_PARENT_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
-const HUDDLE_THREAD_ROOT_ID = "mock-general-welcome";
+const HUDDLE_THREAD_ROOT_ID = GENERAL_WELCOME_EVENT_ID;
 
 /**
  * Initials a key-fallback avatar shows: the two characters just before the
@@ -559,13 +560,16 @@ test("keeps main-app shortcuts from navigating the huddle room", async ({
     await expect(page.getByTestId("settings-view")).toHaveCount(0);
   }
 
-  await page.evaluate(async (channelId) => {
-    await window.__BUZZ_E2E_EMIT_TAURI_EVENT__?.("deep-link-message", {
-      channelId,
-      messageId: "mock-general-welcome",
-      threadRootId: null,
-    });
-  }, HUDDLE_PARENT_ID);
+  await page.evaluate(
+    async ({ channelId, messageId }) => {
+      await window.__BUZZ_E2E_EMIT_TAURI_EVENT__?.("deep-link-message", {
+        channelId,
+        messageId,
+        threadRootId: null,
+      });
+    },
+    { channelId: HUDDLE_PARENT_ID, messageId: GENERAL_WELCOME_EVENT_ID },
+  );
   await expect.poll(() => page.url()).toBe(huddleUrl);
 
   const pendingCommunityLink = {

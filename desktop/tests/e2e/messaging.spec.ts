@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { expect, test, type Locator } from "@playwright/test";
+import { GENERAL_ALICE_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
@@ -3238,11 +3239,13 @@ test("narrow thread view collapses channel header actions into a menu", async ({
   await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
   await expect(page.getByTestId("channel-actions-menu-trigger")).toHaveCount(0);
 
-  const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
+  const rootMessage = page.locator(
+    `[data-message-id="${GENERAL_ALICE_EVENT_ID}"]`,
+  );
   const threadPanel = page.getByTestId("message-thread-panel");
 
   await rootMessage.hover();
-  await page.getByTestId("reply-message-mock-general-alice").click();
+  await page.getByTestId(`reply-message-${GENERAL_ALICE_EVENT_ID}`).click();
   await expect(threadPanel).toBeVisible();
   await expect(threadPanel.getByTestId("message-thread-back")).toHaveCount(0);
 
@@ -3282,11 +3285,13 @@ test("single-panel thread view hides channel actions", async ({ page }) => {
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
 
-  const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
+  const rootMessage = page.locator(
+    `[data-message-id="${GENERAL_ALICE_EVENT_ID}"]`,
+  );
   const threadPanel = page.getByTestId("message-thread-panel");
 
   await rootMessage.hover();
-  await page.getByTestId("reply-message-mock-general-alice").click();
+  await page.getByTestId(`reply-message-${GENERAL_ALICE_EVENT_ID}`).click();
   await expect(threadPanel).toBeVisible();
   await expect(threadPanel.getByTestId("message-thread-back")).toBeVisible();
   await expect(page.getByTestId("channel-actions-menu-trigger")).toHaveCount(0);

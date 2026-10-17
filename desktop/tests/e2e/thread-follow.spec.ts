@@ -1,4 +1,8 @@
 import { expect, test } from "@playwright/test";
+import {
+  GENERAL_ALICE_EVENT_ID,
+  GENERAL_WELCOME_EVENT_ID,
+} from "@/testing/e2eSeedIds";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
@@ -165,7 +169,7 @@ test("a delivered message can be followed before its first reply and unfollowed"
   await expect(page.getByTestId("chat-title")).toHaveText(CHANNEL);
   await waitForMockLiveSubscription(page, CHANNEL);
 
-  const rootId = "mock-general-alice";
+  const rootId = GENERAL_ALICE_EVENT_ID;
   await expect(
     page.locator(`[data-testid="message-row"][data-message-id="${rootId}"]`),
   ).toContainText("Hey team — checking in.");
@@ -225,7 +229,7 @@ test("a delivered message can be followed before its first reply and unfollowed"
 
   await emitMessage(page, {
     content: "Control reply after muted reply",
-    parentEventId: "mock-general-welcome",
+    parentEventId: GENERAL_WELCOME_EVENT_ID,
     createdAt: Math.floor(Date.now() / 1000) + 180,
   });
   await expect

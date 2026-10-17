@@ -1,4 +1,5 @@
 import { expect, test, type Locator } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { truncateNpub } from "../../src/shared/lib/pubkey";
 import { waitForAnimations } from "../helpers/animations";
@@ -887,7 +888,7 @@ test("thread autocomplete keeps multiple long names readable in a narrow panel",
   await page.setViewportSize({ width: 760, height: 640 });
 
   await emitMockMessage(page, "general", "Reply to open the thread", {
-    parentEventId: "mock-general-welcome",
+    parentEventId: GENERAL_WELCOME_EVENT_ID,
   });
   const threadSummary = page.getByTestId("message-thread-summary").first();
   await expect(threadSummary).toBeVisible();

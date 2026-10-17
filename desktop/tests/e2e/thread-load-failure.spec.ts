@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
@@ -61,13 +62,13 @@ async function setThreadRepliesFailing(page: Page, failing: boolean) {
 // so the panel is reliably open before the error-card assertions run.
 async function openWelcomeThread(page: Page) {
   const summary = page.locator(
-    '[data-testid="message-thread-summary"][data-thread-head-id="mock-general-welcome"]',
+    `[data-testid="message-thread-summary"][data-thread-head-id="${GENERAL_WELCOME_EVENT_ID}"]`,
   );
   if (await summary.count()) {
     await summary.first().click();
   } else {
     const root = page.locator(
-      '[data-testid="message-row"][data-message-id="mock-general-welcome"]',
+      `[data-testid="message-row"][data-message-id="${GENERAL_WELCOME_EVENT_ID}"]`,
     );
     await root.hover();
     await root.getByRole("button", { name: "Reply" }).click();
@@ -105,25 +106,31 @@ test.describe("thread load failure", () => {
         ),
       )
       .toBe(true);
-    await page.evaluate((pubkey) => {
-      (
-        window as typeof window & {
-          __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-            channelName: string;
-            content: string;
-            parentEventId?: string;
-            pubkey?: string;
-            createdAt?: number;
-          }) => unknown;
-        }
-      ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
-        channelName: "general",
-        content: "First reply to welcome",
-        parentEventId: "mock-general-welcome",
-        pubkey,
-        createdAt: Math.floor(Date.now() / 1000) - 10,
-      });
-    }, TEST_IDENTITIES.alice.pubkey);
+    await page.evaluate(
+      ({ parentEventId, pubkey }) => {
+        (
+          window as typeof window & {
+            __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
+              channelName: string;
+              content: string;
+              parentEventId?: string;
+              pubkey?: string;
+              createdAt?: number;
+            }) => unknown;
+          }
+        ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+          channelName: "general",
+          content: "First reply to welcome",
+          parentEventId,
+          pubkey,
+          createdAt: Math.floor(Date.now() / 1000) - 10,
+        });
+      },
+      {
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+      },
+    );
 
     await page.getByTestId("channel-general").click();
     await expect(page.getByTestId("chat-title")).toHaveText("general");

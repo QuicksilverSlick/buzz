@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
@@ -194,7 +195,7 @@ async function seedChannelActivity(
     page,
     "I tightened the empty state and added the direct thread link.",
     {
-      parentEventId: "mock-general-welcome",
+      parentEventId: GENERAL_WELCOME_EVENT_ID,
       pubkey: TEST_IDENTITIES.alice.pubkey,
       createdAt: unreadAt,
       mentionPubkeys: [SELF_PUBKEY],
@@ -463,7 +464,7 @@ test.describe("channel activity hover preview", () => {
       page,
       "A second unread reply should stay grouped with this thread.",
       {
-        parentEventId: "mock-general-welcome",
+        parentEventId: GENERAL_WELCOME_EVENT_ID,
         pubkey: TEST_IDENTITIES.bob.pubkey,
         createdAt: Math.floor(Date.now() / 1_000) + 120,
         mentionPubkeys: [SELF_PUBKEY],

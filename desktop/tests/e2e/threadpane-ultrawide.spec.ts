@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
@@ -72,7 +73,7 @@ async function openThread(page: import("@playwright/test").Page) {
     page,
     "general",
     "Reply to welcome",
-    "mock-general-welcome",
+    GENERAL_WELCOME_EVENT_ID,
   );
   const threadSummary = page.getByTestId("message-thread-summary").first();
   await expect(threadSummary).toBeVisible();

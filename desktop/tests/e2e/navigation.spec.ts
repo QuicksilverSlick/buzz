@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
@@ -425,7 +426,7 @@ test("mixed Buzz permalinks render as chips in the composer", async ({
   const pullRequestId = "c".repeat(64);
   const issueId = "b".repeat(64);
   const links = [
-    `buzz://message?channel=${channelId}&id=mock-general-welcome`,
+    `buzz://message?channel=${channelId}&id=${GENERAL_WELCOME_EVENT_ID}`,
     `buzz://channel/${channelId}`,
     `buzz://repo?owner=${owner}&d=buzz-world`,
     `buzz://pr?id=${pullRequestId}&owner=${owner}&d=buzz-world`,
@@ -693,14 +694,13 @@ test("message links to visible root messages open the thread panel", async ({
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Welcome to general",
   );
-  await page.evaluate(() => {
+  await page.evaluate((eventId) => {
     (
       window as Window & { __BUZZ_E2E_DEFER_GET_EVENT__?: string | null }
-    ).__BUZZ_E2E_DEFER_GET_EVENT__ = "mock-general-welcome";
-  });
+    ).__BUZZ_E2E_DEFER_GET_EVENT__ = eventId;
+  }, GENERAL_WELCOME_EVENT_ID);
 
-  const link =
-    "buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
+  const link = `buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=${GENERAL_WELCOME_EVENT_ID}`;
   const composerInput = page.getByTestId("message-input");
   await composerInput.fill("Root link repro #random ");
   await composerInput.focus();
@@ -880,7 +880,9 @@ test("message links to visible root messages open the thread panel", async ({
 
   const threadPanel = page.getByTestId("message-thread-panel");
   await expect(threadPanel).toBeVisible();
-  await expect(page).toHaveURL(/thread=mock-general-welcome/);
+  await expect(page).toHaveURL(
+    new RegExp(`thread=${GENERAL_WELCOME_EVENT_ID}`),
+  );
   await expect(threadPanel.getByTestId("message-thread-head")).toContainText(
     "Welcome to general",
   );
@@ -987,7 +989,7 @@ test("message links reopen a closed thread when the same messageId is already in
   page,
 }) => {
   await page.goto(
-    "/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=mock-general-welcome",
+    `/#/channels/9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50?messageId=${GENERAL_WELCOME_EVENT_ID}`,
   );
   await expect(page.getByTestId("chat-title")).toHaveText("general");
 
@@ -1000,8 +1002,7 @@ test("message links reopen a closed thread when the same messageId is already in
   await threadPanel.getByRole("button", { name: "Close panel" }).click();
   await expect(threadPanel).not.toBeVisible();
 
-  const link =
-    "buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
+  const link = `buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=${GENERAL_WELCOME_EVENT_ID}`;
   await page
     .getByTestId("message-input")
     .fill(`Reopen same root link repro ${link}`);
