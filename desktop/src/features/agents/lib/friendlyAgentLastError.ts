@@ -1,3 +1,5 @@
+import type { FactoryPaused } from "@/shared/api/types";
+
 /**
  * Promote certain machine-readable `lastError` strings to user-facing copy.
  *
@@ -42,12 +44,160 @@ export const RELAY_MESH_DENIED_COPY =
 export const MODEL_NOT_FOUND_COPY =
   "The configured model is not available — open agent settings and select a different one from the dropdown.";
 
+/**
+ * buzz-acp now folds the adapter's detail (codex-acp's `data.message`) into
+ * the message, so a bare "Internal error" really carried no detail; it is
+ * not a hint that a Codex model is unsupported.
+ */
 export const CLI_ACP_INTERNAL_ERROR_COPY =
-  "The agent's harness reported an internal error. For Codex agents this can mean the configured model isn't supported by your installed codex-acp — check the model in `~/.codex/config.toml` or reinstall the adapter from Settings → Agents → Agent runtimes.";
+  "The agent's adapter reported an internal error and gave no detail. The agent's log may say more.";
 
 const EMBEDDED_CODE_RE = /^Agent reported error \(code (-?\d+)\): /;
 /** Bare form of the standard JSON-RPC -32603 message (after stripping the ACP wrapper prefix). */
 const BARE_INTERNAL_ERROR = "Internal error";
+
+/**
+ * The Claude SDK's own usage-limit prefixes (`USAGE_LIMIT_ERROR_PREFIXES`),
+ * as `crates/buzz-acp/src/factory.rs` reads them: text that means a limit
+ * was reached, with no secrets in it, so it is shown word for word.
+ */
+const LIMIT_PREFIXES = [
+  "You've hit your",
+  "You've reached your",
+  "You're out of usage credits",
+  "Your org is out of usage · add funds to continue",
+  "Your org is out of usage · contact your admin",
+  "Your seat type doesn't include usage credits",
+  "Your seat type doesn't include usage",
+  "Your usage allocation has been disabled by your admin",
+  "Your group's usage limit is set to $0",
+  "Fable 5 requires usage credits",
+  "You're out of extra usage",
+  "Your seat type doesn't include extra usage",
+];
+/** buzz-acp's ` (errorKind: …)` / ` (codexErrorInfo: …)` markers at the end of a message. */
+const ADAPTER_MARKER_RE = / \((errorKind|codexErrorInfo): ([^)]*)\)$/;
+
+/**
+ * "Paused: Claude weekly limit · resets Oct 18, 7pm (America/Chicago)" for a
+ * usage or spend limit the harness parks work behind, in the provider's own
+ * words; null for any other error.
+ */
+export function pausedLimitCopy(message: string): string | null {
+  let text = message.trim().replace(/^Internal error: /, "");
+  let provider = "Claude";
+  let codexLimit = false;
+  for (
+    let marker = ADAPTER_MARKER_RE.exec(text);
+    marker;
+    marker = ADAPTER_MARKER_RE.exec(text)
+  ) {
+    if (marker[1] === "codexErrorInfo") {
+      provider = "Codex";
+      codexLimit ||= marker[2] === "usageLimitExceeded";
+    }
+    text = text.slice(0, marker.index);
+  }
+  if (!codexLimit && !LIMIT_PREFIXES.some((p) => text.startsWith(p))) {
+    return null;
+  }
+  const hit = /^You've (?:hit|reached) your /.exec(text);
+  return hit
+    ? `Paused: ${provider} ${text.slice(hit[0].length)}`
+    : `Paused: ${provider}: ${text}`;
+}
+
+/**
+ * "Paused: Claude weekly limit · resets Sun 18 Oct 7:00 PM" from the
+ * harness's own durable paused state (buzz-acp `factory::paused_state`).
+ *
+ * This is the panel's signal for most of an outage: the turn frames it would
+ * otherwise read live in a capped window that is trimmed once it fills and
+ * is empty after a restart, while a parked harness never exits and so never
+ * records a `lastError`. The record is already scrubbed and expired-checked
+ * on the Rust side, so it is shown as given.
+ */
+export function pausedStateCopy(
+  paused: FactoryPaused,
+): FriendlyAgentLastError | null {
+  const what = PAUSED_CLASS_COPY[paused.class];
+  if (!what) return null;
+  const label = `${paused.provider} ${what}`;
+  const reset = paused.resetsAt ? shortReset(paused.resetsAt) : null;
+  return {
+    // A spend cap and a lost sign-in need the owner; a timed limit lifts on
+    // its own, so it reads as information rather than a problem to fix.
+    severity: paused.state === "DOWN" ? "denied" : "generic",
+    copy: reset ? `Paused: ${label} · resets ${reset}` : `Paused: ${label}`,
+  };
+}
+
+/** The classes the harness parks work behind, as the panel names them. */
+const PAUSED_CLASS_COPY: Record<string, string> = {
+  weekly_limit: "weekly limit",
+  session_limit: "session limit",
+  usage_limit: "usage limit",
+  spend_cap: "spend cap — the owner has to raise it",
+  sign_in: "sign-in — the owner has to sign it in again",
+};
+
+/** An ISO reset time as the panel shows it: "Sun 18 Oct 7:00 PM", local. */
+function shortReset(iso: string): string | null {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return null;
+  return at.toLocaleString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * The error of the agent's newest finished turn, or null when that turn
+ * succeeded. A harness that parks work behind a limit keeps running, so the
+ * `lastError` recorded at exit stays empty; the turn frames carry the error.
+ *
+ * A failed turn also ends with its own `turn_completed` (buzz-acp's turn
+ * guard), emitted beside its `turn_error` in either order, so the two are
+ * matched by turn id: only a turn with no error frame succeeded.
+ */
+export function latestTurnError(
+  events: readonly {
+    kind: string;
+    payload: unknown;
+    turnId?: string | null;
+  }[],
+): { error: string; code: number | null } | null {
+  // The newest terminal frame decides.
+  let failed: (typeof events)[number] | undefined;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const { kind, turnId } = events[i];
+    if (kind === "turn_error") {
+      failed = events[i];
+      break;
+    }
+    if (kind === "turn_completed") {
+      failed =
+        turnId == null
+          ? undefined
+          : events.find((e) => e.kind === "turn_error" && e.turnId === turnId);
+      break;
+    }
+  }
+  if (!failed) return null;
+  const { error, code } = (failed.payload ?? {}) as {
+    error?: unknown;
+    code?: unknown;
+  };
+  if (typeof error !== "string") return null;
+  const numeric = code == null ? null : Number(code);
+  return {
+    error,
+    code: numeric != null && Number.isFinite(numeric) ? numeric : null,
+  };
+}
 
 function recoverEmbeddedCode(trimmed: string): {
   code: number;
@@ -82,11 +232,11 @@ export function friendlyAgentLastError(
       case -32002:
         return { severity: "denied", copy: MODEL_NOT_FOUND_COPY };
       case -32603: {
-        // Standard JSON-RPC "Internal error" — emitted by external harnesses
-        // (e.g. codex-acp) when the configured model is unsupported. Only
-        // substitute the hint when the message is the bare "Internal error"
-        // form; if the adapter included specific detail, preserve it so we
-        // don't bury actionable information with a broad codex-specific hint.
+        // Standard JSON-RPC "Internal error": the adapters report usage and
+        // spend limits this way, and other failures with their detail after
+        // it. Only the bare "Internal error" form gets the no-detail copy;
+        // specific detail is preserved so actionable information is not
+        // buried.
         //
         // "Bare" means the remainder after stripping the ACP wrapper prefix
         // (if present) is exactly "Internal error". This covers both the raw
@@ -96,7 +246,10 @@ export function friendlyAgentLastError(
         if (remainder === BARE_INTERNAL_ERROR) {
           return { severity: "generic", copy: CLI_ACP_INTERNAL_ERROR_COPY };
         }
-        return { severity: "generic", copy: remainder };
+        return {
+          severity: "generic",
+          copy: pausedLimitCopy(remainder) ?? remainder,
+        };
       }
     }
     // A structured code we don't recognize is authoritative — don't let

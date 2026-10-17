@@ -9,6 +9,7 @@ mod approval_gate;
 mod config;
 mod edit_routing;
 mod engram_fetch;
+mod factory;
 mod filter;
 mod isolated_execution;
 mod observer;
@@ -972,6 +973,7 @@ impl NormalListenerIngress {
             received_at,
             prompt_tag,
             edit,
+            parked: false,
         });
         QueuedNormalListenerEvent {
             accepted,
@@ -3333,11 +3335,14 @@ async fn run_harness(
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
+                let launch_env = config.factory.lock().launch_env(idx, chrono::Utc::now());
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, idx, observer)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -3864,6 +3869,10 @@ async fn run_harness(
                                 "admitted event — resolved session scope"
                             );
                             let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
+                            // A depth cap sheds a parked request only when
+                            // the channel holds nothing else to give up, and
+                            // never silently (spec 8.6).
+                            report_shed_parked(config, &mut queue, Some(&ctx.rest_client));
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -4007,8 +4016,9 @@ async fn run_harness(
                     }
                     let pp = presence_publisher.clone();
                     let pk = presence_keys.clone();
+                    let presence = config.factory.lock().presence();
                     presence_task = Some(tokio::spawn(async move {
-                        if let Err(e) = publish_presence(&pp, &pk, "online").await {
+                        if let Err(e) = publish_presence(&pp, &pk, presence).await {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
@@ -4095,6 +4105,7 @@ async fn run_harness(
                 if let Some(scope) = result.source.scope() {
                     typing_channels.remove(scope);
                 }
+                let presence_before = config.factory.lock().presence();
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -4112,6 +4123,23 @@ async fn run_harness(
                 {
                     break;
                 }
+                // Away while work is parked behind a limit, online again on
+                // the first real answer: published now, not at the next beat.
+                let presence = config.factory.lock().presence();
+                if config.presence_enabled && presence != presence_before {
+                    if let Some(h) = presence_task.take() {
+                        h.abort();
+                    }
+                    let pp = presence_publisher.clone();
+                    let pk = presence_keys.clone();
+                    presence_task = Some(tokio::spawn(async move {
+                        match publish_presence(&pp, &pk, presence).await {
+                            Ok(()) => tracing::info!("presence set to {presence}"),
+                            Err(e) => tracing::warn!("presence update failed: {e}"),
+                        }
+                    }));
+                }
+                report_factory_state(config, &ctx.rest_client);
                 if drain_ready_join_results(
                     &mut pool,
                     &mut queue,
@@ -4925,6 +4953,7 @@ mod try_native_steer_fallback_log_tests {
                 received_at: std::time::Instant::now(),
                 prompt_tag: "mention".into(),
                 edit: None,
+                parked: false,
             }),
             "queued event must be accepted before the steer attempt"
         );
@@ -5259,34 +5288,11 @@ fn dispatch_pending(
     dispatched_channels
 }
 
-/// Returns `true` when `error` is a non-retryable authentication failure.
-///
-/// Retrying auth errors is harmful: the token won't self-repair between
-/// attempts, so each retry wastes an attempt slot, delays the visible failure,
-/// and burns the user's context window. Dead-letter immediately and surface a
-/// re-authentication hint instead.
-///
-/// # Classification rationale
-///
-/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
-/// surfaced from the upstream CLI. Two narrow patterns reliably identify
-/// non-transient auth failures observed in the field:
-///
-/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
-///   expired ("OAuth access token has expired. Re-authenticate to continue.").
-///   Specific to the auth-expiry flow; does not appear in unrelated errors.
-/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
-///   the standard auth-failure status and does not arise from network blips.
-///
-/// False positives (misclassifying a transient error as non-retryable) silently
-/// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
-fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
-        return false;
-    };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
-}
+// A lost sign-in is now one of `factory::classify`'s classes
+// (`factory::AUTH_PREFIXES`), which anchors the same two field patterns to the
+// provider's own opening words instead of searching the whole message for
+// them. Its retry rationale is unchanged: the token will not self-repair
+// between attempts, so the work is parked for the owner rather than retried.
 
 /// Thread placement for a batch's terminal failure notice.
 ///
@@ -5442,6 +5448,106 @@ fn spawn_failure_notice(
     });
 }
 
+/// The harness cannot tell whether a tool already ran in a failed turn, so a
+/// notice never claims nothing was changed (spec 8.6).
+const MAY_BE_DONE: &str =
+    "Some of the work may already be done, so check where things stand before sending it again.";
+
+/// The thread's notice for a request given up on after it waited out its
+/// park budget (spec 8.6). Neutral, like the pause line it follows: the
+/// class, the billing state and the provider's words are the owner's, on
+/// their card and in #factory (D8).
+fn park_spent_notice() -> String {
+    format!(
+        "⚠️ The AI service I use stayed unavailable for too long, so I've stopped waiting on \
+         this one rather than hold it indefinitely. {MAY_BE_DONE} Sending it again once the \
+         service is back is the way to pick it up."
+    )
+}
+
+/// The thread's notice for a request dropped after its retries.
+fn retries_spent_notice(outcome: &PromptOutcome) -> String {
+    format!(
+        "⚠️ I tried this several times and couldn't get through it — {}. I've stopped rather \
+         than keep failing quietly. {MAY_BE_DONE} This one needs a person to look at it.",
+        failure_reason_text(outcome)
+    )
+}
+
+/// The thread's notice for a parked request a depth cap had to shed.
+fn shed_parked_notice() -> String {
+    format!(
+        "⚠️ This one was waiting for the AI service to be available again, and so much else \
+         came in on this channel meanwhile that I could not keep holding it. {MAY_BE_DONE} \
+         Please send it again."
+    )
+}
+
+/// Dead-letter the parked requests a depth cap had to shed.
+///
+/// A parked batch is exempt from the queue's oldest-first eviction, but a
+/// scope or channel holding nothing else still has to shrink. What it gives
+/// up is a request somebody sent and is waiting on, so it never goes quietly:
+/// the owner gets the Critical card and the thread is told (spec 8.6).
+fn report_shed_parked(
+    config: &Config,
+    queue: &mut EventQueue,
+    rest_client: Option<&relay::RestClient>,
+) {
+    for shed in queue.take_shed_parked() {
+        tracing::error!(
+            channel_id = %shed.channel_id,
+            scope = %shed.scope.telemetry_label(),
+            "queue depth cap shed a parked request — dead-lettering it"
+        );
+        let batch = FlushBatch {
+            channel_id: shed.channel_id,
+            scope: shed.scope.clone(),
+            events: vec![shed.into_batch_event()],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        spawn_failure_notice(
+            rest_client,
+            &batch,
+            shed_parked_notice(),
+            owner_mentions(config.agent_owner.as_deref()),
+        );
+        card_dropped(
+            config,
+            &batch,
+            "it was waiting on the AI service when this channel's queue filled up, and the \
+             queue cannot grow without end",
+        );
+    }
+}
+
+/// The owner's Critical card for a request the harness gave up on.
+fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
+    if let Some(last) = batch.events.last() {
+        config
+            .factory
+            .lock()
+            .dropped(batch.channel_id, &last.event.id.to_hex(), why);
+    }
+}
+
+/// Log the STATE record when the harness's health changed, and post it to
+/// #factory when one is configured (spec 4.2). Never into a work thread.
+fn report_factory_state(config: &Config, rest: &relay::RestClient) {
+    let Some(record) = config.factory.lock().take_report(chrono::Utc::now()) else {
+        return;
+    };
+    let channel = config.factory.lock().reporting.channel;
+    tracing::warn!(posted = channel.is_some(), "factory {record}");
+    if let Some(channel) = channel {
+        let rest = rest.clone();
+        tokio::spawn(async move {
+            pool::post_notice(&rest, channel, &ThreadTags::default(), &record, &[]).await;
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -5499,6 +5605,22 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    // Set when a limit handed the batch to another login of the account pool:
+    // the agent restarts on it instead of returning to the pool.
+    let mut restart_on_next_login = false;
+    let now = chrono::Utc::now();
+    let failure = match &result.outcome {
+        PromptOutcome::Error(e) => Some(factory::classify(e, now)),
+        _ => None,
+    };
+    if let Some(f) = failure.as_ref().filter(|f| !f.class.parks()) {
+        config.factory.lock().on_error(agent_index, f, now);
+    }
+    // Why a request was given up on, for the owner's card: the provider's
+    // (scrubbed) words, or the state for a timeout or a crash.
+    let why = failure
+        .as_ref()
+        .map_or_else(|| failure_reason_text(&result.outcome), |f| f.text.clone());
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -5541,16 +5663,17 @@ fn handle_prompt_result(
                     "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
-                let content = "⚠️ I couldn't finish this one. I worked on it for a long \
-                    stretch without getting closer, so I stopped rather than keep going — \
-                    nothing was changed. Send it again if you'd like me to try once more."
-                    .to_string();
+                let content = format!(
+                    "⚠️ I couldn't finish this one. I worked on it for a long stretch without \
+                     getting closer, so I stopped rather than keep going. {MAY_BE_DONE}"
+                );
                 spawn_failure_notice(
                     rest_client,
                     &batch,
                     content,
                     owner_mentions(config.agent_owner.as_deref()),
                 );
+                card_dropped(config, &batch, &why);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -5564,24 +5687,109 @@ fn handle_prompt_result(
                     "hard-cap timeout with recent activity — requeueing for retry"
                 );
                 if let Some(dead) = queue.requeue(batch) {
-                    let content = "⚠️ I tried this several times and couldn't get through it, \
-                        so I've stopped rather than keep failing quietly. Nothing was changed. \
-                        Sending it again is unlikely to help on its own — this one needs a person \
-                        to look at it."
-                        .to_string();
+                    let content = format!(
+                        "⚠️ I tried this several times and couldn't get through it, so I've \
+                         stopped rather than keep failing quietly. {MAY_BE_DONE} Sending it \
+                         again is unlikely to help on its own — this one needs a person to look \
+                         at it."
+                    );
                     spawn_failure_notice(
                         rest_client,
                         &dead,
                         content,
                         owner_mentions(config.agent_owner.as_deref()),
                     );
+                    card_dropped(config, &dead, &why);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
+            } else if let Some(failure) = failure.as_ref().filter(|f| f.class.parks()) {
+                // A usage, spend or rate limit, or a lost sign-in: retrying
+                // cannot fix it and the 10-retry budget would drop the request
+                // long before a weekly limit resets. Hand it to another login
+                // of the account pool, or park it — never counted, never
+                // dropped — and tell the thread once, plainly.
+                let (plan, account) = {
+                    let mut factory = config.factory.lock();
+                    let account = factory.label(agent_index).to_string();
+                    (
+                        factory.plan(agent_index, &batch.scope, failure, now),
+                        account,
+                    )
+                };
+                match plan {
+                    factory::Plan::HandOff { label, line } => {
+                        tracing::warn!(
+                            channel_id = %batch.channel_id,
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            next_account = %label,
+                            "provider limit — handing batch to the next login"
+                        );
+                        if let Some(line) = line {
+                            spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                        }
+                        queue.requeue_preserve_timestamps(batch);
+                        restart_on_next_login = true;
+                    }
+                    factory::Plan::Park {
+                        wait,
+                        line,
+                        mention_owner,
+                    } => {
+                        tracing::warn!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            wait_secs = wait.as_secs(),
+                            "provider limit — parking batch"
+                        );
+                        if let Some(line) = line {
+                            // Normally no mention: a parked request is a calm
+                            // line in the thread, and the owner hears about a
+                            // Critical through their card and #factory. With
+                            // neither of those configured this line is the
+                            // only path left, so it mentions them.
+                            let mentions = if mention_owner {
+                                owner_mentions(config.agent_owner.as_deref())
+                            } else {
+                                Vec::new()
+                            };
+                            spawn_failure_notice(rest_client, &batch, line, mentions);
+                        }
+                        queue.park(batch, std::time::Instant::now() + wait);
+                    }
+                    factory::Plan::DeadLetter { why } => {
+                        // The park budget is spent: the limit outlasted what
+                        // the harness can hold. Dropping it silently is the
+                        // failure M1 exists to end, so the owner gets the
+                        // Critical card and the thread is told plainly.
+                        tracing::error!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            class = failure.slug,
+                            provider_text = %failure.text,
+                            account = %account,
+                            "provider limit outlasted the park budget — dead-lettering batch; \
+                             discarding {} events",
+                            batch.events.len(),
+                        );
+                        spawn_failure_notice(
+                            rest_client,
+                            &batch,
+                            park_spent_notice(),
+                            owner_mentions(config.agent_owner.as_deref()),
+                        );
+                        card_dropped(config, &batch, &why);
+                    }
+                }
             } else if matches!(
                 &result.outcome,
-                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
+                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message, .. })
                     if message.contains("model not found")
             ) {
                 // Retrying the same missing model cannot repair its configuration.
@@ -5601,42 +5809,17 @@ fn handle_prompt_result(
                     content,
                     owner_mentions(config.agent_owner.as_deref()),
                 );
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I've lost my ability to sign in to the tool I use to do this \
-                    work, so I can't act on this — or anything else — until that's restored. \
-                    Nothing was changed. This isn't something you can fix from here: it needs \
-                    whoever runs this workspace, and I've flagged them on this message."
-                    .to_string();
-                spawn_failure_notice(
-                    rest_client,
-                    &batch,
-                    content,
-                    owner_mentions(config.agent_owner.as_deref()),
-                );
+                card_dropped(config, &batch, &why);
             } else if let Some(dead) = queue.requeue(batch) {
                 // The raw error stays in the log above; what reaches the
                 // channel names the state, not the mechanism.
-                let reason = failure_reason_text(&result.outcome);
-                let content = format!(
-                    "⚠️ I tried this several times and couldn't get through it — {reason}. \
-                     I've stopped rather than keep failing quietly, and nothing was changed. \
-                     This one needs a person to look at it."
-                );
                 spawn_failure_notice(
                     rest_client,
                     &dead,
-                    content,
+                    retries_spent_notice(&result.outcome),
                     owner_mentions(config.agent_owner.as_deref()),
                 );
+                card_dropped(config, &dead, &why);
             }
         } else {
             tracing::debug!(
@@ -5646,12 +5829,32 @@ fn handle_prompt_result(
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
         }
+    } else if let Some(failure) = failure.as_ref().filter(|f| f.class.parks()) {
+        // A heartbeat turn carries no batch, so there is nothing to park and
+        // nobody waiting on one — but the outage is just as real. Record it:
+        // the login is marked limited, health and presence move, the STATE
+        // record falls due and a spend cap or lost sign-in still raises the
+        // owner's card. Only the queue and the thread line are skipped.
+        tracing::warn!(
+            class = failure.slug,
+            provider_text = %failure.text,
+            "provider limit on a turn with no batch — recording the state"
+        );
+        config
+            .factory
+            .lock()
+            .record_limit(agent_index, failure, now);
     }
 
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
+
+    // Parking a batch can itself push its channel over the aggregate cap.
+    // Whatever that sheds is somebody's request, so it is dead-lettered
+    // rather than logged (spec 8.6).
+    report_shed_parked(config, queue, rest_client);
 
     // Strip sessions for channels the agent was removed from while this
     // agent was checked out. This covers the gap where invalidate_channel_sessions
@@ -5713,7 +5916,36 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
-            pool.return_agent(result.agent);
+            let back_to_primary = {
+                let mut factory = config.factory.lock();
+                factory.on_success(agent_index, now);
+                factory.wants_restart(agent_index, now)
+            };
+            if back_to_primary {
+                // An earlier login of the pool (the primary, after its reset)
+                // is free again: restart there between turns.
+                tracing::info!(
+                    agent = agent_index,
+                    "returning to the account pool's preferred login"
+                );
+                let index = result.agent.index;
+                if !spawn_respawn_task(
+                    result.agent,
+                    config,
+                    &mut crash_history[index],
+                    false,
+                    respawn_tx,
+                    respawn_tasks,
+                    observer,
+                ) && pool.live_count() == 0
+                    && !any_respawn_in_flight(crash_history)
+                {
+                    tracing::error!("all agents dead — exiting");
+                    return LoopAction::Exit;
+                }
+            } else {
+                pool.return_agent(result.agent);
+            }
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
@@ -5746,6 +5978,7 @@ fn handle_prompt_result(
                 result.agent,
                 config,
                 slot_history,
+                true,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
@@ -5786,6 +6019,7 @@ fn handle_prompt_result(
                 result.agent,
                 config,
                 slot_history,
+                true,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
@@ -5844,14 +6078,19 @@ fn handle_prompt_result(
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
             };
-            if is_transport_error {
+            if is_transport_error || restart_on_next_login {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
                     error = %e,
-                    "transport/protocol error — respawning agent"
+                    "{}",
+                    if is_transport_error {
+                        "transport/protocol error — respawning agent"
+                    } else {
+                        "provider limit — restarting agent on the next login"
+                    }
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
@@ -5861,6 +6100,7 @@ fn handle_prompt_result(
                     result.agent,
                     config,
                     slot_history,
+                    is_transport_error,
                     respawn_tx,
                     respawn_tasks,
                     observer,
@@ -5913,8 +6153,11 @@ fn recover_panicked_agent(
         if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
+                // panic path has no outcome to report, so no thread notice,
+                // but a dropped request still reaches the owner.
+                if let Some(dead) = queue.requeue(batch) {
+                    card_dropped(config, &dead, "the agent crashed on it every time");
+                }
                 tracing::warn!("requeued batch for panicked agent {i}");
             } else {
                 tracing::debug!(
@@ -5990,13 +6233,14 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let launch_env = config.factory.lock().launch_env(i, chrono::Utc::now());
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -6218,10 +6462,15 @@ fn default_heartbeat_prompt() -> String {
 /// The result comes back through `respawn_tx` so the main loop stays responsive.
 ///
 /// Returns `true` if a respawn task was spawned, `false` if the circuit is open.
+///
+/// `crashed` is false for a planned restart (a switch of account-pool login):
+/// it is not a fault, so it never counts toward the circuit breaker, which
+/// would otherwise open on a pool of four logins limited in a row and exit.
 fn spawn_respawn_task(
     old_agent: OwnedAgent,
     config: &Config,
     slot: &mut SlotCircuit,
+    crashed: bool,
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
@@ -6229,18 +6478,22 @@ fn spawn_respawn_task(
     let index = old_agent.index;
 
     // Circuit breaker: record crash, decide whether to respawn.
-    let delay = match slot.record_crash() {
-        CrashVerdict::CircuitOpen => {
-            tracing::error!(agent = index, "circuit open — not respawning");
-            return false;
-        }
-        CrashVerdict::HalfOpenProbe => {
-            tracing::info!(agent = index, "circuit half-open — probe respawn");
-            Duration::ZERO
-        }
-        CrashVerdict::Respawn(d) => {
-            tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
-            d
+    let delay = if !crashed {
+        Duration::ZERO
+    } else {
+        match slot.record_crash() {
+            CrashVerdict::CircuitOpen => {
+                tracing::error!(agent = index, "circuit open — not respawning");
+                return false;
+            }
+            CrashVerdict::HalfOpenProbe => {
+                tracing::info!(agent = index, "circuit half-open — probe respawn");
+                Duration::ZERO
+            }
+            CrashVerdict::Respawn(d) => {
+                tracing::info!(agent = index, delay_ms = d.as_millis(), "respawn backoff");
+                d
+            }
         }
     };
 
@@ -6251,6 +6504,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let launch_env = config.factory.lock().launch_env(index, chrono::Utc::now());
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6262,7 +6516,8 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, &launch_env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -6308,11 +6563,13 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
+        let launch_env = startup.factory.lock().launch_env(i, chrono::Utc::now());
+        let spawn_result = AcpClient::spawn_with_env(
             &startup.command,
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
+            &launch_env,
         )
         .await;
         match spawn_result {
@@ -6415,13 +6672,20 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
+    launch_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let mut acp = AcpClient::spawn_with_env(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        launch_env,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -7188,6 +7452,7 @@ mod owner_control_command_tests {
             event: make_event(KIND_STREAM_MESSAGE, "held", None),
             received_at: oldest,
             prompt_tag: "test".into(),
+            parked: false,
         });
         for i in 0..500 {
             queue.push(queue::QueuedEvent {
@@ -7197,6 +7462,7 @@ mod owner_control_command_tests {
                 event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
                 received_at: std::time::Instant::now(),
                 prompt_tag: "test".into(),
+                parked: false,
             });
         }
 
@@ -10625,6 +10891,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 
@@ -11747,6 +12014,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 
@@ -12365,6 +12633,7 @@ mod error_outcome_emission_tests {
             event,
             received_at: std::time::Instant::now(),
             prompt_tag: "t".into(),
+            parked: false,
         });
         let batch = queue.flush_next().expect("flush thread batch");
         assert!(queue.is_scope_in_flight(&scope));
@@ -13010,6 +13279,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            parked: false,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -13335,66 +13605,591 @@ mod error_outcome_emission_tests {
         assert!(respawn_tasks.is_empty());
     }
 
-    // ── is_auth_error classification ───────────────────────────────────────
+    // ── lost-sign-in classification ────────────────────────────────────────
 
+    /// The cases `is_auth_error` used to pin, now through the one classifier
+    /// that decides what a failed turn means: both field texts are a lost
+    /// sign-in, and nothing else is — a transport failure and a usage-credit
+    /// error must not be, since a wrong sign-in verdict parks a request for
+    /// the owner instead of retrying it.
     #[test]
-    fn is_auth_error_matches_reauthenticate_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
+    fn a_lost_sign_in_is_classified_from_the_providers_opening_words() {
+        let now = chrono::Utc::now();
+        for message in [
+            "API Error: OAuth access token has expired. Re-authenticate to continue.",
+            "Internal error: API Error: 401 OAuth access token has expired.",
+        ] {
+            assert_eq!(
+                factory::classify(&agent_error(message), now).class,
+                factory::Class::SignIn,
+                "{message}"
+            );
+        }
+        for error in [
+            agent_error("Usage credits required for 1M context — turn on usage credits"),
+            acp::AcpError::Io(std::io::Error::other("pipe broke")),
+            acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5)),
+            // The words quoted mid-message are a tool's output, not a 401.
+            agent_error("Internal error: the test asserted \"API Error: 401\" and Re-authenticate"),
+        ] {
+            assert_eq!(
+                factory::classify(&error, now).class,
+                factory::Class::Other,
+                "{error:?}"
+            );
+        }
+    }
+
+    // ── limit and sign-in parking ──────────────────────────────────────────
+
+    /// Run one failed turn for a fresh single-event batch through
+    /// `handle_prompt_result`, with the scope's retry count preset to
+    /// `prior_retries`. Returns the queue and the batch's channel.
+    async fn run_failed_turn(
+        config: &Config,
+        error: acp::AcpError,
+        prior_retries: u32,
+    ) -> (EventQueue, uuid::Uuid, AgentPool, tokio::task::JoinSet<()>) {
+        run_failed_turn_for(config, uuid::Uuid::new_v4(), error, prior_retries).await
+    }
+
+    /// As [`run_failed_turn`], for a named channel, so repeated failures can
+    /// be driven through one scope's own state (its park budget).
+    async fn run_failed_turn_for(
+        config: &Config,
+        channel_id: uuid::Uuid,
+        error: acp::AcpError,
+        prior_retries: u32,
+    ) -> (EventQueue, uuid::Uuid, AgentPool, tokio::task::JoinSet<()>) {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
         };
-        assert!(
-            is_auth_error(&e),
-            "Re-authenticate variant must be classified as auth error"
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
         );
-    }
-
-    #[test]
-    fn is_auth_error_matches_401_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        queue.set_retry_count_for_test(channel_id, prior_retries);
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        // One crash short of the breaker: a login hand-off that still
+        // restarts the agent proves it was not counted as a crash.
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: vec![std::time::Instant::now(); CIRCUIT_BREAKER_THRESHOLD - 1],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: Some(batch),
         };
-        assert!(
-            is_auth_error(&e),
-            "API Error: 401 variant must be classified as auth error"
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
         );
+        (queue, channel_id, pool, respawn_tasks)
     }
 
-    #[test]
-    fn is_auth_error_rejects_other_agent_error_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32601,
-            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
-        };
-        assert!(
-            !is_auth_error(&e),
-            "usage-credit error must NOT be classified as auth error"
-        );
+    fn agent_error(message: &str) -> acp::AcpError {
+        acp::AcpError::agent_error(-32603, message)
     }
 
-    #[test]
-    fn is_auth_error_rejects_transport_errors() {
-        let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
-        assert!(
-            !is_auth_error(&io),
-            "I/O error must not be classified as auth error"
-        );
-        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
-        assert!(
-            !is_auth_error(&timeout),
-            "WriteTimeout must not be classified as auth error"
-        );
+    /// The error as the read loop builds it from the adapter's JSON-RPC
+    /// error object, so a case that depends on `data.errorKind` or
+    /// `data.codexErrorInfo` really carries that field.
+    fn adapter_error(error: serde_json::Value) -> acp::AcpError {
+        acp::agent_error_from_json(&error)
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
-
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
+    /// A limit or lost sign-in parks the batch even with the retry budget
+    /// already spent: it is kept, throttled, and its retry count unchanged.
+    /// On 16-17 Oct the same errors burned all 10 retries and dropped two
+    /// requests.
     #[tokio::test]
-    async fn auth_error_dead_letters_immediately_without_requeueing() {
+    async fn limit_errors_park_without_spending_the_retry_budget() {
+        // The dot turns away while work waits; one short rate limit only slows it.
+        for (error, presence) in [
+            (
+                adapter_error(serde_json::json!({"code": -32603,
+                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "data": {"errorKind": "rate_limit"}})),
+                "away",
+            ),
+            (
+                agent_error("Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage"),
+                "away",
+            ),
+            (
+                agent_error("Internal error: API Error: This request would exceed your account's rate limit. Please try again later."),
+                "online",
+            ),
+            (
+                adapter_error(serde_json::json!({"code": -32603, "message": "Internal error",
+                    "data": {"message": "You've hit your usage limit.",
+                             "codexErrorInfo": "usageLimitExceeded"}})),
+                "away",
+            ),
+            (
+                agent_error("API Error: 401 OAuth access token has expired. Re-authenticate to continue."),
+                "away",
+            ),
+        ] {
+            let message = error.to_string();
+            let config = test_config();
+            let (mut queue, channel_id, mut pool, respawn_tasks) =
+                run_failed_turn(&config, error, crate::queue::MAX_RETRIES).await;
+            assert_eq!(queue.queued_event_count(channel_id), 1, "{message}: kept");
+            assert!(!queue.has_flushable_work(), "{message}: parked, not due yet");
+            assert!(queue.next_retry_deadline().is_some(), "{message}: wakes up");
+            assert_eq!(
+                queue.retry_count_for_test(channel_id),
+                crate::queue::MAX_RETRIES,
+                "{message}: no retry spent"
+            );
+            assert!(pool.agents_mut()[0].is_some(), "{message}: agent stays");
+            assert!(respawn_tasks.is_empty());
+            assert_eq!(config.factory.lock().presence(), presence, "{message}");
+            let record = config.factory.lock().take_report(chrono::Utc::now());
+            assert!(
+                record.is_some_and(|r| r.starts_with("STATE v1 scope=account:")),
+                "{message}: one STATE record"
+            );
+        }
+    }
+
+    /// With an account pool, a weekly limit on the primary re-runs the same
+    /// batch at once: it stays queued and due, and the agent restarts on the
+    /// second login.
+    #[tokio::test]
+    async fn limit_on_the_primary_reruns_the_same_batch_on_the_next_login() {
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let weekly =
+            "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)";
+        let (mut queue, channel_id, mut pool, respawn_tasks) =
+            run_failed_turn(&config, agent_error(weekly), crate::queue::MAX_RETRIES).await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "the same request");
+        assert!(queue.has_flushable_work(), "runs again now, not parked");
+        assert!(pool.agents_mut()[0].is_none(), "the agent restarts");
+        assert_eq!(respawn_tasks.len(), 1);
+        assert_eq!(config.factory.lock().label(0), "two");
+
+        // A sign-in loss with the same pool parks; it never rotates.
+        let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
+            &config,
+            agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            0,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(!queue.has_flushable_work());
+        assert!(pool.agents_mut()[0].is_some());
+        assert!(respawn_tasks.is_empty());
+    }
+
+    /// An ordinary error still spends the budget and is dropped at the end.
+    #[tokio::test]
+    async fn ordinary_errors_still_spend_the_retry_budget() {
+        let config = test_config();
+        let (queue, channel_id, _, _) = run_failed_turn(
+            &config,
+            agent_error("Internal error"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 0, "dead-lettered");
+        let (queue, channel_id, _, _) =
+            run_failed_turn(&config, agent_error("Internal error"), 0).await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "requeued");
+        assert_eq!(queue.retry_count_for_test(channel_id), 1);
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "retrying, not parked"
+        );
+    }
+
+    /// A limit nobody lifts does not park the request forever. Once the
+    /// scope's park budget is spent the batch leaves the queue, the owner
+    /// gets the Critical "dropped a request" card naming the class and the
+    /// provider's own words, the thread is told plainly, and presence goes
+    /// back to online instead of staying stuck at away (spec 8.6).
+    #[tokio::test]
+    async fn a_spend_cap_nobody_raises_dead_letters_once_its_park_budget_is_spent() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        let channel_id = uuid::Uuid::new_v4();
+        let cap = || {
+            agent_error(
+                "Internal error: You've hit your monthly spend limit · raise it at \
+                 claude.ai/settings/usage",
+            )
+        };
+
+        // Every probe but the last parks the same request, untouched.
+        for probe in 0..factory::PARK_MAX_PROBES - 1 {
+            let (queue, _, _, _) =
+                run_failed_turn_for(&config, channel_id, cap(), crate::queue::MAX_RETRIES).await;
+            assert_eq!(
+                queue.queued_event_count(channel_id),
+                1,
+                "probe {probe}: still parked"
+            );
+            assert_eq!(config.factory.lock().presence(), "away", "probe {probe}");
+        }
+
+        let (queue, _, _, _) =
+            run_failed_turn_for(&config, channel_id, cap(), crate::queue::MAX_RETRIES).await;
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "the budget is spent: the request is given up on, not held"
+        );
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "nothing is parked behind the limit any more"
+        );
+        let record = config
+            .factory
+            .lock()
+            .take_report(chrono::Utc::now())
+            .expect("the recovery is reported");
+        assert!(
+            record.contains("state=DEGRADED class=spend_cap"),
+            "{record}"
+        );
+
+        let inbox = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let cards: Vec<serde_json::Value> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| {
+                serde_json::from_str(&std::fs::read_to_string(e.unwrap().path()).unwrap()).unwrap()
+            })
+            .collect();
+        let dropped = cards
+            .iter()
+            .find(|c| c["id"].as_str().is_some_and(|id| id.contains("-dropped-")))
+            .expect("a dropped-request card");
+        let body = dropped["body"].as_str().unwrap();
+        assert_eq!(dropped["severity"], "critical");
+        assert!(body.contains("spending cap was never raised"), "{body}");
+        assert!(body.contains("monthly spend limit"), "{body}");
+        assert!(
+            dropped["links"][0]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("buzz://message?channel={channel_id}&id=")),
+            "the card links the request"
+        );
+    }
+
+    /// A limit that begins while the pool is idle used to leave the dot
+    /// green and #factory silent: `on_error` is skipped for a class that
+    /// parks, and `plan` was only reached through a batch, which a heartbeat
+    /// turn does not carry. The outage stayed invisible until some real
+    /// request happened along and failed.
+    #[tokio::test]
+    async fn a_heartbeat_turn_that_hits_a_limit_still_records_the_state() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        assert_eq!(config.factory.lock().presence(), "online");
+
+        let mut heartbeat_in_flight = true;
+        run_failed_heartbeat(
+            &config,
+            agent_error(
+                "Internal error: You've hit your weekly limit · resets Oct 18, 7pm \
+                 (America/Chicago)",
+            ),
+            &mut heartbeat_in_flight,
+        )
+        .await;
+        assert!(!heartbeat_in_flight);
+        assert_eq!(
+            config.factory.lock().presence(),
+            "away",
+            "the dot is honest about a limit found by a heartbeat"
+        );
+        let record = config
+            .factory
+            .lock()
+            .take_report(chrono::Utc::now())
+            .expect("a STATE record for the outage");
+        assert!(
+            record.contains("state=BLOCKED class=weekly_limit"),
+            "{record}"
+        );
+        assert!(record.contains("You've hit your weekly limit"), "{record}");
+
+        // The two classes only the owner can lift still raise their card.
+        let mut heartbeat_in_flight = true;
+        run_failed_heartbeat(
+            &config,
+            agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            &mut heartbeat_in_flight,
+        )
+        .await;
+        let card = bench
+            .path()
+            .join("inbox")
+            .join(factory::CARD_WRITER)
+            .join("ade9d0e2-sign-in.json");
+        assert!(card.is_file(), "the sign-in card is raised");
+    }
+
+    /// One failed heartbeat turn — no batch, no scope — through
+    /// `handle_prompt_result`.
+    async fn run_failed_heartbeat(
+        config: &Config,
+        error: acp::AcpError,
+        heartbeat_in_flight: &mut bool,
+    ) {
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "heartbeat-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Heartbeat,
+            turn_id: "heartbeat-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: None,
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            config,
+            result,
+            heartbeat_in_flight,
+            &std::collections::HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+        assert_eq!(queue.queued_event_count(uuid::Uuid::nil()), 0);
+    }
+
+    /// A parked request a depth cap truly had to shed reaches the owner as a
+    /// Critical card linking it, not as a `warn!` nobody reads (spec 8.6).
+    #[tokio::test]
+    async fn a_parked_request_shed_by_a_depth_cap_raises_a_card() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+
+        // One parked batch, its scope at the cap, and one more event: the
+        // queue has nothing unparked left to give up.
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let keys = nostr::Keys::generate();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let parked = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: (0..crate::queue::MAX_PENDING_PER_SCOPE)
+                .map(|i| BatchEvent {
+                    event: nostr::EventBuilder::new(nostr::Kind::Custom(9), format!("parked-{i}"))
+                        .sign_with_keys(&keys)
+                        .unwrap(),
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                    edit: None,
+                })
+                .collect(),
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let shed_event = parked.events[0].event.id.to_hex();
+        queue.park(
+            parked,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope,
+            event: nostr::EventBuilder::new(nostr::Kind::Custom(9), "one more")
+                .sign_with_keys(&keys)
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            edit: None,
+            parked: false,
+        }));
+
+        report_shed_parked(&config, &mut queue, None);
+
+        let card: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                bench
+                    .path()
+                    .join("inbox")
+                    .join(factory::CARD_WRITER)
+                    .join(format!("ade9d0e2-dropped-{}.json", &shed_event[..12])),
+            )
+            .expect("a card for the shed request"),
+        )
+        .unwrap();
+        assert_eq!(card["severity"], "critical");
+        assert!(
+            card["body"]
+                .as_str()
+                .unwrap()
+                .contains("waiting on the AI service when this channel's queue filled up"),
+            "{}",
+            card["body"]
+        );
+        assert_eq!(
+            card["links"][0]["url"],
+            format!("buzz://message?channel={channel_id}&id={shed_event}")
+        );
+        // The thread's own notice is honest about what may already be done.
+        let notice = shed_parked_notice();
+        assert!(notice.contains(MAY_BE_DONE));
+    }
+
+    /// The thread hears that the harness stopped waiting, in the same
+    /// neutral words as the pause line it follows, and never that nothing
+    /// was changed (D8, spec 8.6).
+    #[test]
+    fn park_spent_notice_is_neutral_and_never_claims_nothing_changed() {
+        let notice = park_spent_notice();
+        assert!(notice.contains(MAY_BE_DONE));
+        assert!(!notice.to_lowercase().contains("nothing was changed"));
+        for word in ["cap", "billing", "spend", "sign-in", "owner"] {
+            assert!(
+                !notice.to_lowercase().contains(word),
+                "{word} in the partner notice: {notice}"
+            );
+        }
+    }
+
+    /// A request dropped after its retries reaches the owner as a Critical
+    /// card linking it (spec 8.6).
+    #[tokio::test]
+    async fn a_dropped_request_raises_a_card() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        config.factory = factory::FactoryHandle::new(factory);
+        let (queue, channel_id, _, _) = run_failed_turn(
+            &config,
+            agent_error("Internal error: boom in /home/me/repo"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 0, "dead-lettered");
+        let inbox = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let cards: Vec<_> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(cards.len(), 1);
+        let card: serde_json::Value = serde_json::from_str(&cards[0]).unwrap();
+        assert!(card["body"]
+            .as_str()
+            .unwrap()
+            .contains("gave up on a request: boom in [path]."));
+        assert!(card["links"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("buzz://message?channel={channel_id}&id=")));
+    }
+
+    /// The thread is never told nothing was changed: a tool may have run
+    /// before the failure (spec 8.6).
+    #[test]
+    fn dropped_notice_never_claims_nothing_changed() {
+        let notice = retries_spent_notice(&PromptOutcome::Error(agent_error("Internal error")));
+        assert!(!notice.to_lowercase().contains("nothing was changed"));
+        assert!(notice.contains(MAY_BE_DONE));
+    }
+
+    #[tokio::test]
+    async fn auth_error_parks_instead_of_dropping() {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -13413,11 +14208,10 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
-        let auth_error = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: 401 OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
+        let auth_error = acp::AcpError::agent_error(
+            -32000,
+            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+        );
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -13468,17 +14262,9 @@ mod error_outcome_emission_tests {
             &mut tokio::time::Instant::now(),
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
-        assert_eq!(
-            queue.pending_channels(),
-            0,
-            "auth error must dead-letter immediately — batch must not be requeued"
-        );
-        assert_eq!(
-            queue.queued_event_count(channel_id),
-            0,
-            "auth error must dead-letter immediately — no events should be pending"
-        );
+        // Kept for the owner to sign in again, not dropped.
+        assert_eq!(queue.pending_channels(), 1);
+        assert_eq!(queue.queued_event_count(channel_id), 1);
     }
 
     /// Run a model-not-found turn failure for `event` through
@@ -13521,10 +14307,7 @@ mod error_outcome_emission_tests {
         };
 
         let raw_error = r#"llm model not found: (gpt-6-astra) 404 Not Found: {"error_code":"NOT_FOUND","message":"'gpt-6-astra' does not exist."}"#;
-        let model_error = AcpError::AgentError {
-            code: -32002,
-            message: raw_error.to_string(),
-        };
+        let model_error = AcpError::agent_error(-32002, raw_error);
         let expected_error = model_error.to_string();
         let observer = ObserverHandle::in_process();
 
@@ -13765,19 +14548,19 @@ mod error_outcome_emission_tests {
     /// standard requeue path so today's behavior is unchanged.
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32000,
-            message: "Usage credits required for 1M context".to_string(),
-        })
+        assert_application_error_is_requeued(acp::AcpError::agent_error(
+            -32000,
+            "Usage credits required for 1M context",
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn non_model_resource_not_found_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32002,
-            message: "Resource not found: session no longer exists".to_string(),
-        })
+        assert_application_error_is_requeued(acp::AcpError::agent_error(
+            -32002,
+            "Resource not found: session no longer exists",
+        ))
         .await;
     }
 

@@ -401,6 +401,28 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
 
+    /// Claude only: an ordered, `;`-separated pool of `CLAUDE_CONFIG_DIR`
+    /// folders, each signed in to its own subscription (first = primary).
+    /// On a usage or spend limit the agent restarts on the next free login
+    /// and re-runs the same request; it returns to the primary after its
+    /// reset. Write an entry as `label=folder` to name that login in records
+    /// and cards; a folder in the home directory is named `primary`, never
+    /// after the OS account.
+    #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
+    pub claude_account_pool: Option<String>,
+
+    /// The #factory channel (uuid) this harness posts its STATE records to
+    /// when its health changes. Unset: records are logged only.
+    #[arg(long, env = "BUZZ_FACTORY_CHANNEL")]
+    pub factory_channel: Option<String>,
+
+    /// The Bench folder whose inbox gets the owner's Critical cards (spend
+    /// cap, lost sign-in, dropped request). Defaults to the Bench's own root
+    /// (see [`default_bench_dir`]); the inbox is created when the first card
+    /// is written.
+    #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
+    pub factory_bench_dir: Option<PathBuf>,
+
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
@@ -654,6 +676,8 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Harness-wide failure state: classes, parks and who has been told.
+    pub(crate) factory: crate::factory::FactoryHandle,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -788,6 +812,26 @@ fn validate_multiple_event_handling(
         ));
     }
     Ok(())
+}
+
+/// The Bench's own root, so a card written here lands in the inbox the
+/// desktop actually scans: `~/.dreamforge/bench`, and `~/.dreamforge-dev/bench`
+/// in a debug build, matching `desktop/src-tauri/src/bench/mod.rs`'s
+/// `root_dir`. The harness is built in the same profile as the desktop that
+/// launches it, so the two agree.
+///
+/// The folder is NOT required to exist: the card writer creates the inbox on
+/// demand. Refusing to write while the Bench has never run on this PC would
+/// silence exactly the first spend cap or lost sign-in, which is the one the
+/// owner most needs to hear about.
+pub(crate) fn default_bench_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let nest = if cfg!(debug_assertions) {
+        ".dreamforge-dev"
+    } else {
+        ".dreamforge"
+    };
+    Some(PathBuf::from(home).join(nest).join("bench"))
 }
 
 pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
@@ -1188,6 +1232,27 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
+        let session_title = args
+            .session_title
+            .as_deref()
+            .and_then(sanitize_session_title);
+        let mut factory =
+            crate::factory::Factory::new(args.claude_account_pool.as_deref(), &agent_command);
+        let short = keys.public_key().to_hex()[..8].to_string();
+        factory.reporting = crate::factory::Reporting {
+            agent: session_title.clone().unwrap_or_else(|| short.clone()),
+            short,
+            pubkey: keys.public_key().to_hex(),
+            channel: args.factory_channel.as_deref().and_then(|raw| {
+                let parsed = uuid::Uuid::parse_str(raw.trim()).ok();
+                if parsed.is_none() {
+                    tracing::warn!("BUZZ_FACTORY_CHANNEL is not a channel uuid — ignoring it");
+                }
+                parsed
+            }),
+            bench: args.factory_bench_dir.or_else(default_bench_dir),
+        };
+        let factory = crate::factory::FactoryHandle::new(factory);
 
         let config = Config {
             capabilities,
@@ -1226,10 +1291,7 @@ impl Config {
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
-            session_title: args
-                .session_title
-                .as_deref()
-                .and_then(sanitize_session_title),
+            session_title,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1244,6 +1306,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            factory,
         };
 
         Ok(config)
@@ -1626,6 +1689,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            factory: Default::default(),
         }
     }
 
@@ -3010,6 +3074,47 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    /// The owner's Critical cards have a sink even when the Bench has never
+    /// run on this PC — the writer creates the inbox on demand, and skipping
+    /// the write would silence exactly the first spend cap or lost sign-in.
+    /// The default root is the Bench's own (`bench/mod.rs` `root_dir`), per
+    /// build profile, so a card lands in the inbox the desktop scans.
+    #[test]
+    fn factory_bench_dir_defaults_to_the_benchs_root_and_need_not_exist() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("from_args should accept the defaults");
+        let bench = config.factory.lock().reporting.bench.clone();
+        assert_eq!(bench, default_bench_dir(), "the Bench's own root");
+        if let Some(dir) = bench {
+            assert!(dir.ends_with("bench"), "{}", dir.display());
+            let nest = dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string());
+            let want = if cfg!(debug_assertions) {
+                ".dreamforge-dev"
+            } else {
+                ".dreamforge"
+            };
+            assert_eq!(nest.as_deref(), Some(want));
+        }
+
+        // An explicit folder is kept whether or not it exists yet.
+        let missing = std::env::temp_dir().join("buzz-factory-bench-that-does-not-exist");
+        assert!(!missing.exists(), "{} should not exist", missing.display());
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--factory-bench-dir",
+            missing.to_str().expect("utf-8 temp dir"),
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("from_args should accept the folder");
+        assert_eq!(config.factory.lock().reporting.bench, Some(missing));
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

@@ -643,6 +643,12 @@ pub struct ManagedAgentSummary {
     pub last_exit_code: Option<i32>,
     pub last_error: Option<String>,
     pub last_error_code: Option<i64>,
+    /// Why this agent's work is paused behind a provider limit, read from
+    /// the harness's own durable record (`factory_paused`). `None` when it
+    /// is not paused. A parked harness keeps running, so `last_error` —
+    /// recovered only from a nonzero exit — is always empty for this case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused: Option<super::factory_paused::FactoryPaused>,
     pub start_on_app_launch: bool,
     pub auto_restart_on_config_change: bool,
     pub log_path: String,

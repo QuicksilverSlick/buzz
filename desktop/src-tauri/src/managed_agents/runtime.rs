@@ -366,6 +366,7 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         last_exit_code: record.last_exit_code,
         last_error: record.last_error.clone(),
         last_error_code: record.last_error_code,
+        paused: super::factory_paused::read(&record.pubkey),
         start_on_app_launch: record.start_on_app_launch,
         auto_restart_on_config_change: record.auto_restart_on_config_change,
         log_path,

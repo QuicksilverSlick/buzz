@@ -18,7 +18,8 @@ import type {
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { AgentConfigPanel } from "./AgentConfigPanel";
-import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import type { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import { useAgentLastError } from "@/features/agents/lib/useAgentLastError";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
@@ -86,10 +87,7 @@ export function ManagedAgentRow({
   // friendly "Community access denied this agent — check its community membership."
   // for auth failures so the user knows it's a membership thing, not a
   // crash. Generic exits stay verbatim so we don't lie about other failures.
-  const friendlyError = friendlyAgentLastError(
-    agent.lastError,
-    agent.lastErrorCode,
-  );
+  const friendlyError = useAgentLastError(agent);
 
   return (
     <div

@@ -72,7 +72,7 @@ pub(crate) fn relay_ws_from(env: Option<&str>) -> Option<String> {
 
 /// `~/.dreamforge/bench` (debug: `~/.dreamforge-dev/bench`): outside the app
 /// data an uninstall wipes and outside `~/.buzz` a boot reset removes.
-fn root_dir() -> Result<PathBuf, String> {
+pub(crate) fn root_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("no home directory")?;
     let nest = if cfg!(debug_assertions) {
         ".dreamforge-dev"

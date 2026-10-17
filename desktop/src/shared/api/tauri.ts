@@ -9,6 +9,7 @@ import type {
   AddChannelMembersResult,
   BackendProviderCandidate,
   BackendProviderProbeResult,
+  FactoryPaused as RawFactoryPaused,
   GetHomeFeedInput,
   HomeFeedResponse,
   ManagedAgent,
@@ -147,6 +148,7 @@ export type RawManagedAgent = {
   last_exit_code: number | null;
   last_error: string | null;
   last_error_code: number | null;
+  paused?: RawFactoryPaused | null;
   log_path: string;
   start_on_app_launch: boolean;
   auto_restart_on_config_change?: boolean;
@@ -637,6 +639,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     lastExitCode: agent.last_exit_code,
     lastError: agent.last_error,
     lastErrorCode: agent.last_error_code ?? null,
+    paused: agent.paused ?? null,
     logPath: agent.log_path,
     startOnAppLaunch: agent.start_on_app_launch,
     autoRestartOnConfigChange: agent.auto_restart_on_config_change ?? true,

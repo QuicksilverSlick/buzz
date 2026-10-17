@@ -4,6 +4,9 @@ import test from "node:test";
 import {
   friendlyAgentLastError,
   friendlyTurnErrorCopy,
+  latestTurnError,
+  pausedLimitCopy,
+  pausedStateCopy,
   CLI_ACP_INTERNAL_ERROR_COPY,
   MODEL_NOT_FOUND_COPY,
   RELAY_MESH_DENIED_COPY,
@@ -215,7 +218,7 @@ test("friendlyTurnErrorCopy: garbage string code coerces to NaN → string path"
   );
 });
 
-// --- -32603 internal error (Fix #2: CLI-ACP unsupported model hint) ---
+// --- -32603 internal error: bare form has no detail ---
 
 test("code -32603 bare 'Internal error' → cli-acp internal error hint (severity: generic)", () => {
   const result = friendlyAgentLastError("Internal error", -32603);
@@ -315,4 +318,156 @@ test("-32603 does not affect -32001/-32002 classification (regression)", () => {
     severity: "denied",
     copy: MODEL_NOT_FOUND_COPY,
   });
+});
+
+test("bare -32603 copy no longer blames the Codex model", () => {
+  assert.ok(!CLI_ACP_INTERNAL_ERROR_COPY.toLowerCase().includes("codex"));
+  assert.ok(CLI_ACP_INTERNAL_ERROR_COPY.includes("gave no detail"));
+});
+
+// --- usage and spend limits: the harness parks the work ---
+
+const WEEKLY =
+  "Agent reported error (code -32603): Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)";
+
+test("Claude weekly limit (turn frame) → Paused copy in Claude's words", () => {
+  const paused =
+    "Paused: Claude weekly limit · resets Oct 18, 7pm (America/Chicago)";
+  assert.deepEqual(friendlyAgentLastError(WEEKLY, -32603), {
+    severity: "generic",
+    copy: paused,
+  });
+  assert.equal(friendlyTurnErrorCopy(WEEKLY, -32603), paused);
+  assert.equal(friendlyAgentLastError(WEEKLY, null)?.copy, paused);
+});
+
+test("pausedLimitCopy: each limit form → its Paused line; anything else → null", () => {
+  const cases = [
+    [
+      "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+      "Paused: Claude monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+    ],
+    [
+      "Internal error: You've hit your session limit · resets 3:50pm",
+      "Paused: Claude session limit · resets 3:50pm",
+    ],
+    [
+      "Internal error: You're out of extra usage · resets Nov 1",
+      "Paused: Claude: You're out of extra usage · resets Nov 1",
+    ],
+    [
+      "Internal error: You've hit your usage limit. Try again at 9:12 AM. (codexErrorInfo: usageLimitExceeded)",
+      "Paused: Codex usage limit. Try again at 9:12 AM.",
+    ],
+    [
+      "Internal error: API Error: This request would exceed your account's rate limit. Please try again later. (errorKind: rate_limit)",
+      null,
+    ],
+    [
+      'Internal error: stream disconnected (codexErrorInfo: {"httpConnectionFailed":{"httpStatusCode":502}})',
+      null,
+    ],
+    ["Internal error", null],
+    ["model not in registry", null],
+  ];
+  for (const [message, want] of cases) {
+    assert.equal(pausedLimitCopy(message), want, message);
+  }
+});
+
+test("latestTurnError: the newest finished turn decides", () => {
+  const error = (text, code) => ({
+    kind: "turn_error",
+    payload: { outcome: "error", error: text, code },
+  });
+  const done = { kind: "turn_completed", payload: {} };
+  const live = { kind: "turn_liveness", payload: {} };
+  assert.equal(latestTurnError([]), null);
+  assert.deepEqual(latestTurnError([done, error(WEEKLY, -32603), live]), {
+    error: WEEKLY,
+    code: -32603,
+  });
+  assert.equal(latestTurnError([error(WEEKLY, -32603), done]), null);
+  assert.deepEqual(latestTurnError([error("boom", "-32603")]), {
+    error: "boom",
+    code: -32603,
+  });
+  assert.deepEqual(latestTurnError([error("boom", undefined)]), {
+    error: "boom",
+    code: null,
+  });
+  assert.equal(latestTurnError([{ kind: "turn_error", payload: null }]), null);
+});
+
+test("latestTurnError: a failed turn's own turn_completed, in either order, keeps its error", () => {
+  const error = (turnId) => ({
+    kind: "turn_error",
+    turnId,
+    payload: { error: WEEKLY, code: -32603 },
+  });
+  const done = (turnId) => ({ kind: "turn_completed", turnId, payload: {} });
+  const want = { error: WEEKLY, code: -32603 };
+  assert.deepEqual(latestTurnError([done("t1"), error("t1")]), want);
+  assert.deepEqual(latestTurnError([error("t1"), done("t1")]), want);
+  // A later turn that succeeded clears it.
+  assert.equal(latestTurnError([done("t1"), error("t1"), done("t2")]), null);
+});
+
+// ── the harness's durable paused state ──────────────────────────────────────
+
+/** The 16 Oct weekly limit, as the harness writes it for the panel. */
+const weeklyPaused = () => ({
+  class: "weekly_limit",
+  text: "You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+  provider: "Claude",
+  state: "BLOCKED",
+  resetsAt: "2026-10-19T00:00:00Z",
+  resumesAt: "2026-10-19T00:02:00Z",
+  since: "2026-10-16T16:52:00Z",
+  expires: "2026-10-19T00:07:00Z",
+});
+
+test("the paused state names the limit and when it resets", () => {
+  const shown = pausedStateCopy(weeklyPaused());
+  assert.equal(shown.severity, "generic");
+  assert.match(shown.copy, /^Paused: Claude weekly limit · resets /);
+  // The reset reads as a local time, not a raw ISO string.
+  assert.ok(!shown.copy.includes("2026-10-19T00:00:00Z"), shown.copy);
+});
+
+test("a spend cap and a lost sign-in say who has to act", () => {
+  const cap = pausedStateCopy({
+    ...weeklyPaused(),
+    class: "spend_cap",
+    resetsAt: null,
+  });
+  assert.equal(cap.severity, "generic");
+  assert.equal(
+    cap.copy,
+    "Paused: Claude spend cap — the owner has to raise it",
+  );
+
+  const lost = pausedStateCopy({
+    ...weeklyPaused(),
+    class: "sign_in",
+    state: "DOWN",
+    resetsAt: null,
+  });
+  // A lost sign-in needs the owner, so it carries destructive weight.
+  assert.equal(lost.severity, "denied");
+  assert.equal(
+    lost.copy,
+    "Paused: Claude sign-in — the owner has to sign it in again",
+  );
+});
+
+test("an unknown class or an unreadable reset is not shown as paused", () => {
+  assert.equal(
+    pausedStateCopy({ ...weeklyPaused(), class: "rate_limit" }),
+    null,
+  );
+  assert.equal(pausedStateCopy({ ...weeklyPaused(), class: "" }), null);
+  // A bad reset time drops the clause rather than the whole line.
+  const shown = pausedStateCopy({ ...weeklyPaused(), resetsAt: "soon" });
+  assert.equal(shown.copy, "Paused: Claude weekly limit");
 });
