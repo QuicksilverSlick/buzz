@@ -36,9 +36,10 @@ export const INBOX_PREVIEW_CLOSE_DELAY_MS = 180;
 
 /**
  * Each Inbox type's icon, label and color. The color is never alone: the
- * icon and label always show with it. Text is 700 light / 400 dark; the
- * row's left stripe is the 500 at 70% when the row has no project (a
- * project's row takes its project's color).
+ * icon and label always show with it. Text is 800 light / 300 dark, 4.5:1
+ * on the default themes (pinned by the test); the row's left stripe is the
+ * 500 at 70% when the row has no project (a project's row takes its
+ * project's color, never one of these hues).
  */
 export const INBOX_TYPE_META: Record<
   InboxItemType,
@@ -47,31 +48,31 @@ export const INBOX_TYPE_META: Record<
   "needs-you": {
     label: "Needs you",
     icon: CircleAlert,
-    text: "text-amber-700 dark:text-amber-400",
+    text: "text-amber-800 dark:text-amber-300",
     stripe: "border-l-amber-500/70",
   },
   bench: {
     label: "Bench",
     icon: ListChecks,
-    text: "text-violet-700 dark:text-violet-400",
+    text: "text-violet-800 dark:text-violet-300",
     stripe: "border-l-violet-500/70",
   },
   code: {
     label: "Code",
     icon: GitPullRequest,
-    text: "text-blue-700 dark:text-blue-400",
+    text: "text-blue-800 dark:text-blue-300",
     stripe: "border-l-blue-500/70",
   },
   dm: {
     label: "DM",
     icon: MessageCircle,
-    text: "text-emerald-700 dark:text-emerald-400",
+    text: "text-emerald-800 dark:text-emerald-300",
     stripe: "border-l-emerald-500/70",
   },
   mention: {
     label: "Mention",
     icon: AtSign,
-    text: "text-fuchsia-700 dark:text-fuchsia-400",
+    text: "text-fuchsia-800 dark:text-fuchsia-300",
     stripe: "border-l-fuchsia-500/70",
   },
   thread: {

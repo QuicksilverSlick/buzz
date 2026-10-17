@@ -71,19 +71,44 @@ export function projectWorkbench(
   return slugWorkbench(project.dtag) ?? slugWorkbench(project.name);
 }
 
+/** Address order: a stable tie-break that a republish never changes. */
+export function compareProjectIds(
+  left: Pick<Project, "id">,
+  right: Pick<Project, "id">,
+): number {
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
 /**
- * A workbench's color: its project's (an announced one first, then a
- * repository-only one), else the color a project with its first slug gets.
+ * A workbench's color: the viewer's own project for it, else the color a
+ * project with its first slug gets. Of the viewer's, a d-tag equal to a slug
+ * (in slug order) beats one that only starts with one or names it, an
+ * announced project beats a repository-only one, then address order. Never
+ * someone else's project, and never recency: a recolor moves nothing.
  */
 export function workbenchColor(
   workbench: Workbench,
-  projects: ReadonlyArray<Pick<Project, "color" | "dtag" | "legacy" | "name">>,
+  projects: ReadonlyArray<
+    Pick<Project, "color" | "dtag" | "id" | "legacy" | "name" | "owner">
+  >,
+  viewerPubkey: string | undefined,
 ): ProjectColor {
-  const names = (project: (typeof projects)[number]) =>
-    projectWorkbench(project)?.id === workbench.id;
-  const project =
-    projects.find((candidate) => !candidate.legacy && names(candidate)) ??
-    projects.find(names);
+  const viewer = viewerPubkey?.toLowerCase();
+  const rank = (project: (typeof projects)[number]) => {
+    const exact = workbench.slugs.indexOf(project.dtag);
+    return (
+      (exact < 0 ? workbench.slugs.length : exact) * 2 +
+      (project.legacy ? 1 : 0)
+    );
+  };
+  const [project] = projects
+    .filter(
+      (candidate) =>
+        viewer !== undefined &&
+        candidate.owner.toLowerCase() === viewer &&
+        projectWorkbench(candidate)?.id === workbench.id,
+    )
+    .sort((a, b) => rank(a) - rank(b) || compareProjectIds(a, b));
   return project
     ? projectColorOf(project)
     : fallbackProjectColor(workbench.slugs[0]);

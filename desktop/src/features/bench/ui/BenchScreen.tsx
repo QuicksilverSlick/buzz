@@ -155,7 +155,7 @@ export function BenchScreen() {
               const count = counts?.[id];
               const workbench = WORKBENCHES.find((w) => w.id === id);
               const color = workbench
-                ? workbenchColor(workbench, projects ?? [])
+                ? workbenchColor(workbench, projects ?? [], viewerPubkey)
                 : null;
               return (
                 <TabsTrigger

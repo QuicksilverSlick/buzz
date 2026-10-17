@@ -17,42 +17,11 @@ export type ProjectColor = {
 
 export const PROJECT_COLOR_TAG = "color";
 
+/**
+ * Palette order is the auto-pick order. None is an Inbox type's hue (amber,
+ * violet, blue, emerald, fuchsia), so a project stripe never reads as a type.
+ */
 export const PROJECT_COLORS: readonly ProjectColor[] = [
-  {
-    id: "blue",
-    label: "Blue",
-    text: "text-blue-800 dark:text-blue-300",
-    stripe: "border-l-blue-500",
-    dot: "bg-blue-500",
-  },
-  {
-    id: "violet",
-    label: "Violet",
-    text: "text-violet-800 dark:text-violet-300",
-    stripe: "border-l-violet-500",
-    dot: "bg-violet-500",
-  },
-  {
-    id: "fuchsia",
-    label: "Fuchsia",
-    text: "text-fuchsia-800 dark:text-fuchsia-300",
-    stripe: "border-l-fuchsia-500",
-    dot: "bg-fuchsia-500",
-  },
-  {
-    id: "rose",
-    label: "Rose",
-    text: "text-rose-800 dark:text-rose-300",
-    stripe: "border-l-rose-500",
-    dot: "bg-rose-500",
-  },
-  {
-    id: "amber",
-    label: "Amber",
-    text: "text-amber-800 dark:text-amber-300",
-    stripe: "border-l-amber-500",
-    dot: "bg-amber-500",
-  },
   {
     id: "lime",
     label: "Lime",
@@ -61,18 +30,53 @@ export const PROJECT_COLORS: readonly ProjectColor[] = [
     dot: "bg-lime-500",
   },
   {
-    id: "emerald",
-    label: "Emerald",
-    text: "text-emerald-800 dark:text-emerald-300",
-    stripe: "border-l-emerald-500",
-    dot: "bg-emerald-500",
+    id: "sky",
+    label: "Sky",
+    text: "text-sky-800 dark:text-sky-300",
+    stripe: "border-l-sky-500",
+    dot: "bg-sky-500",
   },
   {
-    id: "cyan",
-    label: "Cyan",
-    text: "text-cyan-800 dark:text-cyan-300",
-    stripe: "border-l-cyan-500",
-    dot: "bg-cyan-500",
+    id: "red",
+    label: "Red",
+    text: "text-red-800 dark:text-red-300",
+    stripe: "border-l-red-500",
+    dot: "bg-red-500",
+  },
+  {
+    id: "teal",
+    label: "Teal",
+    text: "text-teal-800 dark:text-teal-300",
+    stripe: "border-l-teal-500",
+    dot: "bg-teal-500",
+  },
+  {
+    id: "orange",
+    label: "Orange",
+    text: "text-orange-800 dark:text-orange-300",
+    stripe: "border-l-orange-500",
+    dot: "bg-orange-500",
+  },
+  {
+    id: "indigo",
+    label: "Indigo",
+    text: "text-indigo-800 dark:text-indigo-300",
+    stripe: "border-l-indigo-500",
+    dot: "bg-indigo-500",
+  },
+  {
+    id: "pink",
+    label: "Pink",
+    text: "text-pink-800 dark:text-pink-300",
+    stripe: "border-l-pink-500",
+    dot: "bg-pink-500",
+  },
+  {
+    id: "yellow",
+    label: "Yellow",
+    text: "text-yellow-800 dark:text-yellow-300",
+    stripe: "border-l-yellow-500",
+    dot: "bg-yellow-500",
   },
 ];
 

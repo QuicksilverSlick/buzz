@@ -303,15 +303,15 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
 });
 
 test("a project's row and chip take its color; a row with none keeps its type's", async () => {
-  const rose = projectColorById("rose");
-  assert.equal(inboxRowStripe({ type: "mention", color: rose }), rose.stripe);
+  const pink = projectColorById("pink");
+  assert.equal(inboxRowStripe({ type: "mention", color: pink }), pink.stripe);
   assert.equal(
     inboxRowStripe({ type: "mention", color: null }),
     INBOX_TYPE_META.mention.stripe,
   );
 
   await act(async () => {
-    render(row({ inboxClass: { ...MENTION, color: rose } }));
+    render(row({ inboxClass: { ...MENTION, color: pink } }));
   });
   await act(async () => {
     fireEvent.keyDown(dom.window.document.body, { key: "Tab" });
@@ -320,8 +320,37 @@ test("a project's row and chip take its color; a row with none keeps its type's"
   const chip = preview()?.querySelector("[data-inbox-project-chip]");
   assert.ok(chip, "the preview shows the project chip");
   assert.equal(chip.textContent, "Dreamforge");
-  for (const name of rose.text.split(" ")) {
+  for (const name of pink.text.split(" ")) {
     assert.ok(chip.classList.contains(name), name);
   }
-  assert.ok(chip.querySelector(`.${rose.dot}`), "a dot in the project color");
+  assert.ok(chip.querySelector(`.${pink.dot}`), "a dot in the project color");
+});
+
+/** "text-amber-800 dark:text-amber-300" or "border-l-amber-500/70" to "amber". */
+const hueOf = (classes) => /-([a-z]+)-\d00/.exec(classes)?.[1] ?? null;
+
+test("type labels read at 4.5:1, and no project color shares a type's hue", async () => {
+  const { assertTextContrast } = await import(
+    "@/shared/theme/themeContrastTestHelpers.mjs"
+  );
+  const { PROJECT_COLORS } = await import(
+    "@/features/projects/lib/projectColors.ts"
+  );
+  const types = Object.values(INBOX_TYPE_META).filter((meta) =>
+    hueOf(meta.text),
+  );
+  assert.equal(types.length, 5, "every type but Thread has a hue");
+  for (const meta of types) {
+    const hue = hueOf(meta.text);
+    assert.equal(meta.text, `text-${hue}-800 dark:text-${hue}-300`);
+    assert.equal(hueOf(meta.stripe), hue);
+  }
+  await assertTextContrast(types.map((meta) => hueOf(meta.text)));
+  const typeHues = new Set(types.map((meta) => hueOf(meta.stripe)));
+  assert.deepEqual(
+    PROJECT_COLORS.filter((color) => typeHues.has(hueOf(color.stripe))).map(
+      (color) => color.id,
+    ),
+    [],
+  );
 });

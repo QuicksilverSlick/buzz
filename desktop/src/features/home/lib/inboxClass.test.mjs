@@ -18,6 +18,8 @@ const REPO = `30617:${OWNER}:buzz`;
 
 const PROJECTS = [
   {
+    id: `30621:${OWNER}:28-day-reset`,
+    owner: OWNER,
     dtag: "28-day-reset",
     name: "28 Day Reset",
     color: "lime",
@@ -28,12 +30,22 @@ const PROJECTS = [
     repositoryAddresses: [],
   },
   {
+    id: `30621:${OWNER}:garden`,
+    owner: OWNER,
     dtag: "garden",
     name: "Garden club",
     legacy: false,
     projectChannelId: "garden-home",
     relatedChannelIds: [],
-    repositories: [{ id: "r", name: "r", channelId: "garden-repo" }],
+    repositories: [
+      {
+        id: "r",
+        name: "r",
+        channelId: "garden-repo",
+        owner: OWNER,
+        repoAddress: `30617:${OWNER}:garden-app`,
+      },
+    ],
     repositoryAddresses: [`30617:${OWNER}:garden-app`],
   },
 ];
@@ -99,7 +111,7 @@ function inboxItem(primary, overrides = {}) {
 }
 
 const marker = (id) => ["client", `bench:card:${id}@0a1b2c`];
-const NONE = inboxProjects([]);
+const NONE = inboxProjects([], OWNER);
 
 test("a signed Bench post is Bench, with its card's project", () => {
   const post = event({
@@ -236,7 +248,7 @@ test("a git item's chip is its repository's project", () => {
 });
 
 test("a channel bound to a project shows that project's chip", () => {
-  const lookup = inboxProjects(PROJECTS);
+  const lookup = inboxProjects(PROJECTS, OWNER);
   const chip = (channelId) =>
     classifyInboxItem(inboxItem(event({ channelId })), null, lookup).workbench;
   assert.equal(chip(RESET_CHANNEL), "28 Day Reset");
@@ -246,7 +258,7 @@ test("a channel bound to a project shows that project's chip", () => {
 });
 
 test("a chip carries its project's color; a row with no project has none", () => {
-  const lookup = inboxProjects(PROJECTS);
+  const lookup = inboxProjects(PROJECTS, OWNER);
   const color = (item, bench = null) =>
     classifyInboxItem(inboxItem(item), bench, lookup).color?.id ?? null;
   const garden = fallbackProjectColor("garden").id;
@@ -279,4 +291,50 @@ test("a chip carries its project's color; a row with no project has none", () =>
   assert.equal(reviewClass.color?.id, garden);
   const notes = event({ kind: 1621, tags: [["a", `30617:${OWNER}:notes`]] });
   assert.equal(color(notes), fallbackProjectColor("notes").id);
+});
+
+test("someone else's project can't label or color the viewer's rows", () => {
+  const repo = `30617:${OWNER}:payments-api`;
+  const mine = {
+    ...PROJECTS[1],
+    id: `30621:${OWNER}:payments`,
+    dtag: "payments",
+    name: "Payments",
+    color: "sky",
+    createdAt: 100,
+    projectChannelId: "payments-home",
+    repositories: [{ id: "p", name: "p", owner: OWNER, repoAddress: repo }],
+    repositoryAddresses: [repo],
+  };
+  const theirs = {
+    ...mine,
+    id: `30621:${STRANGER}:approve`,
+    owner: STRANGER,
+    dtag: "approve",
+    name: "Approve now - Russell",
+    color: "red",
+    createdAt: 200,
+  };
+  const review = event({ kind: 1618, tags: [["a", repo]] });
+  const chipOf = (projects, item = review) =>
+    classifyInboxItem(inboxItem(item), null, inboxProjects(projects, OWNER));
+  for (const projects of [
+    [theirs, mine],
+    [mine, theirs],
+  ]) {
+    assert.equal(chipOf(projects).workbench, "Payments");
+    assert.equal(chipOf(projects).color?.id, "sky");
+    const home = event({ channelId: "payments-home" });
+    assert.equal(chipOf(projects, home).workbench, "Payments");
+  }
+  // A repository its owner doesn't own or maintain is never theirs to claim.
+  assert.equal(chipOf([theirs]).workbench, "payments-api");
+  // A recolor republishes (newer createdAt) and moves no other chip.
+  const second = { ...mine, id: `30621:${OWNER}:billing`, name: "Billing" };
+  for (const createdAt of [50, 500]) {
+    assert.equal(
+      chipOf([{ ...second, createdAt, color: "teal" }, mine]).workbench,
+      "Billing",
+    );
+  }
 });

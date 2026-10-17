@@ -11,7 +11,6 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
-import { projectColorOf } from "@/features/projects/lib/projectColors";
 import { presentContextCount } from "@/features/projects/lib/projectHomeSummary";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
 import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
@@ -23,7 +22,10 @@ import {
   type Project,
 } from "@/features/projects/hooks";
 import { ProjectChannelIcon } from "@/features/projects/ui/ProjectChannelIcon";
-import { ProjectColorPicker } from "@/features/projects/ui/ProjectColorPicker";
+import {
+  ProjectColorPicker,
+  useQueuedColorSave,
+} from "@/features/projects/ui/ProjectColorPicker";
 import { useSetProjectColorMutation } from "@/features/projects/useSetProjectColor";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -183,7 +185,7 @@ function ChannelContextRow({
   );
 }
 
-/** The project's color; picking one republishes the project at once. */
+/** The project's color; a pick republishes the project, the latest pick wins. */
 function ProjectColorSetting({
   identityPubkey,
   project,
@@ -195,34 +197,33 @@ function ProjectColorSetting({
     project,
     identityPubkey,
   );
-  const mutation = useSetProjectColorMutation();
+  const { mutateAsync } = useSetProjectColorMutation();
+  const color = useQueuedColorSave(project, (next, target) =>
+    mutateAsync({
+      color: next,
+      ownerControlAgentPubkey,
+      project: target,
+    }).catch((error: unknown) => {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't change the project color.",
+      );
+      throw error;
+    }),
+  );
   return (
     <div className="px-2 py-1">
       <ProjectColorPicker
-        disabled={!canEdit || mutation.isPending}
+        busy={color.saving}
+        disabled={!canEdit}
         legendClassName="mb-1 text-xs text-sidebar-foreground/70"
         name={`project-color-${project.id}`}
-        onChange={(color) =>
-          mutation.mutate(
-            { color, ownerControlAgentPubkey, project },
-            {
-              onError: (error) =>
-                toast.error(
-                  error instanceof Error
-                    ? error.message
-                    : "Couldn't change the project color.",
-                ),
-            },
-          )
-        }
+        onChange={color.pick}
         title={
           canEdit ? undefined : "Only the project owner can change the color"
         }
-        value={
-          mutation.isPending
-            ? mutation.variables.color
-            : projectColorOf(project).id
-        }
+        value={color.value}
       />
     </div>
   );

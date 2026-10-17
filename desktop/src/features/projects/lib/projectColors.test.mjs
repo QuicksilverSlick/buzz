@@ -1,13 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import test from "node:test";
 
-import { createThemeVars, luminance } from "@/shared/theme/adaptive-theme.ts";
-import {
-  extractThemeInfo,
-  loadThemeData,
-} from "@/shared/theme/theme-loader.ts";
+import { assertTextContrast } from "@/shared/theme/themeContrastTestHelpers.mjs";
 import { buildProjectBootstrapTemplates } from "../projectCreation.ts";
 import { buildProjectReadModels } from "../projectModels.ts";
 import { buildProjectColorPatchTemplate } from "../projectRepositoryCreation.ts";
@@ -23,50 +17,6 @@ const OWNER = "a".repeat(64);
 const OTHER = "b".repeat(64);
 const CHANNEL = "11111111-1111-4111-8111-111111111111";
 
-const tailwindTheme = readFileSync(
-  createRequire(import.meta.url).resolve("tailwindcss/theme.css"),
-  "utf8",
-);
-
-/** Tailwind's oklch shade to relative luminance, clipped to sRGB. */
-function shadeLuminance(name) {
-  const match = new RegExp(
-    `--color-${name}:\\s*oklch\\(([\\d.]+)% ([\\d.]+) ([\\d.]+)\\)`,
-  ).exec(tailwindTheme);
-  assert.ok(match, `Tailwind has no ${name}`);
-  const L = Number(match[1]) / 100;
-  const h = (Number(match[3]) * Math.PI) / 180;
-  const a = Number(match[2]) * Math.cos(h);
-  const b = Number(match[2]) * Math.sin(h);
-  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
-  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
-  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
-  const clip = (v) => Math.min(1, Math.max(0, v));
-  const r = clip(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s);
-  const g = clip(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s);
-  const bl = clip(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s);
-  return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
-}
-
-/** A theme var ("H S% L%") to relative luminance. */
-function hslLuminance(value) {
-  const [h, s, l] = value.split(" ").map((part) => Number.parseFloat(part));
-  const k = (n) => (n + h / 30) % 12;
-  const amp = (s / 100) * Math.min(l / 100, 1 - l / 100);
-  const channel = (n) =>
-    Math.round(
-      255 * (l / 100 - amp * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))),
-    );
-  const hex = [0, 8, 4]
-    .map((n) => channel(n).toString(16).padStart(2, "0"))
-    .join("");
-  return luminance(`#${hex}`);
-}
-
-function contrast(a, b) {
-  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
-}
-
 test("the palette is eight distinct colors with their classes written out", () => {
   assert.equal(PROJECT_COLORS.length, 8);
   assert.equal(new Set(PROJECT_COLORS.map((c) => c.id)).size, 8);
@@ -80,32 +30,13 @@ test("the palette is eight distinct colors with their classes written out", () =
     assert.equal(color.dot, `bg-${color.id}-500`);
     assert.ok(color.label);
   }
-  assert.equal(projectColorById("blue")?.id, "blue");
-  assert.equal(projectColorById("red"), null);
+  assert.equal(projectColorById("sky")?.id, "sky");
+  assert.equal(projectColorById("blue"), null);
   assert.equal(projectColorById(undefined), null);
 });
 
 test("project text reads at 4.5:1 on the default light and dark themes", async () => {
-  for (const name of [
-    "buzz",
-    "buzz-dark",
-    "catppuccin-latte",
-    "catppuccin-macchiato",
-  ]) {
-    const info = extractThemeInfo(name, await loadThemeData(name));
-    const { isDark, vars } = createThemeVars(info.bg, info.fg, info.comment);
-    for (const surface of ["--background", "--muted", "--popover"]) {
-      const back = hslLuminance(vars[surface]);
-      for (const color of PROJECT_COLORS) {
-        const shade = `${color.id}-${isDark ? 300 : 800}`;
-        const ratio = contrast(shadeLuminance(shade), back);
-        assert.ok(
-          ratio >= 4.5,
-          `${shade} on ${name} ${surface} is ${ratio.toFixed(2)}:1`,
-        );
-      }
-    }
-  }
+  await assertTextContrast(PROJECT_COLORS.map((color) => color.id));
 });
 
 test("a project with no known color gets the same one from its d-tag", () => {
@@ -179,13 +110,13 @@ function readOne(projectEvent) {
 }
 
 test("the color tag round-trips through create and read", () => {
-  const event = created("emerald");
+  const event = created("teal");
   assert.deepEqual(
     event.tags.filter((tag) => tag[0] === "color"),
-    [["color", "emerald"]],
+    [["color", "teal"]],
   );
-  assert.equal(readOne(event).color, "emerald");
-  assert.equal(projectColorOf(readOne(event)).id, "emerald");
+  assert.equal(readOne(event).color, "teal");
+  assert.equal(projectColorOf(readOne(event)).id, "teal");
 
   const untagged = created(undefined);
   assert.ok(!untagged.tags.some((tag) => tag[0] === "color"));
@@ -202,12 +133,12 @@ test("reading takes the first known color and never drops the project", () => {
   const withTags = (...tags) => ({ ...base, tags: [...base.tags, ...tags] });
   assert.equal(readOne(withTags(["color", "plaid"])).color, undefined);
   assert.equal(
-    readOne(withTags(["color", "plaid"], ["color", "rose"])).color,
-    "rose",
+    readOne(withTags(["color", "plaid"], ["color", "pink"])).color,
+    "pink",
   );
   assert.equal(
-    readOne(withTags(["color", "cyan"], ["color", "rose"])).color,
-    "cyan",
+    readOne(withTags(["color", "indigo"], ["color", "pink"])).color,
+    "indigo",
   );
 });
 
@@ -231,26 +162,26 @@ test("a repository-only project gets its d-tag's color", () => {
 
 test("saving a color replaces only the color tag", () => {
   const live = {
-    ...created("blue"),
+    ...created("sky"),
     content: "kept verbatim",
     tags: [
-      ...created("blue").tags,
+      ...created("sky").tags,
       ["buzz-related-channel", "22222222-2222-4222-8222-222222222222"],
       ["x-future", "a", "b"],
-      ["color", "rose"],
+      ["color", "pink"],
     ],
   };
   const patch = buildProjectColorPatchTemplate({
-    color: "amber",
+    color: "orange",
     liveHead: live,
   });
   assert.equal(patch.kind, 30621);
   assert.equal(patch.content, "kept verbatim");
   assert.deepEqual(patch.tags, [
     ...live.tags.filter((tag) => tag[0] !== "color"),
-    ["color", "amber"],
+    ["color", "orange"],
   ]);
-  assert.equal(readOne({ ...live, ...patch }).color, "amber");
+  assert.equal(readOne({ ...live, ...patch }).color, "orange");
   assert.throws(
     () => buildProjectColorPatchTemplate({ color: "plaid", liveHead: live }),
     /color is invalid/,

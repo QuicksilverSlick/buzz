@@ -45,6 +45,7 @@ import {
   RemindersPanel,
   useReminderSources,
 } from "@/features/reminders/ui/RemindersPanel";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel } from "@/shared/api/types";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { cn } from "@/shared/lib/cn";
@@ -132,7 +133,7 @@ function InboxLabel({
         <span
           className={cn(
             MENTION_CHIP_BASE_CLASSES,
-            "inbox-channel-chip min-w-0 shrink overflow-hidden",
+            "inbox-channel-chip min-w-0 shrink gap-1 overflow-hidden",
           )}
           data-inbox-project-chip=""
           data-project-color={projectColor?.id}
@@ -336,9 +337,10 @@ export function InboxListPane({
   const reminderSources = useReminderSources(reminders);
   const benchSnapshot = useBenchSnapshot();
   const { data: projects } = useProjectsQuery();
+  const viewerPubkey = useIdentityQuery().data?.pubkey;
   const projectChips = React.useMemo(
-    () => inboxProjects(projects ?? []),
-    [projects],
+    () => inboxProjects(projects ?? [], viewerPubkey),
+    [projects, viewerPubkey],
   );
   const channelDescriptions = React.useMemo(
     () =>

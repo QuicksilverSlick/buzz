@@ -11,7 +11,10 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 
 import { PROJECT_COLORS } from "../lib/projectColors.ts";
-import { ProjectColorPicker } from "./ProjectColorPicker.tsx";
+import {
+  ProjectColorPicker,
+  useQueuedColorSave,
+} from "./ProjectColorPicker.tsx";
 
 async function mount(props) {
   const container = document.createElement("div");
@@ -39,7 +42,7 @@ async function mount(props) {
 
 test("eight named radios in one group, the pick checked and named", async () => {
   const picks = [];
-  const view = await mount({ onChange: (id) => picks.push(id), value: "rose" });
+  const view = await mount({ onChange: (id) => picks.push(id), value: "pink" });
   try {
     const group = view.container.querySelector("fieldset");
     assert.equal(group.querySelector("legend")?.textContent, "Color");
@@ -60,18 +63,81 @@ test("eight named radios in one group, the pick checked and named", async () => 
     }
     assert.deepEqual(
       radios.filter((radio) => radio.checked).map((radio) => radio.value),
-      ["rose"],
+      ["pink"],
     );
-    assert.ok(group.textContent.endsWith("Rose"), "the pick's name shows");
+    assert.ok(group.textContent.endsWith("Pink"), "the pick's name shows");
 
     // A label click and an arrow key both check a radio and fire `click`.
     await act(async () => radios[0].closest("label").click());
     await act(async () => radios[5].click());
-    assert.deepEqual(picks, ["blue", PROJECT_COLORS[5].id]);
+    assert.deepEqual(picks, [PROJECT_COLORS[0].id, PROJECT_COLORS[5].id]);
 
-    await view.rerender({ disabled: true, onChange() {}, value: "rose" });
+    await view.rerender({ disabled: true, onChange() {}, value: "pink" });
     assert.equal(group.disabled, true);
   } finally {
     await view.unmount();
+  }
+});
+
+test("arrowing while a save runs keeps focus and saves only the latest pick", async () => {
+  const saves = [];
+  function Setting() {
+    const [project, setProject] = React.useState({ color: "lime", dtag: "g" });
+    const color = useQueuedColorSave(project, (next, target) => {
+      const done = Promise.withResolvers();
+      saves.push({ color: next, target, done });
+      return done.promise.then(() => {
+        const saved = { ...target, color: next };
+        setProject(saved);
+        return saved;
+      });
+    });
+    return React.createElement(ProjectColorPicker, {
+      busy: color.saving,
+      name: "color",
+      onChange: color.pick,
+      value: color.value,
+    });
+  }
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(Setting)));
+    const group = container.querySelector("fieldset");
+    const radios = [...group.querySelectorAll("input")];
+    const ids = PROJECT_COLORS.map((c) => c.id);
+    // An arrow key moves focus to the next radio and checks it (a click).
+    const arrowTo = (index) =>
+      act(async () => {
+        radios[index].focus();
+        radios[index].click();
+      });
+
+    await arrowTo(1);
+    assert.equal(saves.length, 1);
+    assert.equal(group.getAttribute("aria-busy"), "true");
+    assert.equal(radios[1].matches(":disabled"), false, "still operable");
+    assert.equal(document.activeElement, radios[1], "focus stays put");
+    await arrowTo(2);
+    await arrowTo(3);
+    assert.equal(document.activeElement, radios[3]);
+    assert.equal(radios[3].checked, true, "the pick shows at once");
+    assert.equal(saves.length, 1, "one save at a time");
+
+    await act(async () => saves[0].done.resolve());
+    assert.deepEqual(
+      saves.map((save) => save.color),
+      [ids[1], ids[3]],
+      "the latest pick, not every step",
+    );
+    assert.equal(saves[1].target.color, ids[1], "on top of the saved head");
+    await act(async () => saves[1].done.resolve());
+    assert.equal(group.hasAttribute("aria-busy"), false);
+    assert.equal(radios[3].checked, true);
+    assert.equal(saves.length, 2);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
   }
 });

@@ -15,6 +15,7 @@ import {
   WORKBENCHES,
   type Workbench,
   cardWorkbench,
+  compareProjectIds,
   projectWorkbench,
   slugWorkbench,
   workbenchColor,
@@ -61,37 +62,54 @@ type ChipProject = Pick<
   Project,
   | "color"
   | "dtag"
+  | "id"
   | "legacy"
   | "name"
+  | "owner"
   | "projectChannelId"
   | "relatedChannelIds"
   | "repositories"
-  | "repositoryAddresses"
 >;
 
 /**
  * Every project's channels and repositories to its chip: its workbench's
- * when it names one, else its own name and color. A channel or repository
- * in two projects keeps the first.
+ * when it names one, else its own name and color. A project claims only
+ * repositories its owner owns or maintains (as `buildProjectReadModels`
+ * does). A channel or repository in two projects goes to the viewer's own
+ * first, an announced one before a repository-only one, then address order:
+ * never recency, so a recolor or someone else's newer project moves nothing.
  */
 export function inboxProjects(
   projects: ReadonlyArray<ChipProject>,
+  viewerPubkey: string | undefined,
 ): InboxProjects {
+  const viewer = viewerPubkey?.toLowerCase();
   const workbenches = Object.fromEntries(
     WORKBENCHES.map((w) => [
       w.id,
-      { label: w.label, color: workbenchColor(w, projects) },
+      { label: w.label, color: workbenchColor(w, projects, viewerPubkey) },
     ]),
   ) as Record<Workbench["id"], ProjectChip>;
+  const rank = (project: ChipProject) =>
+    (project.owner.toLowerCase() === viewer ? 0 : 2) + (project.legacy ? 1 : 0);
   const chips = new Map<string, ProjectChip>();
-  for (const project of projects) {
+  for (const project of [...projects].sort(
+    (a, b) => rank(a) - rank(b) || compareProjectIds(a, b),
+  )) {
     const workbench = projectWorkbench(project);
     const chip = workbench
       ? workbenches[workbench.id]
       : { label: project.name, color: projectColorOf(project) };
+    const repositories = project.repositories.filter(
+      (repository) =>
+        repository.owner === project.owner ||
+        repository.maintainers?.includes(project.owner),
+    );
     const keys = [
-      ...listProjectBoundChannels(project).map((bound) => bound.channelId),
-      ...project.repositoryAddresses,
+      ...listProjectBoundChannels({ ...project, repositories }).map(
+        (bound) => bound.channelId,
+      ),
+      ...repositories.map((repository) => repository.repoAddress),
     ];
     for (const key of keys) if (!chips.has(key)) chips.set(key, chip);
   }

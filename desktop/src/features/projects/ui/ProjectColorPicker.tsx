@@ -1,5 +1,58 @@
-import { PROJECT_COLORS } from "@/features/projects/lib/projectColors";
+import * as React from "react";
+
+import type { Project } from "@/features/projects/projectModels";
+import {
+  PROJECT_COLORS,
+  projectColorOf,
+} from "@/features/projects/lib/projectColors";
 import { cn } from "@/shared/lib/cn";
+
+type ColorTarget = Pick<Project, "color" | "dtag">;
+
+/**
+ * Saves color picks one at a time, and only the latest: a pick made while a
+ * save runs waits, replacing any pick already waiting. The radios stay
+ * enabled meanwhile, so arrow keys keep focus and move on, and arrowing
+ * across the palette publishes twice at most, not once per step.
+ */
+export function useQueuedColorSave<T extends ColorTarget>(
+  target: T,
+  save: (color: string, target: T) => Promise<T>,
+): { pick: (color: string) => void; saving: boolean; value: string } {
+  const [choice, setChoice] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const busy = React.useRef(false);
+  const waiting = React.useRef<string | null>(null);
+  const pick = (color: string) => {
+    setChoice(color);
+    if (busy.current) {
+      waiting.current = color;
+      return;
+    }
+    busy.current = true;
+    setSaving(true);
+    void (async () => {
+      let next: string | null = color;
+      let saved = target;
+      try {
+        while (next !== null) {
+          saved = await save(next, saved);
+          next = waiting.current;
+          waiting.current = null;
+          if (next === projectColorOf(saved).id) next = null;
+        }
+      } catch {
+        // `save` reports its own failure; a waiting pick is dropped with it.
+      } finally {
+        busy.current = false;
+        waiting.current = null;
+        setSaving(false);
+        setChoice(null);
+      }
+    })();
+  };
+  return { pick, saving, value: choice ?? projectColorOf(target).id };
+}
 
 /**
  * The eight project colors as native radios sharing one name: the browser
@@ -7,6 +60,7 @@ import { cn } from "@/shared/lib/cn";
  * and its name shows beside the swatches, so color is never the only sign.
  */
 export function ProjectColorPicker({
+  busy,
   disabled,
   legendClassName,
   name,
@@ -14,6 +68,7 @@ export function ProjectColorPicker({
   title,
   value,
 }: {
+  busy?: boolean;
   disabled?: boolean;
   legendClassName?: string;
   name: string;
@@ -24,6 +79,7 @@ export function ProjectColorPicker({
   const selected = PROJECT_COLORS.find((color) => color.id === value);
   return (
     <fieldset
+      aria-busy={busy || undefined}
       className="min-w-0 space-y-1.5 disabled:opacity-60"
       data-testid="project-color-picker"
       disabled={disabled}

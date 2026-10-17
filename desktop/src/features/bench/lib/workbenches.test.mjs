@@ -106,31 +106,65 @@ test("counts per tab: current cards and what needs you; tabs filter items", () =
   assert.equal(workbenchSnapshot(snapshot(items), "all").items.length, 5);
 });
 
-test("a workbench tab takes its project's color, announced projects first", () => {
-  const [reset, dreamforge] = WORKBENCHES;
-  const project = (dtag, name, color, legacy = false) => ({
+const VIEWER = "a".repeat(64);
+const STRANGER = "b".repeat(64);
+
+function project(dtag, name, color, overrides = {}) {
+  return {
     color,
     dtag,
-    legacy,
+    id: `30621:${VIEWER}:${dtag}`,
+    legacy: false,
     name,
-  });
+    owner: VIEWER,
+    ...overrides,
+  };
+}
+
+test("a workbench tab takes its project's color, announced projects first", () => {
+  const [reset, dreamforge] = WORKBENCHES;
   const projects = [
-    project("reset-notes", "reset-notes", undefined, true),
-    project("garden", "Garden", "blue"),
+    project("reset-notes", "reset-notes", undefined, { legacy: true }),
+    project("garden", "Garden", "sky"),
     project("program", "28 Day Reset", "lime"),
   ];
-  assert.equal(workbenchColor(reset, projects).id, "lime");
+  assert.equal(workbenchColor(reset, projects, VIEWER).id, "lime");
   assert.equal(
-    workbenchColor(reset, projects.slice(0, 2)),
+    workbenchColor(reset, projects.slice(0, 2), VIEWER),
     fallbackProjectColor("reset-notes"),
   );
   // Dreamforge with no project of its own: the fixed color of its slug.
   assert.equal(
-    workbenchColor(dreamforge, projects),
+    workbenchColor(dreamforge, projects, VIEWER),
     fallbackProjectColor("dreamforge"),
   );
   assert.equal(
-    workbenchColor(dreamforge, [project("buzz", "buzz", "cyan")]).id,
-    "cyan",
+    workbenchColor(dreamforge, [project("buzz", "buzz", "indigo")], VIEWER).id,
+    "indigo",
+  );
+});
+
+test("a newer or someone else's matching project never recolors a workbench", () => {
+  const [reset] = WORKBENCHES;
+  const program = project("28-day-reset", "28 Day Reset", "lime");
+  const cohort = project("reset-q4-cohort", "Reset Q4 cohort", "sky");
+  const theirs = project("28-day-reset", "28 Day Reset", "red", {
+    id: `30621:${STRANGER}:28-day-reset`,
+    owner: STRANGER,
+  });
+  // useProjectsQuery lists newest first; order must not matter.
+  for (const projects of [
+    [cohort, theirs, program],
+    [theirs, program, cohort],
+  ]) {
+    assert.equal(workbenchColor(reset, projects, VIEWER).id, "lime");
+  }
+  assert.equal(
+    workbenchColor(reset, [theirs], VIEWER),
+    fallbackProjectColor("28-day-reset"),
+  );
+  assert.equal(
+    workbenchColor(reset, [program], undefined),
+    fallbackProjectColor("28-day-reset"),
   );
 });
