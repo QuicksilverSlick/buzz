@@ -368,8 +368,13 @@ pub(crate) fn chicago_label(t: DateTime<Utc>) -> String {
 }
 
 /// The one plain thread line for a parked request (spec 4.3 and D8): what
-/// happened and when it resumes, never the provider's billing wording, and
-/// no mention, so partner channels get a calm line instead of a ping.
+/// happened and when it resumes, and no mention, so partner channels get a
+/// calm line instead of a ping.
+///
+/// A spend cap and a lost sign-in get the same neutral sentence as a usage
+/// limit. The service being unavailable is all the sender needs; whose money
+/// or whose sign-in it is belongs to the owner, in the #factory STATE record
+/// and the card (D8, spec 4.4) — these lines also land in partner channels.
 pub(crate) fn pause_line(failure: &Failure, resumes: DateTime<Utc>) -> String {
     let saved = "Your request is saved and nothing is lost.";
     match failure.class {
@@ -377,13 +382,9 @@ pub(crate) fn pause_line(failure: &Failure, resumes: DateTime<Utc>) -> String {
             "Paused: the AI service this agent uses hit its usage limit. {saved} It resumes about {}.",
             chicago_label(resumes)
         ),
-        Class::SpendCap => format!(
-            "Paused: the AI service this agent uses reached its spending cap. {saved} It runs once \
-             the owner raises the cap; I check every 30 minutes."
-        ),
-        Class::SignIn => format!(
-            "Paused: this agent lost its sign-in to the AI service. {saved} It runs once the owner \
-             signs it in again; I check every 30 minutes."
+        Class::SpendCap | Class::SignIn => format!(
+            "Paused: the AI service this agent uses is unavailable. {saved} I check every 30 \
+             minutes."
         ),
         Class::RateLimit => format!(
             "Paused: the AI service this agent uses is limiting how fast it can work. {saved} It \
@@ -1422,6 +1423,56 @@ mod tests {
         assert_eq!(park_line(&mut factory, &rate), None);
         assert_eq!(park_line(&mut factory, &rate), None);
         assert!(park_line(&mut factory, &rate).is_some());
+    }
+
+    /// A partner's thread never learns whose money or sign-in stopped the
+    /// work: a spend cap and a lost sign-in read exactly as a usage limit
+    /// does (D8, spec 4.4). The owner's own words stay in the STATE record
+    /// and the card.
+    #[test]
+    fn partner_lines_carry_no_billing_or_sign_in_wording() {
+        let now = oct16();
+        let spend = classify(
+            &agent_error(
+                "Internal error: You've hit your monthly spend limit · raise it at \
+                 claude.ai/settings/usage?from=cc_cli_limit_message",
+            ),
+            now,
+        );
+        let sign_in = classify(
+            &agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            now,
+        );
+        let neutral = "Paused: the AI service this agent uses is unavailable. Your request is \
+                       saved and nothing is lost. I check every 30 minutes.";
+        for failure in [&spend, &sign_in] {
+            let line = pause_line(failure, now);
+            assert_eq!(line, neutral, "{}", failure.slug);
+            let lower = line.to_lowercase();
+            for word in [
+                "spend",
+                "spending",
+                "cap",
+                "billing",
+                "sign-in",
+                "sign in",
+                "raise it",
+                "claude",
+                "owner",
+                "pay",
+            ] {
+                assert!(!lower.contains(word), "{word} in the partner line: {line}");
+            }
+        }
+        // The owner still gets the words, in #factory and on the card.
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Support Agent");
+        f.plan(0, &scope(), &spend, now);
+        let record = f.take_report(now).expect("a STATE record");
+        assert!(record.contains("class=spend_cap"), "{record}");
+        assert!(record.contains("monthly spend limit"), "{record}");
     }
 
     /// The dot is away exactly while work waits on a limit or a lost
