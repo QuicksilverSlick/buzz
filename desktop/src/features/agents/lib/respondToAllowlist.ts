@@ -12,7 +12,16 @@
  * entry (users copy npubs from profile/verify surfaces elsewhere in the app).
  */
 
+import {
+  resolveUserLabel,
+  type UserProfileLookup,
+} from "@/features/profile/lib/identity";
 import { parsePubkeyInput as parseCanonicalPubkey } from "@/shared/lib/nostrUtils";
+import {
+  canonicalNpub,
+  normalizePubkey,
+  truncateNpub,
+} from "@/shared/lib/pubkey";
 
 export type ParsedAllowlist = {
   /** Successfully parsed entries — lowercase hex, deduplicated, in order. */
@@ -69,4 +78,79 @@ export function mergeAllowlist(existing: string[], add: string[]): string[] {
     out.push(canonical);
   }
   return out;
+}
+
+export type AllowlistChip = {
+  pubkey: string;
+  /** Profile name, then NIP-05, then the managed agent's name, then short npub. */
+  label: string;
+  /** Full npub for the hover tooltip; null when the key cannot be encoded. */
+  title: string | null;
+  /** `Craig (npub1y9f…u08a)`, or just the short npub when no name is known. */
+  accessibleName: string;
+  avatarUrl: string | null;
+  isAgent: boolean;
+  /** Another selected entry shows the same name, so the key must be visible. */
+  ambiguous: boolean;
+};
+
+/**
+ * Label selected allowlist entries the way message headers do, so the owner
+ * can tell who they are removing. A display name is self-asserted: the key
+ * stays in the tooltip and accessible name, and is shown inline whenever two
+ * entries share a name so an impostor cannot hide behind a duplicate.
+ */
+export function allowlistChips(
+  allowlist: readonly string[],
+  profiles: UserProfileLookup | undefined,
+  agentNames: ReadonlyMap<string, string>,
+): AllowlistChip[] {
+  const chips = allowlist.map((pubkey) => {
+    const key = normalizePubkey(pubkey);
+    const agentName = agentNames.get(key);
+    const shortNpub = truncateNpub(pubkey);
+    const label = resolveUserLabel({
+      pubkey,
+      profiles,
+      fallbackName: agentName,
+    });
+    return {
+      pubkey,
+      label,
+      title: canonicalNpub(pubkey),
+      accessibleName:
+        label === shortNpub ? shortNpub : `${label} (${shortNpub})`,
+      avatarUrl: profiles?.[key]?.avatarUrl ?? null,
+      isAgent: profiles?.[key]?.isAgent === true || agentName !== undefined,
+      ambiguous: false,
+    };
+  });
+  const nameCounts = new Map<string, number>();
+  for (const chip of chips) {
+    const name = chip.label.trim().toLowerCase();
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+  for (const chip of chips) {
+    chip.ambiguous =
+      chip.accessibleName !== chip.label &&
+      (nameCounts.get(chip.label.trim().toLowerCase()) ?? 0) > 1;
+  }
+  return chips;
+}
+
+/**
+ * Whether a selected entry matches the picker's search text: anywhere in the
+ * name, but only as a key prefix, since short text lands inside a random key.
+ */
+export function allowlistChipMatches(
+  chip: AllowlistChip,
+  query: string,
+): boolean {
+  const needle = query.trim().toLowerCase();
+  return (
+    needle.length === 0 ||
+    chip.label.toLowerCase().includes(needle) ||
+    (chip.title?.startsWith(needle) ?? false) ||
+    chip.pubkey.toLowerCase().startsWith(needle)
+  );
 }
