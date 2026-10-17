@@ -694,11 +694,11 @@ test("message links to visible root messages open the thread panel", async ({
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Welcome to general",
   );
-  await page.evaluate(() => {
+  await page.evaluate((eventId) => {
     (
       window as Window & { __BUZZ_E2E_DEFER_GET_EVENT__?: string | null }
-    ).__BUZZ_E2E_DEFER_GET_EVENT__ = GENERAL_WELCOME_EVENT_ID;
-  });
+    ).__BUZZ_E2E_DEFER_GET_EVENT__ = eventId;
+  }, GENERAL_WELCOME_EVENT_ID);
 
   const link = `buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=${GENERAL_WELCOME_EVENT_ID}`;
   const composerInput = page.getByTestId("message-input");

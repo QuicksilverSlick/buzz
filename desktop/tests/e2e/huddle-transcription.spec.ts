@@ -560,13 +560,16 @@ test("keeps main-app shortcuts from navigating the huddle room", async ({
     await expect(page.getByTestId("settings-view")).toHaveCount(0);
   }
 
-  await page.evaluate(async (channelId) => {
-    await window.__BUZZ_E2E_EMIT_TAURI_EVENT__?.("deep-link-message", {
-      channelId,
-      messageId: GENERAL_WELCOME_EVENT_ID,
-      threadRootId: null,
-    });
-  }, HUDDLE_PARENT_ID);
+  await page.evaluate(
+    async ({ channelId, messageId }) => {
+      await window.__BUZZ_E2E_EMIT_TAURI_EVENT__?.("deep-link-message", {
+        channelId,
+        messageId,
+        threadRootId: null,
+      });
+    },
+    { channelId: HUDDLE_PARENT_ID, messageId: GENERAL_WELCOME_EVENT_ID },
+  );
   await expect.poll(() => page.url()).toBe(huddleUrl);
 
   const pendingCommunityLink = {

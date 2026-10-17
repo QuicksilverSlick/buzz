@@ -3673,6 +3673,7 @@ test("Inbox All never lists drafts and unread-only hides reminders", async ({
       messageId,
       reminderId,
       senderPubkey,
+      targetEventId,
     }) => {
       const now = Math.floor(Date.now() / 1_000);
       window.__BUZZ_E2E_SEED_MOCK_REMINDERS__?.([
@@ -3687,7 +3688,7 @@ test("Inbox All never lists drafts and unread-only hides reminders", async ({
           ],
           content: JSON.stringify({
             target: {
-              eventId: GENERAL_ALICE_EVENT_ID,
+              eventId: targetEventId,
               channelId,
               preview: "Due reminder in mixed Inbox",
               authorPubkey: senderPubkey,
@@ -3726,6 +3727,7 @@ test("Inbox All never lists drafts and unread-only hides reminders", async ({
       messageId,
       reminderId,
       senderPubkey: TEST_IDENTITIES.alice.pubkey,
+      targetEventId: GENERAL_ALICE_EVENT_ID,
     },
   );
 
@@ -3821,7 +3823,7 @@ test("Inbox All keeps its filter when opening a due reminder", async ({
 
   const reminderId = "inbox-stable-reminder";
   await page.evaluate(
-    async ({ channelId, id, pubkey }) => {
+    async ({ channelId, id, pubkey, targetEventId }) => {
       const now = Math.floor(Date.now() / 1000);
       window.__BUZZ_E2E_SEED_MOCK_REMINDERS__?.([
         {
@@ -3835,7 +3837,7 @@ test("Inbox All keeps its filter when opening a due reminder", async ({
           ],
           content: JSON.stringify({
             target: {
-              eventId: GENERAL_ALICE_EVENT_ID,
+              eventId: targetEventId,
               channelId,
               preview: "Review the Inbox behavior",
               authorPubkey: pubkey,
@@ -3853,6 +3855,7 @@ test("Inbox All keeps its filter when opening a due reminder", async ({
       channelId: GENERAL_CHANNEL_ID,
       id: reminderId,
       pubkey: MOCK_IDENTITY_PUBKEY,
+      targetEventId: GENERAL_ALICE_EVENT_ID,
     },
   );
 

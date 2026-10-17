@@ -106,25 +106,31 @@ test.describe("thread load failure", () => {
         ),
       )
       .toBe(true);
-    await page.evaluate((pubkey) => {
-      (
-        window as typeof window & {
-          __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-            channelName: string;
-            content: string;
-            parentEventId?: string;
-            pubkey?: string;
-            createdAt?: number;
-          }) => unknown;
-        }
-      ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
-        channelName: "general",
-        content: "First reply to welcome",
+    await page.evaluate(
+      ({ parentEventId, pubkey }) => {
+        (
+          window as typeof window & {
+            __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
+              channelName: string;
+              content: string;
+              parentEventId?: string;
+              pubkey?: string;
+              createdAt?: number;
+            }) => unknown;
+          }
+        ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+          channelName: "general",
+          content: "First reply to welcome",
+          parentEventId,
+          pubkey,
+          createdAt: Math.floor(Date.now() / 1000) - 10,
+        });
+      },
+      {
         parentEventId: GENERAL_WELCOME_EVENT_ID,
-        pubkey,
-        createdAt: Math.floor(Date.now() / 1000) - 10,
-      });
-    }, TEST_IDENTITIES.alice.pubkey);
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+      },
+    );
 
     await page.getByTestId("channel-general").click();
     await expect(page.getByTestId("chat-title")).toHaveText("general");
