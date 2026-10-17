@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import {
   type BenchCard as BenchCardData,
   benchSearch,
@@ -88,6 +89,7 @@ export function BenchScreen() {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
   const { data: projects } = useProjectsQuery();
+  const viewerAgents = useViewerAgentPubkeys();
   const { goChannel } = useAppNavigation();
   const [query, setQuery] = React.useState("");
   const matches = React.useMemo(() => benchSearch(query), [query]);
@@ -155,7 +157,12 @@ export function BenchScreen() {
               const count = counts?.[id];
               const workbench = WORKBENCHES.find((w) => w.id === id);
               const color = workbench
-                ? workbenchColor(workbench, projects ?? [], viewerPubkey)
+                ? workbenchColor(
+                    workbench,
+                    projects ?? [],
+                    viewerPubkey,
+                    viewerAgents,
+                  )
                 : null;
               return (
                 <TabsTrigger

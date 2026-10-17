@@ -277,6 +277,25 @@ test("a prompt from another draft can't be answered here", async () => {
   assert.deepEqual(resubmits, []);
 });
 
+test("an ambiguous mention skips the prompt instead of failing the send", async () => {
+  const { act } = await import("@testing-library/react");
+  const { result } = await renderPrompt(() => {}, {
+    mentions: {
+      extractMentionPubkeys: () => {
+        throw new Error("The mention @Claude is ambiguous.");
+      },
+    },
+  });
+  for (const draft of ["@Claude hi", `@Claude see ${LINK}`]) {
+    let held = true;
+    await act(async () => {
+      held = await result.current.check(draft);
+    });
+    assert.equal(held, false, "the send goes on to the mention flow's toast");
+    assert.equal(result.current.prompt, null);
+  }
+});
+
 test("no prompt for a link with nothing to share", async () => {
   const { act } = await import("@testing-library/react");
   const { result } = await renderPrompt(() => {});

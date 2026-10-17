@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
+import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import {
   getInboxTypeLabel,
@@ -337,10 +338,11 @@ export function InboxListPane({
   const reminderSources = useReminderSources(reminders);
   const benchSnapshot = useBenchSnapshot();
   const { data: projects } = useProjectsQuery();
+  const viewerAgents = useViewerAgentPubkeys();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
   const projectChips = React.useMemo(
-    () => inboxProjects(projects ?? [], viewerPubkey),
-    [projects, viewerPubkey],
+    () => inboxProjects(projects ?? [], viewerPubkey, viewerAgents),
+    [projects, viewerAgents, viewerPubkey],
   );
   const channelDescriptions = React.useMemo(
     () =>

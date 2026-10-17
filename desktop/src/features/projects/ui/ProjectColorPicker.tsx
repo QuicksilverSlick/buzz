@@ -7,39 +7,45 @@ import {
 } from "@/features/projects/lib/projectColors";
 import { cn } from "@/shared/lib/cn";
 
-type ColorTarget = Pick<Project, "color" | "dtag">;
+type ColorTarget = Pick<Project, "color" | "dtag" | "id">;
 
 /**
  * Saves color picks one at a time, and only the latest: a pick made while a
  * save runs waits, replacing any pick already waiting. The radios stay
  * enabled meanwhile, so arrow keys keep focus and move on, and arrowing
- * across the palette publishes twice at most, not once per step.
+ * across the palette publishes twice at most, not once per step. A pick
+ * keeps the project it was made on: the same setting reused for another
+ * project (a route change) never shows or saves it there.
  */
 export function useQueuedColorSave<T extends ColorTarget>(
   target: T,
   save: (color: string, target: T) => Promise<T>,
 ): { pick: (color: string) => void; saving: boolean; value: string } {
-  const [choice, setChoice] = React.useState<string | null>(null);
+  type Queued = { color: string; target: T };
+  const [choice, setChoice] = React.useState<Queued | null>(null);
   const [saving, setSaving] = React.useState(false);
   const busy = React.useRef(false);
-  const waiting = React.useRef<string | null>(null);
+  const waiting = React.useRef<Queued | null>(null);
   const pick = (color: string) => {
-    setChoice(color);
+    setChoice({ color, target });
     if (busy.current) {
-      waiting.current = color;
+      waiting.current = { color, target };
       return;
     }
     busy.current = true;
     setSaving(true);
     void (async () => {
-      let next: string | null = color;
+      let next: Queued | null = { color, target };
       let saved = target;
+      // The project just saved builds on that head; another on its own.
+      const head = (queued: Queued) =>
+        queued.target.id === saved.id ? saved : queued.target;
       try {
         while (next !== null) {
-          saved = await save(next, saved);
+          saved = await save(next.color, head(next));
           next = waiting.current;
           waiting.current = null;
-          if (next === projectColorOf(saved).id) next = null;
+          if (next && next.color === projectColorOf(head(next)).id) next = null;
         }
       } catch {
         // `save` reports its own failure; a waiting pick is dropped with it.
@@ -51,7 +57,14 @@ export function useQueuedColorSave<T extends ColorTarget>(
       }
     })();
   };
-  return { pick, saving, value: choice ?? projectColorOf(target).id };
+  return {
+    pick,
+    saving,
+    value:
+      choice?.target.id === target.id
+        ? choice.color
+        : projectColorOf(target).id,
+  };
 }
 
 /**

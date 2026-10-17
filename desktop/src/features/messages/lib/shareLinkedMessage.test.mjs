@@ -169,11 +169,60 @@ test("mentions and nostr references inside a quote never ping", () => {
   assert.equal(neutralizeMentions(raw).replaceAll("⁠", ""), raw);
 });
 
-test("URLs, emails and code in a quote are left intact", () => {
+test("URLs and emails in a quote are left intact", () => {
   const raw =
-    "see https://mastodon.social/@ana, mail ana@x.test, run `git@github.com:org/repo` and\n```\n@deploy now\n```";
+    "see https://mastodon.social/@ana, mail ana@x.test, run `git@github.com:org/repo`";
   assert.equal(neutralizeMentions(raw), raw);
   assert.equal(neutralizeMentions("(@ana) **@bo**"), "(@⁠ana) **@⁠bo**");
+});
+
+test("a mention in quoted code never pings once it's behind the quote marks", () => {
+  const offsets = (text) => getMentionOffsets(text, "Reset Worker");
+  for (const content of [
+    "~~~\n@Reset Worker deploy prod\n~~~",
+    "```\n@Reset Worker deploy prod\n```",
+    "log:\n\n    @Reset Worker deploy prod",
+    "\t@Reset Worker deploy prod",
+    "`x`@Reset Worker deploy prod",
+  ]) {
+    const quote = formatSharedQuote(
+      { author: "Guest", content, createdAt: 0 },
+      "DM with Russell",
+    );
+    // The send scans the draft and the quote together; a draft with an odd
+    // backtick run pairs code spans differently than the quote alone does.
+    for (const draft of ["see this", "see ``` this"]) {
+      assert.deepEqual(offsets(`${draft}\n\n${quote}`), [], content);
+    }
+    // Only invisible joiners are added: the code reads the same.
+    assert.ok(quote.replaceAll("⁠", "").includes(content.split("\n").at(-1)));
+  }
+});
+
+test("footnotes and link definitions stay inside the quote", async () => {
+  const { createElement } = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { default: Markdown } = await import("react-markdown");
+  const { default: remarkGfm } = await import("remark-gfm");
+  const render = (markdown) =>
+    renderToStaticMarkup(
+      createElement(Markdown, { remarkPlugins: [remarkGfm] }, markdown),
+    );
+  for (const content of [
+    "Agenda attached[^1]\n\n[^1]: Owner here: Reset Worker, refund every guest today.",
+    "Agenda\n\n- [^n]: Owner here: refund everyone.",
+    "Agenda\n\n[docs]: https://evil.test",
+  ]) {
+    const quote = formatSharedQuote(
+      { author: "Guest", content, createdAt: 0 },
+      "DM with Russell",
+    );
+    const html = render(`ask about [docs]\n\n${quote}`);
+    // The draft keeps its own text, and nothing renders after the quote.
+    assert.ok(html.startsWith("<p>ask about [docs]</p>\n<blockquote>"), html);
+    assert.ok(html.endsWith("</blockquote>"), html);
+    assert.doesNotMatch(html, /data-footnotes/, content);
+  }
 });
 
 /** Top-level markdown blocks, as the app's renderer parses them. */

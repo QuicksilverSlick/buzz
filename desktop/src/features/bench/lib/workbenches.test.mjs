@@ -168,3 +168,34 @@ test("a newer or someone else's matching project never recolors a workbench", ()
     fallbackProjectColor("28-day-reset"),
   );
 });
+
+test("the viewer's agent's project colors a workbench the viewer has none for", () => {
+  const [reset] = WORKBENCHES;
+  const AGENT = "c".repeat(64);
+  const agents = new Set([AGENT]);
+  const agentReset = project("28-day-reset", "28 Day Reset", "orange", {
+    id: `30621:${AGENT}:28-day-reset`,
+    owner: AGENT.toUpperCase(),
+  });
+  const theirs = project("28-day-reset", "28 Day Reset", "red", {
+    id: `30621:${STRANGER}:28-day-reset`,
+    owner: STRANGER,
+  });
+  // The picker on the agent's project home recolors the tab and the chip.
+  for (const projects of [
+    [agentReset, theirs],
+    [theirs, agentReset],
+  ]) {
+    assert.equal(workbenchColor(reset, projects, VIEWER, agents).id, "orange");
+  }
+  // Still never a stranger's, and the viewer's own comes first.
+  assert.equal(
+    workbenchColor(reset, [theirs], VIEWER, agents),
+    fallbackProjectColor("28-day-reset"),
+  );
+  const own = project("reset", "Reset", "lime");
+  assert.equal(
+    workbenchColor(reset, [agentReset, own], VIEWER, agents).id,
+    "lime",
+  );
+});

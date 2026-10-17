@@ -145,3 +145,20 @@ export function useIsOtherSetupAgent(
     })
   );
 }
+
+/**
+ * Agents the viewer signs for: managed on this computer, or owned by them in
+ * the relay directory. Their projects are ones the viewer can recolor.
+ */
+export function useViewerAgentPubkeys(): ReadonlySet<string> {
+  const { currentPubkey, localPubkeys, relayOwners } = React.useContext(
+    AgentManagementContext,
+  );
+  return React.useMemo(() => {
+    const viewer = normalizePubkey(currentPubkey ?? "");
+    const owned = [...relayOwners]
+      .filter(([, owner]) => viewer && normalizePubkey(owner ?? "") === viewer)
+      .map(([agent]) => agent);
+    return new Set([...localPubkeys, ...owned]);
+  }, [currentPubkey, localPubkeys, relayOwners]);
+}

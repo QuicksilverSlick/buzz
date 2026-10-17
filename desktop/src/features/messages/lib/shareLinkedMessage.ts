@@ -1,6 +1,5 @@
 import { resolveChannelDisplayLabel } from "@/features/sidebar/lib/channelLabels";
 import type { Channel } from "@/shared/api/types";
-import { maskMarkdownCode } from "@/shared/lib/mentionBoundaries";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 import { formatFullDateTime } from "./dateFormatters";
@@ -12,8 +11,9 @@ import {
 
 // Invisible, and breaks every `@name` and `nostr:` matcher (composer, renderer, SDK).
 const WORD_JOINER = String.fromCharCode(0x2060);
-// The boundary `getMentionOffsets` accepts before an `@`.
-const MENTION_START = /(^|[\s(*_|])@(?=\S)/g;
+// The boundary `getMentionOffsets` accepts before an `@`, plus the backtick
+// that closes a code span: its scan masks that to a space, a boundary too.
+const MENTION_START = /(^|[\s(*_|`])@(?=\S)/g;
 const NOSTR_REFERENCE = /\bnostr:(?=n(?:pub|profile|event|ote|addr)1)/gi;
 // CommonMark ends a line at CR too; U+2028/9 look like one.
 const LINE_BREAK = /\r\n|\r|\n|\u2028|\u2029/;
@@ -44,16 +44,16 @@ export type LinkedMessageShare = {
 
 /**
  * Break `@name` mentions and `nostr:` references so a quote can never ping
- * anyone. Code and `@` inside words (emails, URL paths) are left as is:
- * no matcher reads them.
+ * anyone. Code too: behind "> " a fence or an indent is no longer code to
+ * the send-time mention scan. `@` inside words (emails, URL paths) is left
+ * as is: no matcher reads it.
  */
 export function neutralizeMentions(text: string): string {
-  const masked = maskMarkdownCode(text);
   const breaks = new Set<number>();
-  for (const match of masked.matchAll(MENTION_START)) {
+  for (const match of text.matchAll(MENTION_START)) {
     breaks.add(match.index + match[1].length + 1);
   }
-  for (const match of masked.matchAll(NOSTR_REFERENCE)) {
+  for (const match of text.matchAll(NOSTR_REFERENCE)) {
     breaks.add(match.index + "nostr".length);
   }
   let result = "";
@@ -85,14 +85,20 @@ function placeOf(
   return link.threadRootId ? `a thread in ${place}` : place;
 }
 
-/** A labeled markdown blockquote; attachments keep only their link text. */
+/**
+ * A labeled markdown blockquote; attachments keep only their link text.
+ * Footnote and link reference definitions (`[^1]: …`, `[x]: …`) lose the
+ * `]:` they need: GFM lifts them out of the quote, document-wide.
+ */
 export function formatSharedQuote(
   message: { author: string; content: string; createdAt: number },
   place: string,
 ): string {
   const header = `Quoted from **${inlineText(message.author)}** in ${inlineText(place)}, ${formatFullDateTime(message.createdAt)}:`;
   const body = neutralizeMentions(
-    message.content.replace(/!\[([^\]]*)\]\(/g, "[$1]("),
+    message.content
+      .replace(/!\[([^\]]*)\]\(/g, "[$1](")
+      .replaceAll("]:", `]${WORD_JOINER}:`),
   );
   return [neutralizeMentions(header), "", ...body.split(LINE_BREAK)]
     .map((line) => (line ? `> ${line}` : ">"))

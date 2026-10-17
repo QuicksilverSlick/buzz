@@ -82,7 +82,11 @@ test("eight named radios in one group, the pick checked and named", async () => 
 test("arrowing while a save runs keeps focus and saves only the latest pick", async () => {
   const saves = [];
   function Setting() {
-    const [project, setProject] = React.useState({ color: "lime", dtag: "g" });
+    const [project, setProject] = React.useState({
+      color: "lime",
+      dtag: "g",
+      id: "p:g",
+    });
     const color = useQueuedColorSave(project, (next, target) => {
       const done = Promise.withResolvers();
       saves.push({ color: next, target, done });
@@ -136,6 +140,63 @@ test("arrowing while a save runs keeps focus and saves only the latest pick", as
     assert.equal(group.hasAttribute("aria-busy"), false);
     assert.equal(radios[3].checked, true);
     assert.equal(saves.length, 2);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+  }
+});
+
+test("a pick stays on the project it was made on when the setting moves on", async () => {
+  const saves = [];
+  let show;
+  function Setting() {
+    const [projects, setProjects] = React.useState({
+      a: { color: "lime", dtag: "a", id: "p:a" },
+      b: { color: "sky", dtag: "b", id: "p:b" },
+    });
+    const [current, setCurrent] = React.useState("a");
+    show = setCurrent;
+    const color = useQueuedColorSave(projects[current], (next, target) => {
+      const done = Promise.withResolvers();
+      saves.push({ color: next, id: target.id, done });
+      return done.promise.then(() => {
+        const saved = { ...target, color: next };
+        setProjects((all) => ({ ...all, [saved.dtag]: saved }));
+        return saved;
+      });
+    });
+    return React.createElement(ProjectColorPicker, {
+      name: "color",
+      onChange: color.pick,
+      value: color.value,
+    });
+  }
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const checked = () => container.querySelector("input:checked")?.value;
+  const pick = (id) =>
+    act(async () => container.querySelector(`input[value="${id}"]`).click());
+  try {
+    await act(async () => root.render(React.createElement(Setting)));
+    await pick("red");
+    await act(async () => show("b"));
+    assert.equal(
+      checked(),
+      "sky",
+      "B shows its own color, not A's pending pick",
+    );
+    await pick("teal");
+    assert.equal(checked(), "teal");
+    await act(async () => saves[0].done.resolve());
+    await act(async () => saves[1]?.done.resolve());
+    assert.deepEqual(
+      saves.map((save) => `${save.color}->${save.id}`),
+      ["red->p:a", "teal->p:b"],
+    );
+    assert.equal(checked(), "teal");
+    await act(async () => show("a"));
+    assert.equal(checked(), "red");
   } finally {
     await act(async () => root.unmount());
     container.remove();

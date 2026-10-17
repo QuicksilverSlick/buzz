@@ -82,12 +82,16 @@ type ChipProject = Pick<
 export function inboxProjects(
   projects: ReadonlyArray<ChipProject>,
   viewerPubkey: string | undefined,
+  viewerAgentPubkeys?: ReadonlySet<string>,
 ): InboxProjects {
   const viewer = viewerPubkey?.toLowerCase();
   const workbenches = Object.fromEntries(
     WORKBENCHES.map((w) => [
       w.id,
-      { label: w.label, color: workbenchColor(w, projects, viewerPubkey) },
+      {
+        label: w.label,
+        color: workbenchColor(w, projects, viewerPubkey, viewerAgentPubkeys),
+      },
     ]),
   ) as Record<Workbench["id"], ProjectChip>;
   const rank = (project: ChipProject) =>

@@ -323,14 +323,19 @@ test("a project's row and chip take its color; a row with none keeps its type's"
   for (const name of pink.text.split(" ")) {
     assert.ok(chip.classList.contains(name), name);
   }
-  assert.ok(chip.querySelector(`.${pink.dot}`), "a dot in the project color");
+  assert.ok(
+    [...chip.querySelectorAll("*")].some((node) =>
+      pink.dot.split(" ").every((name) => node.classList.contains(name)),
+    ),
+    "a dot in the project color",
+  );
 });
 
 /** "text-amber-800 dark:text-amber-300" or "border-l-amber-500/70" to "amber". */
 const hueOf = (classes) => /-([a-z]+)-\d00/.exec(classes)?.[1] ?? null;
 
-test("type labels read at 4.5:1, and no project color shares a type's hue", async () => {
-  const { assertTextContrast } = await import(
+test("type labels read at 4.5:1, and no project stripe looks like a type's", async () => {
+  const { assertStripesApart, assertTextContrast } = await import(
     "@/shared/theme/themeContrastTestHelpers.mjs"
   );
   const { PROJECT_COLORS } = await import(
@@ -352,5 +357,12 @@ test("type labels read at 4.5:1, and no project color shares a type's hue", asyn
       (color) => color.id,
     ),
     [],
+  );
+  // Not only another hue name: measurably apart, light and dark, at the
+  // type stripe's 70%. Type stripes are about 0.106 apart from each other.
+  await assertStripesApart(
+    PROJECT_COLORS.map((color) => color.stripe),
+    types.map((meta) => meta.stripe),
+    0.1,
   );
 });

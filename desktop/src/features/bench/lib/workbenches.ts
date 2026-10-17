@@ -14,6 +14,7 @@ import {
 import { projectDtagFromName } from "@/features/projects/projectCreation";
 import type { Project } from "@/features/projects/projectModels";
 import { PRODUCT_NAME } from "@/shared/constants/brand";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type WorkbenchId = "reset" | "dreamforge" | "other";
 export type BenchTab = "all" | WorkbenchId;
@@ -80,11 +81,12 @@ export function compareProjectIds(
 }
 
 /**
- * A workbench's color: the viewer's own project for it, else the color a
- * project with its first slug gets. Of the viewer's, a d-tag equal to a slug
- * (in slug order) beats one that only starts with one or names it, an
- * announced project beats a repository-only one, then address order. Never
- * someone else's project, and never recency: a recolor moves nothing.
+ * A workbench's color: the viewer's own project for it, else one of their
+ * agents' (which they can recolor too), else the color a project with its
+ * first slug gets. Then a d-tag equal to a slug (in slug order) beats one
+ * that only starts with one or names it, an announced project beats a
+ * repository-only one, then address order. Never a stranger's project, and
+ * never recency: a recolor moves nothing.
  */
 export function workbenchColor(
   workbench: Workbench,
@@ -92,8 +94,13 @@ export function workbenchColor(
     Pick<Project, "color" | "dtag" | "id" | "legacy" | "name" | "owner">
   >,
   viewerPubkey: string | undefined,
+  viewerAgentPubkeys: ReadonlySet<string> = new Set(),
 ): ProjectColor {
-  const viewer = viewerPubkey?.toLowerCase();
+  const viewer = viewerPubkey ? normalizePubkey(viewerPubkey) : undefined;
+  const whose = (project: (typeof projects)[number]) => {
+    const owner = normalizePubkey(project.owner);
+    return owner === viewer ? 0 : viewerAgentPubkeys.has(owner) ? 1 : -1;
+  };
   const rank = (project: (typeof projects)[number]) => {
     const exact = workbench.slugs.indexOf(project.dtag);
     return (
@@ -104,11 +111,13 @@ export function workbenchColor(
   const [project] = projects
     .filter(
       (candidate) =>
-        viewer !== undefined &&
-        candidate.owner.toLowerCase() === viewer &&
+        whose(candidate) >= 0 &&
         projectWorkbench(candidate)?.id === workbench.id,
     )
-    .sort((a, b) => rank(a) - rank(b) || compareProjectIds(a, b));
+    .sort(
+      (a, b) =>
+        whose(a) - whose(b) || rank(a) - rank(b) || compareProjectIds(a, b),
+    );
   return project
     ? projectColorOf(project)
     : fallbackProjectColor(workbench.slugs[0]);

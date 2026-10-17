@@ -115,42 +115,48 @@ export function useShareLinkPrompt({
       const token = ++request.current;
       setPrompt(null); // A new send asks afresh; an older answer never applies.
       const revision = getComposerRevision();
-      const share = await findLinkedMessageShare(content, {
-        channelId,
-        channels,
-        recipientPubkeys: new Set(
-          [
-            ...memberPubkeys,
-            ...extractMentionPubkeys(content),
-            ...addressedAgentPubkeys,
-          ].map(normalizePubkey),
-        ),
-        newRecipientNames: extractMentionPersonas(content).map(
-          (mention) => mention.displayName,
-        ),
-        ownerPubkey,
-        getMemberPubkeys: async (id) =>
-          (
-            await queryClient.fetchQuery({
-              queryKey: channelMembersQueryKey(id),
-              queryFn: () => getChannelMembers(id),
-              staleTime: CHANNEL_MEMBERS_STALE_TIME_MS,
-            })
-          ).map((member) => member.pubkey),
-        getMessage: async (link) =>
-          fetchMessageForQuote(
-            link,
-            await queryClient
-              .fetchQuery({
-                queryKey: relaySelfQueryKey,
-                queryFn: getRelaySelf,
-                staleTime: Number.POSITIVE_INFINITY,
-              })
-              .catch(() => null),
-          ),
-        getDisplayName: (pubkey) =>
-          getMentionDisplayName(pubkey) ?? truncateNpub(pubkey),
-      }).catch(() => null); // A failed lookup sends the link alone: nothing leaks.
+      // Inside the chain: a mention read that throws (an ambiguous name) skips
+      // the prompt, and the send flow reports it as it always has.
+      const share = await Promise.resolve()
+        .then(() =>
+          findLinkedMessageShare(content, {
+            channelId,
+            channels,
+            recipientPubkeys: new Set(
+              [
+                ...memberPubkeys,
+                ...extractMentionPubkeys(content),
+                ...addressedAgentPubkeys,
+              ].map(normalizePubkey),
+            ),
+            newRecipientNames: extractMentionPersonas(content).map(
+              (mention) => mention.displayName,
+            ),
+            ownerPubkey,
+            getMemberPubkeys: async (id) =>
+              (
+                await queryClient.fetchQuery({
+                  queryKey: channelMembersQueryKey(id),
+                  queryFn: () => getChannelMembers(id),
+                  staleTime: CHANNEL_MEMBERS_STALE_TIME_MS,
+                })
+              ).map((member) => member.pubkey),
+            getMessage: async (link) =>
+              fetchMessageForQuote(
+                link,
+                await queryClient
+                  .fetchQuery({
+                    queryKey: relaySelfQueryKey,
+                    queryFn: getRelaySelf,
+                    staleTime: Number.POSITIVE_INFINITY,
+                  })
+                  .catch(() => null),
+              ),
+            getDisplayName: (pubkey) =>
+              getMentionDisplayName(pubkey) ?? truncateNpub(pubkey),
+          }),
+        )
+        .catch(() => null); // A failed lookup sends the link alone: nothing leaks.
       // Switched conversation, typed or dismissed meanwhile: offer nothing,
       // send nothing; the draft stays where it was written.
       if (

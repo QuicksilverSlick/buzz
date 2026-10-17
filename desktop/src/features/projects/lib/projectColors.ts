@@ -4,8 +4,9 @@ import type { Project } from "@/features/projects/projectModels";
  * The eight project colors. A project saves one as its `color` tag; one
  * without a known id gets a fixed color from its d-tag. Text is the 800 in
  * light and the 300 in dark, 4.5:1 on the default themes (pinned by the
- * test); the stripe and the dot are the 500. Class names stay written out
- * so Tailwind finds them. Color is never alone: the name always shows.
+ * test); the stripe and the dot are the 600 in light and the 400 in dark.
+ * Class names stay written out so Tailwind finds them. Color is never
+ * alone: the name always shows.
  */
 export type ProjectColor = {
   id: string;
@@ -19,64 +20,65 @@ export const PROJECT_COLOR_TAG = "color";
 
 /**
  * Palette order is the auto-pick order. None is an Inbox type's hue (amber,
- * violet, blue, emerald, fuchsia), so a project stripe never reads as a type.
+ * violet, blue, emerald, fuchsia), and each stripe is at least 0.1 OKLab
+ * from every type stripe on the default themes.
  */
 export const PROJECT_COLORS: readonly ProjectColor[] = [
   {
     id: "lime",
     label: "Lime",
     text: "text-lime-800 dark:text-lime-300",
-    stripe: "border-l-lime-500",
-    dot: "bg-lime-500",
+    stripe: "border-l-lime-600 dark:border-l-lime-400",
+    dot: "bg-lime-600 dark:bg-lime-400",
   },
   {
     id: "sky",
     label: "Sky",
     text: "text-sky-800 dark:text-sky-300",
-    stripe: "border-l-sky-500",
-    dot: "bg-sky-500",
+    stripe: "border-l-sky-600 dark:border-l-sky-400",
+    dot: "bg-sky-600 dark:bg-sky-400",
   },
   {
     id: "red",
     label: "Red",
     text: "text-red-800 dark:text-red-300",
-    stripe: "border-l-red-500",
-    dot: "bg-red-500",
+    stripe: "border-l-red-600 dark:border-l-red-400",
+    dot: "bg-red-600 dark:bg-red-400",
   },
   {
     id: "teal",
     label: "Teal",
     text: "text-teal-800 dark:text-teal-300",
-    stripe: "border-l-teal-500",
-    dot: "bg-teal-500",
+    stripe: "border-l-teal-600 dark:border-l-teal-400",
+    dot: "bg-teal-600 dark:bg-teal-400",
   },
   {
     id: "orange",
     label: "Orange",
     text: "text-orange-800 dark:text-orange-300",
-    stripe: "border-l-orange-500",
-    dot: "bg-orange-500",
+    stripe: "border-l-orange-600 dark:border-l-orange-400",
+    dot: "bg-orange-600 dark:bg-orange-400",
   },
   {
     id: "indigo",
     label: "Indigo",
     text: "text-indigo-800 dark:text-indigo-300",
-    stripe: "border-l-indigo-500",
-    dot: "bg-indigo-500",
+    stripe: "border-l-indigo-600 dark:border-l-indigo-400",
+    dot: "bg-indigo-600 dark:bg-indigo-400",
   },
   {
     id: "pink",
     label: "Pink",
     text: "text-pink-800 dark:text-pink-300",
-    stripe: "border-l-pink-500",
-    dot: "bg-pink-500",
+    stripe: "border-l-pink-600 dark:border-l-pink-400",
+    dot: "bg-pink-600 dark:bg-pink-400",
   },
   {
     id: "yellow",
     label: "Yellow",
     text: "text-yellow-800 dark:text-yellow-300",
-    stripe: "border-l-yellow-500",
-    dot: "bg-yellow-500",
+    stripe: "border-l-yellow-600 dark:border-l-yellow-400",
+    dot: "bg-yellow-600 dark:bg-yellow-400",
   },
 ];
 

@@ -338,3 +338,22 @@ test("someone else's project can't label or color the viewer's rows", () => {
     );
   }
 });
+
+test("an agent-owned Reset project colors the Reset chip for its owner", () => {
+  const AGENT = "d".repeat(64);
+  const agentReset = {
+    ...PROJECTS[0],
+    id: `30621:${AGENT}:28-day-reset`,
+    owner: AGENT,
+    color: "orange",
+  };
+  const home = event({ channelId: "reset-home" });
+  const chipOf = (agents) =>
+    classifyInboxItem(
+      inboxItem(home),
+      null,
+      inboxProjects([agentReset], WRITER, agents),
+    ).color?.id;
+  assert.equal(chipOf(new Set([AGENT])), "orange");
+  assert.equal(chipOf(undefined), fallbackProjectColor("28-day-reset").id);
+});

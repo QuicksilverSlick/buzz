@@ -26,8 +26,11 @@ test("the palette is eight distinct colors with their classes written out", () =
       `text-${color.id}-800 dark:text-${color.id}-300`,
       color.id,
     );
-    assert.equal(color.stripe, `border-l-${color.id}-500`);
-    assert.equal(color.dot, `bg-${color.id}-500`);
+    assert.equal(
+      color.stripe,
+      `border-l-${color.id}-600 dark:border-l-${color.id}-400`,
+    );
+    assert.equal(color.dot, `bg-${color.id}-600 dark:bg-${color.id}-400`);
     assert.ok(color.label);
   }
   assert.equal(projectColorById("sky")?.id, "sky");
