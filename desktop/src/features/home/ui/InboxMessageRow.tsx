@@ -1,6 +1,9 @@
 import * as React from "react";
 
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
+import { BenchCard } from "@/features/bench/ui/BenchCard";
+import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import type { InboxContextMessage } from "@/features/home/lib/inbox";
 import { toTimelineMessage } from "@/features/home/lib/inboxViewHelpers";
 import { formatTimeWithoutDayPeriod } from "@/features/messages/lib/dateFormatters";
@@ -38,6 +41,8 @@ type InboxMessageRowProps = {
   canReply: boolean;
   /** Channel UUID for "Copy link" — passed straight through to MessageActionBar. */
   channelId?: string | null;
+  /** The viewer, for a Bench card's answer buttons. */
+  currentPubkey?: string;
   isContinuation?: boolean;
   isFirst?: boolean;
   isFocusHighlightVisible: boolean;
@@ -61,6 +66,7 @@ export function InboxMessageRow({
   agentPubkeys,
   canReply,
   channelId = null,
+  currentPubkey,
   isContinuation = false,
   isFirst = false,
   isFocusHighlightVisible,
@@ -96,6 +102,20 @@ export function InboxMessageRow({
     errorMessage: reactionErrorMessage,
     select: handleReactionSelect,
   } = useReactionHandler(timelineMessage, onToggleReaction);
+  // A live Bench card's post shows as the card, as in its channel: its text
+  // as posted may be an older format (see benchRowState for the guard).
+  const benchCard = useBenchCardForMessage({
+    channelId,
+    id: message.id,
+    kind: message.kind,
+    signerPubkey: message.signerPubkey,
+  });
+  // A live card's option buttons already show its answer keycaps.
+  const shownReactions = benchCard
+    ? reactions.filter(
+        (reaction) => !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
+      )
+    : reactions;
   // "Is this pubkey an agent" = the community-scoped baseline every surface
   // shares plus this surface's extras passed via `agentPubkeys` (HomeView
   // folds feed-profile `isAgent` flags in). Mirrors MessageRow's predicate.
@@ -285,34 +305,45 @@ export function InboxMessageRow({
             className={isContinuation ? "mt-0" : "mt-conversation-body"}
             data-testid="message-body"
           >
-            <VideoReviewCommentMarkdown
-              className={cn(
-                "max-w-full text-left text-message text-foreground",
-                emojiOnly &&
-                  "text-4xl leading-tight [&_p]:leading-tight [&_img[data-custom-emoji]]:h-[1.45em] [&_img[data-custom-emoji]]:align-middle [&_button:has(img[data-custom-emoji])]:align-middle",
-              )}
-              // Only pass the author pubkey for agent-authored messages so
-              // config-nudge cards can authenticate the sender. Uses the
-              // raw event signer (signerPubkey), not a relay-delegated display
-              // author, because the agent itself must have signed the card.
-              configNudgeAuthorPubkey={getConfigNudgeAuthorPubkey(
-                timelineMessage,
-                isKnownAgentPubkey,
-              )}
-              content={message.content}
-              messageId={message.id}
-              linkPreviewsSuppressed={hasLinkPreviewSuppression(
-                timelineMessage.tags,
-              )}
-              customEmoji={customEmoji}
-              imetaByUrl={imetaByUrl}
-              agentMentionPubkeysByName={agentMentionPubkeysByName}
-              leadingInlineContent={agentAddressPrefix}
-              mentionNames={message.mentionNames}
-              mentionPubkeysByName={message.mentionPubkeysByName}
-              videoReviewCommentRootId={videoReviewCommentRootId}
-              videoReviewContext={videoReviewContext}
-            />
+            {benchCard ? (
+              <BenchCard
+                card={benchCard.card}
+                onOther={
+                  canReply ? () => onSelectReplyTarget(message) : undefined
+                }
+                ownerPubkey={benchCard.ownerPubkey}
+                viewerPubkey={currentPubkey}
+              />
+            ) : (
+              <VideoReviewCommentMarkdown
+                className={cn(
+                  "max-w-full text-left text-message text-foreground",
+                  emojiOnly &&
+                    "text-4xl leading-tight [&_p]:leading-tight [&_img[data-custom-emoji]]:h-[1.45em] [&_img[data-custom-emoji]]:align-middle [&_button:has(img[data-custom-emoji])]:align-middle",
+                )}
+                // Only pass the author pubkey for agent-authored messages so
+                // config-nudge cards can authenticate the sender. Uses the
+                // raw event signer (signerPubkey), not a relay-delegated display
+                // author, because the agent itself must have signed the card.
+                configNudgeAuthorPubkey={getConfigNudgeAuthorPubkey(
+                  timelineMessage,
+                  isKnownAgentPubkey,
+                )}
+                content={message.content}
+                messageId={message.id}
+                linkPreviewsSuppressed={hasLinkPreviewSuppression(
+                  timelineMessage.tags,
+                )}
+                customEmoji={customEmoji}
+                imetaByUrl={imetaByUrl}
+                agentMentionPubkeysByName={agentMentionPubkeysByName}
+                leadingInlineContent={agentAddressPrefix}
+                mentionNames={message.mentionNames}
+                mentionPubkeysByName={message.mentionPubkeysByName}
+                videoReviewCommentRootId={videoReviewCommentRootId}
+                videoReviewContext={videoReviewContext}
+              />
+            )}
             <MessageReactions
               canToggle={canToggleReactions}
               messageId={message.id}
@@ -326,7 +357,7 @@ export function InboxMessageRow({
                 );
               }}
               pending={reactionPending}
-              reactions={reactions}
+              reactions={shownReactions}
             />
             {reactionErrorMessage ? (
               <p className="mt-1.5 text-xs text-destructive">

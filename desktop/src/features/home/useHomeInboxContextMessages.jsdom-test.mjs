@@ -53,11 +53,14 @@ test("the relay's dm_created is not a message; a person's JSON still is", () => 
     ["2", DM_CREATED],
     ["3", "hi Bo"],
   ]);
-  // A relay key it can't check hides nothing.
-  assert.deepEqual(
-    contents(null).map(([id]) => id),
-    ["1", "2", "3"],
-  );
+  // While the relay's key is unknown, no system row shows raw; a person's
+  // message still does.
+  for (const unknown of [null, undefined]) {
+    assert.deepEqual(
+      contents(unknown).map(([id]) => id),
+      ["2", "3"],
+    );
+  }
   // Another key's 40099 is that key's message.
   assert.deepEqual(
     contents(BO).map(([id]) => id),

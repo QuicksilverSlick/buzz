@@ -769,6 +769,7 @@ function InboxMessageDetailPane({
                   agentPubkeys={agentPubkeys}
                   canReply={canReply}
                   channelId={item.item.channelId}
+                  currentPubkey={currentPubkey}
                   isContinuation={isContinuation}
                   isFirst={index === 0}
                   isFocusHighlightVisible={isFocusHighlightVisible}

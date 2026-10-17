@@ -385,7 +385,7 @@ export function InboxListPane({
         ? "Reopening…"
         : "Open in channel";
     const inboxClass = classifyInboxItem(item, benchSnapshot, projectChips);
-    const cardPost = inboxCardPost(item, inboxClass);
+    const cardPost = inboxCardPost(item, benchSnapshot);
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =

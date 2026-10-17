@@ -23,9 +23,13 @@ before(() => {
   });
 });
 
+const clients = [];
+
 afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
+  // A Bench card row polls and caches; nothing may outlive its test.
+  for (const client of clients.splice(0)) client.clear();
 });
 
 after(() => dom.window.close());
@@ -64,7 +68,7 @@ function message(overrides) {
   };
 }
 
-async function renderRow(inboxMessage) {
+async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
   const React = await import("react");
   const { render } = await import("@testing-library/react");
   const { QueryClient, QueryClientProvider } = await import(
@@ -80,6 +84,8 @@ async function renderRow(inboxMessage) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { enabled: false, retry: false } },
   });
+  clients.push(queryClient);
+  if (benchCards) queryClient.setQueryData(["bench-cards"], benchCards);
   // Only the router context the Markdown renderer reads; no route resolves.
   const router = createRouter({
     routeTree: createRootRoute(),
@@ -95,6 +101,7 @@ async function renderRow(inboxMessage) {
         React.createElement(InboxMessageRow, {
           agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
           canReply: false,
+          channelId,
           isFocusHighlightVisible: false,
           message: inboxMessage,
           onSelectReplyTarget: () => {},
@@ -171,4 +178,85 @@ test("a workflow post shows the workflow icon in place of an avatar", async () =
 
   assert.ok(view.getByTestId("workflow-avatar"));
   assert.equal(view.getByTestId("message-author").textContent, "Workflow");
+});
+
+const BENCH = "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10";
+const WRITER = "a".repeat(64);
+const CARD_EVENT = "e".repeat(64);
+const OLD_TEXT =
+  "🔴 · 28-day-reset · orchestrator\n**Ship it?**\n\nWhat changes: the welcome email\nAsked by: Craig";
+
+function benchCards() {
+  return {
+    enabled: true,
+    channelId: BENCH,
+    writerPubkey: WRITER,
+    ownerPubkey: AUTHOR,
+    lastError: null,
+    lastTick: "2026-10-17T10:00:00Z",
+    items: [
+      {
+        id: "orchestrator/ship",
+        writer: "orchestrator",
+        kind: "pending",
+        title: "Ship it?",
+        body: "What changes: the welcome email\nAsked by: Craig",
+        area: "28-day-reset",
+        severity: "critical",
+        options: ["Ship", "Hold"],
+        state: null,
+        decidedBy: null,
+        deadline: null,
+        links: [],
+        order: 0,
+        validity: "current",
+        cardEventId: CARD_EVENT,
+        answer: null,
+        recorded: null,
+        updatedAt: "2026-10-17T10:00:00Z",
+        channelId: null,
+        project: null,
+        scoped: false,
+        needs: "you",
+        answerers: [],
+        ownerName: null,
+        recommend: null,
+        recommender: null,
+        reply: null,
+        request: null,
+      },
+    ],
+  };
+}
+
+test("a live Bench card's post shows as the card, not the text it was posted with", async () => {
+  const card = message({
+    authorPubkey: WRITER,
+    content: OLD_TEXT,
+    id: CARD_EVENT,
+    kind: 9,
+    signerPubkey: WRITER,
+    tags: [["h", BENCH]],
+  });
+  const view = await renderRow(card, {
+    benchCards: benchCards(),
+    channelId: BENCH,
+  });
+  const shown = view.getByTestId("bench-card");
+  assert.deepEqual(
+    [...shown.querySelectorAll("p > span.font-semibold")].map(
+      (span) => span.textContent,
+    ),
+    ["What changes:", "Asked by:"],
+  );
+  assert.ok(!view.container.textContent.includes("28-day-reset"));
+  view.unmount();
+
+  // Anyone else's message with the card's id, or the card's text, is chat.
+  const forged = await renderRow(
+    { ...card, signerPubkey: AUTHOR, authorPubkey: AUTHOR },
+    { benchCards: benchCards(), channelId: BENCH },
+  );
+  assert.equal(forged.queryByTestId("bench-card"), null);
+  assert.ok(forged.container.textContent.includes("28-day-reset"));
 });

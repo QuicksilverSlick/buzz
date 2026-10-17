@@ -43,14 +43,14 @@ export function useHomeInboxContextMessages({
 
     // The relay's own system rows (a DM's dm_created, a join) are JSON for
     // the timeline's system lines, which hide the kinds they don't know;
-    // here they would show raw. Only the relay's key: anyone else's event
-    // is a message, whatever it says.
+    // here they would show raw. Another key's is that key's message. While
+    // the relay's key is unknown (loading, or its fetch failed) every one
+    // hides: a system kind, never a person's chat, so hiding spoofs nothing.
     const relay = relaySelfPubkey ? normalizePubkey(relaySelfPubkey) : null;
     const shown = events.filter(
       (event) =>
         event.kind !== KIND_SYSTEM_MESSAGE ||
-        relay === null ||
-        normalizePubkey(event.pubkey) !== relay,
+        (relay !== null && normalizePubkey(event.pubkey) !== relay),
     );
     const eventById = new Map(shown.map((event) => [event.id, event]));
     const contextEventIds = new Set(eventById.keys());
