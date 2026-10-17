@@ -4011,8 +4011,9 @@ async fn run_harness(
                     }
                     let pp = presence_publisher.clone();
                     let pk = presence_keys.clone();
+                    let presence = config.factory.lock().presence();
                     presence_task = Some(tokio::spawn(async move {
-                        if let Err(e) = publish_presence(&pp, &pk, "online").await {
+                        if let Err(e) = publish_presence(&pp, &pk, presence).await {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
@@ -4099,6 +4100,7 @@ async fn run_harness(
                 if let Some(scope) = result.source.scope() {
                     typing_channels.remove(scope);
                 }
+                let presence_before = config.factory.lock().presence();
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -4115,6 +4117,22 @@ async fn run_harness(
                 ) == LoopAction::Exit
                 {
                     break;
+                }
+                // Away while work is parked behind a limit, online again on
+                // the first real answer: published now, not at the next beat.
+                let presence = config.factory.lock().presence();
+                if config.presence_enabled && presence != presence_before {
+                    if let Some(h) = presence_task.take() {
+                        h.abort();
+                    }
+                    let pp = presence_publisher.clone();
+                    let pk = presence_keys.clone();
+                    presence_task = Some(tokio::spawn(async move {
+                        match publish_presence(&pp, &pk, presence).await {
+                            Ok(()) => tracing::info!("presence set to {presence}"),
+                            Err(e) => tracing::warn!("presence update failed: {e}"),
+                        }
+                    }));
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -5511,6 +5529,9 @@ fn handle_prompt_result(
         PromptOutcome::Error(e) => Some(factory::classify(e, now)),
         _ => None,
     };
+    if failure.as_ref().is_some_and(|f| !f.class.parks()) {
+        config.factory.lock().on_error();
+    }
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -5752,7 +5773,7 @@ fn handle_prompt_result(
             );
             let back_to_primary = {
                 let mut factory = config.factory.lock();
-                factory.on_success(agent_index);
+                factory.on_success(agent_index, now);
                 factory.wants_restart(agent_index, now)
             };
             if back_to_primary {
@@ -13556,12 +13577,13 @@ mod error_outcome_emission_tests {
     /// requests.
     #[tokio::test]
     async fn limit_errors_park_without_spending_the_retry_budget() {
-        for message in [
-            "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)",
-            "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage",
-            "Internal error: API Error: This request would exceed your account's rate limit. Please try again later.",
-            "Internal error: You've hit your usage limit. (codexErrorInfo: usageLimitExceeded)",
-            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+        // The dot turns away while work waits; one short rate limit only slows it.
+        for (message, presence) in [
+            ("Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago) (errorKind: rate_limit)", "away"),
+            ("Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage", "away"),
+            ("Internal error: API Error: This request would exceed your account's rate limit. Please try again later.", "online"),
+            ("Internal error: You've hit your usage limit. (codexErrorInfo: usageLimitExceeded)", "away"),
+            ("API Error: 401 OAuth access token has expired. Re-authenticate to continue.", "away"),
         ] {
             let config = test_config();
             let (mut queue, channel_id, mut pool, respawn_tasks) =
@@ -13576,6 +13598,7 @@ mod error_outcome_emission_tests {
             );
             assert!(pool.agents_mut()[0].is_some(), "{message}: agent stays");
             assert!(respawn_tasks.is_empty());
+            assert_eq!(config.factory.lock().presence(), presence, "{message}");
         }
     }
 
@@ -13629,6 +13652,11 @@ mod error_outcome_emission_tests {
             run_failed_turn(&config, agent_error("Internal error"), 0).await;
         assert_eq!(queue.queued_event_count(channel_id), 1, "requeued");
         assert_eq!(queue.retry_count_for_test(channel_id), 1);
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "retrying, not parked"
+        );
     }
 
     #[tokio::test]

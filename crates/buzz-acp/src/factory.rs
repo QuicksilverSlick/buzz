@@ -440,9 +440,31 @@ pub(crate) enum Plan {
     },
 }
 
+/// The harness's own health (spec 2.2), set by code from what its turns
+/// return. It decides the presence dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Health {
+    #[default]
+    Operational,
+    /// Moving, with a catch: retrying, rate-limited, or on another login.
+    Degraded,
+    /// Stopped safely: work is parked until a reset or the owner.
+    Blocked,
+    /// The sign-in is lost: work is parked until the owner signs in.
+    Down,
+    /// The first real answers after Blocked or Down.
+    Recovering,
+}
+
+/// Real answers in a row that turn Recovering into Operational (spec 2.3).
+const ANSWERS_TO_RECOVER: u32 = 3;
+
 /// Harness-wide failure state, shared through [`Config`](crate::config::Config).
 #[derive(Debug, Default)]
 pub(crate) struct Factory {
+    health: Health,
+    /// Real answers since Recovering began.
+    answers: u32,
     /// The account pool; empty when none is configured, which is exactly the
     /// single-login behaviour.
     accounts: Vec<Account>,
@@ -551,6 +573,7 @@ impl Factory {
                     .told
                     .insert((scope.clone(), true))
                     .then(|| hand_off_line(&label));
+                self.health = Health::Degraded;
                 return Plan::HandOff { label, line };
             }
             wait = self
@@ -561,20 +584,65 @@ impl Factory {
                 .min()
                 .unwrap_or(wait);
         }
-        let worth_a_line = failure.class != Class::RateLimit || self.rate_streak >= 3;
-        let line = (worth_a_line && self.told.insert((scope.clone(), false))).then(|| {
+        // Three short rate limits in a row are Blocked (short), spec 3.2.
+        let blocked = failure.class != Class::RateLimit || self.rate_streak >= 3;
+        let line = (blocked && self.told.insert((scope.clone(), false))).then(|| {
             let resumes = now + chrono::Duration::from_std(wait).unwrap_or_default();
             pause_line(failure, resumes)
         });
+        self.health = match failure.class {
+            Class::SignIn => Health::Down,
+            _ if blocked => Health::Blocked,
+            _ => Health::Degraded,
+        };
         Plan::Park { wait, line }
     }
 
+    /// An ordinary failure (class 18): retried as today, but no longer silent.
+    pub(crate) fn on_error(&mut self) {
+        if matches!(self.health, Health::Operational | Health::Recovering) {
+            self.health = Health::Degraded;
+        }
+    }
+
     /// A real answer from agent `slot` ends the incident and proves its login.
-    pub(crate) fn on_success(&mut self, slot: usize) {
+    /// After Blocked or Down it takes [`ANSWERS_TO_RECOVER`] in a row to be
+    /// Operational again; work on a login other than the primary stays
+    /// Degraded until it returns ("on standby" is sticky, spec 2.3).
+    pub(crate) fn on_success(&mut self, slot: usize, now: DateTime<Utc>) {
         self.rate_streak = 0;
         self.told.clear();
         if let Some(&i) = self.started_on.get(&slot) {
             self.accounts[i].limited = None;
+        }
+        let settled = if self.preferred(now).is_some_and(|p| p > 0) {
+            Health::Degraded
+        } else {
+            Health::Operational
+        };
+        self.health = match self.health {
+            Health::Blocked | Health::Down => {
+                self.answers = 1;
+                Health::Recovering
+            }
+            Health::Recovering => {
+                self.answers += 1;
+                if self.answers >= ANSWERS_TO_RECOVER {
+                    settled
+                } else {
+                    Health::Recovering
+                }
+            }
+            _ => settled,
+        };
+    }
+
+    /// The presence dot: "away" while work is parked behind a limit or a lost
+    /// sign-in, "online" otherwise (spec 2.4, Agent).
+    pub(crate) fn presence(&self) -> &'static str {
+        match self.health {
+            Health::Blocked | Health::Down => "away",
+            _ => "online",
         }
     }
 
@@ -905,7 +973,7 @@ mod tests {
         );
         assert!(!line.contains("weekly limit"), "D8: no provider wording");
         assert_eq!(park_line(&mut factory, &weekly), None);
-        factory.on_success(0);
+        factory.on_success(0, oct16());
         assert!(park_line(&mut factory, &weekly).is_some());
 
         // Short rate limits stay quiet until the third in a row.
@@ -914,6 +982,54 @@ mod tests {
         assert_eq!(park_line(&mut factory, &rate), None);
         assert_eq!(park_line(&mut factory, &rate), None);
         assert!(park_line(&mut factory, &rate).is_some());
+    }
+
+    /// The dot is away exactly while work waits on a limit or a lost
+    /// sign-in, and online again from the first real answer.
+    #[test]
+    fn presence_follows_health() {
+        let now = oct16();
+        let seen = |f: &Factory| (f.health, f.presence());
+        let mut f = Factory::default();
+        assert_eq!(seen(&f), (Health::Operational, "online"));
+        f.plan(0, &scope(), &weekly(), now);
+        assert_eq!(seen(&f), (Health::Blocked, "away"));
+        f.on_success(0, now);
+        assert_eq!(seen(&f), (Health::Recovering, "online"));
+        f.on_success(0, now);
+        assert_eq!(seen(&f), (Health::Recovering, "online"));
+        f.on_success(0, now);
+        assert_eq!(seen(&f), (Health::Operational, "online"));
+
+        let sign_in = classify(&agent_error("API Error: 401 expired"), now);
+        f.plan(0, &scope(), &sign_in, now);
+        assert_eq!(seen(&f), (Health::Down, "away"));
+
+        let mut f = Factory::default();
+        let rate = classify(&agent_error("Internal error: API Error: 429"), now);
+        f.plan(0, &scope(), &rate, now);
+        f.plan(0, &scope(), &rate, now);
+        assert_eq!(seen(&f), (Health::Degraded, "online"));
+        f.plan(0, &scope(), &rate, now);
+        assert_eq!(seen(&f), (Health::Blocked, "away"));
+
+        let mut f = Factory::default();
+        f.on_error();
+        assert_eq!(seen(&f), (Health::Degraded, "online"));
+        f.on_success(0, now);
+        assert_eq!(seen(&f), (Health::Operational, "online"));
+
+        // On the second login the dot stays online, and Degraded is sticky
+        // until the primary is free again.
+        let mut f = pool();
+        f.launch_env(0, now);
+        f.plan(0, &scope(), &weekly(), now);
+        assert_eq!(seen(&f), (Health::Degraded, "online"));
+        f.launch_env(0, now);
+        f.on_success(0, now);
+        assert_eq!(seen(&f), (Health::Degraded, "online"));
+        f.on_success(0, at(2026, 10, 19, 0, 3));
+        assert_eq!(seen(&f), (Health::Operational, "online"));
     }
 
     fn scope() -> SessionScope {
@@ -1053,7 +1169,7 @@ mod tests {
         factory.launch_env(0, oct16());
         factory.plan(0, &scope(), &weekly(), oct16());
         factory.launch_env(0, oct16());
-        factory.on_success(0);
+        factory.on_success(0, oct16());
         assert!(
             !factory.wants_restart(0, oct16()),
             "the primary is still limited"
@@ -1063,7 +1179,7 @@ mod tests {
         assert_eq!(factory.launch_env(0, after_reset), env(FACTORY_DIR));
         assert!(!factory.wants_restart(0, after_reset));
         // A real answer on a login clears its record.
-        factory.on_success(0);
+        factory.on_success(0, oct16());
         assert!(factory.accounts()[0].limited.is_none());
     }
 }
