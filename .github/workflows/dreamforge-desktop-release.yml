@@ -93,8 +93,13 @@ jobs:
           INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           out() { echo "$1" | tee -a "$GITHUB_OUTPUT"; }
+          # Check each value before writing it: a newline in an input would add outputs of its
+          # own (sha=... would point the signed build at another commit).
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit sha: '$SHA'"; exit 1; }
           out "sha=$SHA"
           if [ "$GITHUB_EVENT_NAME" != workflow_run ]; then
+            [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$INPUT_VERSION'"; exit 1; }
+            [[ "${INPUT_PUBLISH:-false}" =~ ^(true|false)$ ]] || { echo "::error::publish must be true or false"; exit 1; }
             out build=true
             out "version=$INPUT_VERSION"
             out "publish=${INPUT_PUBLISH:-false}"
@@ -111,6 +116,7 @@ jobs:
           fi
           # shellcheck disable=SC2086 # one released version per word
           version=$(python3 scripts/release-latest-json.py --next "$BUZZ_UPDATER_ENDPOINT" "$VERSION_FLOOR" ${tags//dreamforge-desktop-v/})
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::computed version is not plain x.y.z: '$version'"; exit 1; }
           out build=true
           out "version=$version"
           out publish=true
