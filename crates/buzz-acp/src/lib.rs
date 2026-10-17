@@ -5668,7 +5668,11 @@ fn handle_prompt_result(
                         queue.requeue_preserve_timestamps(batch);
                         restart_on_next_login = true;
                     }
-                    factory::Plan::Park { wait, line } => {
+                    factory::Plan::Park {
+                        wait,
+                        line,
+                        mention_owner,
+                    } => {
                         tracing::warn!(
                             channel_id = %batch.channel_id,
                             events = batch.events.len(),
@@ -5679,7 +5683,17 @@ fn handle_prompt_result(
                             "provider limit — parking batch"
                         );
                         if let Some(line) = line {
-                            spawn_failure_notice(rest_client, &batch, line, Vec::new());
+                            // Normally no mention: a parked request is a calm
+                            // line in the thread, and the owner hears about a
+                            // Critical through their card and #factory. With
+                            // neither of those configured this line is the
+                            // only path left, so it mentions them.
+                            let mentions = if mention_owner {
+                                owner_mentions(config.agent_owner.as_deref())
+                            } else {
+                                Vec::new()
+                            };
+                            spawn_failure_notice(rest_client, &batch, line, mentions);
                         }
                         queue.park(batch, std::time::Instant::now() + wait);
                     }
@@ -13496,9 +13510,7 @@ mod error_outcome_emission_tests {
             acp::AcpError::Io(std::io::Error::other("pipe broke")),
             acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5)),
             // The words quoted mid-message are a tool's output, not a 401.
-            agent_error(
-                "Internal error: the test asserted \"API Error: 401\" and Re-authenticate",
-            ),
+            agent_error("Internal error: the test asserted \"API Error: 401\" and Re-authenticate"),
         ] {
             assert_eq!(
                 factory::classify(&error, now).class,

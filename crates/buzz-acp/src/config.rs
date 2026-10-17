@@ -417,8 +417,9 @@ pub struct CliArgs {
     pub factory_channel: Option<String>,
 
     /// The Bench folder whose inbox gets the owner's Critical cards (spend
-    /// cap, lost sign-in, dropped request). Default `~/.dreamforge/bench`;
-    /// no cards are written while the folder does not exist.
+    /// cap, lost sign-in, dropped request). Defaults to the Bench's own root
+    /// (see [`default_bench_dir`]); the inbox is created when the first card
+    /// is written.
     #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
     pub factory_bench_dir: Option<PathBuf>,
 
@@ -811,6 +812,26 @@ fn validate_multiple_event_handling(
         ));
     }
     Ok(())
+}
+
+/// The Bench's own root, so a card written here lands in the inbox the
+/// desktop actually scans: `~/.dreamforge/bench`, and `~/.dreamforge-dev/bench`
+/// in a debug build, matching `desktop/src-tauri/src/bench/mod.rs`'s
+/// `root_dir`. The harness is built in the same profile as the desktop that
+/// launches it, so the two agree.
+///
+/// The folder is NOT required to exist: the card writer creates the inbox on
+/// demand. Refusing to write while the Bench has never run on this PC would
+/// silence exactly the first spend cap or lost sign-in, which is the one the
+/// owner most needs to hear about.
+pub(crate) fn default_bench_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let nest = if cfg!(debug_assertions) {
+        ".dreamforge-dev"
+    } else {
+        ".dreamforge"
+    };
+    Some(PathBuf::from(home).join(nest).join("bench"))
 }
 
 pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
@@ -1228,13 +1249,7 @@ impl Config {
                 }
                 parsed
             }),
-            bench: args
-                .factory_bench_dir
-                .or_else(|| {
-                    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
-                    home.map(|h| PathBuf::from(h).join(".dreamforge").join("bench"))
-                })
-                .filter(|dir| dir.is_dir()),
+            bench: args.factory_bench_dir.or_else(default_bench_dir),
         };
         let factory = crate::factory::FactoryHandle::new(factory);
 
@@ -3058,6 +3073,47 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    /// The owner's Critical cards have a sink even when the Bench has never
+    /// run on this PC — the writer creates the inbox on demand, and skipping
+    /// the write would silence exactly the first spend cap or lost sign-in.
+    /// The default root is the Bench's own (`bench/mod.rs` `root_dir`), per
+    /// build profile, so a card lands in the inbox the desktop scans.
+    #[test]
+    fn factory_bench_dir_defaults_to_the_benchs_root_and_need_not_exist() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("from_args should accept the defaults");
+        let bench = config.factory.lock().reporting.bench.clone();
+        assert_eq!(bench, default_bench_dir(), "the Bench's own root");
+        if let Some(dir) = bench {
+            assert!(dir.ends_with("bench"), "{}", dir.display());
+            let nest = dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string());
+            let want = if cfg!(debug_assertions) {
+                ".dreamforge-dev"
+            } else {
+                ".dreamforge"
+            };
+            assert_eq!(nest.as_deref(), Some(want));
+        }
+
+        // An explicit folder is kept whether or not it exists yet.
+        let missing = std::env::temp_dir().join("buzz-factory-bench-that-does-not-exist");
+        assert!(!missing.exists(), "{} should not exist", missing.display());
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--factory-bench-dir",
+            missing.to_str().expect("utf-8 temp dir"),
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("from_args should accept the folder");
+        assert_eq!(config.factory.lock().reporting.bench, Some(missing));
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

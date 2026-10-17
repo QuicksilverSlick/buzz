@@ -524,6 +524,11 @@ pub(crate) enum Plan {
     Park {
         wait: Duration,
         line: Option<String>,
+        /// Mention the owner on `line`. Set only when a Critical has no
+        /// other way to reach them (no Bench inbox and no #factory channel),
+        /// so a spend cap or a lost sign-in is never delivered nowhere. The
+        /// line's words stay neutral either way (D8).
+        mention_owner: bool,
     },
 }
 
@@ -766,12 +771,31 @@ impl Factory {
             _ => Health::Degraded,
         };
         self.set_health(health, now);
-        match failure.class {
-            Class::SpendCap => self.limit_card(failure, true),
-            Class::SignIn => self.limit_card(failure, false),
-            _ => {}
+        let critical = match failure.class {
+            Class::SpendCap => {
+                self.limit_card(failure, true);
+                true
+            }
+            Class::SignIn => {
+                self.limit_card(failure, false);
+                true
+            }
+            _ => false,
+        };
+        Plan::Park {
+            wait,
+            line,
+            mention_owner: critical && !self.critical_reaches_the_owner(),
         }
-        Plan::Park { wait, line }
+    }
+
+    /// Whether a Critical has a way to the owner that is not the work
+    /// thread: a Bench inbox for the card, or #factory for the STATE record.
+    /// With neither configured the thread line is the only delivery path
+    /// there is, so it mentions them — a Critical with zero paths is how an
+    /// outage goes unnoticed for a weekend.
+    fn critical_reaches_the_owner(&self) -> bool {
+        self.reporting.bench.is_some() || self.reporting.channel.is_some()
     }
 
     /// An ordinary failure (class 18): retried as today, but no longer silent.
@@ -1570,16 +1594,8 @@ mod tests {
             assert_eq!(line, neutral, "{}", failure.slug);
             let lower = line.to_lowercase();
             for word in [
-                "spend",
-                "spending",
-                "cap",
-                "billing",
-                "sign-in",
-                "sign in",
-                "raise it",
-                "claude",
-                "owner",
-                "pay",
+                "spend", "spending", "cap", "billing", "sign-in", "sign in", "raise it", "claude",
+                "owner", "pay",
             ] {
                 assert!(!lower.contains(word), "{word} in the partner line: {line}");
             }
@@ -1790,6 +1806,9 @@ mod tests {
             Plan::Park {
                 wait: PROBE_EVERY,
                 line: Some(pause_line(&spend, oct16() + chrono::Duration::minutes(30))),
+                // No Bench and no #factory in this fixture, so the one line
+                // the owner can see is mentioned.
+                mention_owner: true,
             }
         );
         // The probe restarts on the login that frees up first: the spend cap's.
@@ -2016,6 +2035,89 @@ mod tests {
             oct16(),
         );
         assert!(!none.path().join("inbox").exists());
+    }
+
+    /// A Critical always has somewhere to go. The card writer makes the
+    /// inbox itself, so the first spend cap on a PC where the Bench has never
+    /// run is still carded; and with no Bench and no #factory at all, the
+    /// thread line mentions the owner instead of reaching nobody.
+    #[test]
+    fn a_critical_is_never_delivered_nowhere() {
+        let spend = classify(
+            &agent_error("Internal error: You've hit your monthly spend limit · raise it"),
+            oct16(),
+        );
+        let sign_in = classify(
+            &agent_error(
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            oct16(),
+        );
+
+        // The Bench has never run here: no bench folder, not even its parent.
+        let root = tempfile::tempdir().unwrap();
+        let bench = root.path().join("never-ran").join("bench");
+        assert!(!bench.exists());
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Support Agent");
+        f.reporting.bench = Some(bench.clone());
+        let plan = f.plan(0, &scope(), &spend, oct16());
+        assert!(
+            matches!(
+                plan,
+                Plan::Park {
+                    mention_owner: false,
+                    ..
+                }
+            ),
+            "the card is the owner's path, so the thread stays calm: {plan:?}"
+        );
+        assert!(
+            read_card(&bench, "ade9d0e2-spend-cap").is_some(),
+            "the inbox is created on demand"
+        );
+
+        // No card sink and no #factory: the thread line is the only path.
+        for failure in [&spend, &sign_in] {
+            let mut f = Factory::new(None, "claude-agent-acp");
+            f.reporting = reporting("Support Agent");
+            let plan = f.plan(0, &scope(), failure, oct16());
+            let Plan::Park {
+                line,
+                mention_owner,
+                ..
+            } = plan
+            else {
+                panic!("expected a park");
+            };
+            assert!(mention_owner, "{}: the owner must be told", failure.slug);
+            // Mentioned, but still in neutral words (D8).
+            let line = line.expect("a line to mention them on");
+            assert!(!line.to_lowercase().contains("cap"), "{line}");
+        }
+
+        // A #factory channel on its own is enough: no mention.
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Support Agent");
+        f.reporting.channel = Some(uuid::Uuid::from_u128(9));
+        assert!(matches!(
+            f.plan(0, &scope(), &sign_in, oct16()),
+            Plan::Park {
+                mention_owner: false,
+                ..
+            }
+        ));
+
+        // A usage limit lifts by itself, so it is never a Critical.
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Support Agent");
+        assert!(matches!(
+            f.plan(0, &scope(), &weekly(), oct16()),
+            Plan::Park {
+                mention_owner: false,
+                ..
+            }
+        ));
     }
 
     #[test]
