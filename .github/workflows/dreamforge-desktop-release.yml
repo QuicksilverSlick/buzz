@@ -3,16 +3,17 @@ name: Dreamforge desktop release
 # Builds Dreamforge for macOS (Apple Silicon and Intel) and Windows, and publishes it
 # to the rolling release dreamforge-desktop-latest, which installed apps poll for updates.
 #
-# Publishing is automatic: when CI passes on a push to main, the gate job picks the next
-# version and the commit is built, published, tagged dreamforge-desktop-v<version>, and
-# checked through the public feed. A newer green main cancels a release still building,
-# so a burst of merges ships once, and nothing ships when no file the app is built from
-# changed since the last tag. A manual run (version, publish=true) still works as an
-# override. Pull requests touching this file only build; their installers are run artifacts.
+# Publishing is automatic: each time CI finishes for a push to main, the gate job looks at
+# main's head and, once that commit's own CI is green, picks the next version; the commit
+# is then built, published, tagged dreamforge-desktop-v<version>, and checked through the
+# public feed. Releases run one at a time, so a burst of merges ships once or twice, and
+# nothing ships when no file the app is built from changed since the last tag. A manual
+# run (version, publish=true) still works as an override. Pull requests touching this
+# file only build; their installers are run artifacts.
 #
 # Updater signing needs the TAURI_SIGNING_PRIVATE_KEY secret: the minisign key whose
 # public half is desktop/src-tauri/dreamforge-updater.pub, with an empty password.
-# The key only reaches code on main (manual runs on main, and CI-green pushes to main),
+# The key only reaches code on main (manual runs on main, and main's head once its CI is green),
 # so it never meets unreviewed code. Other runs still produce installers but no updater
 # archives, and publish refuses.
 #
@@ -44,10 +45,12 @@ on:
       - scripts/release-latest-json.py
 
 concurrency:
-  # Automatic runs for pushes cancel each other (one release per burst of merges), but
-  # never a manual run, and a CI run for a pull request never cancels a release.
+  # Automatic runs queue, never cancel: CI runs finish in any order, and an older one must
+  # not cancel the build of a newer main. Each run releases main's head, so the last one to
+  # run ships the newest green main. Manual runs have their own group, and a CI run for a
+  # pull request never touches a release.
   group: dreamforge-desktop-release-${{ github.event_name == 'workflow_run' && format('auto-{0}', github.event.workflow_run.event) || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -58,9 +61,10 @@ env:
   # publish=false test build uses a version above the live feed, or testers on that build
   # never update (the updater only moves to a higher version).
   VERSION_FLOOR: 0.5.36
-  # Green CI for a push to this repo's main: merged code, never a pull request's.
-  AUTO_RELEASE: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}
-  HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)) }}
+  # A CI run for a push to this repo's main (merged code, never a pull request's). The gate
+  # then releases main's head only once that commit's own CI is green.
+  AUTO_RELEASE: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}
+  HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)) }}
 
 jobs:
   gate:
@@ -95,28 +99,35 @@ jobs:
           out() { echo "$1" | tee -a "$GITHUB_OUTPUT"; }
           # Check each value before writing it: a newline in an input would add outputs of its
           # own (sha=... would point the signed build at another commit).
-          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit sha: '$SHA'"; exit 1; }
-          out "sha=$SHA"
+          sha_ok() { [[ "$1" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit sha: '$1'"; exit 1; }; }
           if [ "$GITHUB_EVENT_NAME" != workflow_run ]; then
+            sha_ok "$SHA"
             [[ -z "$INPUT_VERSION" || "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain x.y.z, got '$INPUT_VERSION'"; exit 1; }
             [[ "${INPUT_PUBLISH:-false}" =~ ^(true|false)$ ]] || { echo "::error::publish must be true or false"; exit 1; }
+            out "sha=$SHA"
             out build=true
             out "version=$INPUT_VERSION"
             out "publish=${INPUT_PUBLISH:-false}"
             exit 0
           fi
-          skip() { echo "::notice::not releasing $SHA: $1"; out build=false; out publish=false; exit 0; }
-          [ "$AUTO_RELEASE" = true ] || skip "the CI run was not a green push to main"
+          skip() { echo "::notice::not releasing: $1"; out build=false; out publish=false; exit 0; }
+          [ "$AUTO_RELEASE" = true ] || skip "the CI run was not for a push to this repo's main"
+          # Release main's head, not the commit whose CI run started this one: runs finish and
+          # queue in any order, so each one looks at main afresh.
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-          [ "$head" = "$SHA" ] || skip "main has moved on to $head, whose own CI run releases it"
+          sha_ok "$head"
+          ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$head&event=push&per_page=1" --jq '.workflow_runs[0] | "\(.status)/\(.conclusion)"')
+          [ "$ci" = completed/success ] || skip "CI for main's head $head is $ci; when it finishes it starts another release run"
+          git cat-file -e "$head^{commit}" 2>/dev/null || git fetch -q --filter=blob:none origin "$head"
           tags=$(git tag -l 'dreamforge-desktop-v*' --sort=-v:refname)
           last=$(echo "$tags" | head -n1)
-          if [ -n "$last" ] && [ -z "$(git diff --name-only --no-renames "$last" "$SHA" -- desktop crates Cargo.toml Cargo.lock scripts preview-features.json .github/workflows/dreamforge-desktop-release.yml)" ]; then
-            skip "no file the app is built from changed since $last"
+          if [ -n "$last" ] && [ -z "$(git diff --name-only --no-renames "$last" "$head" -- desktop crates Cargo.toml Cargo.lock scripts preview-features.json .github/workflows/dreamforge-desktop-release.yml)" ]; then
+            skip "no file the app is built from changed between $last and main's head $head"
           fi
           # shellcheck disable=SC2086 # one released version per word
           version=$(python3 scripts/release-latest-json.py --next "$BUZZ_UPDATER_ENDPOINT" "$VERSION_FLOOR" ${tags//dreamforge-desktop-v/})
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::computed version is not plain x.y.z: '$version'"; exit 1; }
+          out "sha=$head"
           out build=true
           out "version=$version"
           out publish=true
