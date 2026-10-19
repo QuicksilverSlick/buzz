@@ -3552,12 +3552,71 @@ async fn read_probe(
     match tokio::time::timeout(limit, probe).await {
         Ok(stdout) => stdout,
         Err(_) => {
-            if !pid.is_some_and(kill_process_group) {
-                let _ = child.start_kill();
-            }
+            kill_probe_tree(&mut child, pid).await;
             None
         }
     }
+}
+
+/// A killed probe is reaped within this, or left to `kill_on_drop`.
+const REAP_AFTER_KILL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Kill a timed-out probe and everything it started, then reap it.
+///
+/// On Unix the probe is its own process group, so one signal takes a
+/// launcher's children with it. On Windows there is no group to signal —
+/// `kill_process_group` is a stub there, and `configure_version_probe` sets
+/// `process_group` under `#[cfg(unix)]` only — and the CLI is reached
+/// through a `.cmd` shim and node, so `start_kill` kills the shim and
+/// leaves the grandchildren running. `taskkill /T /F` walks the tree the
+/// way the OS records it.
+///
+/// This used to run once per agent spawn, behind the version check. The
+/// sign-in check puts it on a 15-minute loop for every login of the pool,
+/// so a `claude auth status` that hangs would orphan a node process roughly
+/// 96 times a day per login — on the platform the harness ships on.
+///
+/// Either way the child is awaited after the kill, so its handle is reaped
+/// here instead of being left to `Drop`'s non-blocking `try_wait` to miss.
+async fn kill_probe_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    let killed = match pid {
+        Some(pid) => kill_process_tree(pid).await,
+        None => false,
+    };
+    if !killed {
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(REAP_AFTER_KILL, child.wait()).await;
+}
+
+#[cfg(unix)]
+async fn kill_process_tree(pid: u32) -> bool {
+    kill_process_group(pid)
+}
+
+/// `taskkill /T /F` on the probe's own pid: the tree below it goes too, so a
+/// shim's node child cannot outlive the probe that started it.
+#[cfg(windows)]
+async fn kill_process_tree(pid: u32) -> bool {
+    let mut cmd = tokio::process::Command::new("taskkill");
+    cmd.arg("/T")
+        .arg("/F")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    configure_no_window(&mut cmd);
+    matches!(
+        tokio::time::timeout(REAP_AFTER_KILL, cmd.status()).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_process_tree(_pid: u32) -> bool {
+    false
 }
 
 /// Write a stub CLI that prints `stdout` and exits with `code`, the way
@@ -6484,6 +6543,63 @@ mod tests {
         assert!(!claude_cli_accepts_thinking_display(&cmd).await);
         cmd.env("CLAUDE_CODE_EXECUTABLE", "");
         assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+    }
+
+    /// The Windows half of the same promise. There is no process group to
+    /// signal here, and the CLI is reached through a `.cmd` shim, so
+    /// `start_kill` would kill the shim and leave its children running —
+    /// once per hang, forever, now that the sign-in check runs this every
+    /// 15 minutes for every login.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_probe_timeout_kills_the_whole_tree_on_windows() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started.txt");
+        let alive = dir.path().join("alive.txt");
+
+        // A grandchild that says it started, waits ~5s, then says it is
+        // still alive — which it must never get to do.
+        let grandchild = dir.path().join("grandchild.cmd");
+        std::fs::write(
+            &grandchild,
+            format!(
+                "@echo off
+echo started > \"{}\"
+ping -n 6 127.0.0.1 > nul
+echo                  alive > \"{}\"
+",
+                started.display(),
+                alive.display()
+            ),
+        )
+        .unwrap();
+        // A launcher that starts it and then hangs, like a shim whose node
+        // child is the thing actually doing the work.
+        let launcher = dir.path().join("hangs.cmd");
+        std::fs::write(
+            &launcher,
+            format!(
+                "@echo off
+start \"\" /b \"{}\"
+ping -n 120 127.0.0.1 > nul
+",
+                grandchild.display()
+            ),
+        )
+        .unwrap();
+
+        let mut cmd = tokio::process::Command::new(&launcher);
+        let out = super::probe_stdout(&mut cmd, 256, Duration::from_millis(1500)).await;
+        assert_eq!(out, None, "a probe that hangs answers nothing");
+        assert!(started.exists(), "the grandchild really ran");
+
+        // Past when it would have written, with the kill long since done.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !alive.exists(),
+            "the launcher's child must not outlive the probe"
+        );
     }
 
     #[cfg(unix)]
