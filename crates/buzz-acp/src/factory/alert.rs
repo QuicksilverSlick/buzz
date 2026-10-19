@@ -35,7 +35,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// in one incident — the owner's last text must never be a reassurance the
 /// state has since contradicted — and two different ways of being stopped
 /// are not an increase.
-fn severity(health: Health) -> u8 {
+pub(super) fn severity(health: Health) -> u8 {
     match health {
         Health::Operational | Health::Recovering => 0,
         Health::Degraded => 1,

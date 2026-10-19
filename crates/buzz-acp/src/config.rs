@@ -1302,6 +1302,9 @@ impl Config {
             }),
             bench: args.factory_bench_dir.or_else(default_bench_dir),
         };
+        // A harness that stopped mid-outage comes back up in it, so the
+        // all-clear it owes the owner still goes out (M2 item 4).
+        factory.resume_from_saved_state(chrono::Utc::now());
         let factory = crate::factory::FactoryHandle::new(factory);
 
         let config = Config {
