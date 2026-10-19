@@ -2635,6 +2635,49 @@ mod idle_pool_sleep_tests {
         }
     }
 
+    /// An idle agent must not keep sitting on a login the pool has given up
+    /// on. A sign-in check that marks the login an agent is running on
+    /// signed out hands the work over and says so — "It is now running on
+    /// login fallback", on the Critical card and in the owner's text —
+    /// while the agent itself is still on the dead one. `wants_restart` is
+    /// otherwise consulted only after a turn, and the agent this check
+    /// exists for is the one nobody has asked anything for hours, so the
+    /// main loop asks this between turns instead.
+    #[test]
+    fn an_idle_agent_moves_off_a_login_a_check_marked_signed_out() {
+        let now = chrono::Utc::now();
+        let pool = r"token=env;fallback=C:\factory\claude";
+        let mut factory = factory::Factory::new(Some(pool), "claude-agent-acp");
+        factory.launch_env(0, now);
+        let quiet = slot(false);
+
+        // Nothing is wrong: the agent stays where it is.
+        assert!(!idle_agent_should_move(true, &quiet, &factory, 0, now));
+
+        // A check marks the login it is running on signed out.
+        factory.signin_checked(0, factory::SignIn::SignedOut, now);
+        assert!(
+            idle_agent_should_move(true, &quiet, &factory, 0, now),
+            "the agent must move off the login it lost"
+        );
+
+        // Not while it is mid-turn, and not when its slot is already being
+        // respawned — either would interrupt or double up.
+        assert!(!idle_agent_should_move(false, &quiet, &factory, 0, now));
+        assert!(!idle_agent_should_move(true, &slot(true), &factory, 0, now));
+
+        // And once the restart has taken it to the preferred login, it
+        // stays put: one restart per change, not one per loop iteration.
+        factory.launch_env(0, now);
+        assert!(!idle_agent_should_move(true, &quiet, &factory, 0, now));
+
+        // Without a pool there is nowhere to move to, so this never fires.
+        let mut single = factory::Factory::new(None, "claude-agent-acp");
+        single.launch_env(0, now);
+        single.signin_checked(0, factory::SignIn::SignedOut, now);
+        assert!(!idle_agent_should_move(true, &quiet, &single, 0, now));
+    }
+
     // The call-site signal for the `wake_or_respawn_in_flight` gate is
     // `any_respawn_in_flight(&crash_history)`, NOT `!respawn_tasks.is_empty()`.
     // Regression for the PR #5682 review blocker: completed respawn tasks are
@@ -3197,6 +3240,12 @@ async fn run_harness(
     // spawn_and_init never blocks the main loop.
     let maintenance_interval = Duration::from_secs(30);
     let mut last_maintenance = std::time::Instant::now();
+    // The sign-in check's own interval (spec M2 item 3), checked on the
+    // maintenance beat. The pool has just started, so its logins were good a
+    // moment ago: the first check is one interval from now.
+    let signin_check_every = (config.factory_signin_check_secs > 0)
+        .then(|| Duration::from_secs(config.factory_signin_check_secs));
+    let mut last_signin_check = std::time::Instant::now();
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -3362,6 +3411,65 @@ async fn run_harness(
                 ) {
                     typing_channels.insert(scope, thread_tags);
                 }
+            }
+
+            // Check the sign-ins while no turn is running: a turn that is in
+            // flight will find a lost sign-in itself, and its own path
+            // (`handle_prompt_result`) is the one that knows which request
+            // to move. With the pool idle there is nobody to find out, which
+            // is exactly the three hours this check exists to cut short.
+            if let Some(every) = signin_check_every {
+                if last_signin_check.elapsed() >= every && pool.task_map().is_empty() {
+                    last_signin_check = std::time::Instant::now();
+                    spawn_signin_check(config, &ctx.rest_client);
+                }
+            }
+        }
+
+        // Move an idle agent off a login the pool has given up on, before a
+        // request arrives on it.
+        //
+        // A check that marks the login an agent is running on signed out
+        // hands the work to the next login — and says so, on the Critical
+        // card and in the owner's text: "It is now running on login
+        // fallback." Nothing made that true. `wants_restart` is otherwise
+        // consulted only after a successful turn, and the agent this check
+        // exists for is the one nobody has asked anything for hours. So the
+        // restart happens here instead, between turns, where it costs
+        // nothing but the spawn.
+        //
+        // Every iteration rather than the 30-second maintenance beat: the
+        // request that must not land on a dead login can arrive at any
+        // moment, and this is one lock and a comparison per slot.
+        if pool_ready && signin_check_every.is_some() && pool.task_map().is_empty() {
+            let now = chrono::Utc::now();
+            for (index, slot) in crash_history.iter_mut().enumerate() {
+                let move_it = idle_agent_should_move(
+                    pool.slot_idle(index),
+                    slot,
+                    &config.factory.lock(),
+                    index,
+                    now,
+                );
+                if !move_it {
+                    continue;
+                }
+                let Some(agent) = pool.take_idle(index) else {
+                    continue;
+                };
+                tracing::info!(
+                    agent = index,
+                    "restarting between turns onto the account pool's preferred login"
+                );
+                spawn_respawn_task(
+                    agent,
+                    config,
+                    slot,
+                    false,
+                    &respawn_tx,
+                    &mut respawn_tasks,
+                    observer.clone(),
+                );
             }
         }
 
@@ -5532,20 +5640,98 @@ fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
     }
 }
 
-/// Log the STATE record when the harness's health changed, and post it to
-/// #factory when one is configured (spec 4.2). Never into a work thread.
+/// Log the STATE record when the harness's health changed, post it to
+/// #factory when one is configured (spec 4.2), and text the owner about a
+/// Critical (spec M2 item 4). Never into a work thread.
 fn report_factory_state(config: &Config, rest: &relay::RestClient) {
-    let Some(record) = config.factory.lock().take_report(chrono::Utc::now()) else {
-        return;
+    let (record, channel, texts) = {
+        let mut factory = config.factory.lock();
+        (
+            factory.take_report(chrono::Utc::now()),
+            factory.reporting.channel,
+            factory.take_alerts(),
+        )
     };
-    let channel = config.factory.lock().reporting.channel;
-    tracing::warn!(posted = channel.is_some(), "factory {record}");
-    if let Some(channel) = channel {
-        let rest = rest.clone();
-        tokio::spawn(async move {
-            pool::post_notice(&rest, channel, &ThreadTags::default(), &record, &[]).await;
-        });
+    if record.is_none() && texts.is_empty() {
+        return;
     }
+    tokio::spawn(deliver_factory_state(
+        record,
+        channel,
+        texts,
+        rest.clone(),
+        config.factory_alert_cmd.clone(),
+        config.factory_alert_sms_to.clone(),
+    ));
+}
+
+/// Post a STATE record to #factory and hand the owner's texts to their alert
+/// command.
+///
+/// Both are off the work path. A record that does not post and a text that
+/// does not send are logged and nothing more: neither is ever a reason an
+/// agent stops working.
+async fn deliver_factory_state(
+    record: Option<String>,
+    channel: Option<Uuid>,
+    texts: Vec<String>,
+    rest: relay::RestClient,
+    alert_cmd: Option<String>,
+    sms_to: Option<String>,
+) {
+    if let Some(record) = record {
+        tracing::warn!(posted = channel.is_some(), "factory {record}");
+        if let Some(channel) = channel {
+            pool::post_notice(&rest, channel, &ThreadTags::default(), &record, &[]).await;
+        }
+    }
+    for text in texts {
+        match &alert_cmd {
+            Some(cmd) => factory::send_alert(cmd, sms_to.as_deref(), &text).await,
+            None => tracing::warn!(
+                "a Critical opened but {} is unset — the owner was not texted: {text}",
+                factory::ALERT_CMD_ENV
+            ),
+        }
+    }
+}
+
+/// Ask each login of the pool whether its sign-in is still good, and act on
+/// what comes back exactly as a failed turn would (spec M2 item 3).
+///
+/// Runs off the main loop: every probe spawns a short-lived process. It costs
+/// no model usage, and only a definite "not signed in" changes anything.
+fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
+    let factory = config.factory.clone();
+    let targets = factory.lock().signin_check_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let rest = rest.clone();
+    let alert_cmd = config.factory_alert_cmd.clone();
+    let sms_to = config.factory_alert_sms_to.clone();
+    tokio::spawn(async move {
+        let mut changed = false;
+        for (login, env) in targets {
+            let found = factory::signin_probe(&env).await;
+            tracing::debug!(login, "sign-in check: {found:?}");
+            changed |= factory
+                .lock()
+                .signin_checked(login, found, chrono::Utc::now());
+        }
+        if !changed {
+            return;
+        }
+        let (record, channel, texts) = {
+            let mut factory = factory.lock();
+            (
+                factory.take_report(chrono::Utc::now()),
+                factory.reporting.channel,
+                factory.take_alerts(),
+            )
+        };
+        deliver_factory_state(record, channel, texts, rest, alert_cmd, sms_to).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6461,6 +6647,26 @@ fn default_heartbeat_prompt() -> String {
 /// the actual shutdown + backoff + spawn_and_init work into a background task.
 /// The result comes back through `respawn_tx` so the main loop stays responsive.
 ///
+/// Whether idle agent `index` should be restarted now onto the login the
+/// account pool would pick for it.
+///
+/// Three things have to hold: the agent is `idle` (sitting in its slot, so
+/// taking it out interrupts no turn), nothing is already respawning that
+/// slot, and the factory says the login it was started on is no longer the
+/// one the pool prefers — a sign-in check having marked it signed out, or an
+/// earlier login's limit having lifted.
+///
+/// Pure, so the rule can be exercised without a live agent subprocess.
+fn idle_agent_should_move(
+    idle: bool,
+    slot: &SlotCircuit,
+    factory: &factory::Factory,
+    index: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    idle && !slot.respawn_in_flight && factory.wants_restart(index, now)
+}
+
 /// Returns `true` if a respawn task was spawned, `false` if the circuit is open.
 ///
 /// `crashed` is false for a planned restart (a switch of account-pool login):
@@ -10892,6 +11098,9 @@ mod build_mcp_servers_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 
@@ -12015,6 +12224,9 @@ mod error_outcome_emission_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 
@@ -13747,11 +13959,17 @@ mod error_outcome_emission_tests {
     /// requests.
     #[tokio::test]
     async fn limit_errors_park_without_spending_the_retry_budget() {
+        // This test runs on the real clock, so the reset must stay in the future: a fixed
+        // "resets Oct 18, 7pm" passed on 18 Oct 2026, and the park budget then rightly gave up.
+        let weekly = format!(
+            "Internal error: You've hit your weekly limit · resets {} (UTC)",
+            (chrono::Utc::now() + chrono::Duration::days(3)).format("%b %-d, %-I%P")
+        );
         // The dot turns away while work waits; one short rate limit only slows it.
         for (error, presence) in [
             (
                 adapter_error(serde_json::json!({"code": -32603,
-                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "message": weekly,
                     "data": {"errorKind": "rate_limit"}})),
                 "away",
             ),
@@ -13817,7 +14035,11 @@ mod error_outcome_emission_tests {
         assert_eq!(respawn_tasks.len(), 1);
         assert_eq!(config.factory.lock().label(0), "two");
 
-        // A sign-in loss with the same pool parks; it never rotates.
+        // A lost sign-in on the second login now re-runs the same batch
+        // too (spec M2 item 2): the only login left is the primary, whose
+        // limit has not lifted, so there is nowhere to go and the batch
+        // parks — but the login it lost is marked signed out, which no
+        // clock lifts.
         let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
             &config,
             agent_error(
@@ -13830,6 +14052,31 @@ mod error_outcome_emission_tests {
         assert!(!queue.has_flushable_work());
         assert!(pool.agents_mut()[0].is_some());
         assert!(respawn_tasks.is_empty());
+        assert_eq!(config.factory.lock().presence(), "away");
+
+        // With the primary free again, the same loss hands the batch over at
+        // once instead of parking it: three hours of downtime become none.
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
+            &config,
+            agent_error("API Error: OAuth session expired and could not be refreshed"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "the same request");
+        assert!(queue.has_flushable_work(), "runs again now, not parked");
+        assert!(pool.agents_mut()[0].is_none(), "the agent restarts");
+        assert_eq!(respawn_tasks.len(), 1);
+        assert_eq!(config.factory.lock().label(0), "two");
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "the work is moving, so the dot stays green"
+        );
     }
 
     /// An ordinary error still spends the budget and is dropped at the end.

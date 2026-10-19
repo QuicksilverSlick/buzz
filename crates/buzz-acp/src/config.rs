@@ -401,14 +401,27 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
 
-    /// Claude only: an ordered, `;`-separated pool of `CLAUDE_CONFIG_DIR`
-    /// folders, each signed in to its own subscription (first = primary).
-    /// On a usage or spend limit the agent restarts on the next free login
-    /// and re-runs the same request; it returns to the primary after its
-    /// reset. Write an entry as `label=folder` to name that login in records
-    /// and cards; a folder in the home directory is named `primary`, never
-    /// after the OS account.
-    #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
+    /// Claude only: an ordered, `;`-separated pool of logins (first =
+    /// primary). On a usage or spend limit, or a lost sign-in, the agent
+    /// restarts on the next healthy login and re-runs the same request; it
+    /// returns to the primary once that login is free again.
+    ///
+    /// An entry is normally a `CLAUDE_CONFIG_DIR` folder signed in to its
+    /// own subscription. Write it as `label=folder` to name that login in
+    /// records and cards; a folder in the home directory is named `primary`,
+    /// never after the OS account.
+    ///
+    /// One entry may be `label=env` instead of a folder, meaning "this login
+    /// is the agent's own environment, unchanged": no `CLAUDE_CONFIG_DIR`
+    /// override, so its settings folder stays as it is, and no blanked
+    /// `CLAUDE_CODE_OAUTH_TOKEN`, so its own long-lived `claude setup-token`
+    /// token is the sign-in. An agent with its own token and its folder
+    /// login as the fallback is written:
+    ///
+    /// ```text
+    /// token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude
+    /// ```
+    #[arg(long, env = crate::factory::ACCOUNT_POOL_ENV)]
     pub claude_account_pool: Option<String>,
 
     /// The #factory channel (uuid) this harness posts its STATE records to
@@ -422,6 +435,37 @@ pub struct CliArgs {
     /// is written.
     #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
     pub factory_bench_dir: Option<PathBuf>,
+
+    /// How often, in seconds, to check that every login's Claude sign-in is
+    /// still valid, so a lost sign-in is found by the harness rather than by
+    /// the next person who asks the agent for something. `0` disables it.
+    ///
+    /// The check runs `claude auth status --json` in each login's own launch
+    /// environment and spends no model usage: no prompt, nothing billable.
+    /// Only a definite "not signed in" is acted on, and then exactly as a
+    /// real 401 would be — the login is marked signed out, the work moves to
+    /// the next healthy login, the Critical card is raised and the owner is
+    /// texted.
+    #[arg(long, env = crate::factory::SIGNIN_CHECK_SECS_ENV,
+          default_value_t = crate::factory::SIGNIN_CHECK_SECS_DEFAULT)]
+    pub factory_signin_check_secs: u64,
+
+    /// A command line the harness runs to text the owner when a Critical
+    /// opens, and once more when it closes. The alert text is passed as the
+    /// command's last argument. Unset: no texts are sent.
+    ///
+    /// ```text
+    /// python "C:\Users\PC owner\.buzz\.agents\skills\sms\send_sms.py"
+    /// ```
+    #[arg(long, env = crate::factory::ALERT_CMD_ENV)]
+    pub factory_alert_cmd: Option<String>,
+
+    /// Who those texts go to. Set, it is placed in the alert command's own
+    /// process environment as `SMS_TO` and nowhere else — the harness's own
+    /// environment is never changed, so an agent that texts a client with
+    /// the same script keeps its own recipient.
+    #[arg(long, env = crate::factory::ALERT_SMS_TO_ENV)]
+    pub factory_alert_sms_to: Option<String>,
 
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
@@ -678,6 +722,12 @@ pub struct Config {
     pub base_prompt_content: Option<String>,
     /// Harness-wide failure state: classes, parks and who has been told.
     pub(crate) factory: crate::factory::FactoryHandle,
+    /// How often to check every login's Claude sign-in; `0` disables it.
+    pub factory_signin_check_secs: u64,
+    /// The command line that texts the owner when a Critical opens.
+    pub factory_alert_cmd: Option<String>,
+    /// The recipient for those texts, set on the alert command only.
+    pub factory_alert_sms_to: Option<String>,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1252,6 +1302,9 @@ impl Config {
             }),
             bench: args.factory_bench_dir.or_else(default_bench_dir),
         };
+        // A harness that stopped mid-outage comes back up in it, so the
+        // all-clear it owes the owner still goes out (M2 item 4).
+        factory.resume_from_saved_state(chrono::Utc::now());
         let factory = crate::factory::FactoryHandle::new(factory);
 
         let config = Config {
@@ -1307,6 +1360,19 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             factory,
+            factory_signin_check_secs: args.factory_signin_check_secs,
+            factory_alert_cmd: args
+                .factory_alert_cmd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            factory_alert_sms_to: args
+                .factory_alert_sms_to
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
         };
 
         Ok(config)
@@ -1690,6 +1756,9 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 

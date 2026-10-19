@@ -3369,6 +3369,106 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// The variable naming the Claude CLI that claude-agent-acp will run. Unset,
+/// the adapter runs its own bundled CLI, which cannot be inspected from here.
+const CLAUDE_EXECUTABLE_ENV: &str = "CLAUDE_CODE_EXECUTABLE";
+
+/// The Claude CLI a probe should run: the one the adapter itself would run
+/// when the launch environment or this process names it, and otherwise
+/// `claude` resolved on `PATH` the way the OS resolves it (see
+/// [`resolve_on_path`]) — a bare name Windows cannot start is no use to a
+/// probe.
+///
+/// Either way the credential it reads is the one `launch_env` chose: a
+/// sign-in lives in `CLAUDE_CONFIG_DIR` or in a token, never in the binary.
+pub(crate) fn claude_cli(launch_env: &[(String, String)]) -> std::ffi::OsString {
+    launch_env
+        .iter()
+        .find(|(key, _)| key == CLAUDE_EXECUTABLE_ENV)
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os(CLAUDE_EXECUTABLE_ENV))
+        .filter(|path| !path.is_empty())
+        .or_else(|| resolve_on_path("claude", launch_env))
+        .unwrap_or_else(|| "claude".into())
+}
+
+/// The extensions Windows will actually start a program from, in the order
+/// `PATHEXT` lists them for a CLI installed by npm. `.cmd` and `.bat` are
+/// batch shims — the desktop's `is_batch_shim`
+/// (`desktop/src-tauri/src/managed_agents/runtime/path.rs`) names the same
+/// two, and skips them for `CLAUDE_CODE_EXECUTABLE` because the *node*
+/// adapter cannot start one. Rust's own `Command` can: it runs a `.cmd`
+/// through `cmd.exe`, verified against this machine's `claude.cmd`. The two
+/// crates share no dependency, so the idea is mirrored here rather than the
+/// code.
+#[cfg(windows)]
+const PROGRAM_EXTS: [&str; 3] = [".exe", ".cmd", ".bat"];
+
+/// Resolve `program` on `PATH` the way the OS would, because
+/// `Command::new("claude")` does not.
+///
+/// On Windows `CreateProcess` appends `.exe` to an extensionless program and
+/// nothing else — it never consults `PATHEXT`. The npm install of the Claude
+/// CLI ships `claude` (a `sh` script Windows cannot run) and `claude.cmd`,
+/// and no `claude.exe` at all, so the bare name could not spawn and every
+/// probe on the owner's own machine came back Unknown. So each directory of
+/// `PATH` is tried against each candidate extension, in the order Windows
+/// itself would, and the resolved path is what gets spawned.
+///
+/// `None` when nothing resolves, which leaves the bare name to fail the way
+/// it always did: a probe that cannot run concludes nothing.
+///
+/// On Unix the bare name is already resolved by `execvp`, so this is a
+/// no-op — and `PATH` there may legitimately name a program with no
+/// extension at all.
+#[cfg(windows)]
+fn resolve_on_path(program: &str, launch_env: &[(String, String)]) -> Option<std::ffi::OsString> {
+    // The launch environment's own `PATH` when it sets one, because that is
+    // the `PATH` the spawned child would search.
+    let path = launch_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"))?;
+    for dir in std::env::split_paths(&path) {
+        for ext in PROGRAM_EXTS {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.into_os_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_on_path(_program: &str, _launch_env: &[(String, String)]) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// Run `cmd` and read at most `max_bytes` of its stdout within `limit`,
+/// whatever it exits with. `None` when the spawn fails or the time runs out:
+/// a probe that did not answer says nothing, rather than saying something
+/// wrong.
+///
+/// The exit status is deliberately not a verdict here. `claude auth status
+/// --json` prints `{"loggedIn": false, …}` and exits **1** when the login is
+/// signed out — the one answer the sign-in check exists to read — so
+/// requiring a clean exit threw it away and left every signed-out login
+/// looking like a probe that could not tell. The version check, whose
+/// caller has no use for a version line from a CLI that did not run
+/// cleanly, keeps the strict form through [`read_probe`].
+pub(crate) async fn probe_stdout(
+    cmd: &mut tokio::process::Command,
+    max_bytes: u64,
+    limit: std::time::Duration,
+) -> Option<String> {
+    configure_version_probe(cmd);
+    let child = cmd.spawn().ok()?;
+    let stdout = read_probe(child, max_bytes, limit, false).await?;
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// Whether the CLI claude-agent-acp will run accepts `--thinking-display`.
 ///
 /// The adapter runs `CLAUDE_CODE_EXECUTABLE` when set and its bundled CLI
@@ -3376,16 +3476,18 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
 /// variable, a hung or failing binary, or unparseable output all answer
 /// `false` and leave the session exactly as before.
 async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> bool {
-    const KEY: &str = "CLAUDE_CODE_EXECUTABLE";
     let executable = cmd
         .as_std()
         .get_envs()
-        .find(|(key, _)| *key == KEY)
+        .find(|(key, _)| *key == CLAUDE_EXECUTABLE_ENV)
         .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
-        .unwrap_or_else(|| std::env::var_os(KEY))
+        .unwrap_or_else(|| std::env::var_os(CLAUDE_EXECUTABLE_ENV))
         .filter(|path| !path.is_empty());
     let Some(executable) = executable else {
-        tracing::debug!(target: "acp::spawn", "{KEY} unset; not requesting thinking summaries");
+        tracing::debug!(
+            target: "acp::spawn",
+            "{CLAUDE_EXECUTABLE_ENV} unset; not requesting thinking summaries"
+        );
         return false;
     };
     let mut version_cmd = tokio::process::Command::new(&executable);
@@ -3416,38 +3518,141 @@ fn configure_version_probe(cmd: &mut tokio::process::Command) {
 }
 
 /// Read at most a version line from `child` and require a clean exit within
-/// `limit`. On timeout the whole process group is killed.
+/// `limit`.
 async fn claude_version_within(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     limit: std::time::Duration,
 ) -> Option<(u64, u64, u64)> {
-    use tokio::io::AsyncReadExt;
     const MAX_VERSION_BYTES: u64 = 256;
+    let stdout = read_probe(child, MAX_VERSION_BYTES, limit, true).await?;
+    parse_claude_version(&String::from_utf8_lossy(&stdout))
+}
+
+/// Read at most `max_bytes` of `child`'s stdout within `limit`, requiring a
+/// clean exit when `require_success`. On timeout the whole process group is
+/// killed, so a launcher's children do not outlive the probe.
+async fn read_probe(
+    mut child: tokio::process::Child,
+    max_bytes: u64,
+    limit: std::time::Duration,
+    require_success: bool,
+) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
     let pid = child.id();
     let probe = async {
         let mut stdout = Vec::new();
         let pipe = child.stdout.take()?;
-        pipe.take(MAX_VERSION_BYTES)
-            .read_to_end(&mut stdout)
-            .await
-            .ok()?;
-        child.wait().await.ok()?.success().then_some(stdout)
+        pipe.take(max_bytes).read_to_end(&mut stdout).await.ok()?;
+        let status = child.wait().await.ok()?;
+        // The exit status still has to be reached — a process that never
+        // ends is a timeout, not an answer — but it is only a verdict on
+        // the output when the caller says so.
+        (!require_success || status.success()).then_some(stdout)
     };
     match tokio::time::timeout(limit, probe).await {
-        Ok(stdout) => parse_claude_version(&String::from_utf8_lossy(&stdout?)),
+        Ok(stdout) => stdout,
         Err(_) => {
-            if !pid.is_some_and(kill_process_group) {
-                let _ = child.start_kill();
-            }
+            kill_probe_tree(&mut child, pid).await;
             None
         }
+    }
+}
+
+/// A killed probe is reaped within this, or left to `kill_on_drop`.
+const REAP_AFTER_KILL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Kill a timed-out probe and everything it started, then reap it.
+///
+/// On Unix the probe is its own process group, so one signal takes a
+/// launcher's children with it. On Windows there is no group to signal —
+/// `kill_process_group` is a stub there, and `configure_version_probe` sets
+/// `process_group` under `#[cfg(unix)]` only — and the CLI is reached
+/// through a `.cmd` shim and node, so `start_kill` kills the shim and
+/// leaves the grandchildren running. `taskkill /T /F` walks the tree the
+/// way the OS records it.
+///
+/// This used to run once per agent spawn, behind the version check. The
+/// sign-in check puts it on a 15-minute loop for every login of the pool,
+/// so a `claude auth status` that hangs would orphan a node process roughly
+/// 96 times a day per login — on the platform the harness ships on.
+///
+/// Either way the child is awaited after the kill, so its handle is reaped
+/// here instead of being left to `Drop`'s non-blocking `try_wait` to miss.
+async fn kill_probe_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    let killed = match pid {
+        Some(pid) => kill_process_tree(pid).await,
+        None => false,
+    };
+    if !killed {
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(REAP_AFTER_KILL, child.wait()).await;
+}
+
+#[cfg(unix)]
+async fn kill_process_tree(pid: u32) -> bool {
+    kill_process_group(pid)
+}
+
+/// `taskkill /T /F` on the probe's own pid: the tree below it goes too, so a
+/// shim's node child cannot outlive the probe that started it.
+#[cfg(windows)]
+async fn kill_process_tree(pid: u32) -> bool {
+    let mut cmd = tokio::process::Command::new("taskkill");
+    cmd.arg("/T")
+        .arg("/F")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    configure_no_window(&mut cmd);
+    matches!(
+        tokio::time::timeout(REAP_AFTER_KILL, cmd.status()).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_process_tree(_pid: u32) -> bool {
+    false
+}
+
+/// Write a stub CLI that prints `stdout` and exits with `code`, the way
+/// `alert.rs` writes its fake sender: a `.cmd` on Windows, a `sh` script
+/// elsewhere. Returns the path to hand to `CLAUDE_CODE_EXECUTABLE`.
+#[cfg(test)]
+pub(crate) fn write_stub_cli(
+    dir: &std::path::Path,
+    name: &str,
+    stdout: &str,
+    code: i32,
+) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join(format!("{name}.cmd"));
+        std::fs::write(
+            &path,
+            format!("@echo off\r\necho {stdout}\r\nexit /b {code}\r\n"),
+        )
+        .unwrap();
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{name}.sh"));
+        std::fs::write(&path, format!("#!/bin/sh\necho '{stdout}'\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 }
 
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
-fn configure_no_window(cmd: &mut tokio::process::Command) {
+pub(crate) fn configure_no_window(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -3463,6 +3668,125 @@ mod tests {
 
     fn opt(kind: &str, id: &str) -> serde_json::Value {
         serde_json::json!({ "kind": kind, "optionId": id })
+    }
+
+    // ── Probes: which binary, and whose answer the exit status is ───────────
+
+    /// `CLAUDE_CODE_EXECUTABLE` still wins, from the launch environment
+    /// first and this process second, and an empty value is no value.
+    #[test]
+    fn a_named_claude_executable_wins_over_the_path() {
+        let named = vec![(
+            super::CLAUDE_EXECUTABLE_ENV.to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+        )];
+        assert_eq!(super::claude_cli(&named), "C:\\tools\\claude.cmd");
+        let empty = vec![(super::CLAUDE_EXECUTABLE_ENV.to_string(), String::new())];
+        assert_ne!(super::claude_cli(&empty), "");
+    }
+
+    /// Windows starts an extensionless program by appending `.exe` and
+    /// nothing else — never `PATHEXT` — and the npm install of the Claude
+    /// CLI ships `claude` (a `sh` script) and `claude.cmd`, with no
+    /// `claude.exe` anywhere. So the bare name never spawned on the owner's
+    /// own machine and every sign-in check came back Unknown. Resolution
+    /// walks `PATH` directory by directory, trying each extension Windows
+    /// would, and the `.cmd` it lands on really does run.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn claude_is_resolved_on_path_the_way_windows_resolves_it() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let sh_only = root.path().join("npm-global");
+        let with_cmd = root.path().join("bin");
+        std::fs::create_dir_all(&sh_only).unwrap();
+        std::fs::create_dir_all(&with_cmd).unwrap();
+        // The npm layout: an extensionless `sh` script Windows cannot start,
+        // in a directory that comes first on PATH.
+        std::fs::write(sh_only.join("claude"), "#!/bin/sh\necho nope\n").unwrap();
+        let cmd = super::write_stub_cli(&with_cmd, "claude", "9.9.9 (Claude Code)", 0);
+
+        let path = vec![(
+            "PATH".to_string(),
+            format!("{};{}", sh_only.display(), with_cmd.display()),
+        )];
+        let resolved = super::claude_cli(&path);
+        assert_eq!(resolved, cmd.as_os_str(), "the .cmd, not the sh script");
+
+        // And the resolved path actually spawns, which the bare name did not.
+        let out = super::probe_stdout(
+            &mut tokio::process::Command::new(&resolved),
+            256,
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            out.as_deref().is_some_and(|o| o.contains("9.9.9")),
+            "the resolved shim ran: {out:?}"
+        );
+
+        // Nothing on PATH leaves the bare name, which fails as it always
+        // did: a probe that cannot run concludes nothing.
+        let empty_dir = root.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let nowhere = vec![("PATH".to_string(), empty_dir.display().to_string())];
+        assert_eq!(
+            super::resolve_on_path("claude", &nowhere),
+            None,
+            "an empty PATH resolves nothing"
+        );
+    }
+
+    // ── Probes: whose answer the exit status is ──────────────────────────────
+
+    /// A CLI whose exit status is part of what it is saying. `claude auth
+    /// status --json` prints `{"loggedIn": false, …}` and exits **1** when
+    /// the login is signed out, so the sign-in check's probe reads the
+    /// output whatever the status. The version check keeps the strict read —
+    /// a version line from a CLI that did not run cleanly is worth nothing —
+    /// which is what threw the sign-in verdict away.
+    #[tokio::test]
+    async fn only_the_strict_read_treats_a_nonzero_exit_as_no_answer() {
+        use std::time::Duration;
+        const MAX: u64 = 8 * 1024;
+        const LIMIT: Duration = Duration::from_secs(20);
+        let dir = tempfile::tempdir().unwrap();
+
+        // The strict read, as the version check uses it.
+        let strict = |path: std::path::PathBuf| async move {
+            let mut cmd = tokio::process::Command::new(&path);
+            super::configure_version_probe(&mut cmd);
+            let child = cmd.spawn().expect("spawn the stub");
+            super::read_probe(child, MAX, LIMIT, true)
+                .await
+                .map(|out| String::from_utf8_lossy(&out).into_owned())
+        };
+
+        let says_no = super::write_stub_cli(dir.path(), "says-no", r#"{"loggedIn": false}"#, 1);
+        assert_eq!(strict(says_no.clone()).await, None, "exit 1, so no answer");
+        let out = super::probe_stdout(&mut tokio::process::Command::new(&says_no), MAX, LIMIT)
+            .await
+            .expect("the output of a CLI that exited 1");
+        assert!(out.contains(r#""loggedIn": false"#), "{out:?}");
+
+        // A clean exit is read either way, and a CLI that is not there is
+        // still no answer at all.
+        let says_yes = super::write_stub_cli(dir.path(), "says-yes", r#"{"loggedIn": true}"#, 0);
+        for read in [
+            strict(says_yes.clone()).await,
+            super::probe_stdout(&mut tokio::process::Command::new(&says_yes), MAX, LIMIT).await,
+        ] {
+            assert!(
+                read.is_some_and(|out| out.contains(r#""loggedIn": true"#)),
+                "a clean exit is read"
+            );
+        }
+        let missing = dir.path().join("buzz-no-such-probe-binary");
+        assert_eq!(
+            super::probe_stdout(&mut tokio::process::Command::new(&missing), MAX, LIMIT).await,
+            None,
+            "a spawn that fails is still no answer"
+        );
     }
 
     // ── Turn authority: how much a turn is trusted ───────────────────────────
@@ -6219,6 +6543,63 @@ mod tests {
         assert!(!claude_cli_accepts_thinking_display(&cmd).await);
         cmd.env("CLAUDE_CODE_EXECUTABLE", "");
         assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+    }
+
+    /// The Windows half of the same promise. There is no process group to
+    /// signal here, and the CLI is reached through a `.cmd` shim, so
+    /// `start_kill` would kill the shim and leave its children running —
+    /// once per hang, forever, now that the sign-in check runs this every
+    /// 15 minutes for every login.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_probe_timeout_kills_the_whole_tree_on_windows() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started.txt");
+        let alive = dir.path().join("alive.txt");
+
+        // A grandchild that says it started, waits ~5s, then says it is
+        // still alive — which it must never get to do.
+        let grandchild = dir.path().join("grandchild.cmd");
+        std::fs::write(
+            &grandchild,
+            format!(
+                "@echo off
+echo started > \"{}\"
+ping -n 6 127.0.0.1 > nul
+echo                  alive > \"{}\"
+",
+                started.display(),
+                alive.display()
+            ),
+        )
+        .unwrap();
+        // A launcher that starts it and then hangs, like a shim whose node
+        // child is the thing actually doing the work.
+        let launcher = dir.path().join("hangs.cmd");
+        std::fs::write(
+            &launcher,
+            format!(
+                "@echo off
+start \"\" /b \"{}\"
+ping -n 120 127.0.0.1 > nul
+",
+                grandchild.display()
+            ),
+        )
+        .unwrap();
+
+        let mut cmd = tokio::process::Command::new(&launcher);
+        let out = super::probe_stdout(&mut cmd, 256, Duration::from_millis(1500)).await;
+        assert_eq!(out, None, "a probe that hangs answers nothing");
+        assert!(started.exists(), "the grandchild really ran");
+
+        // Past when it would have written, with the kill long since done.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !alive.exists(),
+            "the launcher's child must not outlive the probe"
+        );
     }
 
     #[cfg(unix)]

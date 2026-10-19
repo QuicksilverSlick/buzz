@@ -17,7 +17,24 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use super::{Factory, Health};
+use super::{Class, Factory, Health};
+
+/// The class a saved `class=` slug came from, and the slug back as the
+/// `'static` string a [`Failure`](super::Failure) carries. `None` for
+/// anything this version does not name, which is not resumed at all: a
+/// record it cannot reproduce faithfully is worse than none.
+fn class_of(slug: &str) -> Option<(Class, &'static str)> {
+    Some(match slug {
+        "weekly_limit" => (Class::UsageLimit, "weekly_limit"),
+        "session_limit" => (Class::UsageLimit, "session_limit"),
+        "usage_limit" => (Class::UsageLimit, "usage_limit"),
+        "spend_cap" => (Class::SpendCap, "spend_cap"),
+        "rate_limit" => (Class::RateLimit, "rate_limit"),
+        "sign_in" => (Class::SignIn, "sign_in"),
+        "error" => (Class::Other, "error"),
+        _ => return None,
+    })
+}
 
 /// The folder under the Bench root that holds the paused-state files.
 pub(crate) const PAUSED_DIR: &str = "state";
@@ -60,6 +77,13 @@ impl Factory {
             "resumesAt": self.resumes.map(iso),
             "since": iso(self.since.unwrap_or(expires)),
             "expires": iso(expires),
+            // The incident, and whether the owner has already been texted
+            // about it — ids and a boolean, nothing a person wrote. A
+            // harness that restarts mid-outage reads these back so the
+            // all-clear it owes still goes out (see
+            // [`resume_from_saved_state`](Factory::resume_from_saved_state)).
+            "incident": self.incident,
+            "alerted": self.alerted.is_some(),
         });
         // Written beside its name and renamed into place, so the desktop
         // never reads half a file — the same discipline as a Bench card.
@@ -76,6 +100,89 @@ impl Factory {
             Ok(()) => tracing::debug!(class = failure.slug, "paused state saved for the desktop"),
             Err(e) => tracing::warn!("paused state not saved: {e}"),
         }
+    }
+
+    /// Pick the outage back up where a restart left it.
+    ///
+    /// The owner's own fix for a lost sign-in is to sign in and restart the
+    /// agent, so the restart lands *between* the Critical and the recovery —
+    /// and `alerted` lived only in memory, so the all-clear was dropped:
+    /// the owner's last word was that it was broken, and nothing ever said
+    /// it came back. That is the exact failure the all-clear was added to
+    /// prevent.
+    ///
+    /// So a harness that finds its own unexpired paused state comes up in
+    /// it: the state, the failure behind it, when it began, its incident,
+    /// and whether the owner was already texted. Nothing has fixed itself
+    /// while the harness was down, and the panel and #factory are already
+    /// saying this — so saying it too is what makes the next transition out
+    /// of it a real one, with the all-clear on the end.
+    ///
+    /// A file past its `expires` says nothing (spec 4.1), and a state this
+    /// version cannot name faithfully is ignored rather than guessed at. A
+    /// Degraded incident leaves no paused state by design — the file is for
+    /// a harness that has genuinely stopped — so a hand-off's text is the
+    /// one case a restart still leaves without its all-clear.
+    pub(crate) fn resume_from_saved_state(&mut self, now: DateTime<Utc>) {
+        let Some(path) = self.paused_state_path() else {
+            return;
+        };
+        let Some(saved) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .filter(|saved| saved["version"] == 1)
+        else {
+            return;
+        };
+        let at = |key: &str| {
+            saved[key]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        // Past its expiry it is not evidence of anything any more.
+        let Some(expires) = at("expires").filter(|expires| now < *expires) else {
+            return;
+        };
+        let health = match saved["state"].as_str() {
+            Some("DOWN") => Health::Down,
+            Some("BLOCKED") => Health::Blocked,
+            _ => return,
+        };
+        let Some((class, slug)) = saved["class"].as_str().and_then(class_of) else {
+            return;
+        };
+        let Some(text) = saved["text"].as_str() else {
+            return;
+        };
+        self.failure = Some(super::Failure {
+            class,
+            slug,
+            text: super::truncate(text, super::TEXT_MAX),
+            resets_at: at("resetsAt"),
+        });
+        self.health = health;
+        self.since = at("since").or(Some(now));
+        self.resumes = at("resumesAt");
+        // The record this file was written beside is already in #factory and
+        // still current, so nothing is re-posted now — but the next change
+        // out of this state is due, which is what clears the file and stops
+        // the panel saying "paused" after the agent is working again.
+        self.reported = Some((health, expires));
+        self.incident = saved["incident"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| Some(now.format("inc-%Y%m%d-%H%M%S").to_string()));
+        if saved["alerted"] == true {
+            // Already texted, so the owner is owed the all-clear and not a
+            // second opening text for the state they already heard about.
+            self.alerted = self.incident.clone();
+            self.alerted_worst = Some(super::alert::severity(health));
+        }
+        tracing::warn!(
+            class = slug,
+            "resuming the outage this harness was in when it stopped"
+        );
     }
 
     /// `<bench>/state/<pubkey>.json`, the path the desktop derives too.
@@ -207,6 +314,105 @@ mod tests {
         // Clearing an already-missing file is not an error.
         f.on_success(0, now);
         f.take_report(now);
+    }
+
+    /// The owner's own fix for a lost sign-in is to sign in and restart the
+    /// agent — so the restart lands between the Critical and the recovery,
+    /// which is where the all-clear used to be lost: `alerted` was memory
+    /// only, so the new harness had nothing to be clear about and said
+    /// nothing. The owner's last word stayed "it is broken".
+    #[test]
+    fn the_all_clear_survives_a_restart_mid_outage() {
+        let bench = tempfile::tempdir().unwrap();
+        let now = at(2026, 10, 18, 20, 32);
+        let lost = classify(
+            &AcpError::agent_error(
+                -32000,
+                "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            ),
+            now,
+        );
+        let mut before = factory(bench.path());
+        before.plan(0, &scope(), &lost, now);
+        before.take_report(now);
+        assert_eq!(before.take_alerts().len(), 1, "the owner was texted");
+        let saved = read(bench.path()).expect("saved");
+        assert_eq!(saved["alerted"], true);
+        assert!(saved["incident"].as_str().is_some(), "{saved}");
+
+        // The harness is restarted. It comes up in the outage it was in.
+        let mut after = factory(bench.path());
+        assert_eq!(after.health, Health::Operational, "before it reads it");
+        after.resume_from_saved_state(now + chrono::Duration::minutes(2));
+        assert_eq!(after.health, Health::Down);
+        assert_eq!(after.presence(), "away");
+        assert_eq!(after.failure.as_ref().map(|f| f.slug), Some("sign_in"));
+        assert!(after.take_alerts().is_empty(), "no second opening text");
+
+        // The owner signed it in before the restart, so it answers again —
+        // and this time the all-clear goes out.
+        let later = now + chrono::Duration::minutes(5);
+        for _ in 0..crate::factory::ANSWERS_TO_RECOVER {
+            after.on_success(0, later);
+        }
+        assert_eq!(after.health, Health::Operational);
+        assert_eq!(
+            after.take_alerts(),
+            ["Buzz: all clear — Reset Worker is working normally again."]
+        );
+        after.take_report(later);
+        assert!(
+            read(bench.path()).is_none(),
+            "and the panel stops saying it"
+        );
+    }
+
+    /// What is not resumed: a state past its own expiry (spec 4.1), a class
+    /// this version cannot name faithfully, and a file that is not there.
+    /// None of them is an error, and none of them takes a working harness
+    /// down.
+    #[test]
+    fn a_stale_or_unreadable_saved_state_is_not_resumed() {
+        let bench = tempfile::tempdir().unwrap();
+        let now = at(2026, 10, 18, 20, 32);
+        let weekly = classify(
+            &AcpError::agent_error(-32603, "Internal error: You've hit your weekly limit"),
+            now,
+        );
+        let mut before = factory(bench.path());
+        before.plan(0, &scope(), &weekly, now);
+        before.take_report(now);
+        let path = bench.path().join(PAUSED_DIR).join(format!("{PUBKEY}.json"));
+
+        // Long past its expiry: evidence of nothing.
+        let mut after = factory(bench.path());
+        after.resume_from_saved_state(now + chrono::Duration::days(2));
+        assert_eq!(after.health, Health::Operational);
+        assert!(after.failure.is_none());
+
+        // A class this version does not know, and junk.
+        for bad in [
+            serde_json::json!({"version": 1, "state": "BLOCKED", "class": "from_the_future",
+                               "text": "x", "expires": "2026-10-18T21:00:00Z"})
+            .to_string(),
+            serde_json::json!({"version": 2, "state": "BLOCKED", "class": "weekly_limit",
+                               "text": "x", "expires": "2026-10-18T21:00:00Z"})
+            .to_string(),
+            "{".to_string(),
+            String::new(),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            let mut after = factory(bench.path());
+            after.resume_from_saved_state(now);
+            assert_eq!(after.health, Health::Operational, "{bad}");
+            assert!(after.failure.is_none(), "{bad}");
+        }
+
+        // And no file at all is the normal case.
+        std::fs::remove_file(&path).unwrap();
+        let mut after = factory(bench.path());
+        after.resume_from_saved_state(now);
+        assert_eq!(after.health, Health::Operational);
     }
 
     /// A rate limit only slows the work, so the panel says nothing: the file

@@ -16,13 +16,24 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
+mod alert;
 mod park_budget;
 mod paused_state;
+mod signin_check;
 
 use park_budget::{Budget, Parks};
 
+pub(crate) use alert::{send as send_alert, ALERT_CMD_ENV, ALERT_SMS_TO_ENV};
+pub(crate) use signin_check::{
+    probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
+    CHECK_SECS_ENV as SIGNIN_CHECK_SECS_ENV,
+};
+
 #[cfg(test)]
 pub(crate) use park_budget::PARK_MAX_PROBES;
+/// The check's verdict, so the main loop's own tests can drive it.
+#[cfg(test)]
+pub(crate) use signin_check::SignIn;
 
 /// What a failed turn means for the work it carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,10 +457,18 @@ pub(crate) fn pause_line(failure: &Failure, resumes: DateTime<Utc>) -> String {
 }
 
 /// The thread line when the work moves to another login of the pool.
-pub(crate) fn hand_off_line(label: &str) -> String {
+///
+/// Why it moved is the owner's business, not the sender's (D8): a lost
+/// sign-in gets the same neutral "unavailable" that a spend cap gets in
+/// [`pause_line`], because these lines land in partner channels too.
+pub(crate) fn hand_off_line(label: &str, class: Class) -> String {
+    let what = match class {
+        Class::SignIn | Class::SpendCap => "is unavailable on one login",
+        _ => "hit its usage limit on one login",
+    };
     format!(
-        "The AI service this agent uses hit its usage limit on one login, so this request is \
-         continuing on {label}. Nothing is lost."
+        "The AI service this agent uses {what}, so this request is continuing on {label}. \
+         Nothing is lost."
     )
 }
 
@@ -498,19 +517,45 @@ fn card_quote(provider: &str, text: &str) -> String {
 /// login in records and cards; otherwise the folder's own name is used, and a
 /// folder sitting directly under the home directory is `primary`, never the
 /// OS account name.
+///
+/// One entry may be written `label=env` ([`ENV_ENTRY`]) instead of a folder,
+/// meaning "this login is the agent's own environment, unchanged": no
+/// `CLAUDE_CONFIG_DIR` override and no blanked token, so the agent's own
+/// long-lived `claude setup-token` token signs it in. An agent with its own
+/// token and its folder login as a fallback is written
+/// `token=env;fallback=…\factory\claude`.
 pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
+
+/// The value that makes a pool entry the agent's own environment rather than
+/// a folder. The exact word, so a folder that happens to be called `env`
+/// still has to be written as a path.
+pub(crate) const ENV_ENTRY: &str = "env";
+
+/// The folder a Claude login's own settings and credential live in.
+const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// A PC-wide token, blanked for a folder entry so it cannot win over that
+/// folder's own login. Named so the one test that guards what reaches an
+/// agent can name it too.
+pub(super) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// One login of the pool.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Account {
-    /// The `CLAUDE_CONFIG_DIR` folder. Never shown: it holds a user path.
-    dir: String,
+    /// The `CLAUDE_CONFIG_DIR` folder, or `None` for a [`ENV_ENTRY`] entry:
+    /// the agent's own environment, left exactly as it is. Never shown
+    /// either way, because a folder holds a user path.
+    dir: Option<String>,
     /// What records and lines call it: the owner's own `label=`, or the
     /// folder's name — never an email, a token or the OS account name. A
     /// `…/factory/claude` folder is `factory`; `~/.claude` is `primary`.
     pub label: String,
     /// The limit this login last hit, until it lifts.
     pub limited: Option<Limit>,
+    /// Set when this login's sign-in is gone. A state of its own and not a
+    /// timed limit: no clock lifts a lost sign-in, so only a passing
+    /// sign-in check or a real answer on this login clears it.
+    pub signed_out: bool,
 }
 
 /// A limit one login of the pool hit.
@@ -628,6 +673,17 @@ pub(crate) struct Factory {
     /// Set when a park ran out of budget and its batch was given up on, so
     /// the record says that rather than claiming an ordinary retry.
     gave_up: bool,
+    /// The owner's texts waiting to go out, oldest first (see [`alert`]).
+    alerts: Vec<String>,
+    /// The incident the owner has already been texted about, until its
+    /// all-clear goes out: one opening text and one all-clear per incident.
+    alerted: Option<String>,
+    /// The worst the incident had got when the owner was last texted about
+    /// it (see [`alert::severity`]). An incident that gets worse — moving,
+    /// then stopped — texts again, because the first text's reassurance
+    /// stops being true; anything that is not worse does not, so a
+    /// 30-minute probe loop stays quiet.
+    alerted_worst: Option<u8>,
 }
 
 impl Factory {
@@ -675,6 +731,7 @@ impl Factory {
                     dir,
                     label,
                     limited: None,
+                    signed_out: false,
                 }
             })
             .collect();
@@ -697,50 +754,101 @@ impl Factory {
         if health == Health::Operational {
             self.failure = None;
             self.carded.clear();
+            self.alert_all_clear();
         }
         self.since = Some(now);
         self.health = health;
     }
 
-    /// The first login not known to be limited.
+    /// The first login that can take work right now: not signed out, and
+    /// not inside a limit it has yet to come out of.
     fn preferred(&self, now: DateTime<Utc>) -> Option<usize> {
         self.accounts
             .iter()
-            .position(|a| a.limited.as_ref().is_none_or(|l| l.until <= now))
+            .position(|a| !a.signed_out && a.limited.as_ref().is_none_or(|l| l.until <= now))
     }
 
-    /// Env for starting agent `slot`: the preferred login's folder, and an
-    /// empty `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
-    /// folder's own login. Empty without a pool. When every login is limited
-    /// it starts on the one that frees up first.
+    /// The login a new agent starts on: the first healthy one, or — when
+    /// every login is out — the one that comes back soonest, preferring a
+    /// timed limit over a lost sign-in, because a clock lifts the first and
+    /// only a person lifts the second. `None` without a pool.
+    fn pick(&self, now: DateTime<Utc>) -> Option<usize> {
+        let soonest = (0..self.accounts.len()).min_by_key(|&i| {
+            let account = &self.accounts[i];
+            (
+                account.signed_out,
+                account.limited.as_ref().map(|l| l.until),
+            )
+        })?;
+        Some(self.preferred(now).unwrap_or(soonest))
+    }
+
+    /// Env for starting agent `slot` on the login [`pick`](Self::pick)
+    /// chose. Empty without a pool.
     pub(crate) fn launch_env(&mut self, slot: usize, now: DateTime<Utc>) -> Vec<(String, String)> {
-        let Some(soonest) = (0..self.accounts.len())
-            .min_by_key(|&i| self.accounts[i].limited.as_ref().map(|l| l.until))
-        else {
+        let Some(i) = self.pick(now) else {
             return Vec::new();
         };
-        let i = self.preferred(now).unwrap_or(soonest);
         self.started_on.insert(slot, i);
-        vec![
-            ("CLAUDE_CONFIG_DIR".into(), self.accounts[i].dir.clone()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
-        ]
+        self.account_env(i)
+    }
+
+    /// The launch environment for login `i`: its folder, and an empty
+    /// `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
+    /// folder's own login.
+    ///
+    /// Empty for a [`ENV_ENTRY`] entry, which is what makes it the agent's
+    /// own environment unchanged — its own `CLAUDE_CONFIG_DIR` for settings
+    /// and its own long-lived token for the sign-in. The sign-in check asks
+    /// through this same function, so it can never judge a different login
+    /// from the one the adapter would run on.
+    pub(super) fn account_env(&self, i: usize) -> Vec<(String, String)> {
+        match self.accounts.get(i).and_then(|a| a.dir.as_deref()) {
+            Some(dir) => vec![
+                (CONFIG_DIR_ENV.into(), dir.to_string()),
+                (OAUTH_TOKEN_ENV.into(), String::new()),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Which login agent `slot` was last started on.
+    fn on(&self, slot: usize) -> usize {
+        self.started_on.get(&slot).copied().unwrap_or(0)
+    }
+
+    /// Whether the work is on login `index`: an agent was started on it, or
+    /// it is the one the next launch would take.
+    ///
+    /// Both halves are needed. `started_on` is what is running now, and goes
+    /// stale between a hand-off and the restart that carries it out — right
+    /// after a hand-off the agent's own slot still names the login it is
+    /// leaving. [`pick`](Self::pick) is where the next request goes, which
+    /// is what "the work is on it" has to mean for a login that has not been
+    /// started on yet, including before anything has started at all.
+    ///
+    /// A login that is neither is a spare: losing it stops nothing.
+    fn work_runs_on(&self, index: usize, now: DateTime<Utc>) -> bool {
+        self.started_on.values().any(|&on| on == index) || self.pick(now) == Some(index)
     }
 
     /// The label of the login `slot` runs on; `default` without a pool.
     pub(crate) fn label(&self, slot: usize) -> &str {
-        self.started_on
-            .get(&slot)
-            .and_then(|&i| self.accounts.get(i))
-            .map_or("default", |a| &a.label)
+        self.at(self.on(slot))
+    }
+
+    /// The label of login `i`; `default` without a pool.
+    fn at(&self, i: usize) -> &str {
+        self.accounts.get(i).map_or("default", |a| &a.label)
     }
 
     /// Decide what happens to `scope`'s batch after agent `slot` failed on
-    /// `failure`. A usage or spend limit marks the slot's login limited and
-    /// hands the batch to the next free login; with no pool, or every login
-    /// limited, the batch parks until the first one frees up. Other limits
-    /// never rotate. Each scope is told once per incident; short rate limits
-    /// stay quiet until the third in a row.
+    /// `failure`. A usage or spend limit marks the slot's login limited, and
+    /// a lost sign-in marks it signed out; either way the batch goes to the
+    /// next healthy login. With no pool, or every login out, the batch parks
+    /// until the first one comes back. Rate limits and ordinary errors never
+    /// rotate. Each scope is told once per incident; short rate limits stay
+    /// quiet until the third in a row.
     ///
     /// Waiting is bounded: once the scope's park budget is spent (see
     /// [`park_budget`]) the batch is given up on instead, so a limit nobody
@@ -753,15 +861,14 @@ impl Factory {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Plan {
-        let (wait, free) = self.begin_limit(slot, failure, now);
+        let (wait, free) = self.begin_limit(self.on(slot), failure, now);
         if let Some(next) = free {
             let label = self.accounts[next].label.clone();
             let line = self
                 .told
                 .insert((scope.clone(), true))
-                .then(|| hand_off_line(&label));
-            self.resumes = None;
-            self.set_health(Health::Degraded, now);
+                .then(|| hand_off_line(&label, failure.class));
+            self.settle_hand_off(failure, next, now);
             return Plan::HandOff { label, line };
         }
         // Counted here, not above: a hand-off re-runs the batch at once on
@@ -793,11 +900,17 @@ impl Factory {
     /// while the pool is idle left the dot green and #factory silent until
     /// some real request happened along and failed (spec 2.2, 4.2).
     pub(crate) fn record_limit(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
-        let (wait, free) = self.begin_limit(slot, failure, now);
-        if free.is_some() {
+        self.record_limit_on(self.on(slot), failure, now);
+    }
+
+    /// [`record_limit`](Self::record_limit) for a login named directly
+    /// rather than through the slot running on it: the sign-in check's path,
+    /// which knows which login it asked about and not which slot is on it.
+    fn record_limit_on(&mut self, on: usize, failure: &Failure, now: DateTime<Utc>) {
+        let (wait, free) = self.begin_limit(on, failure, now);
+        if let Some(next) = free {
             // Another login can take the next request: moving, with a catch.
-            self.resumes = None;
-            self.set_health(Health::Degraded, now);
+            self.settle_hand_off(failure, next, now);
             return;
         }
         self.resumes = Some(now + chrono::Duration::from_std(wait).unwrap_or_default());
@@ -806,30 +919,38 @@ impl Factory {
     }
 
     /// The first half both paths share: count the rate streak, record who
-    /// and what failed, mark the slot's login limited for a class a login
-    /// can hit, and return how long the wait is plus the free login, if any,
-    /// that could take the work right now.
+    /// and what failed, mark login `on` out for a class a login can hit,
+    /// and return how long the wait is plus the healthy login, if any, that
+    /// could take the work right now.
     fn begin_limit(
         &mut self,
-        slot: usize,
+        on: usize,
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> (Duration, Option<usize>) {
         if failure.class == Class::RateLimit {
             self.rate_streak += 1;
         }
-        self.account = self.label(slot).to_string();
+        self.account = self.at(on).to_string();
         self.failure = Some(failure.clone());
         self.gave_up = false;
         let mut wait = park_for(failure, now, self.rate_streak);
-        if matches!(failure.class, Class::UsageLimit | Class::SpendCap) && !self.accounts.is_empty()
-        {
-            let on = self.started_on.get(&slot).copied().unwrap_or(0);
-            self.accounts[on].limited = Some(Limit {
-                until: now + chrono::Duration::from_std(wait).unwrap_or_default(),
-                slug: failure.slug,
-                text: failure.text.clone(),
-            });
+        let rotates = matches!(
+            failure.class,
+            Class::UsageLimit | Class::SpendCap | Class::SignIn
+        );
+        if rotates && !self.accounts.is_empty() {
+            if failure.class == Class::SignIn {
+                // No clock lifts a lost sign-in, so it gets a state of its
+                // own rather than a limit with a made-up reset time.
+                self.accounts[on].signed_out = true;
+            } else {
+                self.accounts[on].limited = Some(Limit {
+                    until: now + chrono::Duration::from_std(wait).unwrap_or_default(),
+                    slug: failure.slug,
+                    text: failure.text.clone(),
+                });
+            }
             if let Some(next) = self.preferred(now) {
                 return (wait, Some(next));
             }
@@ -842,6 +963,22 @@ impl Factory {
                 .unwrap_or(wait);
         }
         (wait, None)
+    }
+
+    /// The hand-off half both paths share: the work moves to login `next`,
+    /// so the harness is moving with a catch.
+    ///
+    /// A lost sign-in is still raised as a Critical even though the work
+    /// goes on, because that login stays out until a person signs it back
+    /// in — and an agent quietly running on its last spare login is how the
+    /// next outage becomes a surprise.
+    fn settle_hand_off(&mut self, failure: &Failure, next: usize, now: DateTime<Utc>) {
+        self.resumes = None;
+        self.set_health(Health::Degraded, now);
+        if failure.class == Class::SignIn {
+            let label = self.at(next).to_string();
+            self.limit_card(failure, false, Some(&label));
+        }
     }
 
     /// Whether this failure stops the work rather than just slowing it:
@@ -862,11 +999,11 @@ impl Factory {
         self.set_health(health, now);
         match failure.class {
             Class::SpendCap => {
-                self.limit_card(failure, true);
+                self.limit_card(failure, true, None);
                 true
             }
             Class::SignIn => {
-                self.limit_card(failure, false);
+                self.limit_card(failure, false, None);
                 true
             }
             _ => false,
@@ -907,8 +1044,16 @@ impl Factory {
         self.clear_parks();
         self.resumes = None;
         self.account = self.label(slot).to_string();
-        if let Some(&i) = self.started_on.get(&slot) {
-            self.accounts[i].limited = None;
+        // A real answer is proof: this login's limit has lifted, and its
+        // sign-in works whatever a check last said about it.
+        if let Some(account) = self
+            .started_on
+            .get(&slot)
+            .copied()
+            .and_then(|i| self.accounts.get_mut(i))
+        {
+            account.limited = None;
+            account.signed_out = false;
         }
         let settled = if self.preferred(now).is_some_and(|p| p > 0) {
             Health::Degraded
@@ -1030,7 +1175,7 @@ impl Factory {
             ),
             (Health::Down, ..) => format!(
                 "{who} lost its sign-in. Its work is paused until it is signed in again; it \
-                 checks every 30 minutes. {saved}"
+                 keeps checking. {saved}"
             ),
             (Health::Blocked, Some(Class::SpendCap), _) => format!(
                 "{who}'s work is paused until the spending cap is raised; it checks every 30 \
@@ -1046,21 +1191,41 @@ impl Factory {
                  about it. It takes new requests as usual."
             ),
             (Health::Degraded, _, Some(on)) => format!(
-                "{who} is continuing on {} while {} is limited. Nothing is lost.",
-                self.accounts[on].label, self.accounts[0].label
+                "{who} is continuing on {} while {} is {}. Nothing is lost.",
+                self.accounts[on].label,
+                self.accounts[0].label,
+                if self.accounts[0].signed_out {
+                    "signed out"
+                } else {
+                    "limited"
+                }
             ),
             (Health::Degraded, Some(Class::RateLimit), None) => {
                 format!("{who} is slowed by a rate limit and tries again shortly.")
             }
+            // No login left to stand by on, and a sign-in is not an error
+            // anything retries: without this arm a sign-in state fell
+            // through to "hit an error and is retrying it", which is not
+            // what is happening and not what the owner has to do about it.
+            (Health::Degraded, Some(Class::SignIn), None) => format!(
+                "{who} is working, and a login of its pool is signed out until someone signs it \
+                 in again. Nothing is lost."
+            ),
             (Health::Degraded, ..) => {
                 format!("{who} hit an error and is retrying it (up to 10 tries).")
             }
         }
     }
 
-    /// The spend-cap or sign-in card (spec 3.2, rows 2 and 7): the work
-    /// stopped and only the owner can lift it.
-    fn limit_card(&mut self, failure: &Failure, spend_cap: bool) {
+    /// The spend-cap or sign-in card (spec 3.2, rows 2 and 7): only the
+    /// owner can lift this one. `moved_to` names the login the work went on
+    /// with, when another login could take it, so the card says in plain
+    /// words where the agent is running now.
+    ///
+    /// The owner is also texted (see [`alert`]), because a card and a STATE
+    /// record both live inside the app and neither reaches a person who is
+    /// not looking at it.
+    fn limit_card(&mut self, failure: &Failure, spend_cap: bool, moved_to: Option<&str>) {
         let who = card_name(self.who(), &self.reporting.short);
         let provider = self.provider_name();
         let (what, title, then) = if spend_cap {
@@ -1079,11 +1244,18 @@ impl Factory {
         // The time is in the text so a later incident is a new card, not
         // the same Drop the Bench already holds.
         let since = chicago_label(self.since.unwrap_or_else(Utc::now));
+        let quote = card_quote(&provider, &failure.text);
+        let where_now = match moved_to {
+            Some(next) => format!("It is now running on login {next}."),
+            None => "Its requests are parked, not dropped.".to_string(),
+        };
         let body = format!(
-            "{who} stopped on login {} at {since}. {} Its requests are parked, not dropped.",
+            "{who} stopped on login {} at {since}. {quote} {where_now}",
             self.account(),
-            card_quote(&provider, &failure.text)
         );
+        // The text leads with what the owner can act on and lets the
+        // provider's own words be what a 300-character cut takes off.
+        self.alert_critical(&format!("{title}. {where_now} {quote}"));
         let links = if spend_cap && self.provider == "claude" {
             serde_json::json!([
                 {"label": "Claude usage settings", "url": "https://claude.ai/settings/usage"}
@@ -1091,10 +1263,17 @@ impl Factory {
         } else {
             serde_json::json!([])
         };
-        let wait = format!(
-            "It checks every 30 minutes and resumes by itself once {then}. Tapping Seen changes \
-             nothing else."
-        );
+        let wait = match moved_to {
+            // The agent is working; it is this login that is waiting.
+            Some(next) => format!(
+                "Its work keeps running on {next}. This login is used again once {then}; \
+                 tapping Seen changes nothing else."
+            ),
+            None => format!(
+                "It checks every 30 minutes and resumes by itself once {then}. Tapping Seen \
+                 changes nothing else."
+            ),
+        };
         let id = format!("{}-{what}", self.reporting.short);
         self.card(&id, &title, &body, &wait, links);
     }
@@ -1119,6 +1298,9 @@ impl Factory {
             event_id.get(..12).unwrap_or(event_id)
         );
         let link = format!("buzz://message?channel={channel_id}&id={event_id}");
+        self.alert_critical(&format!(
+            "{who} dropped a request: {why}. Whoever sent it needs to send it again."
+        ));
         self.card(
             &id,
             &format!("{who} dropped a request"),
@@ -1198,12 +1380,20 @@ pub(crate) const PRIMARY_LABEL: &str = "primary";
 
 /// One pool entry: a folder, or `label=folder` when the owner names it.
 /// Naming it is the way to keep the label off the path altogether.
-fn parse_entry(entry: &str) -> (String, String) {
+///
+/// `label=env` ([`ENV_ENTRY`]) is the one entry that names no folder: it
+/// means the agent's own environment, unchanged, so its own long-lived token
+/// is the login. The label is still the owner's own word, which is how a
+/// token-based login gets a name that is neither a token nor a path.
+fn parse_entry(entry: &str) -> (String, Option<String>) {
     match entry.split_once('=') {
-        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
-            (slug(label.trim()), dir.trim().to_string())
+        Some((label, value)) if is_plain_label(label) && value.trim() == ENV_ENTRY => {
+            (slug(label.trim()), None)
         }
-        _ => (account_label(entry), entry.to_string()),
+        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
+            (slug(label.trim()), Some(dir.trim().to_string()))
+        }
+        _ => (account_label(entry), Some(entry.to_string())),
     }
 }
 
@@ -1788,6 +1978,145 @@ mod tests {
         ]
     }
 
+    /// The owner's own pool from 18 Oct: the agent's own long-lived token
+    /// first, its folder login as the fallback.
+    const TOKEN_POOL: &str = r"token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude";
+
+    /// A `label=env` entry starts the agent with its environment exactly as
+    /// it is: no `CLAUDE_CONFIG_DIR` override to move its settings, and no
+    /// blanked token, so the agent's own `claude setup-token` token is what
+    /// signs it in. A folder entry still blanks the token, so a PC-wide one
+    /// cannot win over that folder's own login.
+    #[test]
+    fn an_env_entry_keeps_the_agents_own_environment() {
+        let mut f = Factory::new(Some(TOKEN_POOL), "claude-agent-acp");
+        let labels: Vec<String> = f.accounts().iter().map(|a| a.label.clone()).collect();
+        assert_eq!(labels, ["token", "fallback"]);
+        assert_eq!(f.accounts()[0].dir, None, "no folder: the env is the login");
+        assert_eq!(
+            f.accounts()[1].dir.as_deref(),
+            Some(FACTORY_DIR),
+            "the fallback is still a folder"
+        );
+
+        assert_eq!(
+            f.launch_env(0, oct16()),
+            Vec::<(String, String)>::new(),
+            "nothing is overridden, so nothing is set"
+        );
+        assert_eq!(f.label(0), "token");
+
+        // The fallback behaves exactly as every folder entry does today.
+        f.plan(0, &scope(), &weekly(), oct16());
+        assert_eq!(f.launch_env(0, oct16()), env(FACTORY_DIR));
+        assert_eq!(f.label(0), "fallback");
+
+        // Only the exact word is the env form; anything else is a folder,
+        // and a label never carries a token, a path or an email.
+        for folder in ["one=envy", "one=env/claude", r"one=C:\env", "env"] {
+            let f = Factory::new(Some(folder), "claude-agent-acp");
+            assert!(f.accounts()[0].dir.is_some(), "{folder}");
+        }
+        for label in &labels {
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "{label}"
+            );
+        }
+    }
+
+    /// A lost sign-in moves the batch to the next login, exactly as a usage
+    /// limit does, and marks the login it lost signed out — a state no clock
+    /// lifts. The owner still gets the Critical and the text, because that
+    /// login stays out until a person signs it back in.
+    #[test]
+    fn a_lost_sign_in_hands_off_and_marks_the_login_signed_out() {
+        let mut f = Factory::new(Some(TOKEN_POOL), "claude-agent-acp");
+        f.reporting = reporting("Reset Worker");
+        f.launch_env(0, oct16());
+        let lost = classify(
+            &agent_error("API Error: OAuth session expired and could not be refreshed"),
+            oct16(),
+        );
+        let plan = f.plan(0, &scope(), &lost, oct16());
+        let Plan::HandOff { label, line } = plan else {
+            panic!("expected a hand-off, got {plan:?}");
+        };
+        assert_eq!(label, "fallback");
+        // Neutral in the thread (D8): a partner never learns whose sign-in
+        // it was, only that the request is continuing.
+        let line = line.expect("the thread is told once");
+        assert_eq!(
+            line,
+            "The AI service this agent uses is unavailable on one login, so this request is \
+             continuing on fallback. Nothing is lost."
+        );
+        for word in ["sign", "token", "Users", "owner", "Claude"] {
+            assert!(!line.contains(word), "{word} in the partner line: {line}");
+        }
+
+        assert!(f.accounts()[0].signed_out, "a state of its own");
+        assert_eq!(f.accounts()[0].limited, None, "not a timed limit");
+        assert_eq!(f.launch_env(0, oct16()), env(FACTORY_DIR));
+        // Time alone never brings it back: a lost sign-in needs a person.
+        assert_eq!(f.launch_env(0, at(2026, 10, 30, 0, 0)), env(FACTORY_DIR));
+
+        // The owner hears about it, with the words Claude used and the
+        // login the work moved to.
+        let record = f.take_report(oct16()).expect("a STATE record");
+        assert!(record.contains("state=DEGRADED class=sign_in"), "{record}");
+        assert!(
+            record.ends_with(
+                "Reset Worker is continuing on fallback while token is signed out. Nothing is \
+                 lost."
+            ),
+            "{record}"
+        );
+        assert_eq!(
+            f.take_alerts(),
+            [
+                "Buzz: Reset Worker lost its Claude sign-in. It is now running on login fallback. \
+              Claude said: \"API Error: OAuth session expired and could not be refreshed\"."
+            ]
+        );
+
+        // A real answer on the fallback proves that login, not the one that
+        // went out: the agent does not drift back to a dead sign-in.
+        f.on_success(0, oct16());
+        assert!(f.accounts()[0].signed_out);
+        assert!(!f.wants_restart(0, oct16()));
+    }
+
+    /// Every login signed out parks the work, exactly as every login
+    /// limited does, and the harness says it is down rather than claiming
+    /// to be fine.
+    #[test]
+    fn a_lost_sign_in_on_every_login_parks() {
+        let mut f = pool();
+        f.launch_env(0, oct16());
+        let lost = classify(&agent_error("API Error: 401 unauthorized"), oct16());
+        assert!(matches!(
+            f.plan(0, &scope(), &lost, oct16()),
+            Plan::HandOff { .. }
+        ));
+        f.launch_env(0, oct16());
+        let plan = f.plan(0, &scope(), &lost, oct16());
+        assert_eq!(
+            plan,
+            Plan::Park {
+                wait: PROBE_EVERY,
+                // The hand-off's line said the work was continuing; this one
+                // has to say it has stopped, so the sender is not left with
+                // a reassurance that is no longer true.
+                line: Some(pause_line(&lost, oct16() + chrono::Duration::minutes(30))),
+                mention_owner: true,
+            }
+        );
+        assert!(f.accounts().iter().all(|a| a.signed_out));
+        assert_eq!(f.health, Health::Down);
+        assert_eq!(f.presence(), "away");
+    }
+
     const FACTORY_DIR: &str = r"C:\Users\PC owner\.buzz-agents\factory\claude";
     const SECOND_DIR: &str = r"C:\Users\PC owner\.buzz-agents\account-test\claude";
 
@@ -1844,7 +2173,10 @@ mod tests {
         let labels: Vec<_> = pool.accounts().iter().map(|a| a.label.as_str()).collect();
         assert_eq!(labels, ["owner", "primary", "primary-2"]);
         // The folder itself is still the one the owner wrote.
-        assert_eq!(pool.accounts()[0].dir, r"C:\Users\PC owner\.claude");
+        assert_eq!(
+            pool.accounts()[0].dir.as_deref(),
+            Some(r"C:\Users\PC owner\.claude")
+        );
         // Nothing derived from a path carries an account or folder name.
         for label in &labels[1..] {
             for leak in ["pc", "craig", "users", "home"] {
@@ -1909,25 +2241,24 @@ mod tests {
         assert_eq!(factory.launch_env(0, later), env(SECOND_DIR));
     }
 
+    /// A short rate limit is the provider slowing one request down, not a
+    /// login going bad, so restarting on another login would only move the
+    /// same wait somewhere else.
     #[test]
-    fn rate_limits_and_sign_in_never_rotate() {
-        for message in [
-            "Internal error: API Error: 429",
-            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
-        ] {
-            let mut factory = pool();
-            factory.launch_env(0, oct16());
-            let failure = classify(&agent_error(message), oct16());
-            assert!(
-                matches!(
-                    factory.plan(0, &scope(), &failure, oct16()),
-                    Plan::Park { .. }
-                ),
-                "{message}"
-            );
-            assert!(factory.accounts().iter().all(|a| a.limited.is_none()));
-            assert_eq!(factory.launch_env(0, oct16()), env(FACTORY_DIR));
-        }
+    fn rate_limits_never_rotate() {
+        let message = "Internal error: API Error: 429";
+        let mut factory = pool();
+        factory.launch_env(0, oct16());
+        let failure = classify(&agent_error(message), oct16());
+        assert!(matches!(
+            factory.plan(0, &scope(), &failure, oct16()),
+            Plan::Park { .. }
+        ));
+        assert!(factory
+            .accounts()
+            .iter()
+            .all(|a| a.limited.is_none() && !a.signed_out));
+        assert_eq!(factory.launch_env(0, oct16()), env(FACTORY_DIR));
     }
 
     #[test]
