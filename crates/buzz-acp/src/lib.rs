@@ -5532,19 +5532,59 @@ fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
     }
 }
 
-/// Log the STATE record when the harness's health changed, and post it to
-/// #factory when one is configured (spec 4.2). Never into a work thread.
+/// Log the STATE record when the harness's health changed, post it to
+/// #factory when one is configured (spec 4.2), and text the owner about a
+/// Critical (spec M2 item 4). Never into a work thread.
 fn report_factory_state(config: &Config, rest: &relay::RestClient) {
-    let Some(record) = config.factory.lock().take_report(chrono::Utc::now()) else {
-        return;
+    let (record, channel, texts) = {
+        let mut factory = config.factory.lock();
+        (
+            factory.take_report(chrono::Utc::now()),
+            factory.reporting.channel,
+            factory.take_alerts(),
+        )
     };
-    let channel = config.factory.lock().reporting.channel;
-    tracing::warn!(posted = channel.is_some(), "factory {record}");
-    if let Some(channel) = channel {
-        let rest = rest.clone();
-        tokio::spawn(async move {
+    if record.is_none() && texts.is_empty() {
+        return;
+    }
+    tokio::spawn(deliver_factory_state(
+        record,
+        channel,
+        texts,
+        rest.clone(),
+        config.factory_alert_cmd.clone(),
+        config.factory_alert_sms_to.clone(),
+    ));
+}
+
+/// Post a STATE record to #factory and hand the owner's texts to their alert
+/// command.
+///
+/// Both are off the work path. A record that does not post and a text that
+/// does not send are logged and nothing more: neither is ever a reason an
+/// agent stops working.
+async fn deliver_factory_state(
+    record: Option<String>,
+    channel: Option<Uuid>,
+    texts: Vec<String>,
+    rest: relay::RestClient,
+    alert_cmd: Option<String>,
+    sms_to: Option<String>,
+) {
+    if let Some(record) = record {
+        tracing::warn!(posted = channel.is_some(), "factory {record}");
+        if let Some(channel) = channel {
             pool::post_notice(&rest, channel, &ThreadTags::default(), &record, &[]).await;
-        });
+        }
+    }
+    for text in texts {
+        match &alert_cmd {
+            Some(cmd) => factory::send_alert(cmd, sms_to.as_deref(), &text).await,
+            None => tracing::warn!(
+                "a Critical opened but {} is unset — the owner was not texted: {text}",
+                factory::ALERT_CMD_ENV
+            ),
+        }
     }
 }
 
@@ -10892,6 +10932,8 @@ mod build_mcp_servers_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 
@@ -12015,6 +12057,8 @@ mod error_outcome_emission_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 

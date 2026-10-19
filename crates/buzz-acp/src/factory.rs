@@ -16,10 +16,13 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
+mod alert;
 mod park_budget;
 mod paused_state;
 
 use park_budget::{Budget, Parks};
+
+pub(crate) use alert::{send as send_alert, ALERT_CMD_ENV, ALERT_SMS_TO_ENV};
 
 #[cfg(test)]
 pub(crate) use park_budget::PARK_MAX_PROBES;
@@ -654,6 +657,11 @@ pub(crate) struct Factory {
     /// Set when a park ran out of budget and its batch was given up on, so
     /// the record says that rather than claiming an ordinary retry.
     gave_up: bool,
+    /// The owner's texts waiting to go out, oldest first (see [`alert`]).
+    alerts: Vec<String>,
+    /// The incident the owner has already been texted about, until its
+    /// all-clear goes out: at most one text per incident each way.
+    alerted: Option<String>,
 }
 
 impl Factory {
@@ -724,6 +732,7 @@ impl Factory {
         if health == Health::Operational {
             self.failure = None;
             self.carded.clear();
+            self.alert_all_clear();
         }
         self.since = Some(now);
         self.health = health;
@@ -1164,6 +1173,10 @@ impl Factory {
     /// owner can lift this one. `moved_to` names the login the work went on
     /// with, when another login could take it, so the card says in plain
     /// words where the agent is running now.
+    ///
+    /// The owner is also texted (see [`alert`]), because a card and a STATE
+    /// record both live inside the app and neither reaches a person who is
+    /// not looking at it.
     fn limit_card(&mut self, failure: &Failure, spend_cap: bool, moved_to: Option<&str>) {
         let who = card_name(self.who(), &self.reporting.short);
         let provider = self.provider_name();
@@ -1192,6 +1205,9 @@ impl Factory {
             "{who} stopped on login {} at {since}. {quote} {where_now}",
             self.account(),
         );
+        // The text leads with what the owner can act on and lets the
+        // provider's own words be what a 300-character cut takes off.
+        self.alert_critical(&format!("{title}. {where_now} {quote}"));
         let links = if spend_cap && self.provider == "claude" {
             serde_json::json!([
                 {"label": "Claude usage settings", "url": "https://claude.ai/settings/usage"}
@@ -1234,6 +1250,9 @@ impl Factory {
             event_id.get(..12).unwrap_or(event_id)
         );
         let link = format!("buzz://message?channel={channel_id}&id={event_id}");
+        self.alert_critical(&format!(
+            "{who} dropped a request: {why}. Whoever sent it needs to send it again."
+        ));
         self.card(
             &id,
             &format!("{who} dropped a request"),
@@ -2005,6 +2024,14 @@ mod tests {
             ),
             "{record}"
         );
+        assert_eq!(
+            f.take_alerts(),
+            [
+                "Buzz: Reset Worker lost its Claude sign-in. It is now running on login fallback. \
+              Claude said: \"API Error: OAuth session expired and could not be refreshed\"."
+            ]
+        );
+
         // A real answer on the fallback proves that login, not the one that
         // went out: the agent does not drift back to a dead sign-in.
         f.on_success(0, oct16());

@@ -436,6 +436,23 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
     pub factory_bench_dir: Option<PathBuf>,
 
+    /// A command line the harness runs to text the owner when a Critical
+    /// opens, and once more when it closes. The alert text is passed as the
+    /// command's last argument. Unset: no texts are sent.
+    ///
+    /// ```text
+    /// python "C:\Users\PC owner\.buzz\.agents\skills\sms\send_sms.py"
+    /// ```
+    #[arg(long, env = crate::factory::ALERT_CMD_ENV)]
+    pub factory_alert_cmd: Option<String>,
+
+    /// Who those texts go to. Set, it is placed in the alert command's own
+    /// process environment as `SMS_TO` and nowhere else — the harness's own
+    /// environment is never changed, so an agent that texts a client with
+    /// the same script keeps its own recipient.
+    #[arg(long, env = crate::factory::ALERT_SMS_TO_ENV)]
+    pub factory_alert_sms_to: Option<String>,
+
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
@@ -691,6 +708,10 @@ pub struct Config {
     pub base_prompt_content: Option<String>,
     /// Harness-wide failure state: classes, parks and who has been told.
     pub(crate) factory: crate::factory::FactoryHandle,
+    /// The command line that texts the owner when a Critical opens.
+    pub factory_alert_cmd: Option<String>,
+    /// The recipient for those texts, set on the alert command only.
+    pub factory_alert_sms_to: Option<String>,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1320,6 +1341,18 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             factory,
+            factory_alert_cmd: args
+                .factory_alert_cmd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            factory_alert_sms_to: args
+                .factory_alert_sms_to
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
         };
 
         Ok(config)
@@ -1703,6 +1736,8 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_alert_cmd: None,
+            factory_alert_sms_to: None,
         }
     }
 

@@ -3460,7 +3460,7 @@ async fn read_probe(
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
-fn configure_no_window(cmd: &mut tokio::process::Command) {
+pub(crate) fn configure_no_window(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
