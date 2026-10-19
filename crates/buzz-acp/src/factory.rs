@@ -19,10 +19,15 @@ use crate::scope::SessionScope;
 mod alert;
 mod park_budget;
 mod paused_state;
+mod signin_check;
 
 use park_budget::{Budget, Parks};
 
 pub(crate) use alert::{send as send_alert, ALERT_CMD_ENV, ALERT_SMS_TO_ENV};
+pub(crate) use signin_check::{
+    probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
+    CHECK_SECS_ENV as SIGNIN_CHECK_SECS_ENV,
+};
 
 #[cfg(test)]
 pub(crate) use park_budget::PARK_MAX_PROBES;
@@ -537,8 +542,8 @@ pub(crate) struct Account {
     /// The limit this login last hit, until it lifts.
     pub limited: Option<Limit>,
     /// Set when this login's sign-in is gone. A state of its own and not a
-    /// timed limit: no clock lifts a lost sign-in, so only a real answer on
-    /// this login clears it.
+    /// timed limit: no clock lifts a lost sign-in, so only a passing
+    /// sign-in check or a real answer on this login clears it.
     pub signed_out: bool,
 }
 
@@ -777,8 +782,10 @@ impl Factory {
     ///
     /// Empty for a [`ENV_ENTRY`] entry, which is what makes it the agent's
     /// own environment unchanged — its own `CLAUDE_CONFIG_DIR` for settings
-    /// and its own long-lived token for the sign-in.
-    fn account_env(&self, i: usize) -> Vec<(String, String)> {
+    /// and its own long-lived token for the sign-in. The sign-in check asks
+    /// through this same function, so it can never judge a different login
+    /// from the one the adapter would run on.
+    pub(super) fn account_env(&self, i: usize) -> Vec<(String, String)> {
         match self.accounts.get(i).and_then(|a| a.dir.as_deref()) {
             Some(dir) => vec![
                 ("CLAUDE_CONFIG_DIR".into(), dir.to_string()),
@@ -865,7 +872,8 @@ impl Factory {
     }
 
     /// [`record_limit`](Self::record_limit) for a login named directly
-    /// rather than through the slot running on it.
+    /// rather than through the slot running on it: the sign-in check's path,
+    /// which knows which login it asked about and not which slot is on it.
     fn record_limit_on(&mut self, on: usize, failure: &Failure, now: DateTime<Utc>) {
         let (wait, free) = self.begin_limit(on, failure, now);
         if let Some(next) = free {
@@ -1004,8 +1012,8 @@ impl Factory {
         self.clear_parks();
         self.resumes = None;
         self.account = self.label(slot).to_string();
-        // A real answer is proof: this login's limit has lifted and its
-        // sign-in works.
+        // A real answer is proof: this login's limit has lifted, and its
+        // sign-in works whatever a check last said about it.
         if let Some(account) = self
             .started_on
             .get(&slot)

@@ -436,6 +436,20 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_FACTORY_BENCH_DIR")]
     pub factory_bench_dir: Option<PathBuf>,
 
+    /// How often, in seconds, to check that every login's Claude sign-in is
+    /// still valid, so a lost sign-in is found by the harness rather than by
+    /// the next person who asks the agent for something. `0` disables it.
+    ///
+    /// The check runs `claude auth status --json` in each login's own launch
+    /// environment and spends no model usage: no prompt, nothing billable.
+    /// Only a definite "not signed in" is acted on, and then exactly as a
+    /// real 401 would be — the login is marked signed out, the work moves to
+    /// the next healthy login, the Critical card is raised and the owner is
+    /// texted.
+    #[arg(long, env = crate::factory::SIGNIN_CHECK_SECS_ENV,
+          default_value_t = crate::factory::SIGNIN_CHECK_SECS_DEFAULT)]
+    pub factory_signin_check_secs: u64,
+
     /// A command line the harness runs to text the owner when a Critical
     /// opens, and once more when it closes. The alert text is passed as the
     /// command's last argument. Unset: no texts are sent.
@@ -708,6 +722,8 @@ pub struct Config {
     pub base_prompt_content: Option<String>,
     /// Harness-wide failure state: classes, parks and who has been told.
     pub(crate) factory: crate::factory::FactoryHandle,
+    /// How often to check every login's Claude sign-in; `0` disables it.
+    pub factory_signin_check_secs: u64,
     /// The command line that texts the owner when a Critical opens.
     pub factory_alert_cmd: Option<String>,
     /// The recipient for those texts, set on the alert command only.
@@ -1341,6 +1357,7 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             factory,
+            factory_signin_check_secs: args.factory_signin_check_secs,
             factory_alert_cmd: args
                 .factory_alert_cmd
                 .as_deref()
@@ -1736,6 +1753,7 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
         }

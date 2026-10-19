@@ -3197,6 +3197,12 @@ async fn run_harness(
     // spawn_and_init never blocks the main loop.
     let maintenance_interval = Duration::from_secs(30);
     let mut last_maintenance = std::time::Instant::now();
+    // The sign-in check's own interval (spec M2 item 3), checked on the
+    // maintenance beat. The pool has just started, so its logins were good a
+    // moment ago: the first check is one interval from now.
+    let signin_check_every = (config.factory_signin_check_secs > 0)
+        .then(|| Duration::from_secs(config.factory_signin_check_secs));
+    let mut last_signin_check = std::time::Instant::now();
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -3361,6 +3367,18 @@ async fn run_harness(
                     observer.as_ref(),
                 ) {
                     typing_channels.insert(scope, thread_tags);
+                }
+            }
+
+            // Check the sign-ins while no turn is running: a turn that is in
+            // flight will find a lost sign-in itself, and its own path
+            // (`handle_prompt_result`) is the one that knows which request
+            // to move. With the pool idle there is nobody to find out, which
+            // is exactly the three hours this check exists to cut short.
+            if let Some(every) = signin_check_every {
+                if last_signin_check.elapsed() >= every && pool.task_map().is_empty() {
+                    last_signin_check = std::time::Instant::now();
+                    spawn_signin_check(config, &ctx.rest_client);
                 }
             }
         }
@@ -5586,6 +5604,44 @@ async fn deliver_factory_state(
             ),
         }
     }
+}
+
+/// Ask each login of the pool whether its sign-in is still good, and act on
+/// what comes back exactly as a failed turn would (spec M2 item 3).
+///
+/// Runs off the main loop: every probe spawns a short-lived process. It costs
+/// no model usage, and only a definite "not signed in" changes anything.
+fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
+    let factory = config.factory.clone();
+    let targets = factory.lock().signin_check_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let rest = rest.clone();
+    let alert_cmd = config.factory_alert_cmd.clone();
+    let sms_to = config.factory_alert_sms_to.clone();
+    tokio::spawn(async move {
+        let mut changed = false;
+        for (login, env) in targets {
+            let found = factory::signin_probe(&env).await;
+            tracing::debug!(login, "sign-in check: {found:?}");
+            changed |= factory
+                .lock()
+                .signin_checked(login, found, chrono::Utc::now());
+        }
+        if !changed {
+            return;
+        }
+        let (record, channel, texts) = {
+            let mut factory = factory.lock();
+            (
+                factory.take_report(chrono::Utc::now()),
+                factory.reporting.channel,
+                factory.take_alerts(),
+            )
+        };
+        deliver_factory_state(record, channel, texts, rest, alert_cmd, sms_to).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10932,6 +10988,7 @@ mod build_mcp_servers_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
         }
@@ -12057,6 +12114,7 @@ mod error_outcome_emission_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
         }

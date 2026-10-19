@@ -3369,6 +3369,40 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// The variable naming the Claude CLI that claude-agent-acp will run. Unset,
+/// the adapter runs its own bundled CLI, which cannot be inspected from here.
+const CLAUDE_EXECUTABLE_ENV: &str = "CLAUDE_CODE_EXECUTABLE";
+
+/// The Claude CLI a probe should run: the one the adapter itself would run
+/// when the launch environment or this process names it, and plain `claude`
+/// from `PATH` otherwise.
+///
+/// Either way the credential it reads is the one `launch_env` chose: a
+/// sign-in lives in `CLAUDE_CONFIG_DIR` or in a token, never in the binary.
+pub(crate) fn claude_cli(launch_env: &[(String, String)]) -> std::ffi::OsString {
+    launch_env
+        .iter()
+        .find(|(key, _)| key == CLAUDE_EXECUTABLE_ENV)
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os(CLAUDE_EXECUTABLE_ENV))
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "claude".into())
+}
+
+/// Run `cmd` and read at most `max_bytes` of its stdout, requiring a clean
+/// exit within `limit`. `None` when any of that goes wrong: a probe that did
+/// not answer says nothing, rather than saying something wrong.
+pub(crate) async fn probe_stdout(
+    cmd: &mut tokio::process::Command,
+    max_bytes: u64,
+    limit: std::time::Duration,
+) -> Option<String> {
+    configure_version_probe(cmd);
+    let child = cmd.spawn().ok()?;
+    let stdout = read_probe(child, max_bytes, limit).await?;
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// Whether the CLI claude-agent-acp will run accepts `--thinking-display`.
 ///
 /// The adapter runs `CLAUDE_CODE_EXECUTABLE` when set and its bundled CLI
@@ -3376,16 +3410,18 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
 /// variable, a hung or failing binary, or unparseable output all answer
 /// `false` and leave the session exactly as before.
 async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> bool {
-    const KEY: &str = "CLAUDE_CODE_EXECUTABLE";
     let executable = cmd
         .as_std()
         .get_envs()
-        .find(|(key, _)| *key == KEY)
+        .find(|(key, _)| *key == CLAUDE_EXECUTABLE_ENV)
         .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
-        .unwrap_or_else(|| std::env::var_os(KEY))
+        .unwrap_or_else(|| std::env::var_os(CLAUDE_EXECUTABLE_ENV))
         .filter(|path| !path.is_empty());
     let Some(executable) = executable else {
-        tracing::debug!(target: "acp::spawn", "{KEY} unset; not requesting thinking summaries");
+        tracing::debug!(
+            target: "acp::spawn",
+            "{CLAUDE_EXECUTABLE_ENV} unset; not requesting thinking summaries"
+        );
         return false;
     };
     let mut version_cmd = tokio::process::Command::new(&executable);
@@ -3429,10 +3465,6 @@ async fn claude_version_within(
 /// Read at most `max_bytes` of `child`'s stdout and require a clean exit
 /// within `limit`. On timeout the whole process group is killed, so a
 /// launcher's children do not outlive the probe.
-///
-/// Split out of the version check so a second short-lived probe of the same
-/// CLI can share one spawn, timeout and kill discipline rather than growing
-/// its own.
 async fn read_probe(
     mut child: tokio::process::Child,
     max_bytes: u64,
