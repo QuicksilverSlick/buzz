@@ -681,6 +681,51 @@ mod tests {
         assert!(f.accounts()[0].signed_out);
     }
 
+    /// The whole probe, end to end, against a CLI that answers the way the
+    /// real one does: `{"loggedIn": false, "authMethod": "none"}` on stdout
+    /// and exit **1**.
+    ///
+    /// Nothing drove this path before. `read_status` was tested on string
+    /// literals, which is below the exit status entirely, and the only test
+    /// that called `probe` pointed it at a binary that does not exist — so
+    /// the suite asserted the Unknown path and never once asserted the
+    /// verdict the feature exists to produce.
+    #[tokio::test]
+    async fn the_probe_reads_a_signed_out_answer_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = |path: &std::path::Path| {
+            vec![(
+                "CLAUDE_CODE_EXECUTABLE".to_string(),
+                path.display().to_string(),
+            )]
+        };
+
+        // Signed out: the real CLI's own output and its own exit status.
+        let out = crate::acp::write_stub_cli(
+            dir.path(),
+            "signed-out",
+            r#"{"loggedIn": false, "authMethod": "none"}"#,
+            1,
+        );
+        assert_eq!(probe(&named(&out)).await, SignIn::SignedOut);
+
+        // Signed in: a clean exit, read the same way.
+        let good = crate::acp::write_stub_cli(dir.path(), "signed-in", r#"{"loggedIn": true}"#, 0);
+        assert_eq!(probe(&named(&good)).await, SignIn::Valid);
+
+        // And output that says nothing about `loggedIn` is still no answer,
+        // whatever it exits with: a CLI printing an error page must not be
+        // the reason a working agent is marked down.
+        for (name, text, code) in [
+            ("asks-to-log-in", "Please run claude login", 1),
+            ("empty", "", 0),
+            ("html", "<html>502 Bad Gateway</html>", 0),
+        ] {
+            let stub = crate::acp::write_stub_cli(dir.path(), name, text, code);
+            assert_eq!(probe(&named(&stub)).await, SignIn::Unknown, "{name}");
+        }
+    }
+
     /// The probe never spends usage and never marks a login down on its own
     /// failure: a CLI that is not there, or one that hangs, is Unknown.
     #[tokio::test]
