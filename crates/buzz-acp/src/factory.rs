@@ -668,8 +668,14 @@ pub(crate) struct Factory {
     /// The owner's texts waiting to go out, oldest first (see [`alert`]).
     alerts: Vec<String>,
     /// The incident the owner has already been texted about, until its
-    /// all-clear goes out: at most one text per incident each way.
+    /// all-clear goes out: one opening text and one all-clear per incident.
     alerted: Option<String>,
+    /// The worst the incident had got when the owner was last texted about
+    /// it (see [`alert::severity`]). An incident that gets worse — moving,
+    /// then stopped — texts again, because the first text's reassurance
+    /// stops being true; anything that is not worse does not, so a
+    /// 30-minute probe loop stays quiet.
+    alerted_worst: Option<u8>,
 }
 
 impl Factory {

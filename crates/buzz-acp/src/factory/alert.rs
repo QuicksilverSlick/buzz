@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use super::{truncate, Factory, TEXT_MAX};
+use super::{truncate, Factory, Health, TEXT_MAX};
 
 /// The command line the harness runs to text the owner; the alert text is
 /// its last argument. Unset: no texts are sent.
@@ -30,20 +30,46 @@ const SMS_TO_ENV: &str = "SMS_TO";
 /// A send that has not finished in this long is abandoned.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How bad a health is for the work the owner is waiting on: working,
+/// moving with a catch, or stopped. Only an increase is worth a second text
+/// in one incident — the owner's last text must never be a reassurance the
+/// state has since contradicted — and two different ways of being stopped
+/// are not an increase.
+fn severity(health: Health) -> u8 {
+    match health {
+        Health::Operational | Health::Recovering => 0,
+        Health::Degraded => 1,
+        Health::Blocked | Health::Down => 2,
+    }
+}
+
 impl Factory {
     /// Queue the owner's text for a Critical that just opened.
     ///
-    /// At most one per incident, whatever else that incident goes on to
-    /// raise: two Criticals in one outage are still one outage, and an agent
-    /// that probes every 30 minutes must not text every 30 minutes. `text`
-    /// is the card's own wording, which is already free of tokens, paths,
-    /// emails and member text.
+    /// At most one per incident *per state*. Two Criticals in one outage are
+    /// still one outage and an agent that probes every 30 minutes must not
+    /// text every 30 minutes — but an incident that gets worse is news. The
+    /// hand-off's text says the agent is still working ("It is now running
+    /// on login fallback"); when the next login goes too and the work stops,
+    /// that reassurance is the opposite of what is happening, and it is the
+    /// last thing the owner was told. The thread line already makes this
+    /// call for the partner, and says why, on
+    /// `a_lost_sign_in_on_every_login_parks`: the owner must not be left
+    /// holding a reassurance that is no longer true.
+    ///
+    /// `text` is the card's own wording, which is already free of tokens,
+    /// paths, emails and member text.
     pub(super) fn alert_critical(&mut self, text: &str) {
         let incident = self.incident.clone().unwrap_or_default();
-        if self.alerted.as_ref() == Some(&incident) {
+        if self.alerted.as_ref() != Some(&incident) {
+            self.alerted = Some(incident);
+            self.alerted_worst = None;
+        }
+        let worse = severity(self.health);
+        if self.alerted_worst.is_some_and(|told| worse <= told) {
             return;
         }
-        self.alerted = Some(incident);
+        self.alerted_worst = Some(worse);
         self.queue_alert(&format!("Buzz: {text}"));
     }
 
@@ -66,6 +92,7 @@ impl Factory {
     /// closes. Never without an opening text, and never twice: an owner who
     /// was not told it broke does not need to be told it is fine.
     pub(super) fn alert_all_clear(&mut self) {
+        self.alerted_worst = None;
         if self.alerted.take().is_none() {
             return;
         }
@@ -173,7 +200,7 @@ fn split_command(line: &str) -> Option<(String, Vec<String>)> {
 mod tests {
     use super::*;
     use crate::acp::AcpError;
-    use crate::factory::{classify, Health, Reporting};
+    use crate::factory::{classify, Reporting};
     use crate::scope::SessionScope;
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -281,6 +308,79 @@ mod tests {
         // A second incident texts again: the owner hears about every outage.
         f.plan(0, &scope(), &lost, at(2026, 10, 19, 9, 0));
         assert_eq!(f.take_alerts().len(), 1);
+    }
+
+    /// An incident that gets worse texts again, once.
+    ///
+    /// Losing the first login texts "It is now running on login fallback" —
+    /// a reassurance that the agent is still working. When the fallback
+    /// goes too, the work stops, and that reassurance becomes the exact
+    /// opposite of what is happening while being the last thing the owner
+    /// was told. The thread line already makes this call for the partner
+    /// (`a_lost_sign_in_on_every_login_parks`); the owner's text has to
+    /// make it too.
+    #[test]
+    fn an_incident_that_gets_worse_texts_again() {
+        let mut f = Factory::new(
+            Some(r"primary=C:\logins\one;fallback=C:\logins\two"),
+            "claude-agent-acp",
+        );
+        f.reporting = Reporting {
+            agent: "Reset Worker".to_string(),
+            short: "ade9d0e2".to_string(),
+            ..Reporting::default()
+        };
+        let lost = lost();
+        f.launch_env(0, oct18());
+
+        // The first login goes: the work moves, and the owner is reassured.
+        f.plan(0, &scope(), &lost, oct18());
+        assert_eq!(f.health, Health::Degraded);
+        let moved = f.take_alerts();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].contains("now running on login fallback"),
+            "{moved:?}"
+        );
+
+        // The agent restarts there, and that login goes too: the work stops.
+        f.launch_env(0, oct18());
+        let worse = oct18() + chrono::Duration::minutes(1);
+        f.plan(0, &scope(), &lost, worse);
+        assert_eq!(f.health, Health::Down);
+        let stopped = f.take_alerts();
+        assert_eq!(stopped.len(), 1, "the owner hears that it stopped");
+        assert!(
+            stopped[0].contains("Its requests are parked, not dropped."),
+            "{stopped:?}"
+        );
+
+        // And no more: the 30-minute probes find the same thing in the same
+        // state, and say nothing.
+        for minute in [30, 60, 90] {
+            f.plan(
+                0,
+                &scope(),
+                &lost,
+                oct18() + chrono::Duration::minutes(minute),
+            );
+            assert!(f.take_alerts().is_empty(), "{minute}");
+        }
+
+        // The owner signs the primary back in, which its own check proves,
+        // and the agent answers again. One all-clear closes the whole
+        // thing, however many texts opened it.
+        f.signin_checked(0, crate::factory::SignIn::Valid, oct18());
+        assert!(f.take_alerts().is_empty(), "a parked batch is not recovery");
+        for _ in 0..crate::factory::ANSWERS_TO_RECOVER {
+            f.on_success(0, oct18() + chrono::Duration::hours(3));
+        }
+        assert_eq!(
+            f.take_alerts(),
+            ["Buzz: all clear — Reset Worker is working normally again."]
+        );
+        f.plan(0, &scope(), &lost, at(2026, 10, 19, 9, 0));
+        assert_eq!(f.take_alerts().len(), 1, "a new incident texts again");
     }
 
     /// An agent that was never texted about an outage is never texted an
