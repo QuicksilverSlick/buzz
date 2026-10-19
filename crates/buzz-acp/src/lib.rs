@@ -13959,11 +13959,17 @@ mod error_outcome_emission_tests {
     /// requests.
     #[tokio::test]
     async fn limit_errors_park_without_spending_the_retry_budget() {
+        // This test runs on the real clock, so the reset must stay in the future: a fixed
+        // "resets Oct 18, 7pm" passed on 18 Oct 2026, and the park budget then rightly gave up.
+        let weekly = format!(
+            "Internal error: You've hit your weekly limit · resets {} (UTC)",
+            (chrono::Utc::now() + chrono::Duration::days(3)).format("%b %-d, %-I%P")
+        );
         // The dot turns away while work waits; one short rate limit only slows it.
         for (error, presence) in [
             (
                 adapter_error(serde_json::json!({"code": -32603,
-                    "message": "Internal error: You've hit your weekly limit · resets Oct 18, 7pm (America/Chicago)",
+                    "message": weekly,
                     "data": {"errorKind": "rate_limit"}})),
                 "away",
             ),
