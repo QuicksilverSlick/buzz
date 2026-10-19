@@ -1126,6 +1126,24 @@ impl AgentPool {
         self.agents.iter().any(|slot| slot.is_some())
     }
 
+    /// Whether agent `index` is sitting in its slot right now: idle, so it
+    /// can be taken out and restarted between turns without interrupting
+    /// anything. `slot_alive` is the wider question and counts an agent that
+    /// is checked out on a turn.
+    pub fn slot_idle(&self, index: usize) -> bool {
+        self.agents.get(index).is_some_and(Option::is_some)
+    }
+
+    /// Take idle agent `index` out of its slot, leaving the slot empty.
+    ///
+    /// For a planned restart between turns: the caller hands the agent to a
+    /// respawn, which returns a fresh one to the same slot. `None` when the
+    /// agent is checked out or the slot is already empty, so this can never
+    /// interrupt a turn.
+    pub fn take_idle(&mut self, index: usize) -> Option<OwnedAgent> {
+        self.agents.get_mut(index).and_then(Option::take)
+    }
+
     /// Confirm that pending work for `scope` successfully claimed a worker.
     ///
     /// In particular, an expired busy-owner hold must not be consumed until

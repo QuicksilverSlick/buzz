@@ -2635,6 +2635,49 @@ mod idle_pool_sleep_tests {
         }
     }
 
+    /// An idle agent must not keep sitting on a login the pool has given up
+    /// on. A sign-in check that marks the login an agent is running on
+    /// signed out hands the work over and says so — "It is now running on
+    /// login fallback", on the Critical card and in the owner's text —
+    /// while the agent itself is still on the dead one. `wants_restart` is
+    /// otherwise consulted only after a turn, and the agent this check
+    /// exists for is the one nobody has asked anything for hours, so the
+    /// main loop asks this between turns instead.
+    #[test]
+    fn an_idle_agent_moves_off_a_login_a_check_marked_signed_out() {
+        let now = chrono::Utc::now();
+        let pool = r"token=env;fallback=C:\factory\claude";
+        let mut factory = factory::Factory::new(Some(pool), "claude-agent-acp");
+        factory.launch_env(0, now);
+        let quiet = slot(false);
+
+        // Nothing is wrong: the agent stays where it is.
+        assert!(!idle_agent_should_move(true, &quiet, &factory, 0, now));
+
+        // A check marks the login it is running on signed out.
+        factory.signin_checked(0, factory::SignIn::SignedOut, now);
+        assert!(
+            idle_agent_should_move(true, &quiet, &factory, 0, now),
+            "the agent must move off the login it lost"
+        );
+
+        // Not while it is mid-turn, and not when its slot is already being
+        // respawned — either would interrupt or double up.
+        assert!(!idle_agent_should_move(false, &quiet, &factory, 0, now));
+        assert!(!idle_agent_should_move(true, &slot(true), &factory, 0, now));
+
+        // And once the restart has taken it to the preferred login, it
+        // stays put: one restart per change, not one per loop iteration.
+        factory.launch_env(0, now);
+        assert!(!idle_agent_should_move(true, &quiet, &factory, 0, now));
+
+        // Without a pool there is nowhere to move to, so this never fires.
+        let mut single = factory::Factory::new(None, "claude-agent-acp");
+        single.launch_env(0, now);
+        single.signin_checked(0, factory::SignIn::SignedOut, now);
+        assert!(!idle_agent_should_move(true, &quiet, &single, 0, now));
+    }
+
     // The call-site signal for the `wake_or_respawn_in_flight` gate is
     // `any_respawn_in_flight(&crash_history)`, NOT `!respawn_tasks.is_empty()`.
     // Regression for the PR #5682 review blocker: completed respawn tasks are
@@ -3380,6 +3423,53 @@ async fn run_harness(
                     last_signin_check = std::time::Instant::now();
                     spawn_signin_check(config, &ctx.rest_client);
                 }
+            }
+        }
+
+        // Move an idle agent off a login the pool has given up on, before a
+        // request arrives on it.
+        //
+        // A check that marks the login an agent is running on signed out
+        // hands the work to the next login — and says so, on the Critical
+        // card and in the owner's text: "It is now running on login
+        // fallback." Nothing made that true. `wants_restart` is otherwise
+        // consulted only after a successful turn, and the agent this check
+        // exists for is the one nobody has asked anything for hours. So the
+        // restart happens here instead, between turns, where it costs
+        // nothing but the spawn.
+        //
+        // Every iteration rather than the 30-second maintenance beat: the
+        // request that must not land on a dead login can arrive at any
+        // moment, and this is one lock and a comparison per slot.
+        if pool_ready && signin_check_every.is_some() && pool.task_map().is_empty() {
+            let now = chrono::Utc::now();
+            for (index, slot) in crash_history.iter_mut().enumerate() {
+                let move_it = idle_agent_should_move(
+                    pool.slot_idle(index),
+                    slot,
+                    &config.factory.lock(),
+                    index,
+                    now,
+                );
+                if !move_it {
+                    continue;
+                }
+                let Some(agent) = pool.take_idle(index) else {
+                    continue;
+                };
+                tracing::info!(
+                    agent = index,
+                    "restarting between turns onto the account pool's preferred login"
+                );
+                spawn_respawn_task(
+                    agent,
+                    config,
+                    slot,
+                    false,
+                    &respawn_tx,
+                    &mut respawn_tasks,
+                    observer.clone(),
+                );
             }
         }
 
@@ -6557,6 +6647,26 @@ fn default_heartbeat_prompt() -> String {
 /// the actual shutdown + backoff + spawn_and_init work into a background task.
 /// The result comes back through `respawn_tx` so the main loop stays responsive.
 ///
+/// Whether idle agent `index` should be restarted now onto the login the
+/// account pool would pick for it.
+///
+/// Three things have to hold: the agent is `idle` (sitting in its slot, so
+/// taking it out interrupts no turn), nothing is already respawning that
+/// slot, and the factory says the login it was started on is no longer the
+/// one the pool prefers — a sign-in check having marked it signed out, or an
+/// earlier login's limit having lifted.
+///
+/// Pure, so the rule can be exercised without a live agent subprocess.
+fn idle_agent_should_move(
+    idle: bool,
+    slot: &SlotCircuit,
+    factory: &factory::Factory,
+    index: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    idle && !slot.respawn_in_flight && factory.wants_restart(index, now)
+}
+
 /// Returns `true` if a respawn task was spawned, `false` if the circuit is open.
 ///
 /// `crashed` is false for a planned restart (a switch of account-pool login):

@@ -31,6 +31,9 @@ pub(crate) use signin_check::{
 
 #[cfg(test)]
 pub(crate) use park_budget::PARK_MAX_PROBES;
+/// The check's verdict, so the main loop's own tests can drive it.
+#[cfg(test)]
+pub(crate) use signin_check::SignIn;
 
 /// What a failed turn means for the work it carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
