@@ -149,7 +149,38 @@ impl Factory {
         if !self.accounts.is_empty() && !self.work_runs_on(index, now) {
             return self.spare_signin_lost(index);
         }
+        if self.health == Health::Blocked {
+            return self.signin_lost_while_parked(index);
+        }
         self.record_limit_on(index, &check_failure(), now);
+        true
+    }
+
+    /// The work is already parked on a limit only the owner or a clock can
+    /// lift, and now the login it is parked on is signed out too.
+    ///
+    /// The login is marked out — the pool stops choosing it, and a later
+    /// check or a real answer clears it — and nothing else moves.
+    /// [`record_limit_on`](Factory::record_limit_on) would overwrite
+    /// `self.failure` wholesale, and with it the reset time the STATE record
+    /// and the desktop's panel are showing: "paused until Sun 7 pm" would
+    /// become a sign-in state with no time in it at all, until the next real
+    /// failure happened to put one back. What the work is waiting for has
+    /// not changed, so what the harness says it is waiting for must not
+    /// change either. The 401 on the first request after the limit lifts is
+    /// what opens the sign-in's own incident, with its own card and text.
+    fn signin_lost_while_parked(&mut self, index: usize) -> bool {
+        let Some(account) = self.accounts.get_mut(index) else {
+            // No pool, so there is no per-login state to keep: the single
+            // login's sign-in is the harness's own, and the harness is
+            // already stopped on something it is reporting truthfully.
+            return false;
+        };
+        account.signed_out = true;
+        tracing::warn!(
+            login = index,
+            "a parked login is also signed out — keeping the limit that parked it on the record"
+        );
         true
     }
 
@@ -491,6 +522,61 @@ mod tests {
         assert!(record.contains("state=DEGRADED class=sign_in"), "{record}");
         assert!(!record.contains("retrying"), "{record}");
         assert!(record.contains("continuing on fallback"), "{record}");
+    }
+
+    /// A check that lands while the work is parked on a limit must not take
+    /// the limit's reset time away with it. The panel says "Paused: Claude
+    /// weekly limit · resets Sun 7 pm", which is the one thing the owner
+    /// needs from it; a background check overwriting the whole failure would
+    /// replace that with a sign-in state carrying no time at all, until some
+    /// later real failure happened to put one back.
+    #[test]
+    fn a_check_on_a_parked_login_keeps_the_limit_that_parked_it() {
+        let mut f = pool();
+        let weekly = classify(
+            &AcpError::agent_error(
+                -32603,
+                "Internal error: You've hit your weekly limit · resets Oct 20, 7pm                  (America/Chicago)",
+            ),
+            oct18(),
+        );
+        // Both logins limited: the work is parked, not handed off.
+        f.launch_env(0, oct18());
+        f.plan(0, &scope(), &weekly, oct18());
+        f.launch_env(0, oct18());
+        f.plan(0, &scope(), &weekly, oct18());
+        assert_eq!(f.health, Health::Blocked);
+        let resets = f.failure.as_ref().and_then(|x| x.resets_at);
+        assert!(resets.is_some(), "the limit has a reset time");
+        let on = f.label(0).to_string();
+        f.take_alerts();
+
+        // The login the work is parked on is signed out as well.
+        let later = oct18() + chrono::Duration::minutes(15);
+        assert!(f.signin_checked(1, SignIn::SignedOut, later));
+        assert!(f.accounts()[1].signed_out, "the login is marked out");
+        // What the work is waiting for has not changed, so neither has what
+        // the harness says about it.
+        assert_eq!(f.health, Health::Blocked);
+        assert_eq!(f.failure.as_ref().map(|x| x.slug), Some("weekly_limit"));
+        assert_eq!(f.failure.as_ref().and_then(|x| x.resets_at), resets);
+        assert_eq!(f.label(0), on, "the work has not moved");
+        assert!(f.take_alerts().is_empty(), "no second text in one outage");
+        let record = f.take_report(later).expect("the record still falls due");
+        assert!(record.contains("class=weekly_limit"), "{record}");
+        assert!(record.contains("resets=2026-10-21T00:00:00Z"), "{record}");
+
+        // Without a pool there is no per-login state to keep, and the
+        // harness is already reporting the limit truthfully.
+        let mut single = Factory::new(None, "claude-agent-acp");
+        single.plan(0, &scope(), &weekly, oct18());
+        assert_eq!(single.health, Health::Blocked);
+        assert!(!single.signin_checked(0, SignIn::SignedOut, later));
+        assert_eq!(single.health, Health::Blocked);
+        assert_eq!(
+            single.failure.as_ref().map(|x| x.slug),
+            Some("weekly_limit")
+        );
     }
 
     /// Every login signed out parks the work, exactly as every login limited
