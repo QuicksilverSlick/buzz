@@ -401,14 +401,27 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
 
-    /// Claude only: an ordered, `;`-separated pool of `CLAUDE_CONFIG_DIR`
-    /// folders, each signed in to its own subscription (first = primary).
-    /// On a usage or spend limit the agent restarts on the next free login
-    /// and re-runs the same request; it returns to the primary after its
-    /// reset. Write an entry as `label=folder` to name that login in records
-    /// and cards; a folder in the home directory is named `primary`, never
-    /// after the OS account.
-    #[arg(long, env = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL")]
+    /// Claude only: an ordered, `;`-separated pool of logins (first =
+    /// primary). On a usage or spend limit, or a lost sign-in, the agent
+    /// restarts on the next healthy login and re-runs the same request; it
+    /// returns to the primary once that login is free again.
+    ///
+    /// An entry is normally a `CLAUDE_CONFIG_DIR` folder signed in to its
+    /// own subscription. Write it as `label=folder` to name that login in
+    /// records and cards; a folder in the home directory is named `primary`,
+    /// never after the OS account.
+    ///
+    /// One entry may be `label=env` instead of a folder, meaning "this login
+    /// is the agent's own environment, unchanged": no `CLAUDE_CONFIG_DIR`
+    /// override, so its settings folder stays as it is, and no blanked
+    /// `CLAUDE_CODE_OAUTH_TOKEN`, so its own long-lived `claude setup-token`
+    /// token is the sign-in. An agent with its own token and its folder
+    /// login as the fallback is written:
+    ///
+    /// ```text
+    /// token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude
+    /// ```
+    #[arg(long, env = crate::factory::ACCOUNT_POOL_ENV)]
     pub claude_account_pool: Option<String>,
 
     /// The #factory channel (uuid) this harness posts its STATE records to

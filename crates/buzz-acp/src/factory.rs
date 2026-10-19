@@ -498,13 +498,27 @@ fn card_quote(provider: &str, text: &str) -> String {
 /// login in records and cards; otherwise the folder's own name is used, and a
 /// folder sitting directly under the home directory is `primary`, never the
 /// OS account name.
+///
+/// One entry may be written `label=env` ([`ENV_ENTRY`]) instead of a folder,
+/// meaning "this login is the agent's own environment, unchanged": no
+/// `CLAUDE_CONFIG_DIR` override and no blanked token, so the agent's own
+/// long-lived `claude setup-token` token signs it in. An agent with its own
+/// token and its folder login as a fallback is written
+/// `token=env;fallback=…\factory\claude`.
 pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
+
+/// The value that makes a pool entry the agent's own environment rather than
+/// a folder. The exact word, so a folder that happens to be called `env`
+/// still has to be written as a path.
+pub(crate) const ENV_ENTRY: &str = "env";
 
 /// One login of the pool.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Account {
-    /// The `CLAUDE_CONFIG_DIR` folder. Never shown: it holds a user path.
-    dir: String,
+    /// The `CLAUDE_CONFIG_DIR` folder, or `None` for a [`ENV_ENTRY`] entry:
+    /// the agent's own environment, left exactly as it is. Never shown
+    /// either way, because a folder holds a user path.
+    dir: Option<String>,
     /// What records and lines call it: the owner's own `label=`, or the
     /// folder's name — never an email, a token or the OS account name. A
     /// `…/factory/claude` folder is `factory`; `~/.claude` is `primary`.
@@ -709,30 +723,54 @@ impl Factory {
             .position(|a| a.limited.as_ref().is_none_or(|l| l.until <= now))
     }
 
-    /// Env for starting agent `slot`: the preferred login's folder, and an
-    /// empty `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
-    /// folder's own login. Empty without a pool. When every login is limited
-    /// it starts on the one that frees up first.
+    /// The login a new agent starts on: the first one not limited, or the
+    /// one that frees up first when every login is. `None` without a pool.
+    fn pick(&self, now: DateTime<Utc>) -> Option<usize> {
+        let soonest = (0..self.accounts.len())
+            .min_by_key(|&i| self.accounts[i].limited.as_ref().map(|l| l.until))?;
+        Some(self.preferred(now).unwrap_or(soonest))
+    }
+
+    /// Env for starting agent `slot` on the login [`pick`](Self::pick)
+    /// chose. Empty without a pool.
     pub(crate) fn launch_env(&mut self, slot: usize, now: DateTime<Utc>) -> Vec<(String, String)> {
-        let Some(soonest) = (0..self.accounts.len())
-            .min_by_key(|&i| self.accounts[i].limited.as_ref().map(|l| l.until))
-        else {
+        let Some(i) = self.pick(now) else {
             return Vec::new();
         };
-        let i = self.preferred(now).unwrap_or(soonest);
         self.started_on.insert(slot, i);
-        vec![
-            ("CLAUDE_CONFIG_DIR".into(), self.accounts[i].dir.clone()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
-        ]
+        self.account_env(i)
+    }
+
+    /// The launch environment for login `i`: its folder, and an empty
+    /// `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
+    /// folder's own login.
+    ///
+    /// Empty for a [`ENV_ENTRY`] entry, which is what makes it the agent's
+    /// own environment unchanged — its own `CLAUDE_CONFIG_DIR` for settings
+    /// and its own long-lived token for the sign-in.
+    fn account_env(&self, i: usize) -> Vec<(String, String)> {
+        match self.accounts.get(i).and_then(|a| a.dir.as_deref()) {
+            Some(dir) => vec![
+                ("CLAUDE_CONFIG_DIR".into(), dir.to_string()),
+                ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Which login agent `slot` was last started on.
+    fn on(&self, slot: usize) -> usize {
+        self.started_on.get(&slot).copied().unwrap_or(0)
     }
 
     /// The label of the login `slot` runs on; `default` without a pool.
     pub(crate) fn label(&self, slot: usize) -> &str {
-        self.started_on
-            .get(&slot)
-            .and_then(|&i| self.accounts.get(i))
-            .map_or("default", |a| &a.label)
+        self.at(self.on(slot))
+    }
+
+    /// The label of login `i`; `default` without a pool.
+    fn at(&self, i: usize) -> &str {
+        self.accounts.get(i).map_or("default", |a| &a.label)
     }
 
     /// Decide what happens to `scope`'s batch after agent `slot` failed on
@@ -753,7 +791,7 @@ impl Factory {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Plan {
-        let (wait, free) = self.begin_limit(slot, failure, now);
+        let (wait, free) = self.begin_limit(self.on(slot), failure, now);
         if let Some(next) = free {
             let label = self.accounts[next].label.clone();
             let line = self
@@ -793,7 +831,7 @@ impl Factory {
     /// while the pool is idle left the dot green and #factory silent until
     /// some real request happened along and failed (spec 2.2, 4.2).
     pub(crate) fn record_limit(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
-        let (wait, free) = self.begin_limit(slot, failure, now);
+        let (wait, free) = self.begin_limit(self.on(slot), failure, now);
         if free.is_some() {
             // Another login can take the next request: moving, with a catch.
             self.resumes = None;
@@ -806,25 +844,24 @@ impl Factory {
     }
 
     /// The first half both paths share: count the rate streak, record who
-    /// and what failed, mark the slot's login limited for a class a login
-    /// can hit, and return how long the wait is plus the free login, if any,
-    /// that could take the work right now.
+    /// and what failed, mark login `on` limited for a class a login can hit,
+    /// and return how long the wait is plus the free login, if any, that
+    /// could take the work right now.
     fn begin_limit(
         &mut self,
-        slot: usize,
+        on: usize,
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> (Duration, Option<usize>) {
         if failure.class == Class::RateLimit {
             self.rate_streak += 1;
         }
-        self.account = self.label(slot).to_string();
+        self.account = self.at(on).to_string();
         self.failure = Some(failure.clone());
         self.gave_up = false;
         let mut wait = park_for(failure, now, self.rate_streak);
         if matches!(failure.class, Class::UsageLimit | Class::SpendCap) && !self.accounts.is_empty()
         {
-            let on = self.started_on.get(&slot).copied().unwrap_or(0);
             self.accounts[on].limited = Some(Limit {
                 until: now + chrono::Duration::from_std(wait).unwrap_or_default(),
                 slug: failure.slug,
@@ -1198,12 +1235,20 @@ pub(crate) const PRIMARY_LABEL: &str = "primary";
 
 /// One pool entry: a folder, or `label=folder` when the owner names it.
 /// Naming it is the way to keep the label off the path altogether.
-fn parse_entry(entry: &str) -> (String, String) {
+///
+/// `label=env` ([`ENV_ENTRY`]) is the one entry that names no folder: it
+/// means the agent's own environment, unchanged, so its own long-lived token
+/// is the login. The label is still the owner's own word, which is how a
+/// token-based login gets a name that is neither a token nor a path.
+fn parse_entry(entry: &str) -> (String, Option<String>) {
     match entry.split_once('=') {
-        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
-            (slug(label.trim()), dir.trim().to_string())
+        Some((label, value)) if is_plain_label(label) && value.trim() == ENV_ENTRY => {
+            (slug(label.trim()), None)
         }
-        _ => (account_label(entry), entry.to_string()),
+        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
+            (slug(label.trim()), Some(dir.trim().to_string()))
+        }
+        _ => (account_label(entry), Some(entry.to_string())),
     }
 }
 
@@ -1788,6 +1833,53 @@ mod tests {
         ]
     }
 
+    /// The owner's own pool from 18 Oct: the agent's own long-lived token
+    /// first, its folder login as the fallback.
+    const TOKEN_POOL: &str = r"token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude";
+
+    /// A `label=env` entry starts the agent with its environment exactly as
+    /// it is: no `CLAUDE_CONFIG_DIR` override to move its settings, and no
+    /// blanked token, so the agent's own `claude setup-token` token is what
+    /// signs it in. A folder entry still blanks the token, so a PC-wide one
+    /// cannot win over that folder's own login.
+    #[test]
+    fn an_env_entry_keeps_the_agents_own_environment() {
+        let mut f = Factory::new(Some(TOKEN_POOL), "claude-agent-acp");
+        let labels: Vec<String> = f.accounts().iter().map(|a| a.label.clone()).collect();
+        assert_eq!(labels, ["token", "fallback"]);
+        assert_eq!(f.accounts()[0].dir, None, "no folder: the env is the login");
+        assert_eq!(
+            f.accounts()[1].dir.as_deref(),
+            Some(FACTORY_DIR),
+            "the fallback is still a folder"
+        );
+
+        assert_eq!(
+            f.launch_env(0, oct16()),
+            Vec::<(String, String)>::new(),
+            "nothing is overridden, so nothing is set"
+        );
+        assert_eq!(f.label(0), "token");
+
+        // The fallback behaves exactly as every folder entry does today.
+        f.plan(0, &scope(), &weekly(), oct16());
+        assert_eq!(f.launch_env(0, oct16()), env(FACTORY_DIR));
+        assert_eq!(f.label(0), "fallback");
+
+        // Only the exact word is the env form; anything else is a folder,
+        // and a label never carries a token, a path or an email.
+        for folder in ["one=envy", "one=env/claude", r"one=C:\env", "env"] {
+            let f = Factory::new(Some(folder), "claude-agent-acp");
+            assert!(f.accounts()[0].dir.is_some(), "{folder}");
+        }
+        for label in &labels {
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "{label}"
+            );
+        }
+    }
+
     const FACTORY_DIR: &str = r"C:\Users\PC owner\.buzz-agents\factory\claude";
     const SECOND_DIR: &str = r"C:\Users\PC owner\.buzz-agents\account-test\claude";
 
@@ -1844,7 +1936,10 @@ mod tests {
         let labels: Vec<_> = pool.accounts().iter().map(|a| a.label.as_str()).collect();
         assert_eq!(labels, ["owner", "primary", "primary-2"]);
         // The folder itself is still the one the owner wrote.
-        assert_eq!(pool.accounts()[0].dir, r"C:\Users\PC owner\.claude");
+        assert_eq!(
+            pool.accounts()[0].dir.as_deref(),
+            Some(r"C:\Users\PC owner\.claude")
+        );
         // Nothing derived from a path carries an account or folder name.
         for label in &labels[1..] {
             for leak in ["pc", "craig", "users", "home"] {
