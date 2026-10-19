@@ -13817,7 +13817,11 @@ mod error_outcome_emission_tests {
         assert_eq!(respawn_tasks.len(), 1);
         assert_eq!(config.factory.lock().label(0), "two");
 
-        // A sign-in loss with the same pool parks; it never rotates.
+        // A lost sign-in on the second login now re-runs the same batch
+        // too (spec M2 item 2): the only login left is the primary, whose
+        // limit has not lifted, so there is nowhere to go and the batch
+        // parks — but the login it lost is marked signed out, which no
+        // clock lifts.
         let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
             &config,
             agent_error(
@@ -13830,6 +13834,31 @@ mod error_outcome_emission_tests {
         assert!(!queue.has_flushable_work());
         assert!(pool.agents_mut()[0].is_some());
         assert!(respawn_tasks.is_empty());
+        assert_eq!(config.factory.lock().presence(), "away");
+
+        // With the primary free again, the same loss hands the batch over at
+        // once instead of parking it: three hours of downtime become none.
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let (mut queue, channel_id, mut pool, respawn_tasks) = run_failed_turn(
+            &config,
+            agent_error("API Error: OAuth session expired and could not be refreshed"),
+            crate::queue::MAX_RETRIES,
+        )
+        .await;
+        assert_eq!(queue.queued_event_count(channel_id), 1, "the same request");
+        assert!(queue.has_flushable_work(), "runs again now, not parked");
+        assert!(pool.agents_mut()[0].is_none(), "the agent restarts");
+        assert_eq!(respawn_tasks.len(), 1);
+        assert_eq!(config.factory.lock().label(0), "two");
+        assert_eq!(
+            config.factory.lock().presence(),
+            "online",
+            "the work is moving, so the dot stays green"
+        );
     }
 
     /// An ordinary error still spends the budget and is dropped at the end.
