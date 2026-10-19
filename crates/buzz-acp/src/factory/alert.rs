@@ -229,6 +229,19 @@ mod tests {
         )
     }
 
+    /// The pool shapes a login's environment can come from: the agent's own
+    /// token, a folder, and mixtures of both.
+    const TWO_LOGINS: &str = r"token=env;fallback=C:\logins\two";
+    const ONE_FOLDER: &str = r"C:\logins\one";
+    const TWO_FOLDERS: &str = r"primary=C:\logins\one;spare=C:\logins\two";
+
+    /// Everything a pool login is allowed to put in the agent's environment:
+    /// its own config folder, and a blanked token so a PC-wide one cannot
+    /// win over the folder's login. Nothing else, and nothing of the
+    /// harness's own.
+    const ALLOWED_AGENT_ENV_KEYS: [&str; 2] =
+        ["CLAUDE_CONFIG_DIR", crate::factory::OAUTH_TOKEN_ENV];
+
     fn factory() -> Factory {
         let mut f = Factory::new(None, "claude-agent-acp");
         f.reporting = Reporting {
@@ -483,9 +496,10 @@ mod tests {
         }
     }
 
-    /// `SMS_TO` reaches the alert command and nothing else. The Orchestrator
-    /// texts a client with this same script from its own environment, so the
-    /// harness's own `SMS_TO` must come out of this unchanged.
+    /// `SMS_TO` reaches the alert command and nothing else — above all not
+    /// the agent. The Orchestrator texts a client with this same script and
+    /// reads its recipient from its own environment, so a leak into a pool
+    /// login's environment would change who that reaches.
     #[tokio::test]
     async fn the_alert_command_gets_sms_to_in_its_own_env_only() {
         // A folder with a space in it, like the owner's own path.
@@ -493,7 +507,6 @@ mod tests {
         let dir = dir.path().join("send sms");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("sent.txt");
-        let before = std::env::var_os(SMS_TO_ENV);
 
         // A fake `send_sms` that writes its recipient and its message.
         let sender = write_fake_sender(&dir, &out);
@@ -504,17 +517,50 @@ mod tests {
         assert!(written.contains("+15551234567"), "{written}");
         assert!(written.contains("Buzz: all clear"), "{written}");
 
-        // The harness's own environment is untouched either way: the
-        // Orchestrator's client keeps getting the Orchestrator's texts.
-        assert_eq!(std::env::var_os(SMS_TO_ENV), before);
+        // With no recipient the command runs without one, rather than being
+        // handed something else's.
         std::fs::remove_file(&out).unwrap();
         send(&cmd, None, "Buzz: no recipient").await;
-        assert_eq!(std::env::var_os(SMS_TO_ENV), before);
         let written = std::fs::read_to_string(&out).expect("the command ran");
         assert!(
             !written.contains("+1555"),
             "no recipient was set: {written}"
         );
+
+        // And the half that matters. This used to be
+        // `assert_eq!(std::env::var_os(SMS_TO_ENV), before)`, which cannot
+        // fail whatever the code does: `Command::env` writes a child's
+        // environment block and cannot mutate this process's. What has to
+        // hold is that no pool shape puts the recipient — under either
+        // name — in the environment an agent is launched with.
+        let now = oct18();
+        for pool in [
+            None,
+            Some("token=env"),
+            Some(TWO_LOGINS),
+            Some(ONE_FOLDER),
+            Some(TWO_FOLDERS),
+        ] {
+            let mut factory = Factory::new(pool, "claude-agent-acp");
+            let mut envs = vec![factory.launch_env(0, now)];
+            for i in 0..=factory.accounts().len() {
+                envs.push(factory.account_env(i));
+            }
+            for env in envs {
+                for (key, value) in env {
+                    assert!(
+                        !key.contains("SMS_TO"),
+                        "{pool:?} put {key} in the agent's environment"
+                    );
+                    // Stronger, and the reason that cannot happen: an
+                    // agent's environment is built from pool folders alone.
+                    assert!(
+                        ALLOWED_AGENT_ENV_KEYS.contains(&key.as_str()),
+                        "{pool:?} put an unexpected {key}={value} in the agent's environment"
+                    );
+                }
+            }
+        }
     }
 
     /// Write a script that records `$SMS_TO` and its first argument in `out`.

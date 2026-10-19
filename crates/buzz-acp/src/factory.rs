@@ -531,6 +531,14 @@ pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
 /// still has to be written as a path.
 pub(crate) const ENV_ENTRY: &str = "env";
 
+/// The folder a Claude login's own settings and credential live in.
+const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// A PC-wide token, blanked for a folder entry so it cannot win over that
+/// folder's own login. Named so the one test that guards what reaches an
+/// agent can name it too.
+pub(super) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
 /// One login of the pool.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Account {
@@ -797,8 +805,8 @@ impl Factory {
     pub(super) fn account_env(&self, i: usize) -> Vec<(String, String)> {
         match self.accounts.get(i).and_then(|a| a.dir.as_deref()) {
             Some(dir) => vec![
-                ("CLAUDE_CONFIG_DIR".into(), dir.to_string()),
-                ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
+                (CONFIG_DIR_ENV.into(), dir.to_string()),
+                (OAUTH_TOKEN_ENV.into(), String::new()),
             ],
             None => Vec::new(),
         }
