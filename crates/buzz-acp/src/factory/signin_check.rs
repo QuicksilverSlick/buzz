@@ -22,9 +22,11 @@
 //! boolean in a documented `--json` output rather than prose to guess at.
 //!
 //! Only a definite `loggedIn: false` is acted on. No CLI to ask, a timeout,
-//! an unclean exit, or output that will not parse are all [`SignIn::Unknown`]
-//! and change nothing: a check that cannot tell must never be the reason a
-//! working agent is marked down. What this check cannot prove — a token the
+//! or output that will not parse are all [`SignIn::Unknown`] and change
+//! nothing: a check that cannot tell must never be the reason a working
+//! agent is marked down. The exit status is not one of those: the CLI exits
+//! 1 to say the login is signed out, so the output is read whatever the
+//! status, and only the output decides. What this check cannot prove — a token the
 //! server has revoked but the CLI still holds locally — is caught instead by
 //! the failover of item 2, at once, on the next real request. Proving it
 //! here would mean a billable or undocumented API call, and a wrong verdict
@@ -176,6 +178,10 @@ pub(crate) async fn probe(env: &[(String, String)]) -> SignIn {
         .arg("status")
         .arg("--json")
         .envs(env.iter().cloned());
+    // Any exit status: the real CLI prints `{"loggedIn": false, …}` and
+    // exits 1 when the login is signed out, which is the answer this whole
+    // check exists to hear. A spawn that fails, a timeout and output that
+    // will not parse are all still Unknown.
     match crate::acp::probe_stdout(&mut cmd, MAX_STATUS_BYTES, CHECK_TIMEOUT).await {
         Some(out) => read_status(&out),
         None => {

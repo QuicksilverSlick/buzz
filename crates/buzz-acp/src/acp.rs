@@ -3389,9 +3389,18 @@ pub(crate) fn claude_cli(launch_env: &[(String, String)]) -> std::ffi::OsString 
         .unwrap_or_else(|| "claude".into())
 }
 
-/// Run `cmd` and read at most `max_bytes` of its stdout, requiring a clean
-/// exit within `limit`. `None` when any of that goes wrong: a probe that did
-/// not answer says nothing, rather than saying something wrong.
+/// Run `cmd` and read at most `max_bytes` of its stdout within `limit`,
+/// whatever it exits with. `None` when the spawn fails or the time runs out:
+/// a probe that did not answer says nothing, rather than saying something
+/// wrong.
+///
+/// The exit status is deliberately not a verdict here. `claude auth status
+/// --json` prints `{"loggedIn": false, …}` and exits **1** when the login is
+/// signed out — the one answer the sign-in check exists to read — so
+/// requiring a clean exit threw it away and left every signed-out login
+/// looking like a probe that could not tell. The version check, whose
+/// caller has no use for a version line from a CLI that did not run
+/// cleanly, keeps the strict form through [`read_probe`].
 pub(crate) async fn probe_stdout(
     cmd: &mut tokio::process::Command,
     max_bytes: u64,
@@ -3399,7 +3408,7 @@ pub(crate) async fn probe_stdout(
 ) -> Option<String> {
     configure_version_probe(cmd);
     let child = cmd.spawn().ok()?;
-    let stdout = read_probe(child, max_bytes, limit).await?;
+    let stdout = read_probe(child, max_bytes, limit, false).await?;
     Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
@@ -3458,17 +3467,18 @@ async fn claude_version_within(
     limit: std::time::Duration,
 ) -> Option<(u64, u64, u64)> {
     const MAX_VERSION_BYTES: u64 = 256;
-    let stdout = read_probe(child, MAX_VERSION_BYTES, limit).await?;
+    let stdout = read_probe(child, MAX_VERSION_BYTES, limit, true).await?;
     parse_claude_version(&String::from_utf8_lossy(&stdout))
 }
 
-/// Read at most `max_bytes` of `child`'s stdout and require a clean exit
-/// within `limit`. On timeout the whole process group is killed, so a
-/// launcher's children do not outlive the probe.
+/// Read at most `max_bytes` of `child`'s stdout within `limit`, requiring a
+/// clean exit when `require_success`. On timeout the whole process group is
+/// killed, so a launcher's children do not outlive the probe.
 async fn read_probe(
     mut child: tokio::process::Child,
     max_bytes: u64,
     limit: std::time::Duration,
+    require_success: bool,
 ) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let pid = child.id();
@@ -3476,7 +3486,11 @@ async fn read_probe(
         let mut stdout = Vec::new();
         let pipe = child.stdout.take()?;
         pipe.take(max_bytes).read_to_end(&mut stdout).await.ok()?;
-        child.wait().await.ok()?.success().then_some(stdout)
+        let status = child.wait().await.ok()?;
+        // The exit status still has to be reached — a process that never
+        // ends is a timeout, not an answer — but it is only a verdict on
+        // the output when the caller says so.
+        (!require_success || status.success()).then_some(stdout)
     };
     match tokio::time::timeout(limit, probe).await {
         Ok(stdout) => stdout,
@@ -3486,6 +3500,36 @@ async fn read_probe(
             }
             None
         }
+    }
+}
+
+/// Write a stub CLI that prints `stdout` and exits with `code`, the way
+/// `alert.rs` writes its fake sender: a `.cmd` on Windows, a `sh` script
+/// elsewhere. Returns the path to hand to `CLAUDE_CODE_EXECUTABLE`.
+#[cfg(test)]
+pub(crate) fn write_stub_cli(
+    dir: &std::path::Path,
+    name: &str,
+    stdout: &str,
+    code: i32,
+) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join(format!("{name}.cmd"));
+        std::fs::write(
+            &path,
+            format!("@echo off\r\necho {stdout}\r\nexit /b {code}\r\n"),
+        )
+        .unwrap();
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{name}.sh"));
+        std::fs::write(&path, format!("#!/bin/sh\necho '{stdout}'\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 }
 
@@ -3508,6 +3552,58 @@ mod tests {
 
     fn opt(kind: &str, id: &str) -> serde_json::Value {
         serde_json::json!({ "kind": kind, "optionId": id })
+    }
+
+    // ── Probes: whose answer the exit status is ──────────────────────────────
+
+    /// A CLI whose exit status is part of what it is saying. `claude auth
+    /// status --json` prints `{"loggedIn": false, …}` and exits **1** when
+    /// the login is signed out, so the sign-in check's probe reads the
+    /// output whatever the status. The version check keeps the strict read —
+    /// a version line from a CLI that did not run cleanly is worth nothing —
+    /// which is what threw the sign-in verdict away.
+    #[tokio::test]
+    async fn only_the_strict_read_treats_a_nonzero_exit_as_no_answer() {
+        use std::time::Duration;
+        const MAX: u64 = 8 * 1024;
+        const LIMIT: Duration = Duration::from_secs(20);
+        let dir = tempfile::tempdir().unwrap();
+
+        // The strict read, as the version check uses it.
+        let strict = |path: std::path::PathBuf| async move {
+            let mut cmd = tokio::process::Command::new(&path);
+            super::configure_version_probe(&mut cmd);
+            let child = cmd.spawn().expect("spawn the stub");
+            super::read_probe(child, MAX, LIMIT, true)
+                .await
+                .map(|out| String::from_utf8_lossy(&out).into_owned())
+        };
+
+        let says_no = super::write_stub_cli(dir.path(), "says-no", r#"{"loggedIn": false}"#, 1);
+        assert_eq!(strict(says_no.clone()).await, None, "exit 1, so no answer");
+        let out = super::probe_stdout(&mut tokio::process::Command::new(&says_no), MAX, LIMIT)
+            .await
+            .expect("the output of a CLI that exited 1");
+        assert!(out.contains(r#""loggedIn": false"#), "{out:?}");
+
+        // A clean exit is read either way, and a CLI that is not there is
+        // still no answer at all.
+        let says_yes = super::write_stub_cli(dir.path(), "says-yes", r#"{"loggedIn": true}"#, 0);
+        for read in [
+            strict(says_yes.clone()).await,
+            super::probe_stdout(&mut tokio::process::Command::new(&says_yes), MAX, LIMIT).await,
+        ] {
+            assert!(
+                read.is_some_and(|out| out.contains(r#""loggedIn": true"#)),
+                "a clean exit is read"
+            );
+        }
+        let missing = dir.path().join("buzz-no-such-probe-binary");
+        assert_eq!(
+            super::probe_stdout(&mut tokio::process::Command::new(&missing), MAX, LIMIT).await,
+            None,
+            "a spawn that fails is still no answer"
+        );
     }
 
     // ── Turn authority: how much a turn is trusted ───────────────────────────
