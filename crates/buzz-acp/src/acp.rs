@@ -3416,25 +3416,38 @@ fn configure_version_probe(cmd: &mut tokio::process::Command) {
 }
 
 /// Read at most a version line from `child` and require a clean exit within
-/// `limit`. On timeout the whole process group is killed.
+/// `limit`.
 async fn claude_version_within(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     limit: std::time::Duration,
 ) -> Option<(u64, u64, u64)> {
-    use tokio::io::AsyncReadExt;
     const MAX_VERSION_BYTES: u64 = 256;
+    let stdout = read_probe(child, MAX_VERSION_BYTES, limit).await?;
+    parse_claude_version(&String::from_utf8_lossy(&stdout))
+}
+
+/// Read at most `max_bytes` of `child`'s stdout and require a clean exit
+/// within `limit`. On timeout the whole process group is killed, so a
+/// launcher's children do not outlive the probe.
+///
+/// Split out of the version check so a second short-lived probe of the same
+/// CLI can share one spawn, timeout and kill discipline rather than growing
+/// its own.
+async fn read_probe(
+    mut child: tokio::process::Child,
+    max_bytes: u64,
+    limit: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
     let pid = child.id();
     let probe = async {
         let mut stdout = Vec::new();
         let pipe = child.stdout.take()?;
-        pipe.take(MAX_VERSION_BYTES)
-            .read_to_end(&mut stdout)
-            .await
-            .ok()?;
+        pipe.take(max_bytes).read_to_end(&mut stdout).await.ok()?;
         child.wait().await.ok()?.success().then_some(stdout)
     };
     match tokio::time::timeout(limit, probe).await {
-        Ok(stdout) => parse_claude_version(&String::from_utf8_lossy(&stdout?)),
+        Ok(stdout) => stdout,
         Err(_) => {
             if !pid.is_some_and(kill_process_group) {
                 let _ = child.start_kill();
