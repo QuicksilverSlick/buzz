@@ -3374,8 +3374,10 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
 const CLAUDE_EXECUTABLE_ENV: &str = "CLAUDE_CODE_EXECUTABLE";
 
 /// The Claude CLI a probe should run: the one the adapter itself would run
-/// when the launch environment or this process names it, and plain `claude`
-/// from `PATH` otherwise.
+/// when the launch environment or this process names it, and otherwise
+/// `claude` resolved on `PATH` the way the OS resolves it (see
+/// [`resolve_on_path`]) — a bare name Windows cannot start is no use to a
+/// probe.
 ///
 /// Either way the credential it reads is the one `launch_env` chose: a
 /// sign-in lives in `CLAUDE_CONFIG_DIR` or in a token, never in the binary.
@@ -3386,7 +3388,62 @@ pub(crate) fn claude_cli(launch_env: &[(String, String)]) -> std::ffi::OsString 
         .map(|(_, value)| std::ffi::OsString::from(value))
         .or_else(|| std::env::var_os(CLAUDE_EXECUTABLE_ENV))
         .filter(|path| !path.is_empty())
+        .or_else(|| resolve_on_path("claude", launch_env))
         .unwrap_or_else(|| "claude".into())
+}
+
+/// The extensions Windows will actually start a program from, in the order
+/// `PATHEXT` lists them for a CLI installed by npm. `.cmd` and `.bat` are
+/// batch shims — the desktop's `is_batch_shim`
+/// (`desktop/src-tauri/src/managed_agents/runtime/path.rs`) names the same
+/// two, and skips them for `CLAUDE_CODE_EXECUTABLE` because the *node*
+/// adapter cannot start one. Rust's own `Command` can: it runs a `.cmd`
+/// through `cmd.exe`, verified against this machine's `claude.cmd`. The two
+/// crates share no dependency, so the idea is mirrored here rather than the
+/// code.
+#[cfg(windows)]
+const PROGRAM_EXTS: [&str; 3] = [".exe", ".cmd", ".bat"];
+
+/// Resolve `program` on `PATH` the way the OS would, because
+/// `Command::new("claude")` does not.
+///
+/// On Windows `CreateProcess` appends `.exe` to an extensionless program and
+/// nothing else — it never consults `PATHEXT`. The npm install of the Claude
+/// CLI ships `claude` (a `sh` script Windows cannot run) and `claude.cmd`,
+/// and no `claude.exe` at all, so the bare name could not spawn and every
+/// probe on the owner's own machine came back Unknown. So each directory of
+/// `PATH` is tried against each candidate extension, in the order Windows
+/// itself would, and the resolved path is what gets spawned.
+///
+/// `None` when nothing resolves, which leaves the bare name to fail the way
+/// it always did: a probe that cannot run concludes nothing.
+///
+/// On Unix the bare name is already resolved by `execvp`, so this is a
+/// no-op — and `PATH` there may legitimately name a program with no
+/// extension at all.
+#[cfg(windows)]
+fn resolve_on_path(program: &str, launch_env: &[(String, String)]) -> Option<std::ffi::OsString> {
+    // The launch environment's own `PATH` when it sets one, because that is
+    // the `PATH` the spawned child would search.
+    let path = launch_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"))?;
+    for dir in std::env::split_paths(&path) {
+        for ext in PROGRAM_EXTS {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.into_os_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_on_path(_program: &str, _launch_env: &[(String, String)]) -> Option<std::ffi::OsString> {
+    None
 }
 
 /// Run `cmd` and read at most `max_bytes` of its stdout within `limit`,
@@ -3552,6 +3609,73 @@ mod tests {
 
     fn opt(kind: &str, id: &str) -> serde_json::Value {
         serde_json::json!({ "kind": kind, "optionId": id })
+    }
+
+    // ── Probes: which binary, and whose answer the exit status is ───────────
+
+    /// `CLAUDE_CODE_EXECUTABLE` still wins, from the launch environment
+    /// first and this process second, and an empty value is no value.
+    #[test]
+    fn a_named_claude_executable_wins_over_the_path() {
+        let named = vec![(
+            super::CLAUDE_EXECUTABLE_ENV.to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+        )];
+        assert_eq!(super::claude_cli(&named), "C:\\tools\\claude.cmd");
+        let empty = vec![(super::CLAUDE_EXECUTABLE_ENV.to_string(), String::new())];
+        assert_ne!(super::claude_cli(&empty), "");
+    }
+
+    /// Windows starts an extensionless program by appending `.exe` and
+    /// nothing else — never `PATHEXT` — and the npm install of the Claude
+    /// CLI ships `claude` (a `sh` script) and `claude.cmd`, with no
+    /// `claude.exe` anywhere. So the bare name never spawned on the owner's
+    /// own machine and every sign-in check came back Unknown. Resolution
+    /// walks `PATH` directory by directory, trying each extension Windows
+    /// would, and the `.cmd` it lands on really does run.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn claude_is_resolved_on_path_the_way_windows_resolves_it() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let sh_only = root.path().join("npm-global");
+        let with_cmd = root.path().join("bin");
+        std::fs::create_dir_all(&sh_only).unwrap();
+        std::fs::create_dir_all(&with_cmd).unwrap();
+        // The npm layout: an extensionless `sh` script Windows cannot start,
+        // in a directory that comes first on PATH.
+        std::fs::write(sh_only.join("claude"), "#!/bin/sh\necho nope\n").unwrap();
+        let cmd = super::write_stub_cli(&with_cmd, "claude", "9.9.9 (Claude Code)", 0);
+
+        let path = vec![(
+            "PATH".to_string(),
+            format!("{};{}", sh_only.display(), with_cmd.display()),
+        )];
+        let resolved = super::claude_cli(&path);
+        assert_eq!(resolved, cmd.as_os_str(), "the .cmd, not the sh script");
+
+        // And the resolved path actually spawns, which the bare name did not.
+        let out = super::probe_stdout(
+            &mut tokio::process::Command::new(&resolved),
+            256,
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            out.as_deref().is_some_and(|o| o.contains("9.9.9")),
+            "the resolved shim ran: {out:?}"
+        );
+
+        // Nothing on PATH leaves the bare name, which fails as it always
+        // did: a probe that cannot run concludes nothing.
+        let empty_dir = root.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let nowhere = vec![("PATH".to_string(), empty_dir.display().to_string())];
+        assert_eq!(
+            super::resolve_on_path("claude", &nowhere),
+            None,
+            "an empty PATH resolves nothing"
+        );
     }
 
     // ── Probes: whose answer the exit status is ──────────────────────────────
