@@ -800,6 +800,21 @@ impl Factory {
         self.started_on.get(&slot).copied().unwrap_or(0)
     }
 
+    /// Whether the work is on login `index`: an agent was started on it, or
+    /// it is the one the next launch would take.
+    ///
+    /// Both halves are needed. `started_on` is what is running now, and goes
+    /// stale between a hand-off and the restart that carries it out — right
+    /// after a hand-off the agent's own slot still names the login it is
+    /// leaving. [`pick`](Self::pick) is where the next request goes, which
+    /// is what "the work is on it" has to mean for a login that has not been
+    /// started on yet, including before anything has started at all.
+    ///
+    /// A login that is neither is a spare: losing it stops nothing.
+    fn work_runs_on(&self, index: usize, now: DateTime<Utc>) -> bool {
+        self.started_on.values().any(|&on| on == index) || self.pick(now) == Some(index)
+    }
+
     /// The label of the login `slot` runs on; `default` without a pool.
     pub(crate) fn label(&self, slot: usize) -> &str {
         self.at(self.on(slot))
@@ -1171,6 +1186,14 @@ impl Factory {
             (Health::Degraded, Some(Class::RateLimit), None) => {
                 format!("{who} is slowed by a rate limit and tries again shortly.")
             }
+            // No login left to stand by on, and a sign-in is not an error
+            // anything retries: without this arm a sign-in state fell
+            // through to "hit an error and is retrying it", which is not
+            // what is happening and not what the owner has to do about it.
+            (Health::Degraded, Some(Class::SignIn), None) => format!(
+                "{who} is working, and a login of its pool is signed out until someone signs it \
+                 in again. Nothing is lost."
+            ),
             (Health::Degraded, ..) => {
                 format!("{who} hit an error and is retrying it (up to 10 tries).")
             }

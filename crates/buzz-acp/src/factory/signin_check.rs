@@ -26,11 +26,17 @@
 //! nothing: a check that cannot tell must never be the reason a working
 //! agent is marked down. The exit status is not one of those: the CLI exits
 //! 1 to say the login is signed out, so the output is read whatever the
-//! status, and only the output decides. What this check cannot prove — a token the
-//! server has revoked but the CLI still holds locally — is caught instead by
-//! the failover of item 2, at once, on the next real request. Proving it
-//! here would mean a billable or undocumented API call, and a wrong verdict
-//! from one of those would park a healthy agent's work.
+//! status, and only the output decides.
+//!
+//! What this check cannot prove — a token the server has revoked but the CLI
+//! still holds locally — is caught instead by the failover of item 2, at
+//! once, on the next real request. Proving it here would mean a billable or
+//! undocumented API call, and a wrong verdict from one of those would park a
+//! healthy agent's work.
+//!
+//! And a login that fails its check while the work is on another one is no
+//! outage at all: it is marked out and said once, with no incident, no card
+//! and no claim that an agent which never stopped has stopped.
 //!
 //! The CLI's output carries a path (`projectsDirectory`), so it is read for
 //! that one boolean and dropped: never logged, never put in a record.
@@ -116,13 +122,21 @@ impl Factory {
     }
 
     /// The check says login `index` is not signed in, and no request was in
-    /// flight to find that out the hard way. Take the same path a real 401
+    /// flight to find that out the hard way.
+    ///
+    /// When the work is on that login, this takes the same path a real 401
     /// takes (M2 item 2): the login is marked signed out, the work moves to
     /// the next healthy login or parks, the Critical card is raised, the
     /// STATE record falls due and the owner is texted.
     ///
-    /// A login already known to be out changes nothing: the check runs every
-    /// 15 minutes and must not card or text on every one of them.
+    /// When it is not — a spare login whose OAuth session quietly expired,
+    /// which is the normal fate of a fallback nobody uses and the state of
+    /// any fallback folder that was never signed in — nothing failed,
+    /// nothing moved and nothing stopped, so none of that is true and none
+    /// of it happens. See [`spare_signin_lost`](Factory::spare_signin_lost).
+    ///
+    /// A login already known to be out changes nothing either way: the check
+    /// runs every 15 minutes and must not card or text on every one of them.
     fn signin_lost(&mut self, index: usize, now: DateTime<Utc>) -> bool {
         let known = match self.accounts.get(index) {
             Some(account) => account.signed_out,
@@ -132,7 +146,31 @@ impl Factory {
         if known {
             return false;
         }
+        if !self.accounts.is_empty() && !self.work_runs_on(index, now) {
+            return self.spare_signin_lost(index);
+        }
         self.record_limit_on(index, &check_failure(), now);
+        true
+    }
+
+    /// A login no agent is using, and no request is going to, lost its
+    /// sign-in.
+    ///
+    /// It is marked out, so the pool stops choosing it and a later check or
+    /// a real answer is what clears it — and that is the whole of it. No
+    /// incident opens: no Degraded, no Critical card claiming the agent
+    /// "stopped on login fallback" when it did not stop, no STATE record,
+    /// and no all-clear owed afterwards for an outage that never happened.
+    /// The owner still hears once, because a pool quietly down to its last
+    /// working login is how the next outage becomes a surprise.
+    fn spare_signin_lost(&mut self, index: usize) -> bool {
+        self.accounts[index].signed_out = true;
+        let line = format!(
+            "{}'s backup sign-in needs signing in again; the agent is unaffected.",
+            self.who()
+        );
+        tracing::warn!("{line}");
+        self.alert_aside(&line);
         true
     }
 
@@ -233,6 +271,14 @@ mod tests {
     }
 
     const POOL: &str = r"token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude";
+
+    /// The Critical sign-in card's path in a Bench inbox.
+    fn card_path(bench: &std::path::Path) -> std::path::PathBuf {
+        bench
+            .join("inbox")
+            .join(crate::factory::CARD_WRITER)
+            .join("ade9d0e2-sign-in.json")
+    }
 
     fn pool() -> Factory {
         let mut f = Factory::new(Some(POOL), "claude-agent-acp");
@@ -350,6 +396,101 @@ mod tests {
                 .exists(),
             "one card per incident"
         );
+    }
+
+    /// A spare login's sign-in going is not an outage. The agent is working
+    /// on `token`; the fallback is a folder nobody has signed in, which is
+    /// the normal state of a login kept for emergencies. The check finds it
+    /// and the honest answer is "your spare needs signing in", not "Reset
+    /// Worker stopped on login fallback" — which is what the Critical path
+    /// said, to the card and to the owner's phone, about an agent that had
+    /// not stopped, had not moved and had lost nothing.
+    #[test]
+    fn a_check_failing_on_a_login_nobody_is_using_opens_no_incident() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut f = pool();
+        f.reporting.bench = Some(bench.path().to_path_buf());
+        f.launch_env(0, oct18());
+        assert_eq!(f.label(0), "token", "the agent is on the first login");
+
+        assert!(f.signin_checked(1, SignIn::SignedOut, oct18()));
+        assert!(f.accounts()[1].signed_out, "the spare is marked out");
+        assert!(
+            !f.accounts()[0].signed_out,
+            "the working login is untouched"
+        );
+        // Nothing failed, so nothing is wrong with the agent.
+        assert_eq!(f.health, Health::Operational);
+        assert_eq!(f.presence(), "online");
+        assert_eq!(f.take_report(oct18()), None, "no STATE record");
+        assert!(
+            !card_path(bench.path()).exists(),
+            "no Critical card for a login nothing was running on"
+        );
+        // The work stays exactly where it was.
+        assert_eq!(f.launch_env(0, oct18()), f.account_env(0));
+        assert!(!f.wants_restart(0, oct18()));
+        // One truthful line, to the owner, once.
+        assert_eq!(
+            f.take_alerts(),
+            [
+                "Buzz: Reset Worker's backup sign-in needs signing in again; the agent is \
+              unaffected."
+            ]
+        );
+        for minute in [15, 30, 45] {
+            let later = oct18() + chrono::Duration::minutes(minute);
+            assert!(!f.signin_checked(1, SignIn::SignedOut, later), "{minute}");
+            assert!(f.take_alerts().is_empty(), "{minute}");
+            assert_eq!(f.take_report(later), None, "{minute}");
+        }
+
+        // And no all-clear is owed for an incident that never opened: the
+        // next passing check on the working login says nothing at all, and
+        // the spare coming back is not an announcement either.
+        let fixed = oct18() + chrono::Duration::hours(1);
+        assert!(!f.signin_checked(0, SignIn::Valid, fixed));
+        assert!(f.take_alerts().is_empty(), "nothing was ever wrong");
+        assert!(
+            f.signin_checked(1, SignIn::Valid, fixed),
+            "the spare is back"
+        );
+        assert!(!f.accounts()[1].signed_out);
+        assert!(f.take_alerts().is_empty());
+        assert_eq!(f.health, Health::Operational);
+    }
+
+    /// Whatever a sign-in state's plain words are, they are never "hit an
+    /// error and is retrying it": nothing retries a lost sign-in, and the
+    /// owner's next move is to sign it in, not to wait.
+    #[test]
+    fn a_sign_in_state_never_reads_as_a_retry() {
+        let mut f = pool();
+        f.launch_env(0, oct18());
+        // Degraded on a sign-in, with no login standing by — the first
+        // login is the one that can take work, so there is nothing to say
+        // the agent is "continuing on" instead. This is the combination
+        // that fell through to the retry words.
+        f.signin_checked(1, SignIn::SignedOut, oct18());
+        f.health = Health::Degraded;
+        f.failure = Some(check_failure());
+        assert_eq!(f.preferred(oct18()), Some(0), "nothing is standing by");
+        let words = f.plain_words(oct18());
+        assert!(!words.contains("retrying"), "{words}");
+        assert!(
+            words.contains("signed out until someone signs it in"),
+            "{words}"
+        );
+
+        // And the ordinary hand-off words, which were always right, are
+        // left as they were.
+        let mut f = pool();
+        f.launch_env(0, oct18());
+        f.signin_checked(0, SignIn::SignedOut, oct18());
+        let record = f.take_report(oct18()).expect("a STATE record");
+        assert!(record.contains("state=DEGRADED class=sign_in"), "{record}");
+        assert!(!record.contains("retrying"), "{record}");
+        assert!(record.contains("continuing on fallback"), "{record}");
     }
 
     /// Every login signed out parks the work, exactly as every login limited

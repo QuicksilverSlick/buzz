@@ -47,6 +47,21 @@ impl Factory {
         self.queue_alert(&format!("Buzz: {text}"));
     }
 
+    /// Queue a line about something the owner will want to act on that is
+    /// not an incident: a spare login of the pool that needs signing in
+    /// again while the agent itself keeps working.
+    ///
+    /// Outside [`alert_critical`]'s dedupe on purpose. That one keys on the
+    /// incident, so borrowing it here would both swallow the next real
+    /// Critical's text and leave an all-clear owed for an incident that
+    /// never opened. The caller's own state is the dedupe instead — a
+    /// login's `signed_out` flag, which the 15-minute check sets once and
+    /// only a passing check or a real answer clears — so this is at most one
+    /// text per episode either way.
+    pub(super) fn alert_aside(&mut self, text: &str) {
+        self.queue_alert(&format!("Buzz: {text}"));
+    }
+
     /// Queue the all-clear when the incident the owner was texted about
     /// closes. Never without an opening text, and never twice: an owner who
     /// was not told it broke does not need to be told it is fine.
