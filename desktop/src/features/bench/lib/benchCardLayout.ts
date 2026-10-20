@@ -166,6 +166,8 @@ export type BenchPost = {
   meta: string;
   /** Its other lines, as posted: For, Recorded, a receipt's answer, Closed. */
   notes: string[];
+  /** A receipt's Outcome (item.rs render_receipt), laid out as its own. */
+  outcome: BenchPost | null;
 };
 
 /**
@@ -181,6 +183,14 @@ export function benchPostCard(item: BenchCard, text: string): BenchPost {
   if (title !== undefined) lines.shift();
   const end = lines.findIndex((line) => POST_TAIL.test(line));
   const tail = end === -1 ? [] : lines.splice(end);
+  // A receipt's Outcome follows its answer: a header, title, body and links.
+  const answered = tail.findIndex((line) => line.startsWith("Answered: "));
+  const at = tail.findIndex(
+    (line, index) =>
+      answered !== -1 && index > answered && line.startsWith("Outcome · "),
+  );
+  const outcome =
+    at === -1 ? null : benchPostCard(item, tail.splice(at).join("\n"));
   const options: string[] = [];
   const links: BenchCard["links"] = [];
   const notes: string[] = [];
@@ -207,6 +217,9 @@ export function benchPostCard(item: BenchCard, text: string): BenchPost {
       options,
       deadline,
       links,
+      // The live item's answer is not this post's.
+      answer: null,
+      recorded: null,
       decidedBy: null,
       recommend: null,
       plain: null,
@@ -215,6 +228,7 @@ export function benchPostCard(item: BenchCard, text: string): BenchPost {
     },
     meta,
     notes,
+    outcome,
   };
 }
 

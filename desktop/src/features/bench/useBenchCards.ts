@@ -145,19 +145,21 @@ export function useBenchSnapshot(): BenchSnapshot | null {
 export function useBenchCardForMessage(
   message: BenchMessageRef,
 ): BenchCardMatch | null {
-  const { channelId, id, kind, pending, signerPubkey, tags } = message;
+  const { channelId, createdAt, id, kind, pending, signerPubkey, tags } =
+    message;
   const candidate = isBenchCandidate(message);
   const select = React.useCallback(
     (cards: BenchCards): BenchRowState =>
       benchRowState(cards, {
         channelId,
+        createdAt,
         id,
         kind,
         pending,
         signerPubkey,
         tags,
       }),
-    [channelId, id, kind, pending, signerPubkey, tags],
+    [channelId, createdAt, id, kind, pending, signerPubkey, tags],
   );
   const { data } = useQuery({
     ...benchCardsQueryOptions,

@@ -300,6 +300,8 @@ test("a replaced card's post shows read-only from its own text and links the liv
       emit?.({
         channelName: "general",
         content: text,
+        // Before the tick that wrote the snapshot.
+        createdAt: Math.floor(Date.now() / 1_000) - 3_600,
         extraTags: marker,
         id: oldId,
         pubkey: writer,
@@ -313,6 +315,14 @@ test("a replaced card's post shows read-only from its own text and links the liv
         content: "card",
         extraTags: marker,
         id: cardId,
+        pubkey: writer,
+      });
+      // Since that tick: maybe the new card the snapshot does not name yet.
+      emit?.({
+        channelName: "general",
+        content: "a newer post of the card",
+        extraTags: marker,
+        id: "7".repeat(64),
         pubkey: writer,
       });
     },
@@ -352,6 +362,11 @@ test("a replaced card's post shows read-only from its own text and links the liv
   await expect(
     live.getByRole("button", { name: /^1\. Ship it/ }),
   ).toBeEnabled();
+  // The post newer than the snapshot is plain text until the next read.
+  const fresh = rows.filter({ hasText: "a newer post of the card" });
+  await expect(fresh).toHaveCount(1);
+  await expect(fresh.getByTestId("bench-card-retired")).toHaveCount(0);
+  await expect(retired).toHaveCount(1);
 
   // In its own channel the jump lands on the live card (here, its thread).
   await retired.getByRole("link", { name: "Go to the newer card" }).click();

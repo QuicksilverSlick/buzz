@@ -324,6 +324,8 @@ test("a replaced Bench card's post shows read-only from its own text", async ({
           "",
           "Closed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.",
         ].join("\n"),
+        // Before the tick that wrote the snapshot.
+        createdAt: Math.floor(Date.now() / 1_000) - 3_600,
         extraTags: [["client", `bench:card:${itemId}@0a1b2c`]],
         id: oldId,
         pubkey: writer,

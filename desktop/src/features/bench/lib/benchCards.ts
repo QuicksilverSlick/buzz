@@ -162,6 +162,8 @@ export type BenchMessageRef = {
   signerPubkey?: string;
   /** For the card marker of a retired post. */
   tags?: readonly (readonly string[])[];
+  /** Unix seconds: a marked post newer than the snapshot is not retired. */
+  createdAt?: number;
 };
 
 const KIND_STREAM_MESSAGE = 9;
@@ -169,7 +171,7 @@ const NOT_A_BENCH_ROW: BenchRowState = { inBenchChannel: false, match: null };
 
 type BenchIndex = {
   cards: ReadonlyMap<string, BenchCard>;
-  /** Bound channels that hold a card; #bench is the snapshot's own. */
+  /** Bound channels of a known item; #bench is the snapshot's own. */
   channels: ReadonlySet<string>;
 };
 
@@ -183,8 +185,8 @@ function benchIndex(snapshot: BenchSnapshot): BenchIndex {
   const ambiguous = new Set<string>();
   for (const item of snapshot.items) {
     const id = item.cardEventId;
-    if (!id) continue;
     if (item.channelId) channels.add(item.channelId);
+    if (!id) continue;
     if (cards.has(id)) ambiguous.add(id);
     else cards.set(id, item);
   }
@@ -236,12 +238,18 @@ export function benchCardMarkerItemId(
 
 /**
  * The known item a retired post marks. Its live card, when it has one, must
- * be its own: a live id claimed twice matches nothing.
+ * be its own: a live id claimed twice matches nothing. A post from the tick
+ * that wrote the snapshot or later (`lastTick` is that tick's start) may be
+ * the new live card the snapshot does not name yet, so it is not retired.
  */
 function markedItem(
   snapshot: BenchSnapshot,
-  tags: BenchMessageRef["tags"],
+  { createdAt, tags }: BenchMessageRef,
 ): BenchCard | undefined {
+  const tick = benchDeadlineSeconds(snapshot.lastTick);
+  if (createdAt !== undefined && (tick === null || createdAt >= tick)) {
+    return undefined;
+  }
   const itemId = benchCardMarkerItemId(tags);
   const item = itemId
     ? snapshot.items.find((candidate) => candidate.id === itemId)
@@ -284,8 +292,7 @@ export function benchRowState(
     return { inBenchChannel: true, match: null };
   }
   const card =
-    indexBenchCards(snapshot).get(message.id) ??
-    markedItem(snapshot, message.tags);
+    indexBenchCards(snapshot).get(message.id) ?? markedItem(snapshot, message);
   const signer = normalizePubkey(message.signerPubkey ?? "");
   const signedByWriter = signer === normalizePubkey(snapshot.writerPubkey);
   const inItsChannel = (card?.channelId ?? snapshot.channelId) === channelId;

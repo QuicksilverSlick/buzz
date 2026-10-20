@@ -384,6 +384,7 @@ export const MessageRow = React.memo(
     // benchRowState); every other row renders as before.
     const benchCard = useBenchCardForMessage({
       channelId,
+      createdAt: message.createdAt,
       id: message.id,
       kind: message.kind,
       pending: message.pending,

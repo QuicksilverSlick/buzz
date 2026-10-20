@@ -282,3 +282,61 @@ test("a replaced post's due line, links and other lines; how to answer never sho
     "Recorded: 2. Move · Craig · 14:07",
   ]);
 });
+
+test("a replaced receipt lays its Outcome out as its own card, after the answer", () => {
+  // item.rs render_receipt, kept when a new question followed the close-out.
+  const receipt = [
+    "🔴 · Dreamforge · orchestrator",
+    "**Relay choice**",
+    "",
+    "Stay or move?",
+    "",
+    "1. Stay",
+    "2. Move",
+    "",
+    "plan: https://github.com/QuicksilverSlick/buzz",
+    "Answered: 2. Move · Craig · 14:02",
+    "",
+    "Outcome · done · 15:10",
+    "**Kept the old email**",
+    "",
+    "**What changes:** nothing was sent.",
+    "",
+    "Outcome · not a header in the body",
+    "",
+    "PR: https://github.com/QuicksilverSlick/buzz/pull/1",
+    `Open thread: buzz://message?channel=c&id=${"e".repeat(64)}`,
+  ].join("\n");
+  const post = benchPostCard(
+    { ...LIVE, answer: { option: 2 }, recorded: 2 },
+    receipt,
+  );
+  assert.equal(post.card.title, "Relay choice");
+  assert.deepEqual(post.card.options, ["Stay", "Move"]);
+  assert.deepEqual(post.card.links, [
+    { label: "plan", url: "https://github.com/QuicksilverSlick/buzz" },
+  ]);
+  assert.deepEqual(post.notes, ["Answered: 2. Move · Craig · 14:02"]);
+  // The live item's answer is not this post's.
+  assert.equal(post.card.answer, null);
+  assert.equal(post.card.recorded, null);
+  const { outcome } = post;
+  assert.equal(outcome?.meta, "done · 15:10");
+  assert.equal(outcome.card.title, "Kept the old email");
+  assert.deepEqual(benchCardLayout(outcome.card).blocks, [
+    field("What changes", "nothing was sent."),
+    text("Outcome · not a header in the body"),
+  ]);
+  assert.deepEqual(outcome.card.options, []);
+  assert.deepEqual(outcome.card.links, [
+    { label: "PR", url: "https://github.com/QuicksilverSlick/buzz/pull/1" },
+  ]);
+  assert.deepEqual(outcome.notes, []);
+  assert.equal(outcome.outcome, null);
+  // A question's post has no Outcome, whatever its body says.
+  assert.equal(benchPostCard(LIVE, vector.closed).outcome, null);
+  assert.equal(
+    benchPostCard(LIVE, "h · x\n**T**\n\nOutcome · a line\n\n1. A").outcome,
+    null,
+  );
+});

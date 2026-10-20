@@ -885,15 +885,68 @@ test("a retired post is read-only, from its own text, with a link to the live ca
     assert.ok(!root.textContent.includes("Tap one number"));
     assert.ok(root.textContent.includes("Closed: a tap or reply here"));
     const jump = screen.queryByRole("link", { name: "Go to the newer card" });
+    const badge = root.firstElementChild.firstElementChild.textContent;
     if (cardEventId) {
+      assert.equal(badge, "Replaced");
+      assert.ok(root.textContent.includes("Asked again on a newer card."));
       assert.equal(
         jump?.getAttribute("href"),
         `buzz://message?channel=${CHANNEL}&id=${CARD_ID}`,
       );
     } else {
+      // Crowded out, withdrawn, or not posted yet: nothing was asked again.
+      assert.equal(badge, "Closed");
+      assert.ok(root.textContent.includes("No longer asked here."));
+      assert.ok(!root.textContent.includes("Asked again"));
       assert.equal(jump, null, "no live card to go to");
     }
     cleanup();
   }
   assert.deepEqual(answerCalls(), []);
+
+  // A receipt kept when a new question followed it: its Outcome is a
+  // section of its own, as on the receipt card.
+  const receipt = [
+    "🔴 · Dreamforge · orchestrator",
+    "**Relay choice**",
+    "",
+    "1. Stay",
+    "2. Move",
+    "",
+    "Answered: 2. Move · Craig · 14:02",
+    "",
+    "Outcome · done · 15:10",
+    "**Kept the old email**",
+    "",
+    "**What changes:** nothing was sent.",
+    "",
+    "PR: https://github.com/QuicksilverSlick/buzz/pull/1",
+  ].join("\n");
+  await act(async () => {
+    render(
+      createElement(
+        RouterContextProvider,
+        { router },
+        wrap(
+          benchCard({
+            card: card(),
+            retiredPost: { channelId: CHANNEL, text: receipt },
+          }),
+        ),
+      ),
+    );
+  });
+  const root = screen.getByTestId("bench-card-retired");
+  const outcome = screen.getByTestId("bench-card-outcome");
+  assert.ok(root.contains(outcome));
+  assert.ok(root.textContent.includes("Answered: 2. Move · Craig · 14:02"));
+  assert.ok(outcome.textContent.startsWith("Outcome · done · 15:10"));
+  assert.ok(outcome.textContent.includes("Kept the old email"));
+  assert.deepEqual(labels(outcome), ["What changes:"]);
+  assert.equal(
+    screen.getByRole("link", { name: "PR" }).closest("section"),
+    outcome,
+  );
+  assert.equal(root.querySelector("button, fieldset"), null);
+  cleanup();
 });

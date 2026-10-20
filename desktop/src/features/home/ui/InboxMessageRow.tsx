@@ -107,6 +107,7 @@ export function InboxMessageRow({
   // own text (see benchRowState).
   const benchCard = useBenchCardForMessage({
     channelId,
+    createdAt: message.createdAt,
     id: message.id,
     kind: message.kind,
     signerPubkey: message.signerPubkey,

@@ -368,4 +368,20 @@ test("a retired card's post shows its own text read-only, the owner's taps but n
   assert.ok(live.getByText("Open thread"));
   assert.equal(live.queryByTestId("bench-card-retired"), null);
   assert.ok(live.getByTestId("bench-card").textContent.includes("Ship it?"));
+  live.unmount();
+
+  // Posted since the snapshot's tick, it may be the new card the snapshot
+  // does not name yet: plain text until the next read, never "Replaced".
+  // (Its thread line left off: this harness renders no message-link pill.)
+  const fresh = await renderRow(
+    {
+      ...retired,
+      content: CLOSED_TEXT.split("\n").slice(0, -1).join("\n"),
+      createdAt: Date.parse("2026-10-17T10:00:00Z") / 1_000,
+    },
+    { benchCards: benchCards(), canReply: true, channelId: BENCH },
+  );
+  assert.equal(fresh.queryByTestId("bench-card-retired"), null);
+  assert.equal(fresh.queryByTestId("bench-card"), null);
+  assert.ok(fresh.container.textContent.includes("Ship it before Friday?"));
 });

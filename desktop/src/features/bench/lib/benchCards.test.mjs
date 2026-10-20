@@ -773,6 +773,49 @@ test("guard: a retired post needs the writer, its channel and a known item", () 
   );
 });
 
+test("guard: a marked post from the snapshot's tick or later is not retired yet", () => {
+  // A tick posts the new card, then writes state.json once it ends: until
+  // the desktop reads that, its snapshot names the old card, or none.
+  const tick = Date.parse("2026-10-12T10:00:00Z") / 1_000;
+  const tags = [marker("dreamforge/ship-it")];
+  for (const items of [[card()], [card({ cardEventId: null })]]) {
+    const at = (createdAt, overrides) =>
+      benchRowState(
+        snapshot(items, overrides),
+        row({ id: RETIRED_POST, tags, createdAt }),
+      ).match;
+    assert.equal(at(tick), null, "posted in the tick that wrote it");
+    assert.equal(at(tick + 5), null, "posted after it");
+    assert.equal(at(tick - 1)?.retired, true, "older than the snapshot");
+    assert.equal(at(undefined)?.retired, true, "no time: as before");
+    assert.equal(at(1, { lastTick: "" }), null, "no tick yet");
+  }
+  assert.equal(
+    benchRowState(snapshot(), row({ createdAt: tick + 5 })).match?.retired,
+    false,
+    "the live post matches whenever it was posted",
+  );
+});
+
+test("guard: a post of an item with no live card matches in its channel alone", () => {
+  // No other card lives in the project channel: the item's own post still
+  // finds it there, as one in #bench does.
+  const tags = [marker("reset-worker/welcome")];
+  const cards = snapshot([card(), scoped({ cardEventId: null })]);
+  const state = benchRowState(
+    cards,
+    row({ channelId: PROJECT, id: RETIRED_POST, tags }),
+  );
+  assert.equal(state.inBenchChannel, true);
+  assert.equal(state.match?.card.id, "reset-worker/welcome");
+  assert.equal(state.match?.retired, true);
+  assert.equal(
+    benchRowState(cards, row({ id: RETIRED_POST, tags })).match,
+    null,
+    "not in #bench",
+  );
+});
+
 test("reactions: a live card hides its keycaps; a retired post only the writer's", () => {
   const pill = (emoji, ...pubkeys) => ({
     emoji,
