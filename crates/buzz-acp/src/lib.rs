@@ -1078,19 +1078,38 @@ pub(crate) async fn is_dm_channel(
     }
 }
 
-/// Whether `channel_id` is a huddle channel, whose events share one
-/// conversation scope (see [`scope::SessionScope::derive`]). Only the thread
-/// policy splits a channel into sessions, so only it pays the lookup.
-async fn is_huddle_channel(
+/// Whether `event` joins its huddle channel's one conversation scope (see
+/// [`scope::SessionScope::derive`]). Only the thread policy splits a channel
+/// into sessions, so only it pays the lookup. Only the owner's own messages
+/// join: a guest's words never enter the history that owner turns run on.
+async fn in_huddle_conversation(
     policy: scope::SessionPolicy,
     channel_id: Uuid,
+    event: &nostr::Event,
     ctx: &pool::PromptContext,
 ) -> bool {
     match ctx.agent_owner_pubkey.as_ref() {
-        Some(owner) if policy == scope::SessionPolicy::Thread => {
-            ctx.channel_info.is_huddle(channel_id, owner).await
-        }
+        Some(owner) if policy == scope::SessionPolicy::Thread && event.pubkey == *owner => ctx
+            .channel_info
+            .huddle_instructions(channel_id, owner)
+            .await
+            .is_some(),
         _ => false,
+    }
+}
+
+/// How an admitted event treats a running turn in its scope. A huddle
+/// conversation always queues: the desktop p-tags every agent on every
+/// utterance, so steering would cancel the turn, mid-tool-call, on talk not
+/// meant for this agent. Queued utterances run, in order, as the next turn.
+fn turn_handling(
+    configured: MultipleEventHandling,
+    huddle_conversation: bool,
+) -> MultipleEventHandling {
+    if huddle_conversation {
+        MultipleEventHandling::Queue
+    } else {
+        configured
     }
 }
 
@@ -3814,9 +3833,10 @@ async fn run_harness(
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
                                             .await
-                                            || is_huddle_channel(
+                                            || in_huddle_conversation(
                                                 config.session_policy,
                                                 buzz_event.channel_id,
+                                                &buzz_event.event,
                                                 &ctx,
                                             )
                                             .await,
@@ -3872,9 +3892,10 @@ async fn run_harness(
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
                                             .await
-                                            || is_huddle_channel(
+                                            || in_huddle_conversation(
                                                 config.session_policy,
                                                 buzz_event.channel_id,
+                                                &buzz_event.event,
                                                 &ctx,
                                             )
                                             .await,
@@ -3999,15 +4020,17 @@ async fn run_harness(
                                 &ctx.channel_info,
                             )
                             .await;
+                            let huddle_conversation = !channel_is_dm
+                                && in_huddle_conversation(
+                                    config.session_policy,
+                                    ingress.buzz_event.channel_id,
+                                    &ingress.buzz_event.event,
+                                    &ctx,
+                                )
+                                .await;
                             let session_scope = ingress.session_scope(
                                 config.session_policy,
-                                channel_is_dm
-                                    || is_huddle_channel(
-                                        config.session_policy,
-                                        ingress.buzz_event.channel_id,
-                                        &ctx,
-                                    )
-                                    .await,
+                                channel_is_dm || huddle_conversation,
                             );
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
@@ -4033,7 +4056,10 @@ async fn run_harness(
                             // event data through the optional steer/interrupt
                             // decision.
                             queued.steer_or_interrupt(
-                                config.multiple_event_handling,
+                                turn_handling(
+                                    config.multiple_event_handling,
+                                    huddle_conversation,
+                                ),
                                 owner_cache.get(),
                                 &mut pool,
                                 &mut queue,
@@ -10041,51 +10067,84 @@ mod author_gate_tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_is_huddle_caches_definitive_answers_only() {
-        use std::sync::atomic::Ordering;
-
-        let owner = nostr::Keys::generate();
-        let huddle = Uuid::new_v4();
-        let instructions = nostr::EventBuilder::new(
+    fn huddle_instructions_event(owner: &nostr::Keys, huddle: Uuid) -> nostr::Event {
+        nostr::EventBuilder::new(
             nostr::Kind::Custom(buzz_core::kind::KIND_HUDDLE_GUIDELINES as u16),
             "You are in a live voice huddle.",
         )
         .tags([nostr::Tag::parse(["h", huddle.to_string().as_str()]).unwrap()])
-        .sign_with_keys(&owner)
-        .unwrap();
+        .sign_with_keys(owner)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_huddle_lookups_are_cached_within_the_retry_window() {
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate();
+        let huddle = Uuid::new_v4();
+        let found = serde_json::json!([huddle_instructions_event(&owner, huddle)]);
+        // Found instructions, a plain channel, and a malformed (failed) reply.
+        for (reply, expected) in [
+            (found, true),
+            (serde_json::json!([]), false),
+            (serde_json::json!({}), false),
+        ] {
+            let (resolver, requests, server) = lazy_resolver_with_response(reply).await;
+            for _ in 0..2 {
+                let instructions = resolver
+                    .huddle_instructions(huddle, &owner.public_key())
+                    .await;
+                assert_eq!(instructions.is_some(), expected);
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "asked once per window");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_only_owner_messages_under_thread_policy_join_a_huddle_conversation() {
+        use scope::SessionPolicy::{Channel, Thread};
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate();
+        let huddle = Uuid::new_v4();
         let (resolver, requests, server) =
-            lazy_resolver_with_response(serde_json::json!([instructions])).await;
-        assert!(resolver.is_huddle(huddle, &owner.public_key()).await);
-        assert!(resolver.is_huddle(huddle, &owner.public_key()).await);
-        assert_eq!(
-            requests.load(Ordering::SeqCst),
-            1,
-            "a huddle is looked up once"
-        );
-        server.abort();
+            lazy_resolver_with_response(serde_json::json!([huddle_instructions_event(
+                &owner, huddle
+            )]))
+            .await;
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.channel_info = resolver;
+        let said = |keys: &nostr::Keys| {
+            nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let (by_owner, by_guest) = (said(&owner), said(&nostr::Keys::generate()));
 
-        let (resolver, requests, server) = lazy_resolver_with_response(serde_json::json!([])).await;
-        let channel = Uuid::new_v4();
-        assert!(!resolver.is_huddle(channel, &owner.public_key()).await);
-        assert!(!resolver.is_huddle(channel, &owner.public_key()).await);
+        assert!(!in_huddle_conversation(Thread, huddle, &by_owner, &ctx).await);
+        ctx.agent_owner_pubkey = Some(owner.public_key());
+        assert!(!in_huddle_conversation(Channel, huddle, &by_owner, &ctx).await);
+        assert!(!in_huddle_conversation(Thread, huddle, &by_guest, &ctx).await);
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            1,
-            "a plain channel is looked up once"
+            0,
+            "no owner, the channel policy, and a guest never pay the lookup"
         );
-        server.abort();
 
-        // A malformed reply is no answer: not a huddle, and asked again.
-        let (resolver, requests, server) = lazy_resolver_with_response(serde_json::json!({})).await;
-        assert!(!resolver.is_huddle(huddle, &owner.public_key()).await);
-        assert!(!resolver.is_huddle(huddle, &owner.public_key()).await);
-        assert_eq!(
-            requests.load(Ordering::SeqCst),
-            2,
-            "a failed lookup is retried"
-        );
+        assert!(in_huddle_conversation(Thread, huddle, &by_owner, &ctx).await);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[test]
+    fn test_huddle_conversation_queues_whatever_the_configured_handling() {
+        use MultipleEventHandling::{Interrupt, OwnerInterrupt, Queue, Steer};
+        for configured in [Queue, Steer, Interrupt, OwnerInterrupt] {
+            assert_eq!(turn_handling(configured, true), Queue);
+            assert_eq!(turn_handling(configured, false), configured);
+        }
     }
 }
 

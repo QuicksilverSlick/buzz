@@ -384,6 +384,9 @@ pub struct AgentPool {
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, tokio::time::Instant>,
+    /// Slot indices in the order their agents last came back, most recent
+    /// last; see [`try_claim`](Self::try_claim).
+    return_order: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -763,11 +766,23 @@ pub(crate) struct ProjectLookupError(String);
 
 const PROJECT_INFO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a channel without huddle instructions, or whose lookup failed,
+/// stays "not a huddle" before its next event asks the relay again.
+const HUDDLE_LOOKUP_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a cached huddle lookup still answers: found instructions for the
+/// channel's life, a miss or a failed lookup for [`HUDDLE_LOOKUP_RETRY`].
+fn huddle_lookup_is_fresh(found: bool, looked_up_at: std::time::Instant) -> bool {
+    found || looked_up_at.elapsed() < HUDDLE_LOOKUP_RETRY
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
     projects: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, CachedProjectInfo>>>,
-    huddles: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, bool>>>,
+    huddles: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<Uuid, (Option<String>, std::time::Instant)>>,
+    >,
     rest_client: RestClient,
 }
 
@@ -798,29 +813,35 @@ impl ChannelInfoResolver {
         }
     }
 
-    /// Whether `channel_id` is a huddle channel: one holding the owner's
-    /// kind:48106 voice instructions, the event a new session loads into its
-    /// system prompt. The desktop posts them before it adds any agent, so an
-    /// answer is cached for the channel's life; a failed lookup answers `false`
-    /// uncached and a later event retries.
-    pub async fn is_huddle(&self, channel_id: Uuid, owner: &nostr::PublicKey) -> bool {
-        if let Some(known) = self
+    /// The owner's kind:48106 voice instructions for `channel_id`, which mark
+    /// it as a huddle channel. The desktop posts them before it adds any agent,
+    /// so found instructions are kept for the channel's life. A channel without
+    /// them, or a failed lookup, is asked again only after
+    /// [`HUDDLE_LOOKUP_RETRY`], so a slow relay stalls the listener at most once
+    /// per channel per window.
+    pub async fn huddle_instructions(
+        &self,
+        channel_id: Uuid,
+        owner: &nostr::PublicKey,
+    ) -> Option<String> {
+        let cached = self
             .huddles
             .read()
             .ok()
-            .and_then(|cache| cache.get(&channel_id).copied())
-        {
-            return known;
+            .and_then(|cache| cache.get(&channel_id).cloned());
+        if let Some((instructions, looked_up_at)) = cached {
+            if huddle_lookup_is_fresh(instructions.is_some(), looked_up_at) {
+                return instructions;
+            }
         }
-        let Some(instructions) =
-            query_huddle_instructions(channel_id, owner, &self.rest_client).await
-        else {
-            return false;
-        };
+        let instructions = fetch_huddle_instructions(channel_id, owner, &self.rest_client).await;
         if let Ok(mut cache) = self.huddles.write() {
-            cache.insert(channel_id, instructions.is_some());
+            cache.insert(
+                channel_id,
+                (instructions.clone(), std::time::Instant::now()),
+            );
         }
-        instructions.is_some()
+        instructions
     }
 
     pub async fn resolve_channel_metadata(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
@@ -993,6 +1014,7 @@ impl AgentPool {
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
             held_since: HashMap::new(),
+            return_order: Vec::new(),
         }
     }
 
@@ -1091,7 +1113,11 @@ impl AgentPool {
     /// Pass 1: prefer an agent that already has a session for this exact scope
     /// (thread affinity — repeated activity in a thread reuses that thread's
     /// provider session).
-    /// Pass 2: any idle agent.
+    /// Pass 2: the idle agent that came back longest ago, never-used agents
+    /// first. A conversation scope never holds for its busy owner (see
+    /// [`hold_decision`](Self::hold_decision)), so taking the agent that just
+    /// finished a turn would leave that scope's next message a cold session on
+    /// another agent.
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
@@ -1107,8 +1133,11 @@ impl AgentPool {
             }
         }
 
-        // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
+        // Pass 2: least recently returned idle agent; `None` (never returned)
+        // sorts first, and ties keep the lowest index.
+        let idx = (0..self.agents.len())
+            .filter(|&i| self.agents[i].is_some())
+            .min_by_key(|&i| self.return_order.iter().position(|&r| r == i));
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
@@ -1135,6 +1164,8 @@ impl AgentPool {
             .scope_owner_generations
             .retain(|scope, _| live_scopes.contains(scope));
         let idx = agent.index;
+        self.return_order.retain(|&i| i != idx);
+        self.return_order.push(idx);
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -2767,7 +2798,7 @@ pub async fn run_prompt_task(
             title_channel = resolved_channel;
             origin_channel_type = resolved_channel_type;
             if let Some(owner) = ctx.agent_owner_pubkey.as_ref() {
-                huddle_instructions = fetch_huddle_instructions(cid, owner, &ctx.rest_client).await;
+                huddle_instructions = ctx.channel_info.huddle_instructions(cid, owner).await;
             }
             // A confirmed DM never receives a canvas section; an undeterminable
             // channel type fails closed as a DM for the same reason.
@@ -3987,18 +4018,6 @@ async fn fetch_huddle_instructions(
     owner: &nostr::PublicKey,
     rest: &RestClient,
 ) -> Option<String> {
-    query_huddle_instructions(channel_id, owner, rest)
-        .await
-        .flatten()
-}
-
-/// [`fetch_huddle_instructions`], keeping a failed query (`None`) apart from a
-/// channel that has no instructions (`Some(None)`).
-async fn query_huddle_instructions(
-    channel_id: Uuid,
-    owner: &nostr::PublicKey,
-    rest: &RestClient,
-) -> Option<Option<String>> {
     use nostr::{Alphabet, SingleLetterTag};
 
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
@@ -4025,11 +4044,7 @@ async fn query_huddle_instructions(
             return None;
         }
     };
-    Some(huddle_instructions_from_query_response(
-        json.as_array()?,
-        channel_id,
-        owner,
-    ))
+    huddle_instructions_from_query_response(json.as_array()?, channel_id, owner)
 }
 
 fn huddle_instructions_from_query_response(
@@ -9322,6 +9337,30 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert_eq!(claimed.index, 1, "next turn resumes the forked session");
     }
 
+    /// An unrelated scope claims the idle agent that came back longest ago,
+    /// not the one whose conversation just finished a turn, so that
+    /// conversation's next message resumes its session.
+    #[tokio::test]
+    async fn unrelated_scope_claims_the_least_recently_returned_agent() {
+        let huddle = conv(Uuid::new_v4());
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        pool.return_agent(idle_agent_with_session(1, conv(Uuid::new_v4())).await);
+        let mut owner = idle_agent_with_session(0, huddle.clone()).await;
+        let generation = pool.record_scope_owner(huddle.clone(), owner.index);
+        owner
+            .state
+            .set_scope_owner_generation(huddle.clone(), generation);
+        pool.return_agent(owner);
+
+        let unrelated = pool
+            .try_claim(Some(&conv(Uuid::new_v4())))
+            .expect("an idle agent");
+        assert_eq!(unrelated.index, 1, "the huddle's agent stays free");
+        let next = pool.try_claim(Some(&huddle)).expect("the huddle's agent");
+        assert_eq!(next.index, 0);
+        assert!(next.state.sessions.contains_key(&huddle));
+    }
+
     #[test]
     fn test_rotate_after_natural_completion_invalidates_channel_state() {
         let (mut s, ch_a, ch_b) = make_state();
@@ -10892,6 +10931,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     }
 
     // ── huddle instructions ─────────────────────────────────────────────────
+
+    #[test]
+    fn huddle_lookup_keeps_found_instructions_and_retries_a_miss_after_the_window() {
+        let now = std::time::Instant::now();
+        let expired = now - HUDDLE_LOOKUP_RETRY;
+        assert!(huddle_lookup_is_fresh(true, expired));
+        assert!(huddle_lookup_is_fresh(false, now));
+        assert!(!huddle_lookup_is_fresh(false, expired));
+    }
 
     #[test]
     fn huddle_instructions_append_as_system_section() {
