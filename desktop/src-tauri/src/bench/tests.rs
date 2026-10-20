@@ -1120,41 +1120,6 @@ async fn pending_reword_deletes_and_reposts_never_edits() {
 }
 
 #[tokio::test]
-async fn pending_reword_keeps_a_card_someone_replied_or_reacted_on() {
-    for heart in [false, true] {
-        let mut b = seeded_bench(Gate::Open, &[]).await;
-        let old_card = b.card("orchestrator/relay-choice");
-        // Neither is an answer or a reply on an unscoped card, so the item
-        // never learns of them; the card is a record all the same.
-        let owner = &b.ctx.owner;
-        let ev = match heart {
-            false => channels::thread_reply(owner, &old_card.event_id, "Why?", b.now, &[]),
-            true => answers::tap(owner, &old_card.event_id, "\u{2764}\u{FE0F}", b.now),
-        };
-        answers::reply(&b, &[&ev]);
-        b.tick().await.unwrap();
-        assert!(!b.s.items["orchestrator/relay-choice"].engaged());
-        let before = b.posts().len();
-        b.drop_file(
-            "orchestrator",
-            "relay-choice",
-            &drop_json(&[("options", json!(["Stay", "Move away"]))]),
-        );
-        b.settle(3).await;
-        // No delete of the old card: a new one, its seeds, the board.
-        let posts = b.posts()[before..].to_vec();
-        assert_eq!(b.kinds()[before..], [9, 7, 7, 9, 5], "heart: {heart}");
-        assert_ne!(tag_value(&posts[4].0, "e").unwrap(), old_card.event_id);
-        assert_ne!(
-            b.card("orchestrator/relay-choice").event_id,
-            old_card.event_id
-        );
-        // A relaunch never adopts it back, so it is never retired.
-        assert_eq!(b.s.kept, [old_card.event_id]);
-    }
-}
-
-#[tokio::test]
 async fn status_change_edits_board_only() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let status = |state: &str| {

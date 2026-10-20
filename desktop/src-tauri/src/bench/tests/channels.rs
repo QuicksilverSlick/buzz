@@ -4,7 +4,7 @@
 //! harness are in scope.
 
 use super::super::roles::AgentAccess;
-use super::answers::{reply, tap, ITEM};
+use super::answers::{posted, reply, tap, ITEM};
 use super::*;
 
 pub(super) const X: &str = "105f15cc-1d5a-431a-9826-9402fba1a12b";
@@ -605,6 +605,36 @@ async fn phone_replies_to_a_threaded_card_name_only_its_root() {
         (a.option, a.source, a.reaction_id),
         (1, AnswerSource::Reply, two.id.to_hex())
     );
+}
+
+/// A card closed for a reaction still ends root replies in its own thread,
+/// not in the one its re-drop moved to.
+#[tokio::test]
+async fn closed_card_keeps_its_own_thread_root() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let (r1, r2) = ("ab".repeat(32), "ef".repeat(32));
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(r1))]));
+    b.settle(6).await;
+    let old = b.card(ASK);
+    // A heart is no answer, so the item never learns of it.
+    let heart = tap(&b.ctx.owner, &old.event_id, "\u{2764}\u{FE0F}", b.now);
+    reply(&b, &[&list, &heart, &posted(&b, &old.event_id)]);
+    b.tick().await.unwrap();
+    assert!(!b.s.items[ASK].engaged());
+    let before = b.posts().len();
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(r2))]));
+    b.settle(3).await;
+    assert_eq!(b.s.kept, [old.event_id.as_str()]);
+    assert_eq!(b.s.kept_at, [(r1, old.created_at)]);
+    let closed = &b.posts()[before].0;
+    assert_eq!(closed["kind"], 40003);
+    assert_eq!(tag_value(closed, "e").unwrap(), old.event_id);
+    let new = b.card(ASK);
+    assert_ne!(new.event_id, old.event_id);
+    assert_eq!(parent(&posted(&b, &new.event_id)), Some(r2.as_str()));
 }
 
 #[tokio::test]

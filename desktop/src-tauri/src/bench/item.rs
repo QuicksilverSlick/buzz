@@ -902,6 +902,10 @@ pub(crate) fn card_hash(item: &Item) -> String {
     }
 }
 
+/// How an open card says to answer it; a closed one (`render_closed`) does not.
+const TAP: &str = "Tap one number below to answer.";
+const OR_REPLY: &str = "Or reply in this thread.";
+
 /// Card text: "Back to you" on a card asked again, the request
 /// (`card_head`), then on an unanswered pending card the line that says how
 /// to answer, `as of`, and the Recorded trailer.
@@ -924,7 +928,7 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     out.push_str(&card_head(item));
     let pending = item.kind == ItemKind::Pending;
     let scoped = pending && item.scoped();
-    let tap = "Tap one number below to answer.";
+    let tap = TAP;
     if scoped {
         out.push_str(&format!("\n{}", for_line(item)));
         if item.answer.is_none() {
@@ -951,9 +955,26 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     }
     // The phone has no Other button: a reply in the thread is the answer.
     if scoped {
-        out.push_str("\nOr reply in this thread.");
+        out.push_str(&format!("\n{OR_REPLY}"));
     }
     out
+}
+
+/// A stale card kept for what is on it (publish (b)), from its text as
+/// posted: closed, it no longer says how to answer, and says where to now.
+pub(crate) fn render_closed(posted: &str) -> String {
+    let open = [
+        format!(" {TAP}"),
+        format!("\n{TAP}"),
+        format!("\n{OR_REPLY}"),
+    ];
+    let text = open
+        .iter()
+        .fold(posted.to_string(), |t, o| t.replace(o, ""));
+    format!(
+        "{text}\n\nClosed: a tap or reply here is no longer read. If this is still asked, \
+         answer on the newer card."
+    )
 }
 
 /// A closed card: the request as it was asked, what was answered, then the
@@ -1184,8 +1205,8 @@ pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
 }
 
 pub(crate) use super::pick::{
-    answer_option, eligible, owner_spoke, pick_answer, pick_reply, reaction_target, refused_taps,
-    root_until,
+    answer_option, eligible, owner_spoke, parent, pick_answer, pick_reply, reaction_target,
+    refused_taps, root_until,
 };
 pub(crate) use super::route::{
     owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
