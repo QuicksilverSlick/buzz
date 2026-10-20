@@ -83,6 +83,10 @@ fn a_label_opens_its_own_paragraph_and_its_value_stays_inert() {
     // A blank line already there is kept, not doubled.
     assert_eq!(body("a\n\nIf you wait: b"), "a\n\n**If you wait:** b");
     assert_eq!(body("Recommended:"), "**Recommended:**");
+    assert_eq!(
+        body("If you wait: x\nThe choice: speed or safety"),
+        "**If you wait:** x\n\n**The choice:** speed or safety"
+    );
 }
 
 #[test]

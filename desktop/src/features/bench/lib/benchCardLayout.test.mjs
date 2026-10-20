@@ -30,6 +30,17 @@ test("a label opening a line starts a field; lines under it join it until a blan
     blocks: [field("Recommended", "Hold")],
     details: ["a\nb"],
   });
+  // The orchestrator's sixth label: the trade-off, before the recommendation.
+  assert.deepEqual(
+    benchBodyBlocks(
+      "If you wait: x\nThe choice: speed or safety\nRecommended: Hold",
+    ).blocks,
+    [
+      field("If you wait", "x"),
+      field("The choice", "speed or safety"),
+      field("Recommended", "Hold"),
+    ],
+  );
 });
 
 test("details keep every paragraph after them until another label", () => {

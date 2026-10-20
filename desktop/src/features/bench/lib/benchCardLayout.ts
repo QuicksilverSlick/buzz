@@ -33,6 +33,7 @@ const FIELD_LABELS = [
   "What changes",
   "Asked by",
   "If you wait",
+  "The choice",
   "Recommended",
   "Details",
 ] as const;

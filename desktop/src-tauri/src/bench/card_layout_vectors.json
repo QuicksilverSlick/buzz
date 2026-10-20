@@ -5,7 +5,7 @@
     "area": "28-day-reset",
     "severity": "critical",
     "options": ["Merge it", "Hold"],
-    "body": "What changes: Admins get a *Copy Script* button.\nAsked by: Craig at 9:37 AM CT.\nRisk: Low; Undo: Easy; Reach: administrators using Production.\nIf you wait: Nothing changes.\nRecommended: Hold (high confidence) - the theme work is unfinished.\n\nDetails: PR #758 changes 1 file; see **notes**."
+    "body": "What changes: Admins get a *Copy Script* button.\nAsked by: Craig at 9:37 AM CT.\nRisk: Low; Undo: Easy; Reach: administrators using Production.\nIf you wait: Nothing changes.\nThe choice: Ship the button today, or keep Production as it is.\nRecommended: Hold (high confidence) - the theme work is unfinished.\n\nDetails: PR #758 changes 1 file; see **notes**."
   },
   "labels": [
     "What changes",
@@ -14,8 +14,9 @@
     "Undo",
     "Reach",
     "If you wait",
+    "The choice",
     "Recommended",
     "Details"
   ],
-  "text": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nTap one number below to answer.\nas of 14:05"
+  "text": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**The choice:** Ship the button today, or keep Production as it is.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nTap one number below to answer.\nas of 14:05"
 }
