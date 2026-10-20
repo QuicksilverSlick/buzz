@@ -65,7 +65,7 @@
 }
 
 .composer-overlay-corner-masks::before {
-  left: 1.25rem;
+  left: var(--composer-dock-gutter, 1.25rem);
   mask-image: radial-gradient(
     circle at top right,
     transparent 0 1rem,
@@ -79,7 +79,7 @@
 }
 
 .composer-overlay-corner-masks::after {
-  right: 1.25rem;
+  right: var(--composer-dock-gutter, 1.25rem);
   mask-image: radial-gradient(
     circle at top left,
     transparent 0 1rem,

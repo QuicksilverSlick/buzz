@@ -68,7 +68,10 @@ function message(overrides) {
   };
 }
 
-async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
+async function renderRow(
+  inboxMessage,
+  { benchCards, canReply = false, channelId } = {},
+) {
   const React = await import("react");
   const { render } = await import("@testing-library/react");
   const { QueryClient, QueryClientProvider } = await import(
@@ -81,6 +84,7 @@ async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
     createRouter,
   } = await import("@tanstack/react-router");
   const { InboxMessageRow } = await import("./InboxMessageRow.tsx");
+  const { TooltipProvider } = await import("@/shared/ui/tooltip.tsx");
   const queryClient = new QueryClient({
     defaultOptions: { queries: { enabled: false, retry: false } },
   });
@@ -98,15 +102,20 @@ async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
       React.createElement(
         QueryClientProvider,
         { client: queryClient },
-        React.createElement(InboxMessageRow, {
-          agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
-          canReply: false,
-          channelId,
-          isFocusHighlightVisible: false,
-          message: inboxMessage,
-          onSelectReplyTarget: () => {},
-          profiles,
-        }),
+        // The action bar a replyable row shows uses tooltips.
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(InboxMessageRow, {
+            agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
+            canReply,
+            channelId,
+            isFocusHighlightVisible: false,
+            message: inboxMessage,
+            onSelectReplyTarget: () => {},
+            profiles,
+          }),
+        ),
       ),
     ),
   );
@@ -259,4 +268,120 @@ test("a live Bench card's post shows as the card, not the text it was posted wit
   );
   assert.equal(forged.queryByTestId("bench-card"), null);
   assert.ok(forged.container.textContent.includes("28-day-reset"));
+});
+
+// The card as it was first asked, closed once a newer card replaced it.
+const CLOSED_TEXT = [
+  "🔴 · 28 Day Reset · orchestrator",
+  "**Ship it before Friday?**",
+  "",
+  "**What changes:** the old welcome email",
+  "",
+  "**Asked by:** Craig",
+  "",
+  "1. Ship now",
+  "2. Wait",
+  "",
+  "as of 14:05",
+  "",
+  "Closed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.",
+  `Open thread: buzz://message?channel=${BENCH}&id=${"9".repeat(64)}`,
+].join("\n");
+
+test("a retired card's post shows its own text read-only, the owner's taps but not the seeds", async () => {
+  const pill = (emoji, ...pubkeys) => ({
+    emoji,
+    count: pubkeys.length,
+    users: pubkeys.map((pubkey) => ({
+      pubkey,
+      displayName: pubkey,
+      avatarUrl: null,
+    })),
+  });
+  const retired = message({
+    authorPubkey: WRITER,
+    content: CLOSED_TEXT,
+    id: "9".repeat(64),
+    kind: 9,
+    reactions: [
+      pill("1️⃣", WRITER),
+      pill("2️⃣", WRITER, AUTHOR),
+      pill("👍", AUTHOR),
+    ],
+    signerPubkey: WRITER,
+    tags: [
+      ["h", BENCH],
+      ["client", "bench:card:orchestrator/ship@0a1b2c"],
+    ],
+  });
+  const view = await renderRow(retired, {
+    benchCards: benchCards(),
+    canReply: true,
+    channelId: BENCH,
+  });
+  const shown = view.getByTestId("bench-card-retired");
+  assert.equal(shown.getAttribute("data-bench-item"), "orchestrator/ship");
+  // The card's layout, from the wording the owner replied to: never the
+  // live card's ("Ship it?", Ship or Hold).
+  assert.ok(shown.textContent.includes("Replaced"));
+  assert.ok(shown.textContent.includes("Ship it before Friday?"));
+  assert.ok(!shown.textContent.includes("Ship it?"));
+  assert.deepEqual(
+    [...shown.querySelectorAll("p > span.font-semibold")].map(
+      (span) => span.textContent,
+    ),
+    ["What changes:", "Asked by:"],
+  );
+  assert.ok(shown.textContent.includes("the old welcome email"));
+  assert.deepEqual(
+    [...shown.querySelectorAll('ol[aria-label="Options"] li')].map(
+      (li) => li.textContent,
+    ),
+    ["1. Ship now", "2. Wait"],
+  );
+  assert.ok(shown.textContent.includes("Closed: a tap or reply here"));
+  assert.ok(!shown.textContent.includes("Tap one number"));
+  // Read-only: nothing to answer, no Other, no thread button of a live card.
+  assert.equal(view.queryByTestId("bench-card"), null);
+  assert.equal(
+    view.container.querySelector('fieldset[aria-label="Answer"]'),
+    null,
+  );
+  assert.equal(shown.querySelector("button"), null);
+  assert.equal(view.queryByText("Other..."), null);
+  const jump = view.getByRole("link", { name: "Go to the newer card" });
+  assert.equal(
+    jump.getAttribute("href"),
+    `buzz://message?channel=${BENCH}&id=${CARD_EVENT}`,
+  );
+  // The writer's seeds go; the owner's own taps stay, keycaps too.
+  const pills = view.getByTestId("message-reactions").textContent;
+  assert.ok(pills.includes("👍") && pills.includes("2️⃣"), pills);
+  assert.ok(!pills.includes("1️⃣"), pills);
+  view.unmount();
+
+  const live = await renderRow(
+    { ...retired, id: CARD_EVENT },
+    { benchCards: benchCards(), canReply: true, channelId: BENCH },
+  );
+  assert.ok(live.container.querySelector('fieldset[aria-label="Answer"]'));
+  assert.ok(live.getByText("Open thread"));
+  assert.equal(live.queryByTestId("bench-card-retired"), null);
+  assert.ok(live.getByTestId("bench-card").textContent.includes("Ship it?"));
+  live.unmount();
+
+  // Posted since the snapshot's tick, it may be the new card the snapshot
+  // does not name yet: plain text until the next read, never "Replaced".
+  // (Its thread line left off: this harness renders no message-link pill.)
+  const fresh = await renderRow(
+    {
+      ...retired,
+      content: CLOSED_TEXT.split("\n").slice(0, -1).join("\n"),
+      createdAt: Date.parse("2026-10-17T10:00:00Z") / 1_000,
+    },
+    { benchCards: benchCards(), canReply: true, channelId: BENCH },
+  );
+  assert.equal(fresh.queryByTestId("bench-card-retired"), null);
+  assert.equal(fresh.queryByTestId("bench-card"), null);
+  assert.ok(fresh.container.textContent.includes("Ship it before Friday?"));
 });

@@ -66,7 +66,7 @@ const ITEM = {
 const MENTION = { type: "mention", workbench: "Dreamforge", benchCard: null };
 const LABEL = { text: "Mentioned in", channelLabel: "general" };
 
-function row({ inboxClass = MENTION } = {}) {
+function row({ cardPost, inboxClass = MENTION } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { gcTime: 0, retry: false } },
   });
@@ -87,6 +87,7 @@ function row({ inboxClass = MENTION } = {}) {
         createElement(
           InboxItemPreview,
           {
+            cardPost,
             channelDescription: "Where the team talks",
             inboxClass,
             item: ITEM,
@@ -331,6 +332,59 @@ test("keyboard focus opens it at once; a Bench card shows its options inertly", 
     dom.window.document.activeElement?.textContent,
     "Open inbox item",
   );
+});
+
+test("a replaced card's row previews the card as its own post has it", async () => {
+  const live = {
+    id: "orchestrator/ask",
+    writer: "orchestrator",
+    kind: "pending",
+    title: "Reworded: send it now?",
+    body: "Reworded body",
+    area: "28-day-reset",
+    severity: "attention",
+    options: ["Reworded A", "Reworded B"],
+    state: null,
+    deadline: null,
+    validity: "current",
+    cardEventId: "e".repeat(64),
+    answer: null,
+    recorded: 0,
+  };
+  const { benchPostCard } = await import(
+    "@/features/bench/lib/benchCardLayout.ts"
+  );
+  const post = benchPostCard(
+    live,
+    [
+      "🟠 · 28 Day Reset · orchestrator",
+      "**Send the week 2 email?**",
+      "",
+      "Old body",
+      "",
+      "1. Send",
+      "2. Hold",
+    ].join("\n"),
+  ).card;
+  await act(async () => {
+    render(
+      row({
+        cardPost: post,
+        inboxClass: { type: "bench", workbench: null, benchCard: live },
+      }),
+    );
+  });
+  await act(async () => {
+    fireEvent.keyDown(dom.window.document.body, { key: "Tab" });
+    screen.getByRole("button", { name: "Open inbox item" }).focus();
+  });
+  const text = preview().textContent;
+  for (const part of ["Send the week 2 email?", "Old body", "1. Send"]) {
+    assert.ok(text.includes(part), part);
+  }
+  // Nothing of the live card: its wording, nor its recorded answer.
+  assert.ok(!text.includes("Reworded"), text);
+  assert.ok(!text.includes("Answered"), text);
 });
 
 test("a project's row and chip take its color; a row with none keeps its type's", async () => {

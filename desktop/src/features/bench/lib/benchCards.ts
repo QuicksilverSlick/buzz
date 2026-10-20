@@ -9,6 +9,7 @@
  * text: callers render it as React text, never markdown or HTML.
  */
 
+import type { TimelineReaction } from "@/features/messages/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSeverity = "critical" | "attention" | "info" | "good";
@@ -140,6 +141,8 @@ export type BenchCards = { enabled: false } | BenchSnapshot;
 export type BenchCardMatch = {
   card: BenchCard;
   ownerPubkey: string | null;
+  /** A post the Bench left behind (kept history), not the live card. */
+  retired: boolean;
 };
 
 /** What a timeline row needs from the snapshot. */
@@ -157,6 +160,10 @@ export type BenchMessageRef = {
   pending?: boolean;
   /** Raw event signer, not a relay-delegated display author. */
   signerPubkey?: string;
+  /** For the card marker of a retired post. */
+  tags?: readonly (readonly string[])[];
+  /** Unix seconds: a marked post newer than the snapshot is not retired. */
+  createdAt?: number;
 };
 
 const KIND_STREAM_MESSAGE = 9;
@@ -164,7 +171,7 @@ const NOT_A_BENCH_ROW: BenchRowState = { inBenchChannel: false, match: null };
 
 type BenchIndex = {
   cards: ReadonlyMap<string, BenchCard>;
-  /** Bound channels that hold a card; #bench is the snapshot's own. */
+  /** Bound channels of a known item; #bench is the snapshot's own. */
   channels: ReadonlySet<string>;
 };
 
@@ -178,8 +185,8 @@ function benchIndex(snapshot: BenchSnapshot): BenchIndex {
   const ambiguous = new Set<string>();
   for (const item of snapshot.items) {
     const id = item.cardEventId;
-    if (!id) continue;
     if (item.channelId) channels.add(item.channelId);
+    if (!id) continue;
     if (cards.has(id)) ambiguous.add(id);
     else cards.set(id, item);
   }
@@ -214,6 +221,46 @@ export function isBenchChannel(
   );
 }
 
+const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
+
+/**
+ * The item a Bench post's `client` tag (`bench:card:<item>@<hash>`) names,
+ * or null. The Bench marks every card post, so a retired post keeps it.
+ */
+export function benchCardMarkerItemId(
+  tags: readonly (readonly string[])[] | undefined,
+): string | null {
+  const marker = tags?.find(
+    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
+  )?.[1];
+  return (marker && CARD_MARKER.exec(marker)?.[1]) || null;
+}
+
+/**
+ * The known item a retired post marks. Its live card, when it has one, must
+ * be its own: a live id claimed twice matches nothing. A post from the tick
+ * that wrote the snapshot or later (`lastTick` is that tick's start) may be
+ * the new live card the snapshot does not name yet, so it is not retired.
+ */
+function markedItem(
+  snapshot: BenchSnapshot,
+  { createdAt, tags }: BenchMessageRef,
+): BenchCard | undefined {
+  const tick = benchDeadlineSeconds(snapshot.lastTick);
+  if (createdAt !== undefined && (tick === null || createdAt >= tick)) {
+    return undefined;
+  }
+  const itemId = benchCardMarkerItemId(tags);
+  const item = itemId
+    ? snapshot.items.find((candidate) => candidate.id === itemId)
+    : undefined;
+  return item &&
+    (!item.cardEventId ||
+      benchIndex(snapshot).cards.get(item.cardEventId) === item)
+    ? item
+    : undefined;
+}
+
 /** Whether a row could be a Bench card at all, before reading the snapshot. */
 export function isBenchCandidate(message: BenchMessageRef): boolean {
   return (
@@ -226,8 +273,9 @@ export function isBenchCandidate(message: BenchMessageRef): boolean {
 
 /**
  * The guard. A message renders as a Bench card only when its id is a live
- * card's event id, it is in that card's own channel, and the Bench writer
- * key signed it. Everything else renders exactly as before.
+ * card's event id (or its client marker names a known item: a retired post,
+ * shown read-only from its own text), it is in that card's own channel, and
+ * the Bench writer key signed it. Everything else renders exactly as before.
  */
 export function benchRowState(
   cards: BenchCards | null | undefined,
@@ -243,7 +291,8 @@ export function benchRowState(
   if (!isBenchCandidate(message) || !snapshot.writerPubkey) {
     return { inBenchChannel: true, match: null };
   }
-  const card = indexBenchCards(snapshot).get(message.id);
+  const card =
+    indexBenchCards(snapshot).get(message.id) ?? markedItem(snapshot, message);
   const signer = normalizePubkey(message.signerPubkey ?? "");
   const signedByWriter = signer === normalizePubkey(snapshot.writerPubkey);
   const inItsChannel = (card?.channelId ?? snapshot.channelId) === channelId;
@@ -251,7 +300,11 @@ export function benchRowState(
     inBenchChannel: true,
     match:
       card && inItsChannel && signedByWriter
-        ? { card, ownerPubkey: snapshot.ownerPubkey }
+        ? {
+            card,
+            ownerPubkey: snapshot.ownerPubkey,
+            retired: card.cardEventId !== message.id,
+          }
         : null,
   };
 }
@@ -781,6 +834,28 @@ const BENCH_OPTION_KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
 export function isBenchAnswerKeycap(card: BenchCard, emoji: string): boolean {
   const index = BENCH_OPTION_KEYCAPS.indexOf(emoji);
   return index !== -1 && index < (card.request ?? card).options.length;
+}
+
+/**
+ * The reaction pills a card's row shows. A live card's option buttons
+ * already show its answer keycaps. A retired post has no buttons, so it
+ * keeps everyone's own reactions, keycaps too, less the writer's: its seeds.
+ */
+export function benchShownReactions(
+  match: BenchCardMatch,
+  reactions: readonly TimelineReaction[],
+  writerPubkey: string | undefined,
+): TimelineReaction[] {
+  if (!match.retired) {
+    return reactions.filter((r) => !isBenchAnswerKeycap(match.card, r.emoji));
+  }
+  const writer = normalizePubkey(writerPubkey ?? "");
+  return reactions.flatMap((r) => {
+    const users = r.users.filter((u) => normalizePubkey(u.pubkey) !== writer);
+    const seeds = r.users.length - users.length;
+    if (seeds === 0) return [r];
+    return r.count > seeds ? [{ ...r, count: r.count - seeds, users }] : [];
+  });
 }
 
 /** RFC 3339 (a deadline, updatedAt) to unix seconds; null if unparseable. */

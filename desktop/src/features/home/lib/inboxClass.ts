@@ -9,8 +9,10 @@
 import {
   type BenchCard,
   type BenchSnapshot,
+  benchCardMarkerItemId,
   indexBenchCards,
 } from "@/features/bench/lib/benchCards";
+import { benchPostCard } from "@/features/bench/lib/benchCardLayout";
 import {
   WORKBENCHES,
   type Workbench,
@@ -148,8 +150,6 @@ function repoChip(address: string, projects: InboxProjects): ProjectChip {
     : { label: dtag, color: fallbackProjectColor(dtag) };
 }
 
-const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
-
 /**
  * The card an event is the post of: it carries the Bench's card marker, the
  * Bench writer key signed it, and it sits in #bench or the card's channel.
@@ -164,10 +164,7 @@ function markedCard(
   ) {
     return null;
   }
-  const marker = event.tags.find(
-    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
-  )?.[1];
-  const id = marker ? CARD_MARKER.exec(marker)?.[1] : undefined;
+  const id = benchCardMarkerItemId(event.tags);
   const card = id ? snapshot.items.find((c) => c.id === id) : undefined;
   return card &&
     event.channelId &&
@@ -199,18 +196,32 @@ function benchCardOf(
 
 /**
  * The row's card when the row shows the card's own post; a reply in its
- * thread is not the card, whatever marker it carries.
+ * thread is not the card, whatever marker it carries. A post a newer card
+ * replaced is the card as its own text has it.
  */
 export function inboxCardPost(
   item: InboxItem,
   snapshot: BenchSnapshot | null,
 ): BenchCard | null {
-  return markedCard(item.item, snapshot);
+  const card = markedCard(item.item, snapshot);
+  return card && card.cardEventId !== item.item.id
+    ? benchPostCard(card, item.item.content).card
+    : card;
 }
 
-function waitsOnOwner(card: BenchCard | null): boolean {
+/**
+ * The card waits on the owner, and the row is its live post or thread: an
+ * older post of the same card no longer takes an answer.
+ */
+function waitsOnOwner(card: BenchCard | null, item: InboxItem): boolean {
+  const live = card?.cardEventId;
   return (
-    card?.kind === "pending" && card.validity === "current" && !card.answer
+    card?.kind === "pending" &&
+    card.validity === "current" &&
+    !card.answer &&
+    !!live &&
+    (item.conversationId === live ||
+      [item.item, ...item.groupItems].some((event) => event.id === live))
   );
 }
 
@@ -222,7 +233,7 @@ export function classifyInboxItem(
   const benchCard = benchCardOf(item, benchSnapshot);
   const repo = inboxRepoAddress(item);
   const type: InboxItemType =
-    item.isActionRequired || waitsOnOwner(benchCard)
+    item.isActionRequired || waitsOnOwner(benchCard, item)
       ? "needs-you"
       : benchCard
         ? "bench"

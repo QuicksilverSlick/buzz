@@ -13,6 +13,8 @@
  *   the phone's order, the action as the command one tap approves, details
  *   apart (long ones folded); a card without them renders as before.
  * - Open thread shows on every card that has a thread.
+ * - A retired post is read-only, from its own text: the card's layout, no
+ *   answer buttons, a link to the live card when there is one.
  */
 
 import assert from "node:assert/strict";
@@ -821,4 +823,130 @@ test("Open thread is on question, status and receipt cards with a thread", async
     assert.equal(thread(), null);
     cleanup();
   }
+});
+
+test("a retired post is read-only, from its own text, with a link to the live card", async () => {
+  // The router reads `self`; its link is the jump to the live card.
+  globalThis.self ??= dom.window;
+  const {
+    RouterContextProvider,
+    createMemoryHistory,
+    createRootRoute,
+    createRouter,
+  } = await import("@tanstack/react-router");
+  const router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
+  const vector = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../../src-tauri/src/bench/card_layout_vectors.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  for (const cardEventId of [CARD_ID, null]) {
+    await act(async () => {
+      render(
+        createElement(
+          RouterContextProvider,
+          { router },
+          wrap(
+            benchCard({
+              card: card({ cardEventId }),
+              onOther: () => {},
+              retiredPost: { channelId: CHANNEL, text: vector.closed },
+            }),
+          ),
+        ),
+      );
+    });
+    const root = screen.getByTestId("bench-card-retired");
+    assert.equal(screen.queryByTestId("bench-card"), null);
+    // The posted wording in the card's layout; the live card's is nowhere.
+    assert.ok(root.textContent.includes("Which Production change goes first?"));
+    assert.ok(!root.textContent.includes("Ship the release?"));
+    assert.deepEqual(
+      labels(root),
+      vector.labels.filter((l) => l !== "Details").map((l) => `${l}:`),
+    );
+    assert.ok(screen.getByTestId("bench-card-details"));
+    assert.deepEqual(
+      [...root.querySelectorAll('ol[aria-label="Options"] li')].map(
+        (li) => li.textContent,
+      ),
+      ["1. Merge it", "2. Hold"],
+    );
+    // No answer buttons, no Other, no Open thread button, no tap line.
+    assert.equal(root.querySelector("fieldset"), null);
+    assert.equal(root.querySelector("button"), null);
+    assert.ok(!root.textContent.includes("Tap one number"));
+    assert.ok(root.textContent.includes("Closed: a tap or reply here"));
+    const jump = screen.queryByRole("link", { name: "Go to the newer card" });
+    const badge = root.firstElementChild.firstElementChild.textContent;
+    if (cardEventId) {
+      assert.equal(badge, "Replaced");
+      assert.ok(root.textContent.includes("Asked again on a newer card."));
+      assert.equal(
+        jump?.getAttribute("href"),
+        `buzz://message?channel=${CHANNEL}&id=${CARD_ID}`,
+      );
+    } else {
+      // Crowded out, withdrawn, or not posted yet: nothing was asked again.
+      assert.equal(badge, "Closed");
+      assert.ok(root.textContent.includes("No longer asked here."));
+      assert.ok(!root.textContent.includes("Asked again"));
+      assert.equal(jump, null, "no live card to go to");
+    }
+    cleanup();
+  }
+  assert.deepEqual(answerCalls(), []);
+
+  // A receipt kept when a new question followed it: its Outcome is a
+  // section of its own, as on the receipt card.
+  const receipt = [
+    "🔴 · Dreamforge · orchestrator",
+    "**Relay choice**",
+    "",
+    "1. Stay",
+    "2. Move",
+    "",
+    "Answered: 2. Move · Craig · 14:02",
+    "",
+    "Outcome · done · 15:10",
+    "**Kept the old email**",
+    "",
+    "**What changes:** nothing was sent.",
+    "",
+    "PR: https://github.com/QuicksilverSlick/buzz/pull/1",
+  ].join("\n");
+  await act(async () => {
+    render(
+      createElement(
+        RouterContextProvider,
+        { router },
+        wrap(
+          benchCard({
+            card: card(),
+            retiredPost: { channelId: CHANNEL, text: receipt },
+          }),
+        ),
+      ),
+    );
+  });
+  const root = screen.getByTestId("bench-card-retired");
+  const outcome = screen.getByTestId("bench-card-outcome");
+  assert.ok(root.contains(outcome));
+  assert.ok(root.textContent.includes("Answered: 2. Move · Craig · 14:02"));
+  assert.ok(outcome.textContent.startsWith("Outcome · done · 15:10"));
+  assert.ok(outcome.textContent.includes("Kept the old email"));
+  assert.deepEqual(labels(outcome), ["What changes:"]);
+  assert.equal(
+    screen.getByRole("link", { name: "PR" }).closest("section"),
+    outcome,
+  );
+  assert.equal(root.querySelector("button, fieldset"), null);
+  cleanup();
 });

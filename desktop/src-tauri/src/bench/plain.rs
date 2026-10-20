@@ -149,10 +149,11 @@ pub(crate) fn lines(item: &Item) -> Vec<String> {
 /// The labels a writer may type at the start of a line of a body. They
 /// print as the plain fields do: bold, a paragraph each. Only these and only
 /// at a line's start; anything else, mid-line too, stays the writer's text.
-const FIELDS: [&str; 5] = [
+const FIELDS: [&str; 6] = [
     "What changes",
     "Asked by",
     "If you wait",
+    "The choice",
     "Recommended",
     "Details",
 ];

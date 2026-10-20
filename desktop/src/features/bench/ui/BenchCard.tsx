@@ -26,12 +26,14 @@ import {
 import {
   benchCardLayout,
   benchCardMeta,
+  benchPostCard,
 } from "@/features/bench/lib/benchCardLayout";
 import {
   BenchCardBlocks,
   BenchCardDetails,
 } from "@/features/bench/ui/BenchCardFields";
 import { useBenchAnswer } from "@/features/bench/useBenchCards";
+import { buildMessageLink } from "@/features/messages/lib/messageLink";
 import { openPopoverLink } from "@/features/messages/lib/openPopoverLink";
 import { cn } from "@/shared/lib/cn";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
@@ -52,7 +54,9 @@ function formatBenchTime(unixSeconds: number): string {
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
  * it. `onOther` opens the card's thread: Other, where a reply is the
  * answer, and Open thread, on every card that has one. A closed card is its
- * receipt: the question, the answer and the outcome.
+ * receipt: the question, the answer and the outcome. A `retiredPost` (one a
+ * newer card replaced) is read-only, from its own text, so it never answers
+ * twice.
  */
 export function BenchCard({
   card,
@@ -60,6 +64,7 @@ export function BenchCard({
   viewerPubkey,
   onOther,
   projectLabel,
+  retiredPost,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
@@ -67,7 +72,9 @@ export function BenchCard({
   onOther?: () => void;
   /** Leads the muted line: the Bench screen's All tab names the project. */
   projectLabel?: string;
+  retiredPost?: BenchRetiredPost;
 }) {
+  if (retiredPost) return <BenchRetiredCard card={card} post={retiredPost} />;
   return card.request ? (
     <BenchReceiptCard
       card={card}
@@ -285,6 +292,103 @@ function BenchReceiptCard({
       <BenchOpenThread card={card} onOpenThread={onOther} />
     </Card>
   );
+}
+
+/** A post a newer card replaced: its text and channel, from its row. */
+type BenchRetiredPost = {
+  text: string;
+  channelId: string | null | undefined;
+};
+
+/**
+ * A replaced post in the card's layout, from its own text: the owner
+ * replied to that wording, never the live card's. Read-only: no answer
+ * buttons, no Other, no line on how to answer; its other lines as posted,
+ * a receipt's Outcome as the receipt card has it. It links the live card
+ * when there is one; with none, nothing is asked again yet.
+ */
+function BenchRetiredCard({
+  card,
+  post,
+}: {
+  card: BenchCardData;
+  post: BenchRetiredPost;
+}) {
+  const shown = benchPostCard(card, post.text);
+  const live = card.cardEventId;
+  return (
+    <Card
+      className="mt-1 max-w-[min(100%,36rem)] px-3 py-2.5"
+      data-bench-item={card.id}
+      data-testid="bench-card-retired"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge variant="secondary">{live ? "Replaced" : "Closed"}</Badge>
+        <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          {shown.meta}
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {live ? "Asked again on a newer card." : "No longer asked here."}
+        {live && post.channelId ? (
+          <>
+            {" "}
+            <BenchLinkAnchor
+              link={{
+                label: "Go to the newer card",
+                scheme: "buzz",
+                url: buildMessageLink({
+                  channelId: post.channelId,
+                  messageId: live,
+                }),
+              }}
+            />
+          </>
+        ) : null}
+      </p>
+      <BenchCardText card={shown.card} />
+      {shown.card.options.length > 0 ? (
+        <ol
+          aria-label="Options"
+          className="mt-2.5 space-y-0.5 text-message text-foreground/90"
+        >
+          {shown.card.options.map((option, index) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: options are positional
+            <li className="[overflow-wrap:anywhere]" key={index}>
+              <span className="font-semibold tabular-nums">{index + 1}.</span>{" "}
+              {option}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <BenchPostNotes notes={shown.notes} />
+      {shown.outcome ? (
+        <section
+          aria-label="Outcome"
+          className="mt-2.5 border-t border-border/70 pt-2"
+          data-testid="bench-card-outcome"
+        >
+          <p className="text-xs text-muted-foreground">
+            Outcome · {shown.outcome.meta}
+          </p>
+          <BenchCardText card={shown.outcome.card} />
+          <BenchPostNotes notes={shown.outcome.notes} />
+        </section>
+      ) : null}
+    </Card>
+  );
+}
+
+function BenchPostNotes({ notes }: { notes: readonly string[] }) {
+  return notes.map((note, index) => (
+    <p
+      className="mt-1.5 text-xs text-muted-foreground [overflow-wrap:anywhere]"
+      // biome-ignore lint/suspicious/noArrayIndexKey: lines are positional
+      key={index}
+    >
+      {note}
+    </p>
+  ));
 }
 
 /** Hidden until the card has a live (or kept) message to thread on. */

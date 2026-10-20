@@ -136,9 +136,9 @@ pub(crate) struct BenchState {
     joined: BTreeMap<String, Vec<String>>,
     /// Each bound channel's join or admin check: cards go only where it passed.
     channels: BTreeMap<String, channels::ChannelCheck>,
-    /// Engaged or owner-told cards a new question left behind: on the relay
-    /// for good, never adopted again by recover (which would retire them as
-    /// stale).
+    /// Engaged or owner-told cards a new question left behind, and stale ones
+    /// closed for what is on them: on the relay for good, never adopted again
+    /// by recover (which would retire them as stale).
     kept: Vec<String>,
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.

@@ -245,3 +245,130 @@ test("a card's typed labels read as bold fields; long details fold", async ({
   const open = await details.locator("p").nth(1).boundingBox();
   expect(open?.height ?? 0).toBeGreaterThan(clamped?.height ?? 0);
 });
+
+/** A card as first asked, closed once a newer card replaced it (item.rs). */
+function closedCardText(channelId: string, postId: string) {
+  return [
+    "🔴 · Dreamforge · release · dreamforge",
+    "**Ship 0.6 before Friday?**",
+    "",
+    "**What changes:** desktop ships first.",
+    "",
+    "1. Ship now",
+    "2. Wait",
+    "",
+    "as of 14:05",
+    "",
+    "Closed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.",
+    `Open thread: buzz://message?channel=${channelId}&id=${postId}`,
+  ].join("\n");
+}
+
+test("a replaced card's post shows read-only from its own text and links the live card", async ({
+  page,
+}) => {
+  // The mock's #general stands in for #bench.
+  const generalId = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+  const cardId = "9".repeat(64);
+  const oldId = "8".repeat(64);
+  await installMockBridge(page, {
+    benchCards: benchSnapshot(null, generalId, cardId),
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await page.waitForFunction(
+    () =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+        kind: 7,
+      }) === true,
+  );
+
+  await page.evaluate(
+    ({ cardId, itemId, oldId, owner, text, writer }) => {
+      const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      const marker = [["client", `bench:card:${itemId}@0a1b2c`]];
+      const react = (content: string, pubkey: string) =>
+        emit?.({
+          channelName: "general",
+          content,
+          extraTags: [["e", oldId]],
+          kind: 7,
+          pubkey,
+        });
+      emit?.({
+        channelName: "general",
+        content: text,
+        // Before the tick that wrote the snapshot.
+        createdAt: Math.floor(Date.now() / 1_000) - 3_600,
+        extraTags: marker,
+        id: oldId,
+        pubkey: writer,
+      });
+      // The writer's seeds and the owner's own tap on the old card.
+      react("1️⃣", writer);
+      react("2️⃣", writer);
+      react("2️⃣", owner);
+      emit?.({
+        channelName: "general",
+        content: "card",
+        extraTags: marker,
+        id: cardId,
+        pubkey: writer,
+      });
+      // Since that tick: maybe the new card the snapshot does not name yet.
+      emit?.({
+        channelName: "general",
+        content: "a newer post of the card",
+        extraTags: marker,
+        id: "7".repeat(64),
+        pubkey: writer,
+      });
+    },
+    {
+      cardId,
+      itemId: ITEM_ID,
+      oldId,
+      owner: OWNER,
+      text: closedCardText(generalId, oldId),
+      writer: WRITER,
+    },
+  );
+
+  const rows = page.getByTestId("message-row");
+  const retired = page.getByTestId("bench-card-retired");
+  const oldRow = rows.filter({ has: retired });
+  await expect(retired).toContainText("Ship 0.6 before Friday?");
+  await expect(retired).not.toContainText("Ship the 0.6 release?");
+  await expect(retired.getByText("What changes:", { exact: true })).toHaveCSS(
+    "font-weight",
+    "600",
+  );
+  await expect(
+    retired.getByRole("list", { name: "Options" }).getByRole("listitem"),
+  ).toHaveText(["1. Ship now", "2. Wait"]);
+  await expect(retired).toContainText("Closed: a tap or reply here");
+  await expect(retired).not.toContainText("Tap one number");
+  // Read-only: no answer or Other buttons, no fieldset.
+  await expect(retired.getByRole("button")).toHaveCount(0);
+  await expect(retired.locator("fieldset")).toHaveCount(0);
+  const pill = (emoji: string) =>
+    oldRow.getByRole("button", { name: `Toggle ${emoji} reaction` });
+  await expect(pill("2️⃣")).toBeVisible();
+  await expect(pill("1️⃣")).toHaveCount(0);
+  // The live card keeps its buttons.
+  const live = rows.filter({ has: page.getByTestId("bench-card") });
+  await expect(
+    live.getByRole("button", { name: /^1\. Ship it/ }),
+  ).toBeEnabled();
+  // The post newer than the snapshot is plain text until the next read.
+  const fresh = rows.filter({ hasText: "a newer post of the card" });
+  await expect(fresh).toHaveCount(1);
+  await expect(fresh.getByTestId("bench-card-retired")).toHaveCount(0);
+  await expect(retired).toHaveCount(1);
+
+  // In its own channel the jump lands on the live card (here, its thread).
+  await retired.getByRole("link", { name: "Go to the newer card" }).click();
+  await expect(page).toHaveURL(new RegExp(cardId));
+});
