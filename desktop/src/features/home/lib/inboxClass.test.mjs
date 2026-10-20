@@ -174,6 +174,23 @@ test("a retired card's post is still Bench; a card in its own channel too", () =
   assert.equal(result.workbench, "28 Day Reset");
 });
 
+test("only a well-formed client marker makes a post the card's (shared parser)", () => {
+  const bench = snapshot([card("claude-ai/ship")]);
+  const post = (tags) =>
+    inboxItem(event({ pubkey: WRITER, channelId: BENCH, tags }));
+  assert.equal(
+    inboxCardPost(post([marker("claude-ai/ship")]), bench)?.id,
+    "claude-ai/ship",
+  );
+  for (const tags of [
+    [["client", "bench:card:claude-ai/ship"]],
+    [["t", "bench:card:claude-ai/ship@0a1b2c"]],
+    [["client", "bench:card:claude-ai/other@0a1b2c"]],
+  ]) {
+    assert.equal(inboxCardPost(post(tags), bench), null, JSON.stringify(tags));
+  }
+});
+
 test("a pending, current, unanswered card needs you; answered it is Bench", () => {
   const post = event({
     pubkey: WRITER,

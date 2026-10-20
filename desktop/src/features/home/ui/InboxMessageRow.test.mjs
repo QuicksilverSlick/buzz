@@ -68,7 +68,10 @@ function message(overrides) {
   };
 }
 
-async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
+async function renderRow(
+  inboxMessage,
+  { benchCards, canReply = false, channelId } = {},
+) {
   const React = await import("react");
   const { render } = await import("@testing-library/react");
   const { QueryClient, QueryClientProvider } = await import(
@@ -81,6 +84,7 @@ async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
     createRouter,
   } = await import("@tanstack/react-router");
   const { InboxMessageRow } = await import("./InboxMessageRow.tsx");
+  const { TooltipProvider } = await import("@/shared/ui/tooltip.tsx");
   const queryClient = new QueryClient({
     defaultOptions: { queries: { enabled: false, retry: false } },
   });
@@ -98,15 +102,20 @@ async function renderRow(inboxMessage, { benchCards, channelId } = {}) {
       React.createElement(
         QueryClientProvider,
         { client: queryClient },
-        React.createElement(InboxMessageRow, {
-          agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
-          canReply: false,
-          channelId,
-          isFocusHighlightVisible: false,
-          message: inboxMessage,
-          onSelectReplyTarget: () => {},
-          profiles,
-        }),
+        // The action bar a replyable row shows uses tooltips.
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(InboxMessageRow, {
+            agentPubkeys: new Set([AGENT, PLAIN_AGENT]),
+            canReply,
+            channelId,
+            isFocusHighlightVisible: false,
+            message: inboxMessage,
+            onSelectReplyTarget: () => {},
+            profiles,
+          }),
+        ),
       ),
     ),
   );
@@ -259,4 +268,40 @@ test("a live Bench card's post shows as the card, not the text it was posted wit
   );
   assert.equal(forged.queryByTestId("bench-card"), null);
   assert.ok(forged.container.textContent.includes("28-day-reset"));
+});
+
+test("a retired card's post shows the item's live card, without its keycap pills", async () => {
+  const keycap = (emoji) => ({ emoji, count: 1, users: [] });
+  const retired = message({
+    authorPubkey: WRITER,
+    content: OLD_TEXT,
+    id: "9".repeat(64),
+    kind: 9,
+    reactions: [keycap("1️⃣"), keycap("2️⃣"), keycap("👍")],
+    signerPubkey: WRITER,
+    tags: [
+      ["h", BENCH],
+      ["client", "bench:card:orchestrator/ship@0a1b2c"],
+    ],
+  });
+  const view = await renderRow(retired, {
+    benchCards: benchCards(),
+    canReply: true,
+    channelId: BENCH,
+  });
+  const shown = view.getByTestId("bench-card");
+  assert.equal(shown.getAttribute("data-bench-item"), "orchestrator/ship");
+  assert.ok(!view.container.textContent.includes("28-day-reset"));
+  const pills = view.getByTestId("message-reactions").textContent;
+  assert.ok(pills.includes("👍"));
+  assert.ok(!pills.includes("1️⃣") && !pills.includes("2️⃣"), pills);
+  // Other replies in the live card's thread only, so the old post has none.
+  assert.equal(view.queryByText("Open thread"), null);
+  view.unmount();
+
+  const live = await renderRow(
+    { ...retired, id: CARD_EVENT },
+    { benchCards: benchCards(), canReply: true, channelId: BENCH },
+  );
+  assert.ok(live.getByText("Open thread"));
 });

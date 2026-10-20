@@ -55,6 +55,7 @@ import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTime
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
+import { useChannelTyping } from "@/features/messages/useChannelTyping";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
@@ -314,6 +315,12 @@ export function HomeView({
       isChannelLoading: channelMessagesQuery.isPending,
     },
   );
+  const typingEntries = useChannelTyping(
+    selectedChannel,
+    currentPubkey,
+    threadContext.events[threadContext.events.length - 1] ?? null,
+    relaySelfPubkey,
+  );
   const { editMessage, isEditingMessage } = useInboxEditMessage(
     selectedChannel,
     threadContext.refreshStructuralEvents,
@@ -330,9 +337,16 @@ export function HomeView({
           .filter((event) => event.kind === KIND_REACTION)
           .map((event) => event.pubkey),
         ...(currentPubkey ? [currentPubkey] : []),
+        ...typingEntries.map((entry) => entry.pubkey),
       ]),
     ],
-    [channelMessages, currentPubkey, feedItems, threadContext.events],
+    [
+      channelMessages,
+      currentPubkey,
+      feedItems,
+      threadContext.events,
+      typingEntries,
+    ],
   );
   const feedProfilesQuery = useUsersBatchQuery(feedProfilePubkeys, {
     enabled: feedProfilePubkeys.length > 0,
@@ -809,11 +823,13 @@ export function HomeView({
               isSinglePanelView={isSinglePanelDetailView}
               hasThreadContextLoadError={threadContext.hasLoadError}
               isThreadContextLoading={threadContext.isLoading}
+              isThreadRootDeleted={threadContext.isRootDeleted}
               item={selectedItem}
               latchedDefaultParentId={latchedDefaultParentId}
               messages={contextMessages}
               profiles={feedProfiles}
               selectedEventId={selectedEventId}
+              typingEntries={typingEntries}
               unreadBoundaryEventId={unreadBoundaryEventId}
               editTargetId={editTargetId}
               onEditTargetChange={setEditTargetId}

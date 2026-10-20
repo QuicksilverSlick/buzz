@@ -102,13 +102,14 @@ export function InboxMessageRow({
     errorMessage: reactionErrorMessage,
     select: handleReactionSelect,
   } = useReactionHandler(timelineMessage, onToggleReaction);
-  // A live Bench card's post shows as the card, as in its channel: its text
-  // as posted may be an older format (see benchRowState for the guard).
+  // A Bench card's post, live or retired, shows as the live card, as in its
+  // channel: its text as posted may be an older format (see benchRowState).
   const benchCard = useBenchCardForMessage({
     channelId,
     id: message.id,
     kind: message.kind,
     signerPubkey: message.signerPubkey,
+    tags: message.tags,
   });
   // A live card's option buttons already show its answer keycaps.
   const shownReactions = benchCard
@@ -308,8 +309,12 @@ export function InboxMessageRow({
             {benchCard ? (
               <BenchCard
                 card={benchCard.card}
+                // The Bench reads Other only in the live card's thread, not a
+                // retired post's.
                 onOther={
-                  canReply ? () => onSelectReplyTarget(message) : undefined
+                  canReply && benchCard.card.cardEventId === message.id
+                    ? () => onSelectReplyTarget(message)
+                    : undefined
                 }
                 ownerPubkey={benchCard.ownerPubkey}
                 viewerPubkey={currentPubkey}

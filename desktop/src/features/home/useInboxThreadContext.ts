@@ -7,6 +7,7 @@ import { getThreadReference } from "@/features/messages/lib/threading";
 import { relayClient } from "@/shared/api/relayClient";
 import { buildChannelReactionAuxFilter } from "@/shared/api/relayChannelFilters";
 import { getEventById } from "@/shared/api/tauri";
+import { isDefinitiveEventNotFound } from "@/shared/lib/eventLookupError";
 import type { FeedItem, RelayEvent } from "@/shared/api/types";
 import {
   CHANNEL_TIMELINE_CONTENT_KINDS,
@@ -17,6 +18,8 @@ type InboxThreadContextResult = {
   events: RelayEvent[];
   hasLoadError: boolean;
   isLoading: boolean;
+  /** The relay says the thread root is gone: deleted, not a load error. */
+  isRootDeleted: boolean;
   /** Edits/deletions referencing context messages, fetched by `#e`. */
   structuralEvents: RelayEvent[];
   /** Re-fetch structural events after an Inbox edit is published. */
@@ -57,6 +60,7 @@ export function useInboxThreadContext(
 ): InboxThreadContextResult {
   const [fetchedEvents, setFetchedEvents] = React.useState<RelayEvent[]>([]);
   const [hasLoadError, setHasLoadError] = React.useState(false);
+  const [deletedRootId, setDeletedRootId] = React.useState<string | null>(null);
   // Readiness belongs to the selection whose context actually settled. A
   // boolean set in the effect reports false for the first render of a new
   // selection, allowing the scroll owner to center before its rows arrive.
@@ -110,6 +114,7 @@ export function useInboxThreadContext(
         const ancestorEventsPromise = (async () => {
           const eventsById = new Map<string, RelayEvent>();
           let failed = false;
+          let rootDeleted = false;
 
           const fetchEvent = async (eventId: string) => {
             if (eventId === targetEvent.id || eventsById.has(eventId)) {
@@ -120,8 +125,15 @@ export function useInboxThreadContext(
               const event = await getEventById(eventId);
               eventsById.set(event.id, event);
               return event;
-            } catch {
-              failed = true;
+            } catch (error) {
+              if (
+                eventId === threadRootId &&
+                isDefinitiveEventNotFound(error)
+              ) {
+                rootDeleted = true;
+              } else {
+                failed = true;
+              }
               return null;
             }
           };
@@ -147,7 +159,7 @@ export function useInboxThreadContext(
             hops += 1;
           }
 
-          return { events: [...eventsById.values()], failed };
+          return { events: [...eventsById.values()], failed, rootDeleted };
         })();
 
         const descendantEventsPromise =
@@ -180,6 +192,7 @@ export function useInboxThreadContext(
         }
 
         setHasLoadError(ancestorResult.failed || descendantResult.failed);
+        setDeletedRootId(ancestorResult.rootDeleted ? threadRootId : null);
         setFetchedEvents(
           dedupeEvents(
             [...ancestorResult.events, ...descendantResult.events].filter(
@@ -379,6 +392,10 @@ export function useInboxThreadContext(
     isLoading: fullChannel
       ? options.isChannelLoading === true
       : selectedEvent !== null && settledEvent !== selectedEvent,
+    isRootDeleted:
+      !fullChannel &&
+      deletedRootId !== null &&
+      deletedRootId === selectedThreadRootId,
     structuralEvents,
     refreshStructuralEvents,
     reactionEvents,

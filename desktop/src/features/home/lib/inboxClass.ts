@@ -9,6 +9,7 @@
 import {
   type BenchCard,
   type BenchSnapshot,
+  benchCardMarkerItemId,
   indexBenchCards,
 } from "@/features/bench/lib/benchCards";
 import {
@@ -148,8 +149,6 @@ function repoChip(address: string, projects: InboxProjects): ProjectChip {
     : { label: dtag, color: fallbackProjectColor(dtag) };
 }
 
-const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
-
 /**
  * The card an event is the post of: it carries the Bench's card marker, the
  * Bench writer key signed it, and it sits in #bench or the card's channel.
@@ -164,10 +163,7 @@ function markedCard(
   ) {
     return null;
   }
-  const marker = event.tags.find(
-    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
-  )?.[1];
-  const id = marker ? CARD_MARKER.exec(marker)?.[1] : undefined;
+  const id = benchCardMarkerItemId(event.tags);
   const card = id ? snapshot.items.find((c) => c.id === id) : undefined;
   return card &&
     event.channelId &&

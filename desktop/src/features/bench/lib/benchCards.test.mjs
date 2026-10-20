@@ -7,6 +7,7 @@ import {
   INITIAL_BENCH_ANSWER_STATE,
   answerTarget,
   benchAnswerReducer,
+  benchCardMarkerItemId,
   benchCardMode,
   benchDeadlineSeconds,
   benchEligible,
@@ -684,6 +685,90 @@ test("guard: a project card matches in its own channel only", () => {
     null,
     "only the writer key signs cards",
   );
+});
+
+const RETIRED_POST = "f".repeat(64);
+const marker = (itemId, hash = "0a1b2c") => [
+  "client",
+  `bench:card:${itemId}@${hash}`,
+];
+
+test("marker: the item a card post's client tag names", () => {
+  assert.equal(
+    benchCardMarkerItemId([["h", CHANNEL], marker("orchestrator/x")]),
+    "orchestrator/x",
+  );
+  assert.equal(benchCardMarkerItemId([marker("a@b")]), "a@b", "last @ is hash");
+  for (const tags of [
+    undefined,
+    [],
+    [["client", "bench:card:orchestrator/x"]],
+    [["client", "bench:card:@abcd"]],
+    [["client", "buzz-desktop"]],
+    [["t", "bench:card:orchestrator/x@abcd"]],
+  ]) {
+    assert.equal(benchCardMarkerItemId(tags), null, JSON.stringify(tags));
+  }
+});
+
+test("guard: a retired post shows its item's live card, answered through the live id", () => {
+  const cards = snapshot();
+  const state = benchRowState(
+    cards,
+    row({ id: RETIRED_POST, tags: [marker("dreamforge/ship-it")] }),
+  );
+  assert.equal(state.match?.card, cards.items[0]);
+  assert.equal(state.match?.card.cardEventId, CARD_ID);
+  assert.equal(state.match?.ownerPubkey, OWNER);
+  // Its seeded keycaps are the live card's option buttons.
+  assert.equal(isBenchAnswerKeycap(state.match.card, "1️⃣"), true);
+});
+
+test("guard: a retired post needs the writer, its channel and a live, unambiguous card", () => {
+  const tags = [marker("dreamforge/ship-it")];
+  const retired = (cards, overrides = {}) =>
+    benchRowState(cards, row({ id: RETIRED_POST, tags, ...overrides })).match;
+  assert.equal(retired(snapshot(), { signerPubkey: STRANGER }), null);
+  assert.equal(retired(snapshot(), { tags: undefined }), null);
+  assert.equal(
+    retired(snapshot(), { tags: [marker("dreamforge/gone")] }),
+    null,
+    "no such item",
+  );
+  assert.equal(
+    retired(snapshot([card({ cardEventId: null })])),
+    null,
+    "the item has no live card",
+  );
+  assert.equal(
+    retired(snapshot([card(), card({ id: "w/dupe" })])),
+    null,
+    "its live id is claimed twice",
+  );
+  const project = snapshot([card(), scoped()]);
+  const projectTags = [marker("reset-worker/welcome")];
+  assert.equal(
+    retired(project, { tags: projectTags }),
+    null,
+    "a project card's post in #bench",
+  );
+  assert.equal(
+    retired(project, { channelId: PROJECT, tags: projectTags })?.card
+      .cardEventId,
+    PROJECT_CARD,
+  );
+  assert.equal(
+    retired(project, { channelId: PROJECT }),
+    null,
+    "a #bench card's post in the project channel",
+  );
+});
+
+test("guard: the live post itself still wins over its marker", () => {
+  const other = card({ id: "w/other", cardEventId: "1".repeat(64) });
+  const cards = snapshot([card(), other]);
+  const state = benchRowState(cards, row({ tags: [marker("w/other")] }));
+  assert.equal(state.match?.card.id, "dreamforge/ship-it");
 });
 
 test("eligible: the shared answer vectors agree with item.rs", () => {
