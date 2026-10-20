@@ -996,11 +996,13 @@ pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String
 /// Build the `NO_PROXY` entry that lets `buzz-cli` reach the relay from inside
 /// Codex's network-restricted Windows sandbox.
 ///
-/// Codex's unelevated Windows sandbox points `HTTP(S)_PROXY` and `ALL_PROXY` at the
-/// dead `http://127.0.0.1:9` and sets `NO_PROXY` only when it is unset
-/// (`apply_no_network_to_env` in codex-rs `windows-sandbox-rs/src/env.rs`). A
-/// `NO_PROXY` already listing the relay host survives, so `buzz-cli` connects
-/// directly; every other host still hits the dead proxy.
+/// With network restricted, Codex's unelevated Windows sandbox fills in any of
+/// `HTTP(S)_PROXY`, `ALL_PROXY` and `NO_PROXY` that is unset: the proxies with the dead
+/// `http://127.0.0.1:9`, `NO_PROXY` with loopback only (`apply_no_network_to_env` in
+/// codex-rs `windows-sandbox-rs/src/env.rs`, `entry().or_insert`). A `NO_PROXY` already
+/// listing the relay host survives, so `buzz-cli` connects directly; every other host
+/// still hits the dead proxy. A real proxy already in the env also survives, which is
+/// why the caller skips this when one is set.
 ///
 /// Returns `None` for non-Codex agents or when the relay URL has no host.
 pub fn codex_relay_no_proxy_env(agent_command: &str, relay_url: &str) -> Option<(String, String)> {
@@ -1298,7 +1300,9 @@ impl Config {
 
         // Codex's Windows sandbox sends buzz-cli to a dead proxy; exempt the relay host.
         // shortcut: an operator-set NO_PROXY wins (persona env is operator-wins) and must list
-        // the relay host itself; merge ours into it if operators hit that.
+        // the relay host itself; merge ours into it if operators hit that. Only env proxies are
+        // checked, not the registry system proxy; on a PC that relies on that one, our NO_PROXY
+        // makes Python and other env-first clients skip it. Read ProxyEnable if that bites.
         if cfg!(windows)
             && ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
                 .iter()
