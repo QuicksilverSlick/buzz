@@ -4813,7 +4813,8 @@ fn try_native_steer(
     // native steer is a *delta* into a live turn — the agent already saw
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
-    // steering (which is to inject only what's new).
+    // steering (which is to inject only what's new). The owner is NOT
+    // omitted: the block's `Authority:` label must match `authority` below.
     // The caller steers natively only a message that replies where the
     // running turn replies (`ReplyRoute::accepts_steer`), so the turn's own
     // `<context>` still routes the reply. An edit's
@@ -4823,7 +4824,7 @@ fn try_native_steer(
     // not from any derived "effective" author: a steered event must never be
     // trusted more than the same event would be if it had started the turn.
     let authority = crate::acp::authority_for_author(&be.event.pubkey.to_hex(), owner);
-    let body = native_steer_body(channel_id, &be);
+    let body = native_steer_body(channel_id, &be, owner);
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4892,9 +4893,9 @@ fn try_native_steer(
 }
 
 /// Render the prompt delta sent by [`try_native_steer`].
-fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent) -> String {
+fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent, owner: Option<&str>) -> String {
     let (tag, closing) = queue::native_steer_framing();
-    let event_block = queue::format_event_block(channel_id, None, be, None, None);
+    let event_block = queue::format_event_block(channel_id, None, be, None, owner);
     let new_message = prompt_framing::semantic_section(tag, "");
     let event_section = prompt_framing::semantic_section_with_attributes(
         "buzz-event",
@@ -11575,12 +11576,34 @@ mod edit_native_steer_tests {
                 target_thread_tags: queue::parse_thread_tags(&original),
             }),
         };
-        let body = native_steer_body(Uuid::new_v4(), &be);
+        let body = native_steer_body(Uuid::new_v4(), &be, None);
         assert!(
             body.contains(&format!("Edit of: {}", original.id.to_hex())),
             "{body}"
         );
         assert!(body.contains(&format!("root={root}")), "{body}");
+    }
+
+    /// A steered owner message is labelled as the owner's, matching the
+    /// authority the steer carries; anyone else, or an unknown owner, is a guest.
+    #[test]
+    fn native_steer_body_marks_the_owner_as_owner() {
+        let event = message(None);
+        let be = queue::BatchEvent {
+            event: event.clone(),
+            prompt_tag: "@mention".into(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        };
+        let owner = event.pubkey.to_hex();
+        let channel_id = Uuid::new_v4();
+        let as_owner = native_steer_body(channel_id, &be, Some(&owner));
+        assert!(as_owner.contains("Authority: owner"), "{as_owner}");
+        let other = "cd".repeat(32);
+        let as_guest = native_steer_body(channel_id, &be, Some(&other));
+        assert!(as_guest.contains("Authority: guest"), "{as_guest}");
+        let unknown = native_steer_body(channel_id, &be, None);
+        assert!(unknown.contains("Authority: guest"), "{unknown}");
     }
 
     /// The listener hands the steer path the same resolved route it queues.
