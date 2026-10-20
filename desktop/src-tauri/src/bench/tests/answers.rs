@@ -479,12 +479,16 @@ async fn stale_card_never_supplies_an_answer() {
     b.tick().await.unwrap();
     assert!(b.s.items[ITEM].answer.is_none());
     assert!(outbox(&b).is_none());
-    assert_eq!(last_query(&b)[0]["#e"], json!([other]));
-    // (b) retired the stale card and (c) reposted it fresh.
+    let queries = b.relay.queries.lock().unwrap().clone();
+    let poll = queries.iter().rev().find(|q| q[0]["kinds"] == json!([7]));
+    assert_eq!(poll.unwrap()[0]["#e"], json!([other]));
+    // (c) reposted it fresh; the owner's tap still on the stale card keeps
+    // it on the relay, so (b) never retires it.
     let retired = b.posts()[before..].iter().any(|(e, _)| {
         e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.event_id.as_str())
     });
-    assert!(retired);
+    assert!(!retired);
+    assert_eq!(b.s.kept, [card.event_id.clone()]);
     assert_ne!(b.card(ITEM).event_id, card.event_id);
 }
 

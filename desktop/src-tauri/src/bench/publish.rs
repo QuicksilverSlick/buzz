@@ -582,7 +582,7 @@ pub(super) async fn publish(
     // no longer wanted, unless someone answered or replied on them or they
     // are a receipt: those stay on the relay for good. A card in a channel
     // that is not ready, or `held`, waits: its taps are read once it is again.
-    let stale: Vec<(String, String, String)> = s
+    let stale: Vec<(String, String, Posted)> = s
         .items
         .values()
         .filter_map(|i| {
@@ -590,14 +590,22 @@ pub(super) async fn publish(
             let stale = c.hash != item::card_hash(i) || !wanted.contains(&i.id);
             let waits = !channel_ready(s, i) || s.held.contains(&i.id);
             let retire = !i.engaged() && i.request.is_none() && stale && !waits;
-            retire.then(|| (i.id.clone(), card_channel(s, i), c.event_id.clone()))
+            retire.then(|| (i.id.clone(), card_channel(s, i), c.clone()))
         })
         .collect();
-    for (id, ch, event_id) in stale {
-        if !spend(budget, 1) {
-            return Ok(());
+    for (id, ch, card) in stale {
+        // A reply or tap the item never read (free text on an unscoped card)
+        // still makes the card a record: it stays, as `carry_card` keeps one.
+        if touched(ctx, s, &ch, &card.event_id, now).await? {
+            s.kept.push(card.event_id.clone());
+            let root = s.items[&id].reply_to.clone();
+            s.kept_at.extend(root.map(|r| (r, card.created_at)));
+        } else {
+            if !spend(budget, 1) {
+                return Ok(());
+            }
+            delete(ctx, s, &ch, &card.event_id, now).await?;
         }
-        delete(ctx, s, &ch, &event_id, now).await?;
         forget_card(s, &id);
     }
 
