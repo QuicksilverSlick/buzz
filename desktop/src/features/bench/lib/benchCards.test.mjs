@@ -20,6 +20,7 @@ import {
   benchRowState,
   benchSearch,
   benchSeverityChip,
+  benchShownReactions,
   benchStateLabel,
   benchValidityLabel,
   createPollGroup,
@@ -727,11 +728,12 @@ test("guard: a retired post matches its item's live card, flagged retired", () =
   assert.equal(isBenchAnswerKeycap(state.match.card, "1️⃣"), true);
 });
 
-test("guard: a retired post needs the writer, its channel and a live, unambiguous card", () => {
+test("guard: a retired post needs the writer, its channel and a known item", () => {
   const tags = [marker("dreamforge/ship-it")];
   const retired = (cards, overrides = {}) =>
     benchRowState(cards, row({ id: RETIRED_POST, tags, ...overrides })).match;
   assert.equal(retired(snapshot(), { signerPubkey: STRANGER }), null);
+  assert.equal(retired(snapshot(), { signerPubkey: OWNER }), null);
   assert.equal(retired(snapshot(), { tags: undefined }), null);
   assert.equal(
     retired(snapshot(), { tags: [marker("dreamforge/gone")] }),
@@ -739,10 +741,14 @@ test("guard: a retired post needs the writer, its channel and a live, unambiguou
     "no such item",
   );
   assert.equal(
-    retired(snapshot([card({ cardEventId: null })])),
+    retired(snapshot(), { channelId: OTHER_CHANNEL }),
     null,
-    "the item has no live card",
+    "another channel",
   );
+  // Its own text is what it shows, so it needs no live card to point at.
+  const unposted = retired(snapshot([card({ cardEventId: null })]));
+  assert.equal(unposted?.retired, true, "the item has no live card");
+  assert.equal(unposted?.card.cardEventId, null);
   assert.equal(
     retired(snapshot([card(), card({ id: "w/dupe" })])),
     null,
@@ -765,6 +771,41 @@ test("guard: a retired post needs the writer, its channel and a live, unambiguou
     null,
     "a #bench card's post in the project channel",
   );
+});
+
+test("reactions: a live card hides its keycaps; a retired post only the writer's", () => {
+  const pill = (emoji, ...pubkeys) => ({
+    emoji,
+    count: pubkeys.length,
+    users: pubkeys.map((pubkey) => ({
+      pubkey,
+      displayName: pubkey,
+      avatarUrl: null,
+    })),
+  });
+  const pills = [
+    pill("1️⃣", WRITER),
+    pill("2️⃣", WRITER.toUpperCase(), OWNER),
+    pill("👍", OWNER),
+    pill("3️⃣", OWNER),
+  ];
+  const live = { card: card(), ownerPubkey: OWNER, retired: false };
+  assert.deepEqual(
+    benchShownReactions(live, pills, WRITER).map((r) => r.emoji),
+    ["👍", "3️⃣"],
+    "a live card's own keycaps are its buttons",
+  );
+  const shown = benchShownReactions({ ...live, retired: true }, pills, WRITER);
+  assert.deepEqual(
+    shown.map((r) => [r.emoji, r.count, r.users.map((u) => u.pubkey)]),
+    [
+      ["2️⃣", 1, [OWNER]],
+      ["👍", 1, [OWNER]],
+      ["3️⃣", 1, [OWNER]],
+    ],
+    "the owner's own taps stay; the writer's seeds go",
+  );
+  assert.equal(shown[1], pills[2], "an untouched pill is the same object");
 });
 
 test("guard: the live post itself still wins over its marker", () => {

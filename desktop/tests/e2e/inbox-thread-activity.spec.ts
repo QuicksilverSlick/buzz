@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import type { BenchCards } from "../../src/features/bench/lib/benchCards";
 import { KIND_TYPING_INDICATOR } from "../../src/shared/constants/kinds";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
@@ -7,6 +8,8 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
  * The Inbox thread pane shows what a channel's thread panel shows under its
  * composer (agent activity and who is typing in the thread), and a thread
  * whose root was deleted shows a muted row in its place, not a load error.
+ * A Bench card's post a newer card replaced shows read-only, as the card
+ * its own text is.
  */
 
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
@@ -246,4 +249,115 @@ test("a root that fails to load keeps the load-error banner", async ({
 
   await expect(detail.getByTestId("home-inbox-context-error")).toBeVisible();
   await expect(detail.getByTestId("home-inbox-root-deleted")).toHaveCount(0);
+});
+
+test("a replaced Bench card's post shows read-only from its own text", async ({
+  page,
+}) => {
+  const writer = "a".repeat(64);
+  const itemId = "orchestrator/ship";
+  const oldId = "d3".repeat(32);
+  const liveId = "d4".repeat(32);
+  const benchCards: BenchCards = {
+    enabled: true,
+    // The mock's #general stands in for #bench.
+    channelId: GENERAL_CHANNEL_ID,
+    writerPubkey: writer,
+    ownerPubkey: "deadbeef".repeat(8),
+    lastError: null,
+    lastTick: new Date().toISOString(),
+    items: [
+      {
+        id: itemId,
+        writer: "orchestrator",
+        kind: "pending",
+        title: "Ship it now?",
+        body: "Asked again, reworded.",
+        area: "28-day-reset",
+        severity: "critical",
+        options: ["Ship", "Hold"],
+        state: null,
+        decidedBy: null,
+        deadline: null,
+        links: [],
+        order: 0,
+        validity: "current",
+        updatedAt: new Date().toISOString(),
+        cardEventId: liveId,
+        answer: null,
+        recorded: null,
+        channelId: null,
+        project: null,
+        scoped: false,
+        needs: "you",
+        answerers: [],
+        ownerName: null,
+        recommend: null,
+        recommender: null,
+        reply: null,
+        request: null,
+      },
+    ],
+  };
+  await installMockBridge(page, { benchCards });
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  await page.waitForFunction(
+    () =>
+      typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function" &&
+      typeof window.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__ === "function",
+  );
+  await page.evaluate(
+    ({ channelId, itemId, oldId, writer }) => {
+      const post = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: [
+          "🔴 · 28 Day Reset · orchestrator",
+          "**Ship it before Friday?**",
+          "",
+          "**What changes:** the old welcome email",
+          "",
+          "1. Ship now",
+          "2. Wait",
+          "",
+          "as of 14:05",
+          "",
+          "Closed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.",
+        ].join("\n"),
+        extraTags: [["client", `bench:card:${itemId}@0a1b2c`]],
+        id: oldId,
+        pubkey: writer,
+      });
+      if (!post) throw new Error("Bridge helpers not ready");
+      window.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?.({
+        category: "mention",
+        channel_id: channelId,
+        channel_name: "general",
+        content: post.content,
+        created_at: post.created_at,
+        id: post.id,
+        kind: post.kind,
+        pubkey: post.pubkey,
+        tags: post.tags,
+      });
+    },
+    { channelId: GENERAL_CHANNEL_ID, itemId, oldId, writer },
+  );
+
+  // The row and the pane show that post's own wording, never the live card's.
+  const row = page.getByTestId(`home-inbox-item-${oldId}`);
+  await expect(row.getByTestId("inbox-bench-snippet")).toContainText(
+    "Ship it before Friday?",
+  );
+  await row.click();
+  const retired = page
+    .getByTestId("home-inbox-detail")
+    .getByTestId("bench-card-retired");
+  await expect(retired).toContainText("Ship it before Friday?");
+  await expect(retired).toContainText("the old welcome email");
+  await expect(retired).not.toContainText("Ship it now?");
+  await expect(retired.getByRole("button")).toHaveCount(0);
+  await expect(retired).not.toContainText("Tap one number");
+  await retired.getByRole("link", { name: "Go to the newer card" }).click();
+  await expect(page).toHaveURL(new RegExp(`messageId=${liveId}`));
 });

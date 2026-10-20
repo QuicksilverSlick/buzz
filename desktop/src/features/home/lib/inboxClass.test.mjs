@@ -242,6 +242,17 @@ test("an older post of a card asked again is Bench, not waiting on you", () => {
     assert.equal(result.type, "bench");
     assert.equal(result.benchCard?.id, "orchestrator/ask");
   }
+  // Its row shows the card as that post asked it, not the current wording.
+  const asked = inboxItem({
+    ...old,
+    content: "🔵 · Dreamforge · orchestrator\n**Asked first**\n\nThen: this",
+  });
+  const shown = inboxCardPost(asked, snapshot([ask]));
+  assert.equal(shown?.id, "orchestrator/ask");
+  assert.equal(shown?.title, "Asked first");
+  assert.equal(shown?.body, "Then: this");
+  const live = inboxItem({ ...old, id: CARD_EVENT });
+  assert.equal(inboxCardPost(live, snapshot([ask]))?.title, "orchestrator/ask");
 });
 
 test("a reply in a card's thread is that card's, by the card's own event id", () => {

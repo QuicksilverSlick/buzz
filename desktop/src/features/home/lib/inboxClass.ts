@@ -12,6 +12,7 @@ import {
   benchCardMarkerItemId,
   indexBenchCards,
 } from "@/features/bench/lib/benchCards";
+import { benchPostCard } from "@/features/bench/lib/benchCardLayout";
 import {
   WORKBENCHES,
   type Workbench,
@@ -195,13 +196,17 @@ function benchCardOf(
 
 /**
  * The row's card when the row shows the card's own post; a reply in its
- * thread is not the card, whatever marker it carries.
+ * thread is not the card, whatever marker it carries. A post a newer card
+ * replaced is the card as its own text has it.
  */
 export function inboxCardPost(
   item: InboxItem,
   snapshot: BenchSnapshot | null,
 ): BenchCard | null {
-  return markedCard(item.item, snapshot);
+  const card = markedCard(item.item, snapshot);
+  return card && card.cardEventId !== item.item.id
+    ? benchPostCard(card, item.item.content).card
+    : card;
 }
 
 /**

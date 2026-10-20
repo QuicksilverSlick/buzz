@@ -42,6 +42,11 @@ fn the_shared_vector_is_the_card_the_bench_posts() {
         .collect();
     let text = render_card(&check(&overrides).unwrap(), "14:05");
     assert_eq!(text, v["text"].as_str().unwrap());
+    // Replaced by a newer card, it is edited closed (publish (b)); a desktop
+    // shows that text read-only in the same layout.
+    let closed = render_closed(&text)
+        + &thread_line("8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10", &"e".repeat(64));
+    assert_eq!(closed, v["closed"].as_str().unwrap());
     // Every label, bold, once, in the writer's order.
     let labels: Vec<&str> = v["labels"]
         .as_array()

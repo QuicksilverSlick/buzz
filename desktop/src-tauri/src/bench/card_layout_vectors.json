@@ -1,5 +1,5 @@
 {
-  "note": "One card as the 28 Day Orchestrator writes it: labels typed into the body. tests/card_layout.rs pins the card text the Bench posts; BenchCardLayout.jsdom-test.mjs renders that text with the desktop's markdown and lays the same body out as the Bench screen does.",
+  "note": "One card as the 28 Day Orchestrator writes it: labels typed into the body. tests/card_layout.rs pins the card text the Bench posts; BenchCardLayout.jsdom-test.mjs renders that text with the desktop's markdown and lays the same body out as the Bench screen does. closed is that card once a newer one replaced it (publish (b): render_closed and its thread line), which a desktop shows read-only in the same layout from its own text.",
   "drop": {
     "title": "Which Production change goes first? (PR #758)",
     "area": "28-day-reset",
@@ -18,5 +18,6 @@
     "Recommended",
     "Details"
   ],
-  "text": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**The choice:** Ship the button today, or keep Production as it is.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nTap one number below to answer.\nas of 14:05"
+  "text": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**The choice:** Ship the button today, or keep Production as it is.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nTap one number below to answer.\nas of 14:05",
+  "closed": "🔴 · 28 Day Reset · orchestrator\n**Which Production change goes first? (PR 758)**\n\n**What changes:** Admins get a ﻿*Copy Script﻿* button.\n\n**Asked by:** Craig at 9:﻿37 AM CT.\n\n**Risk:** Low · **Undo:** Easy · **Reach:** administrators using Production.\n\n**If you wait:** Nothing changes.\n\n**The choice:** Ship the button today, or keep Production as it is.\n\n**Recommended:** Hold (high confidence) - the theme work is unfinished.\n\n**Details:** PR #﻿758 changes 1 file; see ﻿*﻿*notes﻿*﻿*.\n\n1. Merge it\n2. Hold\n\nas of 14:05\n\nClosed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.\nOpen thread: buzz://message?channel=8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10&id=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 }

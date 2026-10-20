@@ -138,6 +138,86 @@ export function benchCardLayout(card: BenchCard): BenchCardLayout {
   };
 }
 
+/**
+ * Where a post's text leaves the request's paragraphs (item.rs card_head):
+ * its options, due line, links, `as of`, a receipt's answer, For or Closed.
+ * prose() puts a U+FEFF after every colon and before a list mark in agent
+ * text, so none of these can open a line of a paragraph.
+ */
+const POST_TAIL =
+  /^(?:\d+\. |due \d{4}-\d\d-\d\dT\d\d:\d|as of \d{1,2}:\d\d$|Answered: |For: |Closed: )|: (?:https|buzz):\/\//;
+/** render_card's lines on how to answer, which a read-only card never says. */
+const POST_HOW_TO =
+  / ?Tap one number below to answer\.$|^Or reply in this thread\.$|^as of \d{1,2}:\d\d$/;
+
+/** A line of a post as plain text: our `**` marks and prose()'s U+FEFFs gone. */
+function postLine(line: string): string {
+  return line
+    .replace(/^\*\*([^*]+)\*\*$/, "$1")
+    .replace(/^\*\*([^*]+):\*\*/, "$1:")
+    .replace(/ · \*\*(Risk|Undo|Reach):\*\*/g, "; $1:")
+    .replaceAll("\uFEFF", "");
+}
+
+export type BenchPost = {
+  /** The card as its post's own text has it; only identity is the item's. */
+  card: BenchCard;
+  /** The header after its marker: place and writer, as posted. */
+  meta: string;
+  /** Its other lines, as posted: For, Recorded, a receipt's answer, Closed. */
+  notes: string[];
+};
+
+/**
+ * A card from its post's own text (item.rs render_card; render_closed on one
+ * a newer card replaced): the wording the owner read and replied to, never
+ * the live item's. Its paragraphs lay out as a body does.
+ */
+export function benchPostCard(item: BenchCard, text: string): BenchPost {
+  const lines = text.split("\n");
+  if (lines[0] === "Back to you") lines.shift();
+  const meta = (lines.shift() ?? "").split(" · ").slice(1).join(" · ");
+  const title = /^\*\*([^*]+)\*\*$/.exec(lines[0] ?? "")?.[1];
+  if (title !== undefined) lines.shift();
+  const end = lines.findIndex((line) => POST_TAIL.test(line));
+  const tail = end === -1 ? [] : lines.splice(end);
+  const options: string[] = [];
+  const links: BenchCard["links"] = [];
+  const notes: string[] = [];
+  let deadline: string | null = null;
+  for (const line of tail) {
+    const option = /^\d+\. (.+)$/.exec(line);
+    const link = /^(.+): ((?:https|buzz):\/\/\S+)$/.exec(line);
+    if (option) options.push(option[1]);
+    else if (/^due \d{4}-\d\d-\d\dT\S+$/.test(line)) deadline = line.slice(4);
+    else if (link) {
+      // Its own thread line (item.rs thread_line): its row opens its thread.
+      if (link[1] !== "Open thread")
+        links.push({ label: link[1], url: link[2] });
+    } else {
+      const note = postLine(line.replace(POST_HOW_TO, ""));
+      if (note) notes.push(note);
+    }
+  }
+  return {
+    card: {
+      ...item,
+      title: title ?? "",
+      body: lines.map(postLine).join("\n").trim(),
+      options,
+      deadline,
+      links,
+      decidedBy: null,
+      recommend: null,
+      plain: null,
+      action: null,
+      request: null,
+    },
+    meta,
+    notes,
+  };
+}
+
 /** The Inbox row's second line: the card's first field, else its first paragraph. */
 export function benchCardLead(card: BenchCard): BenchCardBlock | null {
   const { blocks } = benchCardLayout(card);

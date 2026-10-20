@@ -9,6 +9,7 @@
  * text: callers render it as React text, never markdown or HTML.
  */
 
+import type { TimelineReaction } from "@/features/messages/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSeverity = "critical" | "attention" | "info" | "good";
@@ -233,8 +234,11 @@ export function benchCardMarkerItemId(
   return (marker && CARD_MARKER.exec(marker)?.[1]) || null;
 }
 
-/** The item a retired post marks, while that item has a live card. */
-function liveCardOfMarker(
+/**
+ * The known item a retired post marks. Its live card, when it has one, must
+ * be its own: a live id claimed twice matches nothing.
+ */
+function markedItem(
   snapshot: BenchSnapshot,
   tags: BenchMessageRef["tags"],
 ): BenchCard | undefined {
@@ -242,8 +246,9 @@ function liveCardOfMarker(
   const item = itemId
     ? snapshot.items.find((candidate) => candidate.id === itemId)
     : undefined;
-  return item?.cardEventId &&
-    benchIndex(snapshot).cards.get(item.cardEventId) === item
+  return item &&
+    (!item.cardEventId ||
+      benchIndex(snapshot).cards.get(item.cardEventId) === item)
     ? item
     : undefined;
 }
@@ -260,10 +265,9 @@ export function isBenchCandidate(message: BenchMessageRef): boolean {
 
 /**
  * The guard. A message renders as a Bench card only when its id is a live
- * card's event id (or it is a retired post of an item that has one, which
- * then points at that live card, read-only), it is in that card's own
- * channel, and the Bench writer key signed it. Everything else renders
- * exactly as before.
+ * card's event id (or its client marker names a known item: a retired post,
+ * shown read-only from its own text), it is in that card's own channel, and
+ * the Bench writer key signed it. Everything else renders exactly as before.
  */
 export function benchRowState(
   cards: BenchCards | null | undefined,
@@ -281,7 +285,7 @@ export function benchRowState(
   }
   const card =
     indexBenchCards(snapshot).get(message.id) ??
-    liveCardOfMarker(snapshot, message.tags);
+    markedItem(snapshot, message.tags);
   const signer = normalizePubkey(message.signerPubkey ?? "");
   const signedByWriter = signer === normalizePubkey(snapshot.writerPubkey);
   const inItsChannel = (card?.channelId ?? snapshot.channelId) === channelId;
@@ -823,6 +827,28 @@ const BENCH_OPTION_KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
 export function isBenchAnswerKeycap(card: BenchCard, emoji: string): boolean {
   const index = BENCH_OPTION_KEYCAPS.indexOf(emoji);
   return index !== -1 && index < (card.request ?? card).options.length;
+}
+
+/**
+ * The reaction pills a card's row shows. A live card's option buttons
+ * already show its answer keycaps. A retired post has no buttons, so it
+ * keeps everyone's own reactions, keycaps too, less the writer's: its seeds.
+ */
+export function benchShownReactions(
+  match: BenchCardMatch,
+  reactions: readonly TimelineReaction[],
+  writerPubkey: string | undefined,
+): TimelineReaction[] {
+  if (!match.retired) {
+    return reactions.filter((r) => !isBenchAnswerKeycap(match.card, r.emoji));
+  }
+  const writer = normalizePubkey(writerPubkey ?? "");
+  return reactions.flatMap((r) => {
+    const users = r.users.filter((u) => normalizePubkey(u.pubkey) !== writer);
+    const seeds = r.users.length - users.length;
+    if (seeds === 0) return [r];
+    return r.count > seeds ? [{ ...r, count: r.count - seeds, users }] : [];
+  });
 }
 
 /** RFC 3339 (a deadline, updatedAt) to unix seconds; null if unparseable. */

@@ -12,7 +12,7 @@ import {
 } from "@/features/messages/lib/canSendToChannel";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
+import { benchShownReactions } from "@/features/bench/lib/benchCards";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
@@ -390,17 +390,13 @@ export const MessageRow = React.memo(
       signerPubkey: message.signerPubkey,
       tags: message.tags,
     });
-    // A live card's option buttons already show its answer keycaps; a retired
-    // post's keycaps are seeds for options it no longer offers.
+    // The guard proved the signer is the Bench writer, whose seeds these are.
     const shownReactions = React.useMemo(
       () =>
         benchCard
-          ? reactions.filter(
-              (reaction) =>
-                !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
-            )
+          ? benchShownReactions(benchCard, reactions, message.signerPubkey)
           : reactions,
-      [benchCard, reactions],
+      [benchCard, reactions, message.signerPubkey],
     );
 
     const renderBody = () => {
@@ -443,7 +439,11 @@ export const MessageRow = React.memo(
                 card={benchCard.card}
                 onOther={onReply ? () => onReply(message) : undefined}
                 ownerPubkey={benchCard.ownerPubkey}
-                retired={benchCard.retired}
+                retiredPost={
+                  benchCard.retired
+                    ? { channelId, text: message.body }
+                    : undefined
+                }
                 viewerPubkey={currentPubkey}
               />
             );

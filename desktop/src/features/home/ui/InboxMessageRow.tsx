@@ -1,7 +1,7 @@
 import * as React from "react";
 
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
+import { benchShownReactions } from "@/features/bench/lib/benchCards";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import type { InboxContextMessage } from "@/features/home/lib/inbox";
@@ -103,8 +103,8 @@ export function InboxMessageRow({
     select: handleReactionSelect,
   } = useReactionHandler(timelineMessage, onToggleReaction);
   // A Bench card's post shows as the card, as in its channel: its text as
-  // posted may be an older format. A retired post only names the live card
-  // (see benchRowState).
+  // posted may be an older format. A retired post shows read-only, from its
+  // own text (see benchRowState).
   const benchCard = useBenchCardForMessage({
     channelId,
     id: message.id,
@@ -112,12 +112,9 @@ export function InboxMessageRow({
     signerPubkey: message.signerPubkey,
     tags: message.tags,
   });
-  // A live card's option buttons already show its answer keycaps; a retired
-  // post's keycaps are seeds for options it no longer offers.
+  // The guard proved the signer is the Bench writer, whose seeds these are.
   const shownReactions = benchCard
-    ? reactions.filter(
-        (reaction) => !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
-      )
+    ? benchShownReactions(benchCard, reactions, message.signerPubkey)
     : reactions;
   // "Is this pubkey an agent" = the community-scoped baseline every surface
   // shares plus this surface's extras passed via `agentPubkeys` (HomeView
@@ -315,7 +312,11 @@ export function InboxMessageRow({
                   canReply ? () => onSelectReplyTarget(message) : undefined
                 }
                 ownerPubkey={benchCard.ownerPubkey}
-                retired={benchCard.retired}
+                retiredPost={
+                  benchCard.retired
+                    ? { channelId, text: message.content }
+                    : undefined
+                }
                 viewerPubkey={currentPubkey}
               />
             ) : (
