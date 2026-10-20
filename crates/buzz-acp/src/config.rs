@@ -944,11 +944,17 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
 /// Returns `Some(("CODEX_CONFIG", "{\"sandbox_workspace_write\":{\"network_access\":true}}"))` for
 /// Codex agents, or `None` for non-Codex agents or when the relay URL cannot be parsed.
 ///
-/// The env var is forwarded by the `@agentclientprotocol/codex-acp` adapter (1.x) as a
+/// The env var is forwarded by the `@agentclientprotocol/codex-acp` adapter as a
 /// session-level config override (via `CODEX_CONFIG` → `thread/start config`), which is
 /// equivalent to the TOML override `sandbox_workspace_write.network_access = true`.
 /// That sets `NetworkSandboxPolicy::Enabled`, causing the Seatbelt policy to include
 /// `(allow network-outbound)` — full outbound TCP/TLS at the OS level.
+///
+/// codex-acp 1.x and 2.x then send their mode's `sandboxPolicy` on every
+/// `turn/start`, which replaces this override (block/buzz#6983, #8247), so today the
+/// sandbox stays network-restricted. It is kept for when codex-acp honours it
+/// (codex-acp PRs #561, #608). On Windows the relay is reached through
+/// [`codex_relay_no_proxy_env`] instead.
 ///
 /// URL validation is preserved as a guard: injection is skipped when the relay URL cannot
 /// be parsed, avoiding accidental sandbox widening for malformed configs.
@@ -985,6 +991,29 @@ pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String
         "CODEX_CONFIG".into(),
         "{\"sandbox_workspace_write\":{\"network_access\":true}}".into(),
     ))
+}
+
+/// Build the `NO_PROXY` entry that lets `buzz-cli` reach the relay from inside
+/// Codex's network-restricted Windows sandbox.
+///
+/// Codex's unelevated Windows sandbox points `HTTP(S)_PROXY` and `ALL_PROXY` at the
+/// dead `http://127.0.0.1:9` and sets `NO_PROXY` only when it is unset
+/// (`apply_no_network_to_env` in codex-rs `windows-sandbox-rs/src/env.rs`). A
+/// `NO_PROXY` already listing the relay host survives, so `buzz-cli` connects
+/// directly; every other host still hits the dead proxy.
+///
+/// Returns `None` for non-Codex agents or when the relay URL has no host.
+pub fn codex_relay_no_proxy_env(agent_command: &str, relay_url: &str) -> Option<(String, String)> {
+    match normalize_agent_command_identity(agent_command).as_str() {
+        "codex" | "codex-acp" => {}
+        _ => return None,
+    }
+    let url = Url::parse(relay_url).ok()?;
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    Some(("NO_PROXY".into(), format!("{host},localhost,127.0.0.1,::1")))
 }
 
 pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<String> {
@@ -1266,6 +1295,17 @@ impl Config {
             } else {
                 false
             };
+
+        // Codex's Windows sandbox sends buzz-cli to a dead proxy; exempt the relay host.
+        // shortcut: an operator-set NO_PROXY wins (persona env is operator-wins) and must list
+        // the relay host itself; merge ours into it if operators hit that.
+        if cfg!(windows)
+            && ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
+                .iter()
+                .all(|key| std::env::var_os(key).is_none())
+        {
+            persona_env_vars.extend(codex_relay_no_proxy_env(&agent_command, &args.relay_url));
+        }
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
@@ -2061,6 +2101,63 @@ mod tests {
     fn codex_network_env_schemeless_string_returns_none() {
         // A bare string with no scheme fails Url::parse — graceful None return.
         assert!(codex_network_env("codex-acp", "not-a-url").is_none());
+    }
+
+    // --- codex_relay_no_proxy_env tests ---
+
+    #[test]
+    fn codex_relay_no_proxy_env_lists_relay_host_and_loopback() {
+        let no_proxy = |value: &str| Some(("NO_PROXY".to_string(), value.to_string()));
+        assert_eq!(
+            codex_relay_no_proxy_env("codex-acp", "wss://greymatterllc.communities.buzz.xyz"),
+            no_proxy("greymatterllc.communities.buzz.xyz,localhost,127.0.0.1,::1")
+        );
+        assert_eq!(
+            codex_relay_no_proxy_env(r"C:\npm\codex.cmd", "https://relay.example.com:8443/q"),
+            no_proxy("relay.example.com,localhost,127.0.0.1,::1")
+        );
+        assert_eq!(
+            codex_relay_no_proxy_env("codex", "ws://[fd00::1]:3000"),
+            no_proxy("fd00::1,localhost,127.0.0.1,::1")
+        );
+    }
+
+    #[test]
+    fn codex_relay_no_proxy_env_none_for_other_agents_and_bad_urls() {
+        assert!(codex_relay_no_proxy_env("goose", "wss://relay.example.com").is_none());
+        assert!(codex_relay_no_proxy_env("claude-agent-acp", "wss://relay.example.com").is_none());
+        assert!(codex_relay_no_proxy_env("codex-acp", "").is_none());
+        assert!(codex_relay_no_proxy_env("codex-acp", "not-a-url").is_none());
+    }
+
+    #[test]
+    fn codex_from_args_sets_relay_no_proxy_only_on_windows() {
+        if ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            return; // a real proxy turns the injection off by design
+        }
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-command",
+            "codex-acp",
+            "--relay-url",
+            "wss://relay.example.com",
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("from_args should accept codex");
+        let no_proxy = config
+            .persona_env_vars
+            .iter()
+            .find(|(key, _)| key == "NO_PROXY")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            no_proxy,
+            cfg!(windows).then_some("relay.example.com,localhost,127.0.0.1,::1")
+        );
     }
 
     #[test]
