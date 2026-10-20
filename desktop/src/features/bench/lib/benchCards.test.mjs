@@ -7,6 +7,7 @@ import {
   INITIAL_BENCH_ANSWER_STATE,
   answerTarget,
   benchAnswerReducer,
+  benchCardMarkerItemId,
   benchCardMode,
   benchDeadlineSeconds,
   benchEligible,
@@ -19,6 +20,7 @@ import {
   benchRowState,
   benchSearch,
   benchSeverityChip,
+  benchShownReactions,
   benchStateLabel,
   benchValidityLabel,
   createPollGroup,
@@ -684,6 +686,177 @@ test("guard: a project card matches in its own channel only", () => {
     null,
     "only the writer key signs cards",
   );
+});
+
+const RETIRED_POST = "f".repeat(64);
+const marker = (itemId, hash = "0a1b2c") => [
+  "client",
+  `bench:card:${itemId}@${hash}`,
+];
+
+test("marker: the item a card post's client tag names", () => {
+  assert.equal(
+    benchCardMarkerItemId([["h", CHANNEL], marker("orchestrator/x")]),
+    "orchestrator/x",
+  );
+  assert.equal(benchCardMarkerItemId([marker("a@b")]), "a@b", "last @ is hash");
+  for (const tags of [
+    undefined,
+    [],
+    [["client", "bench:card:orchestrator/x"]],
+    [["client", "bench:card:@abcd"]],
+    [["client", "buzz-desktop"]],
+    [["t", "bench:card:orchestrator/x@abcd"]],
+  ]) {
+    assert.equal(benchCardMarkerItemId(tags), null, JSON.stringify(tags));
+  }
+});
+
+test("guard: a retired post matches its item's live card, flagged retired", () => {
+  const cards = snapshot();
+  const state = benchRowState(
+    cards,
+    row({ id: RETIRED_POST, tags: [marker("dreamforge/ship-it")] }),
+  );
+  assert.equal(state.match?.card, cards.items[0]);
+  assert.equal(state.match?.card.cardEventId, CARD_ID);
+  assert.equal(state.match?.ownerPubkey, OWNER);
+  // Kept history, so it renders read-only and never answers.
+  assert.equal(state.match?.retired, true);
+  assert.equal(benchRowState(cards, row()).match?.retired, false);
+  // Its seeded keycaps are hidden like the live card's.
+  assert.equal(isBenchAnswerKeycap(state.match.card, "1️⃣"), true);
+});
+
+test("guard: a retired post needs the writer, its channel and a known item", () => {
+  const tags = [marker("dreamforge/ship-it")];
+  const retired = (cards, overrides = {}) =>
+    benchRowState(cards, row({ id: RETIRED_POST, tags, ...overrides })).match;
+  assert.equal(retired(snapshot(), { signerPubkey: STRANGER }), null);
+  assert.equal(retired(snapshot(), { signerPubkey: OWNER }), null);
+  assert.equal(retired(snapshot(), { tags: undefined }), null);
+  assert.equal(
+    retired(snapshot(), { tags: [marker("dreamforge/gone")] }),
+    null,
+    "no such item",
+  );
+  assert.equal(
+    retired(snapshot(), { channelId: OTHER_CHANNEL }),
+    null,
+    "another channel",
+  );
+  // Its own text is what it shows, so it needs no live card to point at.
+  const unposted = retired(snapshot([card({ cardEventId: null })]));
+  assert.equal(unposted?.retired, true, "the item has no live card");
+  assert.equal(unposted?.card.cardEventId, null);
+  assert.equal(
+    retired(snapshot([card(), card({ id: "w/dupe" })])),
+    null,
+    "its live id is claimed twice",
+  );
+  const project = snapshot([card(), scoped()]);
+  const projectTags = [marker("reset-worker/welcome")];
+  assert.equal(
+    retired(project, { tags: projectTags }),
+    null,
+    "a project card's post in #bench",
+  );
+  assert.equal(
+    retired(project, { channelId: PROJECT, tags: projectTags })?.card
+      .cardEventId,
+    PROJECT_CARD,
+  );
+  assert.equal(
+    retired(project, { channelId: PROJECT }),
+    null,
+    "a #bench card's post in the project channel",
+  );
+});
+
+test("guard: a marked post from the snapshot's tick or later is not retired yet", () => {
+  // A tick posts the new card, then writes state.json once it ends: until
+  // the desktop reads that, its snapshot names the old card, or none.
+  const tick = Date.parse("2026-10-12T10:00:00Z") / 1_000;
+  const tags = [marker("dreamforge/ship-it")];
+  for (const items of [[card()], [card({ cardEventId: null })]]) {
+    const at = (createdAt, overrides) =>
+      benchRowState(
+        snapshot(items, overrides),
+        row({ id: RETIRED_POST, tags, createdAt }),
+      ).match;
+    assert.equal(at(tick), null, "posted in the tick that wrote it");
+    assert.equal(at(tick + 5), null, "posted after it");
+    assert.equal(at(tick - 1)?.retired, true, "older than the snapshot");
+    assert.equal(at(undefined)?.retired, true, "no time: as before");
+    assert.equal(at(1, { lastTick: "" }), null, "no tick yet");
+  }
+  assert.equal(
+    benchRowState(snapshot(), row({ createdAt: tick + 5 })).match?.retired,
+    false,
+    "the live post matches whenever it was posted",
+  );
+});
+
+test("guard: a post of an item with no live card matches in its channel alone", () => {
+  // No other card lives in the project channel: the item's own post still
+  // finds it there, as one in #bench does.
+  const tags = [marker("reset-worker/welcome")];
+  const cards = snapshot([card(), scoped({ cardEventId: null })]);
+  const state = benchRowState(
+    cards,
+    row({ channelId: PROJECT, id: RETIRED_POST, tags }),
+  );
+  assert.equal(state.inBenchChannel, true);
+  assert.equal(state.match?.card.id, "reset-worker/welcome");
+  assert.equal(state.match?.retired, true);
+  assert.equal(
+    benchRowState(cards, row({ id: RETIRED_POST, tags })).match,
+    null,
+    "not in #bench",
+  );
+});
+
+test("reactions: a live card hides its keycaps; a retired post only the writer's", () => {
+  const pill = (emoji, ...pubkeys) => ({
+    emoji,
+    count: pubkeys.length,
+    users: pubkeys.map((pubkey) => ({
+      pubkey,
+      displayName: pubkey,
+      avatarUrl: null,
+    })),
+  });
+  const pills = [
+    pill("1️⃣", WRITER),
+    pill("2️⃣", WRITER.toUpperCase(), OWNER),
+    pill("👍", OWNER),
+    pill("3️⃣", OWNER),
+  ];
+  const live = { card: card(), ownerPubkey: OWNER, retired: false };
+  assert.deepEqual(
+    benchShownReactions(live, pills, WRITER).map((r) => r.emoji),
+    ["👍", "3️⃣"],
+    "a live card's own keycaps are its buttons",
+  );
+  const shown = benchShownReactions({ ...live, retired: true }, pills, WRITER);
+  assert.deepEqual(
+    shown.map((r) => [r.emoji, r.count, r.users.map((u) => u.pubkey)]),
+    [
+      ["2️⃣", 1, [OWNER]],
+      ["👍", 1, [OWNER]],
+      ["3️⃣", 1, [OWNER]],
+    ],
+    "the owner's own taps stay; the writer's seeds go",
+  );
+  assert.equal(shown[1], pills[2], "an untouched pill is the same object");
+});
+
+test("guard: the live post itself still wins over its marker", () => {
+  const other = card({ id: "w/other", cardEventId: "1".repeat(64) });
+  const cards = snapshot([card(), other]);
+  const state = benchRowState(cards, row({ tags: [marker("w/other")] }));
+  assert.equal(state.match?.card.id, "dreamforge/ship-it");
+  assert.equal(state.match?.retired, false);
 });
 
 test("eligible: the shared answer vectors agree with item.rs", () => {

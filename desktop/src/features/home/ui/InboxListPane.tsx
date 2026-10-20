@@ -688,6 +688,7 @@ export function InboxListPane({
 
     return (
       <InboxItemPreview
+        cardPost={cardPost}
         channelDescription={
           channelDescriptions.get(item.item.channelId ?? "")?.trim() || null
         }

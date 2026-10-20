@@ -1900,7 +1900,7 @@ impl AcpClient {
                     let lowered = self.current_turn_authority.weaker(req.authority);
                     if lowered != self.current_turn_authority {
                         tracing::info!(
-                            target: "acp::authority",
+                            target: "buzz_acp::authority",
                             "steered event from a non-owner: the rest of this turn runs as Guest"
                         );
                         self.current_turn_authority = lowered;

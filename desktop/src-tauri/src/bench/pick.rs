@@ -30,7 +30,7 @@ pub(crate) fn eligible(item: &Item, pk: &str, owner_set: &[String]) -> bool {
 /// The event a kind 9 replies to: its NIP-10 `reply` e tag, else its only e
 /// tag. A reply deeper in a thread names its own parent, so a card that is
 /// only the root of another card's thread is not what it answers.
-fn parent(e: &nostr::Event) -> Option<&str> {
+pub(crate) fn parent(e: &nostr::Event) -> Option<&str> {
     let es: Vec<&[String]> = e
         .tags
         .iter()

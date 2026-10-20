@@ -420,6 +420,82 @@ async fn ack_by_redrop_clears_answer_and_keeps_the_old_card() {
     assert_eq!(b.s.kept, [card.event_id]);
 }
 
+/// A post of the Bench's, as the relay hands it back.
+pub(super) fn posted(b: &Bench, id: &str) -> nostr::Event {
+    let (e, _) = b.posts().into_iter().find(|(e, _)| e["id"] == id).unwrap();
+    serde_json::from_value(e).unwrap()
+}
+
+#[tokio::test]
+async fn pending_reword_closes_a_card_someone_replied_or_reacted_on() {
+    for heart in [false, true] {
+        let mut b = seeded_bench(Gate::Open, &[]).await;
+        let old_card = b.card(ITEM);
+        // Neither is an answer or a reply on an unscoped card, so the item
+        // never learns of them; the card is a record all the same.
+        let owner = &b.ctx.owner;
+        let ev = match heart {
+            false => super::channels::thread_reply(owner, &old_card.event_id, "Why?", b.now, &[]),
+            true => tap(owner, &old_card.event_id, "\u{2764}\u{FE0F}", b.now),
+        };
+        reply(&b, &[&ev, &posted(&b, &old_card.event_id)]);
+        b.tick().await.unwrap();
+        assert!(!b.s.items[ITEM].engaged());
+        let before = b.posts().len();
+        b.drop_file(
+            "orchestrator",
+            "relay-choice",
+            &drop_json(&[("options", json!(["Stay", "Move away"]))]),
+        );
+        b.settle(3).await;
+        // No delete: the old card is closed, then a new one, its seeds, the
+        // board.
+        let posts = b.posts()[before..].to_vec();
+        assert_eq!(
+            b.kinds()[before..],
+            [40003, 9, 7, 7, 9, 5],
+            "heart: {heart}"
+        );
+        assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old_card.event_id);
+        let closed = text(&posts[0].0);
+        assert!(closed.contains("**Relay choice**\n\nStay or move?\n\n1. Stay\n2. Move\n\nas of"));
+        assert!(!closed.contains("Tap one number"), "{closed}");
+        assert!(closed.contains("\n\nClosed: a tap or reply here is no longer read."));
+        assert!(closed.ends_with(&thread_line(&b.channel(), &old_card.event_id)));
+        assert_ne!(tag_value(&posts[5].0, "e").unwrap(), old_card.event_id);
+        assert_ne!(b.card(ITEM).event_id, old_card.event_id);
+        // A relaunch never adopts it back, so it is never retired.
+        assert_eq!(b.s.kept, [old_card.event_id]);
+        assert!(b.s.kept_at.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stale_cards_are_looked_up_within_the_post_budget() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ids = ["a", "b", "c", "d", "relay-choice"];
+    for id in &ids[..4] {
+        b.drop_file("orchestrator", id, &drop_json(&[("title", json!(id))]));
+    }
+    b.settle(10).await;
+    assert!(ids
+        .iter()
+        .all(|id| b.s.items[&format!("orchestrator/{id}")].card.is_some()));
+    // All five asked again at once, against four posts a tick.
+    for id in ids {
+        let title = json!(format!("{id}, reworded"));
+        b.drop_file("orchestrator", id, &drop_json(&[("title", title)]));
+    }
+    let (posts, queries) = (b.posts().len(), b.relay.queries.lock().unwrap().len());
+    b.tick().await.unwrap();
+    assert_eq!(b.kinds()[posts..], [5, 5, 5, 5]);
+    let lookups = b.relay.queries.lock().unwrap()[queries..]
+        .iter()
+        .filter(|q| q[0]["kinds"] == json!([7, 9, 40003]))
+        .count();
+    assert_eq!(lookups, 4);
+}
+
 #[tokio::test]
 async fn ignored_reactions_never_answer() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
@@ -479,12 +555,16 @@ async fn stale_card_never_supplies_an_answer() {
     b.tick().await.unwrap();
     assert!(b.s.items[ITEM].answer.is_none());
     assert!(outbox(&b).is_none());
-    assert_eq!(last_query(&b)[0]["#e"], json!([other]));
-    // (b) retired the stale card and (c) reposted it fresh.
+    let queries = b.relay.queries.lock().unwrap().clone();
+    let poll = queries.iter().rev().find(|q| q[0]["kinds"] == json!([7]));
+    assert_eq!(poll.unwrap()[0]["#e"], json!([other]));
+    // (c) reposted it fresh; the owner's tap still on the stale card keeps
+    // it on the relay, so (b) never retires it.
     let retired = b.posts()[before..].iter().any(|(e, _)| {
         e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.event_id.as_str())
     });
-    assert!(retired);
+    assert!(!retired);
+    assert_eq!(b.s.kept, [card.event_id.as_str()]);
     assert_ne!(b.card(ITEM).event_id, card.event_id);
 }
 

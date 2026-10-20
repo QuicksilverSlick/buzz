@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -6,6 +7,7 @@ import {
   benchCardLayout,
   benchCardMeta,
   benchCardPlace,
+  benchPostCard,
 } from "./benchCardLayout.ts";
 
 const field = (label, text) => ({ kind: "fields", fields: [{ label, text }] });
@@ -30,6 +32,17 @@ test("a label opening a line starts a field; lines under it join it until a blan
     blocks: [field("Recommended", "Hold")],
     details: ["a\nb"],
   });
+  // The orchestrator's sixth label: the trade-off, before the recommendation.
+  assert.deepEqual(
+    benchBodyBlocks(
+      "If you wait: x\nThe choice: speed or safety\nRecommended: Hold",
+    ).blocks,
+    [
+      field("If you wait", "x"),
+      field("The choice", "speed or safety"),
+      field("Recommended", "Hold"),
+    ],
+  );
 });
 
 test("details keep every paragraph after them until another label", () => {
@@ -151,5 +164,179 @@ test("the header names a workbench by name, then an area that says more", () => 
       "28 Day Reset",
     ),
     "Pending · 28 Day Reset · reset-billing · orchestrator",
+  );
+});
+
+const vector = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../src-tauri/src/bench/card_layout_vectors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
+// The live item, reworded since: none of its wording may show.
+const LIVE = {
+  id: "orchestrator/pr-758",
+  writer: "orchestrator",
+  kind: "pending",
+  title: "Reworded title",
+  body: "Reworded body.\nRecommended: Merge",
+  area: "28-day-reset",
+  options: ["Reworded A", "Reworded B", "Reworded C"],
+  deadline: "2026-12-01T00:00:00Z",
+  links: [{ label: "Reworded", url: "https://example.com/new" }],
+  cardEventId: "1".repeat(64),
+  decidedBy: null,
+  recommend: 1,
+  plain: { whatChanges: "Reworded change", details: "Reworded details" },
+  action: "reworded action",
+  request: null,
+};
+
+test("a replaced post lays out from its own text as the body it was posted from", () => {
+  const body = benchBodyBlocks(vector.drop.body);
+  for (const text of [vector.text, vector.closed]) {
+    const post = benchPostCard(LIVE, text);
+    assert.equal(post.meta, "28 Day Reset · orchestrator");
+    assert.equal(
+      post.card.title,
+      "Which Production change goes first? (PR 758)",
+    );
+    assert.deepEqual(post.card.options, ["Merge it", "Hold"]);
+    // The writer's own fields, values and details, read back from the posted
+    // text: its bold labels and U+FEFFs are ours.
+    assert.deepEqual(benchCardLayout(post.card), {
+      blocks: body.blocks,
+      details: body.details.join("\n\n"),
+      action: null,
+    });
+    assert.ok(!JSON.stringify(post).includes("Reworded"), "no live wording");
+    assert.ok(!JSON.stringify(post).includes("\uFEFF"));
+    assert.equal(post.card.id, LIVE.id);
+    assert.equal(post.card.cardEventId, LIVE.cardEventId);
+  }
+  // Closed, it says so in its own words; neither shows a line on how to
+  // answer, nor its own thread line (its row opens its thread).
+  assert.deepEqual(benchPostCard(LIVE, vector.text).notes, []);
+  const closed = benchPostCard(LIVE, vector.closed);
+  assert.deepEqual(closed.notes, [
+    "Closed: a tap or reply here is no longer read. If this is still asked, answer on the newer card.",
+  ]);
+  assert.deepEqual(closed.card.links, []);
+  assert.equal(closed.card.deadline, null);
+});
+
+test("a replaced post's due line, links and other lines; how to answer never shows", () => {
+  const post = benchPostCard(
+    LIVE,
+    [
+      "Back to you",
+      "🟠 · Dreamforge · reset-worker",
+      "**Pick a relay**",
+      "",
+      "Stay or move?",
+      // prose() breaks a list mark and each colon in agent text.
+      "\uFEFF1. not an option",
+      "due 2026-10-21T17:\uFEFF00:\uFEFF00Z or so",
+      "",
+      "**Recommended:** 2 (Reset Worker) - cheaper",
+      "If you choose Move: run the move",
+      "",
+      "1. Stay",
+      "2. Move",
+      "",
+      "due 2026-10-21T17:00:00Z",
+      "PR 9: https://github.com/block/buzz/pull/9",
+      "For: Craig or Quicksilver (owner). Tap one number below to answer.",
+      "as of 14:05",
+      "Recorded: 2. Move · Craig · 14:07",
+      "Or reply in this thread.",
+    ].join("\n"),
+  );
+  assert.equal(post.meta, "Dreamforge · reset-worker");
+  assert.equal(post.card.title, "Pick a relay");
+  assert.deepEqual(benchCardLayout(post.card).blocks, [
+    {
+      kind: "text",
+      text: "Stay or move?\n1. not an option\ndue 2026-10-21T17:00:00Z or so",
+    },
+    {
+      kind: "fields",
+      fields: [
+        {
+          label: "Recommended",
+          text: "2 (Reset Worker) - cheaper\nIf you choose Move: run the move",
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(post.card.options, ["Stay", "Move"]);
+  assert.equal(post.card.deadline, "2026-10-21T17:00:00Z");
+  assert.deepEqual(post.card.links, [
+    { label: "PR 9", url: "https://github.com/block/buzz/pull/9" },
+  ]);
+  assert.deepEqual(post.notes, [
+    "For: Craig or Quicksilver (owner).",
+    "Recorded: 2. Move · Craig · 14:07",
+  ]);
+});
+
+test("a replaced receipt lays its Outcome out as its own card, after the answer", () => {
+  // item.rs render_receipt, kept when a new question followed the close-out.
+  const receipt = [
+    "🔴 · Dreamforge · orchestrator",
+    "**Relay choice**",
+    "",
+    "Stay or move?",
+    "",
+    "1. Stay",
+    "2. Move",
+    "",
+    "plan: https://github.com/QuicksilverSlick/buzz",
+    "Answered: 2. Move · Craig · 14:02",
+    "",
+    "Outcome · done · 15:10",
+    "**Kept the old email**",
+    "",
+    "**What changes:** nothing was sent.",
+    "",
+    "Outcome · not a header in the body",
+    "",
+    "PR: https://github.com/QuicksilverSlick/buzz/pull/1",
+    `Open thread: buzz://message?channel=c&id=${"e".repeat(64)}`,
+  ].join("\n");
+  const post = benchPostCard(
+    { ...LIVE, answer: { option: 2 }, recorded: 2 },
+    receipt,
+  );
+  assert.equal(post.card.title, "Relay choice");
+  assert.deepEqual(post.card.options, ["Stay", "Move"]);
+  assert.deepEqual(post.card.links, [
+    { label: "plan", url: "https://github.com/QuicksilverSlick/buzz" },
+  ]);
+  assert.deepEqual(post.notes, ["Answered: 2. Move · Craig · 14:02"]);
+  // The live item's answer is not this post's.
+  assert.equal(post.card.answer, null);
+  assert.equal(post.card.recorded, null);
+  const { outcome } = post;
+  assert.equal(outcome?.meta, "done · 15:10");
+  assert.equal(outcome.card.title, "Kept the old email");
+  assert.deepEqual(benchCardLayout(outcome.card).blocks, [
+    field("What changes", "nothing was sent."),
+    text("Outcome · not a header in the body"),
+  ]);
+  assert.deepEqual(outcome.card.options, []);
+  assert.deepEqual(outcome.card.links, [
+    { label: "PR", url: "https://github.com/QuicksilverSlick/buzz/pull/1" },
+  ]);
+  assert.deepEqual(outcome.notes, []);
+  assert.equal(outcome.outcome, null);
+  // A question's post has no Outcome, whatever its body says.
+  assert.equal(benchPostCard(LIVE, vector.closed).outcome, null);
+  assert.equal(
+    benchPostCard(LIVE, "h · x\n**T**\n\nOutcome · a line\n\n1. A").outcome,
+    null,
   );
 });

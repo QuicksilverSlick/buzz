@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 
 use super::channels::{card_channel, channel_ready, joined};
 use super::{
-    forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, same_drop, save_both,
-    spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS, RECOVER_LIMIT,
+    forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
+    same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
+    MAX_CARDS, RECOVER_LIMIT,
 };
 use crate::events;
 
@@ -271,6 +272,31 @@ async fn touched(
             .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "e" && v == card));
         on_card && !(e.kind.as_u16() == 7 && e.pubkey == writer)
     }))
+}
+
+/// A stale card kept for what is on it (`touched`), for good: edited closed
+/// from its own text as posted (`item::render_closed`), its thread root (its
+/// parent) ending older cards' root-reply windows there. One gone from the
+/// relay is only kept.
+async fn close(
+    ctx: &Ctx<'_>,
+    s: &mut BenchState,
+    ch: &str,
+    card: &Posted,
+    now: u64,
+) -> Result<(), String> {
+    let filter = serde_json::json!({ "ids": [card.event_id], "kinds": [9], "#h": [ch] });
+    if let Some(e) = query_writer(ctx, s, filter, now).await?.first() {
+        let text = item::render_closed(&e.content) + &item::thread_line(ch, &card.event_id);
+        match edit(ctx, s, ch, &card.event_id, &text, now).await {
+            Err(err) if !err.contains("not found") => return Err(err),
+            _ => {}
+        }
+        let root = item::parent(e).map(|r| (r.to_string(), card.created_at));
+        s.kept_at.extend(root);
+    }
+    s.kept.push(card.event_id.clone());
+    Ok(())
 }
 
 /// A thread the relay will not take: its root is gone, in another channel or
@@ -580,9 +606,10 @@ pub(super) async fn publish(
 
     // (b) Delete cards that are stale (another Drop, card format or stamp) or
     // no longer wanted, unless someone answered or replied on them or they
-    // are a receipt: those stay on the relay for good. A card in a channel
+    // are a receipt: those stay on the relay for good, and so, closed, does
+    // one with anything else on it but its seeds. A card in a channel
     // that is not ready, or `held`, waits: its taps are read once it is again.
-    let stale: Vec<(String, String, String)> = s
+    let stale: Vec<(String, String, Posted)> = s
         .items
         .values()
         .filter_map(|i| {
@@ -590,14 +617,23 @@ pub(super) async fn publish(
             let stale = c.hash != item::card_hash(i) || !wanted.contains(&i.id);
             let waits = !channel_ready(s, i) || s.held.contains(&i.id);
             let retire = !i.engaged() && i.request.is_none() && stale && !waits;
-            retire.then(|| (i.id.clone(), card_channel(s, i), c.event_id.clone()))
+            retire.then(|| (i.id.clone(), card_channel(s, i), c.clone()))
         })
         .collect();
-    for (id, ch, event_id) in stale {
+    for (id, ch, card) in stale {
+        // One post per card, its lookups riding on it: the delete, or the edit
+        // that closes it.
         if !spend(budget, 1) {
             return Ok(());
         }
-        delete(ctx, s, &ch, &event_id, now).await?;
+        // A reply or tap the item never read (free text on an unscoped card)
+        // still makes the card a record: it stays, as `carry_card` keeps one,
+        // but closed, since nothing reads it any more.
+        if touched(ctx, s, &ch, &card.event_id, now).await? {
+            close(ctx, s, &ch, &card, now).await?;
+        } else {
+            delete(ctx, s, &ch, &card.event_id, now).await?;
+        }
         forget_card(s, &id);
     }
 

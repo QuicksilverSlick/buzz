@@ -12,7 +12,7 @@ import {
 } from "@/features/messages/lib/canSendToChannel";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { isBenchAnswerKeycap } from "@/features/bench/lib/benchCards";
+import { benchShownReactions } from "@/features/bench/lib/benchCards";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { useBenchCardForMessage } from "@/features/bench/useBenchCards";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
@@ -379,25 +379,25 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
-    // Non-null only for a live Bench card in its own channel signed by the
-    // Bench writer key (see benchRowState); every other row renders as before.
+    // Non-null only for a live Bench card (or a retired post of one, shown
+    // read-only) in its own channel signed by the Bench writer key (see
+    // benchRowState); every other row renders as before.
     const benchCard = useBenchCardForMessage({
       channelId,
+      createdAt: message.createdAt,
       id: message.id,
       kind: message.kind,
       pending: message.pending,
       signerPubkey: message.signerPubkey,
+      tags: message.tags,
     });
-    // A live card's option buttons already show its answer keycaps.
+    // The guard proved the signer is the Bench writer, whose seeds these are.
     const shownReactions = React.useMemo(
       () =>
         benchCard
-          ? reactions.filter(
-              (reaction) =>
-                !isBenchAnswerKeycap(benchCard.card, reaction.emoji),
-            )
+          ? benchShownReactions(benchCard, reactions, message.signerPubkey)
           : reactions,
-      [benchCard, reactions],
+      [benchCard, reactions, message.signerPubkey],
     );
 
     const renderBody = () => {
@@ -440,6 +440,11 @@ export const MessageRow = React.memo(
                 card={benchCard.card}
                 onOther={onReply ? () => onReply(message) : undefined}
                 ownerPubkey={benchCard.ownerPubkey}
+                retiredPost={
+                  benchCard.retired
+                    ? { channelId, text: message.body }
+                    : undefined
+                }
                 viewerPubkey={currentPubkey}
               />
             );

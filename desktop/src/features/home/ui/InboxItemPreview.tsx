@@ -148,12 +148,15 @@ function focusVisible(target: EventTarget | null): boolean {
  * holds no buttons or links.
  */
 export function InboxItemPreview({
+  cardPost = null,
   channelDescription,
   children,
   inboxClass,
   item,
   label,
 }: {
+  /** The card as the row's own post has it (`inboxCardPost`). */
+  cardPost?: BenchCard | null;
   channelDescription: string | null;
   children: React.ReactNode;
   inboxClass: InboxClass;
@@ -251,7 +254,7 @@ export function InboxItemPreview({
       >
         <PreviewHeader inboxClass={inboxClass} item={item} label={label} />
         {inboxClass.benchCard ? (
-          <BenchPreview card={inboxClass.benchCard} />
+          <BenchPreview card={cardPost ?? inboxClass.benchCard} />
         ) : inboxClass.type === "code" ? (
           <CodePreview item={item} label={label} />
         ) : (

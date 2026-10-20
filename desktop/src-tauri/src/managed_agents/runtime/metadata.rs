@@ -109,15 +109,19 @@ pub(crate) fn resolve_session_title(display_name: Option<&str>, name: &str) -> O
 }
 
 /// Build the `RUST_LOG` value forwarded to the agent child: keep an existing
-/// filter that already mentions `buzz_acp`, append `buzz_acp=info` to any other
-/// non-empty filter, and default to `buzz_acp=info` when unset.
+/// filter that already mentions `buzz_acp`, append [`CHILD_RUST_LOG`] to any
+/// other non-empty filter, and default to it when unset.
 pub(crate) fn child_rust_log_filter() -> String {
     match std::env::var("RUST_LOG") {
         Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing},{CHILD_RUST_LOG}"),
+        _ => CHILD_RUST_LOG.to_string(),
     }
 }
+
+/// `pool=info` adds the harness's `pool::*` targets (session creation, turn
+/// start, effort), which sit outside the `buzz_acp` module path.
+const CHILD_RUST_LOG: &str = "buzz_acp=info,pool=info";
 
 #[cfg(test)]
 mod tests {

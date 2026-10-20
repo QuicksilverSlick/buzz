@@ -935,11 +935,15 @@ impl NormalListenerIngress {
         self
     }
 
-    fn session_scope(&self, policy: scope::SessionPolicy, is_dm: bool) -> scope::SessionScope {
+    fn session_scope(
+        &self,
+        policy: scope::SessionPolicy,
+        conversation_channel: bool,
+    ) -> scope::SessionScope {
         scope::SessionScope::derive_routed(
             policy,
             self.buzz_event.channel_id,
-            is_dm,
+            conversation_channel,
             &self.buzz_event.event,
             self.edit.as_ref(),
         )
@@ -1071,6 +1075,66 @@ pub(crate) async fn is_dm_channel(
             );
             true
         }
+    }
+}
+
+/// Whether `channel_id` is a huddle that this agent's owner started: it holds
+/// the owner's kind:48106 voice instructions.
+async fn is_owner_huddle(channel_id: Uuid, ctx: &pool::PromptContext) -> bool {
+    let Some(owner) = ctx.agent_owner_pubkey.as_ref() else {
+        return false;
+    };
+    ctx.channel_info
+        .huddle_instructions(channel_id, owner, false)
+        .await
+        .is_some()
+}
+
+/// Whether `event` joins its huddle channel's one conversation scope (see
+/// [`scope::SessionScope::derive`]). Only the thread policy splits a channel
+/// into sessions, so only it pays the lookup. Only the owner's top-level
+/// messages join, as every spoken utterance is one. A guest's message, or a
+/// reply in a thread, keeps its thread scope, so a guest's words never enter
+/// the history that owner turns run on.
+async fn in_huddle_conversation(
+    policy: scope::SessionPolicy,
+    channel_id: Uuid,
+    event: &nostr::Event,
+    ctx: &pool::PromptContext,
+) -> bool {
+    policy == scope::SessionPolicy::Thread
+        && ctx.agent_owner_pubkey == Some(event.pubkey)
+        && queue::parse_thread_tags(event).root_event_id.is_none()
+        && is_owner_huddle(channel_id, ctx).await
+}
+
+/// How an admitted event treats a running turn in its scope. The desktop
+/// p-tags every agent on every huddle utterance, so in a huddle an event that
+/// also p-tags someone else queues, under either session policy: steering
+/// would cancel this agent's turn, mid-tool-call, on talk likely meant for
+/// another agent. Queued events run, in order, as the next turn. Talk for this
+/// agent alone keeps the configured handling, so the owner can still redirect
+/// a one-agent huddle by voice. Only an event that would signal a running turn
+/// pays the huddle lookup.
+async fn turn_handling(
+    configured: MultipleEventHandling,
+    queued: &QueuedNormalListenerEvent,
+    queue: &EventQueue,
+    own_pubkey_hex: &str,
+    ctx: &pool::PromptContext,
+) -> MultipleEventHandling {
+    let cross_talk = configured != MultipleEventHandling::Queue
+        && queued.accepted
+        && queue.is_scope_in_flight(&queued.scope)
+        && queue::parse_thread_tags(&queued.steer_event.event)
+            .mentioned_pubkeys
+            .iter()
+            .any(|tagged| !tagged.eq_ignore_ascii_case(own_pubkey_hex))
+        && is_owner_huddle(queued.scope.channel_id(), ctx).await;
+    if cross_talk {
+        MultipleEventHandling::Queue
+    } else {
+        configured
     }
 }
 
@@ -3793,6 +3857,13 @@ async fn run_harness(
                                         config.session_policy,
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await
+                                            || in_huddle_conversation(
+                                                config.session_policy,
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                                &ctx,
+                                            )
                                             .await,
                                         &buzz_event.event,
                                     );
@@ -3845,6 +3916,13 @@ async fn run_harness(
                                         config.session_policy,
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await
+                                            || in_huddle_conversation(
+                                                config.session_policy,
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                                &ctx,
+                                            )
                                             .await,
                                         &buzz_event.event,
                                     );
@@ -3955,10 +4033,11 @@ async fn run_harness(
                             };
                             let ingress = ingress.resolve_edit_routing(&ctx.rest_client).await;
                             // Derive the session scope once, at admission, from
-                            // the operator policy, DM status, and NIP-10 thread
-                            // tags. Under the default `channel` policy this is
-                            // always a conversation scope, preserving today's
-                            // channel-keyed routing. Telemetry only for now —
+                            // the operator policy, DM or huddle status, and
+                            // NIP-10 thread tags. Under the default `channel`
+                            // policy this is always a conversation scope,
+                            // preserving today's channel-keyed routing.
+                            // Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
                             let channel_is_dm = is_dm_channel(
@@ -3966,8 +4045,21 @@ async fn run_harness(
                                 &ctx.channel_info,
                             )
                             .await;
-                            let session_scope =
-                                ingress.session_scope(config.session_policy, channel_is_dm);
+                            let huddle_conversation = !channel_is_dm
+                                && in_huddle_conversation(
+                                    config.session_policy,
+                                    ingress.buzz_event.channel_id,
+                                    &ingress.buzz_event.event,
+                                    &ctx,
+                                )
+                                .await;
+                            let session_scope = ingress.session_scope(
+                                config.session_policy,
+                                channel_is_dm || huddle_conversation,
+                            );
+                            if huddle_conversation {
+                                pool.mark_huddle_conversation(session_scope.clone());
+                            }
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -3991,8 +4083,16 @@ async fn run_harness(
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
                             // decision.
-                            queued.steer_or_interrupt(
+                            let handling = turn_handling(
                                 config.multiple_event_handling,
+                                &queued,
+                                &queue,
+                                &pubkey_hex,
+                                &ctx,
+                            )
+                            .await;
+                            queued.steer_or_interrupt(
+                                handling,
                                 owner_cache.get(),
                                 &mut pool,
                                 &mut queue,
@@ -4813,7 +4913,8 @@ fn try_native_steer(
     // native steer is a *delta* into a live turn — the agent already saw
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
-    // steering (which is to inject only what's new).
+    // steering (which is to inject only what's new). The owner is NOT
+    // omitted: the block's `Authority:` label must match `authority` below.
     // The caller steers natively only a message that replies where the
     // running turn replies (`ReplyRoute::accepts_steer`), so the turn's own
     // `<context>` still routes the reply. An edit's
@@ -4823,7 +4924,7 @@ fn try_native_steer(
     // not from any derived "effective" author: a steered event must never be
     // trusted more than the same event would be if it had started the turn.
     let authority = crate::acp::authority_for_author(&be.event.pubkey.to_hex(), owner);
-    let body = native_steer_body(channel_id, &be);
+    let body = native_steer_body(channel_id, &be, owner);
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4892,9 +4993,9 @@ fn try_native_steer(
 }
 
 /// Render the prompt delta sent by [`try_native_steer`].
-fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent) -> String {
+fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent, owner: Option<&str>) -> String {
     let (tag, closing) = queue::native_steer_framing();
-    let event_block = queue::format_event_block(channel_id, None, be, None, None);
+    let event_block = queue::format_event_block(channel_id, None, be, None, owner);
     let new_message = prompt_framing::semantic_section(tag, "");
     let event_section = prompt_framing::semantic_section_with_attributes(
         "buzz-event",
@@ -9999,6 +10100,162 @@ mod author_gate_tests {
             "an unresolvable channel type must be treated as a DM"
         );
     }
+
+    fn huddle_instructions_event(owner: &nostr::Keys, huddle: Uuid) -> nostr::Event {
+        nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_HUDDLE_GUIDELINES as u16),
+            "You are in a live voice huddle.",
+        )
+        .tags([nostr::Tag::parse(["h", huddle.to_string().as_str()]).unwrap()])
+        .sign_with_keys(owner)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_huddle_answers_are_kept_and_failed_lookups_retried() {
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate();
+        let huddle = Uuid::new_v4();
+        let found = serde_json::json!([huddle_instructions_event(&owner, huddle)]);
+        // Found instructions and a plain channel are answers; a reply without
+        // an event array is a failed lookup.
+        for (reply, expected, answered) in [
+            (found, true, true),
+            (serde_json::json!([]), false, true),
+            (serde_json::json!({}), false, false),
+        ] {
+            let (resolver, requests, server) = lazy_resolver_with_response(reply).await;
+            for _ in 0..2 {
+                let instructions = resolver
+                    .huddle_instructions(huddle, &owner.public_key(), false)
+                    .await;
+                assert_eq!(instructions.is_some(), expected);
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "the listener asks once");
+            resolver
+                .huddle_instructions(huddle, &owner.public_key(), true)
+                .await;
+            let retried = if answered { 1 } else { 2 };
+            assert_eq!(requests.load(Ordering::SeqCst), retried);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_only_owner_top_level_messages_under_thread_policy_join_a_huddle_conversation() {
+        use scope::SessionPolicy::{Channel, Thread};
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate();
+        let huddle = Uuid::new_v4();
+        let (resolver, requests, server) =
+            lazy_resolver_with_response(serde_json::json!([huddle_instructions_event(
+                &owner, huddle
+            )]))
+            .await;
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.channel_info = resolver;
+        let said = |keys: &nostr::Keys, tags: Vec<nostr::Tag>| {
+            nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+                .tags(tags)
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let (root, parent) = ("a".repeat(64), "b".repeat(64));
+        let thread_reply = vec![
+            nostr::Tag::parse(["e", root.as_str(), "", "root"]).unwrap(),
+            nostr::Tag::parse(["e", parent.as_str(), "", "reply"]).unwrap(),
+        ];
+        let by_owner = said(&owner, vec![]);
+        let by_guest = said(&nostr::Keys::generate(), vec![]);
+        let owner_reply = said(&owner, thread_reply);
+
+        assert!(!in_huddle_conversation(Thread, huddle, &by_owner, &ctx).await);
+        ctx.agent_owner_pubkey = Some(owner.public_key());
+        assert!(!in_huddle_conversation(Channel, huddle, &by_owner, &ctx).await);
+        assert!(!in_huddle_conversation(Thread, huddle, &by_guest, &ctx).await);
+        assert!(!in_huddle_conversation(Thread, huddle, &owner_reply, &ctx).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "no owner, the channel policy, a guest, and a thread reply never pay the lookup"
+        );
+
+        assert!(in_huddle_conversation(Thread, huddle, &by_owner, &ctx).await);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_huddle_talk_that_tags_another_agent_queues_and_talk_for_this_one_steers() {
+        use std::sync::atomic::Ordering;
+        use MultipleEventHandling::{Queue, Steer};
+
+        let owner = nostr::Keys::generate();
+        let (me, other) = (
+            nostr::Keys::generate().public_key().to_hex(),
+            nostr::Keys::generate().public_key().to_hex(),
+        );
+        let (me, other) = (me.as_str(), other.as_str());
+        let (huddle, ordinary, idle) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (resolver, requests, server) =
+            lazy_resolver_with_response(serde_json::json!([huddle_instructions_event(
+                &owner, huddle
+            )]))
+            .await;
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.channel_info = resolver;
+        ctx.agent_owner_pubkey = Some(owner.public_key());
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let conv = |channel_id| scope::SessionScope::Conversation { channel_id };
+        let mut said = 0;
+        let mut utter = |queue: &mut EventQueue, channel_id: Uuid, tagged: &[&str]| {
+            said += 1;
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), format!("line {said}"))
+                .tags(tagged.iter().map(|p| nostr::Tag::parse(["p", *p]).unwrap()))
+                .sign_with_keys(&owner)
+                .unwrap();
+            NormalListenerIngress {
+                buzz_event: relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                effective_author: owner.public_key().to_hex(),
+                prompt_tag: "@mention".into(),
+                edit: None,
+            }
+            .push(queue, conv(channel_id), false)
+        };
+        for channel_id in [huddle, ordinary] {
+            utter(&mut queue, channel_id, &[me]);
+            queue.flush_next().expect("a running turn");
+        }
+
+        let both = utter(&mut queue, huddle, &[me, other]);
+        let alone = utter(&mut queue, huddle, &[me]);
+        let not_running = utter(&mut queue, idle, &[me, other]);
+        assert_eq!(turn_handling(Queue, &both, &queue, me, &ctx).await, Queue);
+        assert_eq!(turn_handling(Steer, &alone, &queue, me, &ctx).await, Steer);
+        assert_eq!(
+            turn_handling(Steer, &not_running, &queue, me, &ctx).await,
+            Steer
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "an event that signals no running turn never pays the lookup"
+        );
+
+        assert_eq!(turn_handling(Steer, &both, &queue, me, &ctx).await, Queue);
+        let elsewhere = utter(&mut queue, ordinary, &[me, other]);
+        assert_eq!(
+            turn_handling(Steer, &elsewhere, &queue, me, &ctx).await,
+            Steer
+        );
+        server.abort();
+    }
 }
 
 #[cfg(test)]
@@ -11575,12 +11832,34 @@ mod edit_native_steer_tests {
                 target_thread_tags: queue::parse_thread_tags(&original),
             }),
         };
-        let body = native_steer_body(Uuid::new_v4(), &be);
+        let body = native_steer_body(Uuid::new_v4(), &be, None);
         assert!(
             body.contains(&format!("Edit of: {}", original.id.to_hex())),
             "{body}"
         );
         assert!(body.contains(&format!("root={root}")), "{body}");
+    }
+
+    /// A steered owner message is labelled as the owner's, matching the
+    /// authority the steer carries; anyone else, or an unknown owner, is a guest.
+    #[test]
+    fn native_steer_body_marks_the_owner_as_owner() {
+        let event = message(None);
+        let be = queue::BatchEvent {
+            event: event.clone(),
+            prompt_tag: "@mention".into(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        };
+        let owner = event.pubkey.to_hex();
+        let channel_id = Uuid::new_v4();
+        let as_owner = native_steer_body(channel_id, &be, Some(&owner));
+        assert!(as_owner.contains("Authority: owner"), "{as_owner}");
+        let other = "cd".repeat(32);
+        let as_guest = native_steer_body(channel_id, &be, Some(&other));
+        assert!(as_guest.contains("Authority: guest"), "{as_guest}");
+        let unknown = native_steer_body(channel_id, &be, None);
+        assert!(unknown.contains("Authority: guest"), "{unknown}");
     }
 
     /// The listener hands the steer path the same resolved route it queues.
