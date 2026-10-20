@@ -38,9 +38,9 @@ use super::{pipeline::start_auto_enabled_transcription, HuddlePhase};
 pub fn voice_mode_guidelines(huddle_channel_id: &str, parent_channel_id: &str) -> String {
     format!(
         "\
-You are in a live voice huddle. The live huddle channel is {huddle_channel_id}, the channel in the current `[Context]` block.
+You are in a live voice huddle. The live huddle channel is {huddle_channel_id}, the channel in the current `<context>` block.
 Only messages sent with `buzz messages send` to {huddle_channel_id} are spoken aloud, in the order sent; everything else you produce is silent.
-Its attached main channel is {parent_channel_id}; that is not the live huddle channel. Never reply there: nothing sent to it is spoken. Post there only what a user asks you to post there.
+The huddle's attached main channel is {parent_channel_id}; that is not the live huddle channel. Never reply there: nothing sent to it is spoken. Post there only what your owner asks you to post there.
 When a user addresses you, your FIRST tool call must send one short sentence to {huddle_channel_id}, before any file read, search, or other tool call. The usual rule against bare acknowledgments does not apply here; the pickup is the feedback that you heard them.
 Then work, sending each useful sentence to {huddle_channel_id} as its own message the moment it is ready—a few sentences per answer, not a monologue.
 Speak plainly without markdown or code. If you are not addressed, stay silent."
@@ -345,14 +345,16 @@ mod tests {
         let guidelines = voice_mode_guidelines("huddle-channel", "parent-channel");
         assert_eq!(guidelines.lines().count(), 6);
         assert!(guidelines.contains("The live huddle channel is huddle-channel"));
+        assert!(guidelines.contains("the channel in the current `<context>` block"));
         assert!(guidelines.contains("buzz messages send` to huddle-channel are spoken aloud"));
-        assert!(guidelines.contains("Its attached main channel is parent-channel"));
+        assert!(guidelines.contains("The huddle's attached main channel is parent-channel"));
         assert!(guidelines.contains("that is not the live huddle channel. Never reply there"));
         assert!(guidelines
             .contains("your FIRST tool call must send one short sentence to huddle-channel"));
         assert!(guidelines.contains("before any file read, search, or other tool call"));
         assert!(guidelines.contains("rule against bare acknowledgments does not apply here"));
-        // The only way a reply reaches the main channel is a user asking for it.
+        // The only way a reply reaches the main channel is the owner asking for it.
+        assert!(guidelines.contains("Post there only what your owner asks you to post there"));
         assert!(!guidelines.contains("long detail to the attached main channel"));
     }
 
