@@ -270,7 +270,7 @@ test("a live Bench card's post shows as the card, not the text it was posted wit
   assert.ok(forged.container.textContent.includes("28-day-reset"));
 });
 
-test("a retired card's post shows the item's live card, without its keycap pills", async () => {
+test("a retired card's post names the live card read-only, without its keycap pills", async () => {
   const keycap = (emoji) => ({ emoji, count: 1, users: [] });
   const retired = message({
     authorPubkey: WRITER,
@@ -289,19 +289,27 @@ test("a retired card's post shows the item's live card, without its keycap pills
     canReply: true,
     channelId: BENCH,
   });
-  const shown = view.getByTestId("bench-card");
+  const shown = view.getByTestId("bench-card-retired");
   assert.equal(shown.getAttribute("data-bench-item"), "orchestrator/ship");
+  assert.ok(shown.textContent.startsWith("Replaced by a newer card"));
   assert.ok(!view.container.textContent.includes("28-day-reset"));
+  // Kept history: no second live card, so nothing to answer or reply to.
+  assert.equal(view.queryByTestId("bench-card"), null);
+  assert.equal(
+    view.container.querySelector('fieldset[aria-label="Answer"]'),
+    null,
+  );
+  assert.equal(view.queryByText("Other..."), null);
+  assert.equal(view.queryByText("Open thread"), null);
   const pills = view.getByTestId("message-reactions").textContent;
   assert.ok(pills.includes("👍"));
   assert.ok(!pills.includes("1️⃣") && !pills.includes("2️⃣"), pills);
-  // Other replies in the live card's thread only, so the old post has none.
-  assert.equal(view.queryByText("Open thread"), null);
   view.unmount();
 
   const live = await renderRow(
     { ...retired, id: CARD_EVENT },
     { benchCards: benchCards(), canReply: true, channelId: BENCH },
   );
+  assert.ok(live.container.querySelector('fieldset[aria-label="Answer"]'));
   assert.ok(live.getByText("Open thread"));
 });

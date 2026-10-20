@@ -52,7 +52,8 @@ function formatBenchTime(unixSeconds: number): string {
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
  * it. `onOther` opens the card's thread: Other, where a reply is the
  * answer, and Open thread, on every card that has one. A closed card is its
- * receipt: the question, the answer and the outcome.
+ * receipt: the question, the answer and the outcome. A `retired` post (one a
+ * newer card replaced) only names that card, so it never answers twice.
  */
 export function BenchCard({
   card,
@@ -60,6 +61,7 @@ export function BenchCard({
   viewerPubkey,
   onOther,
   projectLabel,
+  retired = false,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
@@ -67,7 +69,21 @@ export function BenchCard({
   onOther?: () => void;
   /** Leads the muted line: the Bench screen's All tab names the project. */
   projectLabel?: string;
+  retired?: boolean;
 }) {
+  if (retired) {
+    return (
+      <Card
+        className="mt-1 max-w-[min(100%,36rem)] px-3 py-2.5"
+        data-bench-item={card.id}
+        data-testid="bench-card-retired"
+      >
+        <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          Replaced by a newer card: {card.title}
+        </p>
+      </Card>
+    );
+  }
   return card.request ? (
     <BenchReceiptCard
       card={card}

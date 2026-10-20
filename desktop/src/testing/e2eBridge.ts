@@ -570,7 +570,8 @@ type E2eConfig = {
       kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
     }>;
     // Event IDs that `get_event` should report as definitively not found.
-    // Causes `useDraftRootStatus` to classify as `deleted`.
+    // Causes `useDraftRootStatus` to classify as `deleted`; a reply naming
+    // one as its parent fails to send.
     deletedEventIds?: string[];
     // Pending community deep links (buzz://join / buzz://connect / buzz://add-community) seeded into
     // the mocked Rust-side queue. Mirrors the real queue's semantics:
@@ -10295,6 +10296,14 @@ async function handleSendChannelMessage(
   // active community/identity.
   assertExpectedRelayScope(args.expectedRelayUrl, config);
   assertExpectedSigner(args.expectedSignerPubkey, config);
+  // Like thread_ref.rs: without a given root, a deleted parent is unresolvable.
+  if (
+    args.parentEventId &&
+    !args.rootEventId &&
+    config?.mock?.deletedEventIds?.includes(args.parentEventId)
+  ) {
+    throw new Error("parent event not found");
+  }
 
   // Mirror the WebSocket send path's failure injection so specs that route
   // the first message through the acknowledged HTTP transport still exercise

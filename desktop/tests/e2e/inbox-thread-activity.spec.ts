@@ -16,8 +16,14 @@ const ANCHOR_ID = "d1".repeat(32);
 const AGENT = TEST_IDENTITIES.alice.pubkey;
 const PERSON = TEST_IDENTITIES.bob.pubkey;
 
-/** Seeds a reply to ROOT_ID that mentions the viewer and opens it. */
-async function openInboxReply(page: Page, { withRoot }: { withRoot: boolean }) {
+/**
+ * Seeds a reply to ROOT_ID (or to `middleId`, itself a reply to ROOT_ID)
+ * that mentions the viewer and opens it.
+ */
+async function openInboxReply(
+  page: Page,
+  { middleId, withRoot }: { middleId?: string; withRoot: boolean },
+) {
   await page.waitForFunction(
     () =>
       typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function" &&
@@ -28,6 +34,7 @@ async function openInboxReply(page: Page, { withRoot }: { withRoot: boolean }) {
       anchorId,
       channelId,
       currentPubkey,
+      middleId,
       rootId,
       senderPubkey,
       withRoot,
@@ -43,12 +50,21 @@ async function openInboxReply(page: Page, { withRoot }: { withRoot: boolean }) {
           pubkey: senderPubkey,
         });
       }
+      if (middleId) {
+        emit({
+          channelName: "general",
+          content: "Middle reply.",
+          id: middleId,
+          parentEventId: rootId,
+          pubkey: senderPubkey,
+        });
+      }
       const anchor = emit({
         channelName: "general",
         content: "Inbox anchor reply.",
         id: anchorId,
         mentionPubkeys: [currentPubkey],
-        parentEventId: rootId,
+        parentEventId: middleId ?? rootId,
         pubkey: senderPubkey,
       });
       push({
@@ -67,6 +83,7 @@ async function openInboxReply(page: Page, { withRoot }: { withRoot: boolean }) {
       anchorId: ANCHOR_ID,
       channelId: GENERAL_CHANNEL_ID,
       currentPubkey: TEST_IDENTITIES.tyler.pubkey,
+      middleId,
       rootId: ROOT_ID,
       senderPubkey: PERSON,
       withRoot,
@@ -93,6 +110,8 @@ async function emitTyping(page: Page, pubkey: string, threadHeadId: string) {
 test("shows agent activity and thread typing under the Inbox composer", async ({
   page,
 }) => {
+  // No dock transitions, so the overlay's height is final at once.
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await installMockBridge(page);
   await page.goto("/");
   await expect(page.getByTestId("home-inbox-list")).toBeVisible();
@@ -113,9 +132,18 @@ test("shows agent activity and thread typing under the Inbox composer", async ({
     )
     .toBe(true);
 
+  const overlay = page.getByTestId("home-inbox-detail-composer-overlay");
+  const overlayHeight = async () => (await overlay.boundingBox())?.height ?? 0;
+  const quietHeight = await overlayHeight();
+  expect(quietHeight).toBeGreaterThan(0);
+
   await emitTyping(page, AGENT, ROOT_ID);
   const trigger = detail.getByTestId("bot-activity-composer-trigger");
   await expect(trigger).toBeVisible();
+  // The activity rail fills the dock's reserved space: the composer stays put.
+  expect(Math.abs((await overlayHeight()) - quietHeight)).toBeLessThanOrEqual(
+    1,
+  );
   await expect(
     detail.getByTestId(`bot-activity-composer-avatar-${AGENT}`),
   ).toBeVisible();
@@ -127,7 +155,10 @@ test("shows agent activity and thread typing under the Inbox composer", async ({
   await expect(typingLabel).toContainText("bob is typing");
   await expect(typingLabel).not.toContainText("charlie");
 
-  // The agent's reply in the thread ends its activity at once.
+  // The agent's reply in the thread ends its activity at once: fresh typing
+  // first, so the typing TTL cannot be what clears it.
+  await emitTyping(page, AGENT, ROOT_ID);
+  await expect(trigger).toBeVisible();
   await page.evaluate(
     ({ pubkey, rootId }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
@@ -140,7 +171,7 @@ test("shows agent activity and thread typing under the Inbox composer", async ({
     { pubkey: AGENT, rootId: ROOT_ID },
   );
   await expect(detail).toContainText("Agent reply done.");
-  await expect(trigger).toHaveCount(0);
+  await expect(trigger).toHaveCount(0, { timeout: 2_000 });
 });
 
 test("a deleted thread root shows a muted row, not the load error", async ({
@@ -156,6 +187,31 @@ test("a deleted thread root shows a muted row, not the load error", async ({
   );
   await expect(detail.getByTestId("home-inbox-context-error")).toHaveCount(0);
   await expect(detail).toContainText("Inbox anchor reply.");
+
+  // The deleted root cannot be a reply's parent, so the reply goes under
+  // the selected message and still sends.
+  const input = detail.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("Reply under a deleted root.");
+  await page.keyboard.press("Enter");
+  await expect(
+    detail
+      .getByTestId("home-inbox-context-message")
+      .filter({ hasText: "Reply under a deleted root." }),
+  ).toBeVisible();
+  await expect(input).toHaveText("");
+});
+
+test("a deleted reply mid-thread is not a load error", async ({ page }) => {
+  const middleId = "d2".repeat(32);
+  await installMockBridge(page, { deletedEventIds: [middleId] });
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  const detail = await openInboxReply(page, { middleId, withRoot: true });
+
+  await expect(detail).toContainText("Thread root message.");
+  await expect(detail.getByTestId("home-inbox-context-error")).toHaveCount(0);
+  await expect(detail.getByTestId("home-inbox-root-deleted")).toHaveCount(0);
 });
 
 test("a root that fails to load keeps the load-error banner", async ({

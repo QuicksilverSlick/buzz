@@ -126,13 +126,11 @@ export function useInboxThreadContext(
               eventsById.set(event.id, event);
               return event;
             } catch (error) {
-              if (
-                eventId === threadRootId &&
-                isDefinitiveEventNotFound(error)
-              ) {
-                rootDeleted = true;
-              } else {
+              // The relay's "event not found" is a deletion, not a load error.
+              if (!isDefinitiveEventNotFound(error)) {
                 failed = true;
+              } else if (eventId === threadRootId) {
+                rootDeleted = true;
               }
               return null;
             }

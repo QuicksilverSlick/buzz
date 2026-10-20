@@ -52,6 +52,7 @@ import {
 } from "@/features/messages/lib/videoReviewContext";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
+import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
@@ -90,8 +91,9 @@ const EMPTY_REPLIES: InboxReply[] = [];
 const EMPTY_TYPING_ENTRIES: TypingIndicatorEntry[] = [];
 const EMPTY_MANAGED_AGENTS: ManagedAgent[] = [];
 const EMPTY_RELAY_AGENTS: RelayAgent[] = [];
-// The dock's quiet rail matches the Inbox composer's own 1rem bottom inset.
+// The dock keeps the Inbox composer's own 1rem gutter and bottom inset.
 const INBOX_COMPOSER_DOCK_STYLE = {
+  "--composer-dock-gutter": "1rem",
   "--composer-dock-quiet-inset": "1rem",
 } as React.CSSProperties;
 
@@ -530,9 +532,15 @@ function InboxMessageDetailPane({
   // Explicit sub-message reply wins. Otherwise use the captured default parent
   // (derived from the selected-event anchor at conversation entry), which does
   // not change when a live incoming message advances the representative item.
+  const defaultParentId = capturedDefaultParentId ?? item.id;
   const composerParentEventId =
     replyTarget?.id ??
-    (isDirectMessage ? null : (capturedDefaultParentId ?? item.id));
+    (isDirectMessage
+      ? null
+      : // The relay cannot resolve a deleted root as a reply's parent.
+        isThreadRootDeleted && defaultParentId === item.conversationId
+        ? (selectedEventId ?? item.id)
+        : defaultParentId);
   const composerReplyTarget =
     replyTarget && replyTarget.id !== item.id
       ? {
@@ -866,33 +874,14 @@ function InboxMessageDetailPane({
           data-testid="home-inbox-detail-composer-overlay"
           ref={composerWrapperRef}
         >
-          <span
-            aria-hidden="true"
-            className="absolute bottom-4 left-4 h-4 w-4 bg-background"
-            style={{
-              maskImage:
-                "radial-gradient(circle at top right, transparent 0 1rem, black calc(1rem + 0.5px))",
-              WebkitMaskImage:
-                "radial-gradient(circle at top right, transparent 0 1rem, black calc(1rem + 0.5px))",
-            }}
-          />
-          <span
-            aria-hidden="true"
-            className="absolute bottom-4 right-4 h-4 w-4 bg-background"
-            style={{
-              maskImage:
-                "radial-gradient(circle at top left, transparent 0 1rem, black calc(1rem + 0.5px))",
-              WebkitMaskImage:
-                "radial-gradient(circle at top left, transparent 0 1rem, black calc(1rem + 0.5px))",
-            }}
-          />
           <div
             className={cn(
-              "composer-dock relative pointer-events-auto",
+              "composer-dock composer-overlay-corner-masks relative pointer-events-auto",
               hasComposerActivity && "composer-dock--with-activity",
             )}
             style={INBOX_COMPOSER_DOCK_STYLE}
           >
+            <ComposerDockBackdrop gutterClassName="inset-x-4" />
             <MessageComposer
               audienceContext={
                 isDirectMessage
@@ -906,6 +895,7 @@ function InboxMessageDetailPane({
               channelName={item.channelLabel ?? "channel"}
               channelType={composerChannelType}
               containerClassName="px-4 pb-0 sm:px-4"
+              layoutMode="dock"
               disabled={!canReply && !composerEditTarget}
               draftKey={
                 isDirectMessage

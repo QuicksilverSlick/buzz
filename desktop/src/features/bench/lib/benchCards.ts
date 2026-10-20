@@ -140,6 +140,8 @@ export type BenchCards = { enabled: false } | BenchSnapshot;
 export type BenchCardMatch = {
   card: BenchCard;
   ownerPubkey: string | null;
+  /** A post the Bench left behind (kept history), not the live card. */
+  retired: boolean;
 };
 
 /** What a timeline row needs from the snapshot. */
@@ -259,8 +261,9 @@ export function isBenchCandidate(message: BenchMessageRef): boolean {
 /**
  * The guard. A message renders as a Bench card only when its id is a live
  * card's event id (or it is a retired post of an item that has one, which
- * then shows that live card), it is in that card's own channel, and the
- * Bench writer key signed it. Everything else renders exactly as before.
+ * then points at that live card, read-only), it is in that card's own
+ * channel, and the Bench writer key signed it. Everything else renders
+ * exactly as before.
  */
 export function benchRowState(
   cards: BenchCards | null | undefined,
@@ -286,7 +289,11 @@ export function benchRowState(
     inBenchChannel: true,
     match:
       card && inItsChannel && signedByWriter
-        ? { card, ownerPubkey: snapshot.ownerPubkey }
+        ? {
+            card,
+            ownerPubkey: snapshot.ownerPubkey,
+            retired: card.cardEventId !== message.id,
+          }
         : null,
   };
 }

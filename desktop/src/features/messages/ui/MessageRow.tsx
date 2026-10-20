@@ -379,9 +379,9 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
-    // Non-null only for a live Bench card (or a retired post of one) in its
-    // own channel signed by the Bench writer key (see benchRowState); every
-    // other row renders as before.
+    // Non-null only for a live Bench card (or a retired post of one, shown
+    // read-only) in its own channel signed by the Bench writer key (see
+    // benchRowState); every other row renders as before.
     const benchCard = useBenchCardForMessage({
       channelId,
       id: message.id,
@@ -390,7 +390,8 @@ export const MessageRow = React.memo(
       signerPubkey: message.signerPubkey,
       tags: message.tags,
     });
-    // A live card's option buttons already show its answer keycaps.
+    // A live card's option buttons already show its answer keycaps; a retired
+    // post's keycaps are seeds for options it no longer offers.
     const shownReactions = React.useMemo(
       () =>
         benchCard
@@ -440,14 +441,9 @@ export const MessageRow = React.memo(
             return (
               <BenchCard
                 card={benchCard.card}
-                // The Bench reads Other only in the live card's thread, not a
-                // retired post's.
-                onOther={
-                  onReply && benchCard.card.cardEventId === message.id
-                    ? () => onReply(message)
-                    : undefined
-                }
+                onOther={onReply ? () => onReply(message) : undefined}
                 ownerPubkey={benchCard.ownerPubkey}
+                retired={benchCard.retired}
                 viewerPubkey={currentPubkey}
               />
             );

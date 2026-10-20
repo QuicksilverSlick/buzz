@@ -711,7 +711,7 @@ test("marker: the item a card post's client tag names", () => {
   }
 });
 
-test("guard: a retired post shows its item's live card, answered through the live id", () => {
+test("guard: a retired post matches its item's live card, flagged retired", () => {
   const cards = snapshot();
   const state = benchRowState(
     cards,
@@ -720,7 +720,10 @@ test("guard: a retired post shows its item's live card, answered through the liv
   assert.equal(state.match?.card, cards.items[0]);
   assert.equal(state.match?.card.cardEventId, CARD_ID);
   assert.equal(state.match?.ownerPubkey, OWNER);
-  // Its seeded keycaps are the live card's option buttons.
+  // Kept history, so it renders read-only and never answers.
+  assert.equal(state.match?.retired, true);
+  assert.equal(benchRowState(cards, row()).match?.retired, false);
+  // Its seeded keycaps are hidden like the live card's.
   assert.equal(isBenchAnswerKeycap(state.match.card, "1️⃣"), true);
 });
 
@@ -769,6 +772,7 @@ test("guard: the live post itself still wins over its marker", () => {
   const cards = snapshot([card(), other]);
   const state = benchRowState(cards, row({ tags: [marker("w/other")] }));
   assert.equal(state.match?.card.id, "dreamforge/ship-it");
+  assert.equal(state.match?.retired, false);
 });
 
 test("eligible: the shared answer vectors agree with item.rs", () => {
