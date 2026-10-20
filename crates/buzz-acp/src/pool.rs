@@ -767,6 +767,7 @@ const PROJECT_INFO_CACHE_TTL: std::time::Duration = std::time::Duration::from_se
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
     projects: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, CachedProjectInfo>>>,
+    huddles: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, bool>>>,
     rest_client: RestClient,
 }
 
@@ -792,8 +793,34 @@ impl ChannelInfoResolver {
         Self {
             cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
             projects: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            huddles: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             rest_client,
         }
+    }
+
+    /// Whether `channel_id` is a huddle channel: one holding the owner's
+    /// kind:48106 voice instructions, the event a new session loads into its
+    /// system prompt. The desktop posts them before it adds any agent, so an
+    /// answer is cached for the channel's life; a failed lookup answers `false`
+    /// uncached and a later event retries.
+    pub async fn is_huddle(&self, channel_id: Uuid, owner: &nostr::PublicKey) -> bool {
+        if let Some(known) = self
+            .huddles
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&channel_id).copied())
+        {
+            return known;
+        }
+        let Some(instructions) =
+            query_huddle_instructions(channel_id, owner, &self.rest_client).await
+        else {
+            return false;
+        };
+        if let Ok(mut cache) = self.huddles.write() {
+            cache.insert(channel_id, instructions.is_some());
+        }
+        instructions.is_some()
     }
 
     pub async fn resolve_channel_metadata(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
@@ -1811,11 +1838,19 @@ async fn create_session_and_apply_model(
     // creation (config options are per-session), mirroring the model-switch
     // application above. The held value comes from `BUZZ_ACP_EFFORT_LEVEL` and
     // never mutates — there is no pool-level effort state and no live switching.
+    // A huddle session (one with voice instructions) requests `HUDDLE_EFFORT`
+    // instead, for this session only.
     // Reads the post-switch snapshot so the configId is discovered on the model
     // the session is actually running; computed BEFORE the capture emission so
     // the cached configOptions tell the truth about the running session.
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
-    let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
+    let effort = session_effort(
+        agent.startup_effort.as_deref(),
+        channel.huddle_instructions.is_some(),
+    )
+    .map(str::to_owned);
+    let effort_outcome =
+        apply_startup_effort(agent, effort, effort_snapshot, &resp.session_id).await?;
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -2081,7 +2116,23 @@ enum StartupEffortOutcome {
     Rejected,
 }
 
-/// Apply the worker's held `startup_effort` via `session/set_config_option`, if
+/// Effort a huddle session requests, whatever the worker's own effort is.
+/// `low` is the lowest level both claude-agent-acp (low..max) and codex-acp
+/// (low..xhigh; `minimal` only on some models) accept, and a spoken reply
+/// needs a fast first sentence more than deep reasoning.
+const HUDDLE_EFFORT: &str = "low";
+
+/// The effort to request for a new session: [`HUDDLE_EFFORT`] for a huddle
+/// session, the worker's configured startup effort for every other one.
+fn session_effort(startup_effort: Option<&str>, is_huddle: bool) -> Option<&str> {
+    if is_huddle {
+        Some(HUDDLE_EFFORT)
+    } else {
+        startup_effort
+    }
+}
+
+/// Apply `value` (see [`session_effort`]) via `session/set_config_option`, if
 /// set and the current model advertises a `thought_level` option.
 ///
 /// Returns `Ok(None)` when there is nothing to apply (no configured effort, or
@@ -2092,10 +2143,11 @@ enum StartupEffortOutcome {
 /// non-fatal: the session proceeds on the model's default effort.
 async fn apply_startup_effort(
     agent: &mut OwnedAgent,
+    value: Option<String>,
     session_new_result: &serde_json::Value,
     session_id: &str,
 ) -> Result<Option<StartupEffortOutcome>, AcpError> {
-    let Some(value) = agent.startup_effort.clone() else {
+    let Some(value) = value else {
         return Ok(None);
     };
     let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
@@ -3935,6 +3987,18 @@ async fn fetch_huddle_instructions(
     owner: &nostr::PublicKey,
     rest: &RestClient,
 ) -> Option<String> {
+    query_huddle_instructions(channel_id, owner, rest)
+        .await
+        .flatten()
+}
+
+/// [`fetch_huddle_instructions`], keeping a failed query (`None`) apart from a
+/// channel that has no instructions (`Some(None)`).
+async fn query_huddle_instructions(
+    channel_id: Uuid,
+    owner: &nostr::PublicKey,
+    rest: &RestClient,
+) -> Option<Option<String>> {
     use nostr::{Alphabet, SingleLetterTag};
 
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
@@ -3961,7 +4025,11 @@ async fn fetch_huddle_instructions(
             return None;
         }
     };
-    huddle_instructions_from_query_response(json.as_array()?, channel_id, owner)
+    Some(huddle_instructions_from_query_response(
+        json.as_array()?,
+        channel_id,
+        owner,
+    ))
 }
 
 fn huddle_instructions_from_query_response(
@@ -10874,6 +10942,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             &owner.public_key(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn huddle_sessions_request_low_effort_and_others_keep_the_worker_effort() {
+        assert_eq!(session_effort(Some("xhigh"), true), Some("low"));
+        assert_eq!(session_effort(None, true), Some("low"));
+        assert_eq!(session_effort(Some("xhigh"), false), Some("xhigh"));
+        assert_eq!(session_effort(None, false), None);
     }
 
     // ── render_canvas_section ────────────────────────────────────────────────

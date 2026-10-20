@@ -935,11 +935,15 @@ impl NormalListenerIngress {
         self
     }
 
-    fn session_scope(&self, policy: scope::SessionPolicy, is_dm: bool) -> scope::SessionScope {
+    fn session_scope(
+        &self,
+        policy: scope::SessionPolicy,
+        conversation_channel: bool,
+    ) -> scope::SessionScope {
         scope::SessionScope::derive_routed(
             policy,
             self.buzz_event.channel_id,
-            is_dm,
+            conversation_channel,
             &self.buzz_event.event,
             self.edit.as_ref(),
         )
@@ -1071,6 +1075,22 @@ pub(crate) async fn is_dm_channel(
             );
             true
         }
+    }
+}
+
+/// Whether `channel_id` is a huddle channel, whose events share one
+/// conversation scope (see [`scope::SessionScope::derive`]). Only the thread
+/// policy splits a channel into sessions, so only it pays the lookup.
+async fn is_huddle_channel(
+    policy: scope::SessionPolicy,
+    channel_id: Uuid,
+    ctx: &pool::PromptContext,
+) -> bool {
+    match ctx.agent_owner_pubkey.as_ref() {
+        Some(owner) if policy == scope::SessionPolicy::Thread => {
+            ctx.channel_info.is_huddle(channel_id, owner).await
+        }
+        _ => false,
     }
 }
 
@@ -3793,6 +3813,12 @@ async fn run_harness(
                                         config.session_policy,
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await
+                                            || is_huddle_channel(
+                                                config.session_policy,
+                                                buzz_event.channel_id,
+                                                &ctx,
+                                            )
                                             .await,
                                         &buzz_event.event,
                                     );
@@ -3845,6 +3871,12 @@ async fn run_harness(
                                         config.session_policy,
                                         buzz_event.channel_id,
                                         is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await
+                                            || is_huddle_channel(
+                                                config.session_policy,
+                                                buzz_event.channel_id,
+                                                &ctx,
+                                            )
                                             .await,
                                         &buzz_event.event,
                                     );
@@ -3955,10 +3987,11 @@ async fn run_harness(
                             };
                             let ingress = ingress.resolve_edit_routing(&ctx.rest_client).await;
                             // Derive the session scope once, at admission, from
-                            // the operator policy, DM status, and NIP-10 thread
-                            // tags. Under the default `channel` policy this is
-                            // always a conversation scope, preserving today's
-                            // channel-keyed routing. Telemetry only for now —
+                            // the operator policy, DM or huddle status, and
+                            // NIP-10 thread tags. Under the default `channel`
+                            // policy this is always a conversation scope,
+                            // preserving today's channel-keyed routing.
+                            // Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
                             let channel_is_dm = is_dm_channel(
@@ -3966,8 +3999,16 @@ async fn run_harness(
                                 &ctx.channel_info,
                             )
                             .await;
-                            let session_scope =
-                                ingress.session_scope(config.session_policy, channel_is_dm);
+                            let session_scope = ingress.session_scope(
+                                config.session_policy,
+                                channel_is_dm
+                                    || is_huddle_channel(
+                                        config.session_policy,
+                                        ingress.buzz_event.channel_id,
+                                        &ctx,
+                                    )
+                                    .await,
+                            );
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -9998,6 +10039,53 @@ mod author_gate_tests {
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
         );
+    }
+
+    #[tokio::test]
+    async fn test_is_huddle_caches_definitive_answers_only() {
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate();
+        let huddle = Uuid::new_v4();
+        let instructions = nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_HUDDLE_GUIDELINES as u16),
+            "You are in a live voice huddle.",
+        )
+        .tags([nostr::Tag::parse(["h", huddle.to_string().as_str()]).unwrap()])
+        .sign_with_keys(&owner)
+        .unwrap();
+        let (resolver, requests, server) =
+            lazy_resolver_with_response(serde_json::json!([instructions])).await;
+        assert!(resolver.is_huddle(huddle, &owner.public_key()).await);
+        assert!(resolver.is_huddle(huddle, &owner.public_key()).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a huddle is looked up once"
+        );
+        server.abort();
+
+        let (resolver, requests, server) = lazy_resolver_with_response(serde_json::json!([])).await;
+        let channel = Uuid::new_v4();
+        assert!(!resolver.is_huddle(channel, &owner.public_key()).await);
+        assert!(!resolver.is_huddle(channel, &owner.public_key()).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a plain channel is looked up once"
+        );
+        server.abort();
+
+        // A malformed reply is no answer: not a huddle, and asked again.
+        let (resolver, requests, server) = lazy_resolver_with_response(serde_json::json!({})).await;
+        assert!(!resolver.is_huddle(huddle, &owner.public_key()).await);
+        assert!(!resolver.is_huddle(huddle, &owner.public_key()).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a failed lookup is retried"
+        );
+        server.abort();
     }
 }
 
