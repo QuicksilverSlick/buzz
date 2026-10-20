@@ -183,6 +183,7 @@ test("a pending, current, unanswered card needs you; answered it is Bench", () =
   const ask = card("orchestrator/ask", {
     writer: "orchestrator",
     kind: "pending",
+    cardEventId: post.id,
   });
   assert.equal(
     classifyInboxItem(inboxItem(post), snapshot([ask]), NONE).type,
@@ -193,6 +194,37 @@ test("a pending, current, unanswered card needs you; answered it is Bench", () =
     classifyInboxItem(inboxItem(post), snapshot([answered]), NONE).type,
     "bench",
   );
+  // Its thread waits on you too, by the card's own event id.
+  const reply = event({ channelId: BENCH, tags: [["e", post.id, "", "root"]] });
+  assert.equal(
+    classifyInboxItem(
+      inboxItem(reply, { conversationId: post.id }),
+      snapshot([ask]),
+      NONE,
+    ).type,
+    "needs-you",
+  );
+});
+
+test("an older post of a card asked again is Bench, not waiting on you", () => {
+  const old = event({
+    pubkey: WRITER,
+    channelId: BENCH,
+    tags: [marker("orchestrator/ask")],
+  });
+  const ask = card("orchestrator/ask", {
+    writer: "orchestrator",
+    kind: "pending",
+    cardEventId: CARD_EVENT,
+  });
+  for (const bench of [
+    snapshot([ask]),
+    snapshot([{ ...ask, cardEventId: null }]),
+  ]) {
+    const result = classifyInboxItem(inboxItem(old), bench, NONE);
+    assert.equal(result.type, "bench");
+    assert.equal(result.benchCard?.id, "orchestrator/ask");
+  }
 });
 
 test("a reply in a card's thread is that card's, by the card's own event id", () => {

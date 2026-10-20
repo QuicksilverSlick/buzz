@@ -208,9 +208,19 @@ export function inboxCardPost(
   return markedCard(item.item, snapshot);
 }
 
-function waitsOnOwner(card: BenchCard | null): boolean {
+/**
+ * The card waits on the owner, and the row is its live post or thread: an
+ * older post of the same card no longer takes an answer.
+ */
+function waitsOnOwner(card: BenchCard | null, item: InboxItem): boolean {
+  const live = card?.cardEventId;
   return (
-    card?.kind === "pending" && card.validity === "current" && !card.answer
+    card?.kind === "pending" &&
+    card.validity === "current" &&
+    !card.answer &&
+    !!live &&
+    (item.conversationId === live ||
+      [item.item, ...item.groupItems].some((event) => event.id === live))
   );
 }
 
@@ -222,7 +232,7 @@ export function classifyInboxItem(
   const benchCard = benchCardOf(item, benchSnapshot);
   const repo = inboxRepoAddress(item);
   const type: InboxItemType =
-    item.isActionRequired || waitsOnOwner(benchCard)
+    item.isActionRequired || waitsOnOwner(benchCard, item)
       ? "needs-you"
       : benchCard
         ? "bench"
