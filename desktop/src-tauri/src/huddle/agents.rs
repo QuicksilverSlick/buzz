@@ -33,16 +33,17 @@ use super::{pipeline::start_auto_enabled_transcription, HuddlePhase};
 /// huddle start. Agents load this event into the channel session system prompt.
 ///
 /// Keep this deliberately short: the invariant that matters is that a directly
-/// addressed user receives an immediate spoken response before any other work.
-pub fn voice_mode_guidelines(parent_channel_id: &str) -> String {
+/// addressed user receives an immediate spoken response, in the huddle channel,
+/// before any other work.
+pub fn voice_mode_guidelines(huddle_channel_id: &str, parent_channel_id: &str) -> String {
     format!(
         "\
-You are in a live voice huddle. Its attached main channel is {parent_channel_id}; that is not the live huddle channel.
-The channel UUID in the current `[Context]` block is the live huddle channel. Only messages sent with `buzz messages send` to that current Context channel are spoken aloud, in the order sent; everything else you produce is silent.
-When a user addresses you, your FIRST tool call must send a brief spoken reply to the current Context channel, before any file read, search, or other tool call. The usual rule against bare acknowledgments does not apply here; the pickup is the feedback that you heard them.
-Then work, sending each useful sentence as its own message the moment it is ready—a few sentences per answer, not a monologue.
-Speak plainly without markdown; post code or long detail to the attached main channel instead.
-If you are not addressed, stay silent."
+You are in a live voice huddle. The live huddle channel is {huddle_channel_id}, the channel in the current `<context>` block.
+Only messages sent with `buzz messages send` to {huddle_channel_id} are spoken aloud, in the order sent; everything else you produce is silent.
+The huddle's attached main channel is {parent_channel_id}; that is not the live huddle channel. Never reply there: nothing sent to it is spoken. Post there only what your owner asks you to post there.
+When a user addresses you, your FIRST tool call must send one short sentence to {huddle_channel_id}, before any file read, search, or other tool call. The usual rule against bare acknowledgments does not apply here; the pickup is the feedback that you heard them.
+Then work, sending each useful sentence to {huddle_channel_id} as its own message the moment it is ready—a few sentences per answer, not a monologue.
+Speak plainly without markdown or code. If you are not addressed, stay silent."
     )
 }
 
@@ -341,15 +342,20 @@ mod tests {
 
     #[test]
     fn voice_mode_guidelines_pin_spoken_reply_as_first_tool_call() {
-        let guidelines = voice_mode_guidelines("parent-channel");
+        let guidelines = voice_mode_guidelines("huddle-channel", "parent-channel");
         assert_eq!(guidelines.lines().count(), 6);
-        assert!(guidelines.contains("Its attached main channel is parent-channel"));
-        assert!(guidelines.contains("that is not the live huddle channel"));
-        assert!(guidelines.contains("current `[Context]` block is the live huddle channel"));
-        assert!(guidelines.contains("buzz messages send` to that current Context channel"));
-        assert!(guidelines.contains("your FIRST tool call must send a brief spoken reply"));
+        assert!(guidelines.contains("The live huddle channel is huddle-channel"));
+        assert!(guidelines.contains("the channel in the current `<context>` block"));
+        assert!(guidelines.contains("buzz messages send` to huddle-channel are spoken aloud"));
+        assert!(guidelines.contains("The huddle's attached main channel is parent-channel"));
+        assert!(guidelines.contains("that is not the live huddle channel. Never reply there"));
+        assert!(guidelines
+            .contains("your FIRST tool call must send one short sentence to huddle-channel"));
         assert!(guidelines.contains("before any file read, search, or other tool call"));
         assert!(guidelines.contains("rule against bare acknowledgments does not apply here"));
+        // The only way a reply reaches the main channel is the owner asking for it.
+        assert!(guidelines.contains("Post there only what your owner asks you to post there"));
+        assert!(!guidelines.contains("long detail to the attached main channel"));
     }
 
     #[test]

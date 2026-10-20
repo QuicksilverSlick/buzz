@@ -15,10 +15,15 @@
 //! | Reply in a channel thread           | `Thread(channel_id, canonical_root)`    |
 //! | Repeated mention in the same thread | reuse that thread scope                 |
 //! | Direct message                      | `Conversation(channel_id)`              |
+//! | Owner's top-level huddle message    | `Conversation(channel_id)`              |
 //!
 //! Under [`SessionPolicy::Channel`] (the current default / rollback path) every
 //! surface collapses to `Conversation(channel_id)`, preserving today's
 //! channel-keyed behavior exactly.
+//!
+//! In the matrix above, a guest's message, or any thread reply, in a huddle
+//! channel follows the channel rows, so a guest's words never enter the
+//! session that the owner's huddle turns run in.
 
 use nostr::Event;
 use uuid::Uuid;
@@ -106,9 +111,15 @@ impl SessionScope {
 
     /// Derive the scope for an admitted event.
     ///
+    /// `conversation_channel` is true for a DM, or for the owner's top-level
+    /// message in a huddle channel.
+    ///
     /// Resolution order:
-    /// 1. DMs are always [`Conversation`](Self::Conversation) — the ticket keeps
-    ///    direct messages conversation-scoped regardless of policy.
+    /// 1. DMs and the owner's top-level huddle messages are always [`Conversation`](Self::Conversation)
+    ///    — the ticket keeps direct messages conversation-scoped regardless of
+    ///    policy, and a huddle is one live voice conversation whose utterances
+    ///    all arrive as top-level messages, so a thread per utterance would start
+    ///    each one in a cold, parallel session.
     /// 2. Under [`SessionPolicy::Channel`], every channel event is
     ///    conversation-scoped (legacy / rollback behavior).
     /// 3. Under [`SessionPolicy::Thread`], a channel event with a NIP-10 root
@@ -128,8 +139,13 @@ impl SessionScope {
     /// split one relay thread across two ACP sessions (queue state, provider
     /// sessions, affinity, delivery ledgers). `nostr::EventId::to_hex()` is
     /// already lowercase, so the top-level path is unaffected.
-    pub fn derive(policy: SessionPolicy, channel_id: Uuid, is_dm: bool, event: &Event) -> Self {
-        Self::derive_routed(policy, channel_id, is_dm, event, None)
+    pub fn derive(
+        policy: SessionPolicy,
+        channel_id: Uuid,
+        conversation_channel: bool,
+        event: &Event,
+    ) -> Self {
+        Self::derive_routed(policy, channel_id, conversation_channel, event, None)
     }
 
     /// [`derive`](Self::derive) for an event whose reply routing may come from
@@ -142,11 +158,11 @@ impl SessionScope {
     pub fn derive_routed(
         policy: SessionPolicy,
         channel_id: Uuid,
-        is_dm: bool,
+        conversation_channel: bool,
         event: &Event,
         edit: Option<&ResolvedEdit>,
     ) -> Self {
-        if is_dm || policy == SessionPolicy::Channel {
+        if conversation_channel || policy == SessionPolicy::Channel {
             return Self::Conversation { channel_id };
         }
 
@@ -231,6 +247,20 @@ mod tests {
         ]);
         let scope = SessionScope::derive(SessionPolicy::Thread, ch, true, &reply);
         assert_eq!(scope, SessionScope::Conversation { channel_id: ch });
+    }
+
+    #[test]
+    fn huddle_channel_is_one_conversation_under_thread_policy() {
+        let ch = Uuid::new_v4();
+        // Every utterance joins the huddle's one session.
+        for ev in [plain_event(), plain_event()] {
+            let scope = SessionScope::derive(SessionPolicy::Thread, ch, true, &ev);
+            assert_eq!(scope, SessionScope::Conversation { channel_id: ch });
+        }
+        // The same top-level messages in an ordinary channel each open a thread.
+        let ev = plain_event();
+        let scope = SessionScope::derive(SessionPolicy::Thread, ch, false, &ev);
+        assert_eq!(scope.root_event_id(), Some(ev.id.to_hex().as_str()));
     }
 
     #[test]

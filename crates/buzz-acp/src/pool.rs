@@ -384,6 +384,9 @@ pub struct AgentPool {
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, tokio::time::Instant>,
+    /// Huddle conversation scopes, so [`try_claim`](Self::try_claim) leaves
+    /// their owners free; pruned with the channel's sessions.
+    huddle_scopes: HashSet<SessionScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -763,10 +766,18 @@ pub(crate) struct ProjectLookupError(String);
 
 const PROJECT_INFO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a failed huddle lookup stays "not a huddle" on the listener loop
+/// before its next event asks the relay again.
+const HUDDLE_LOOKUP_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `Ok` is the relay's answer; `Err` is when the lookup last failed.
+type HuddleLookup = Result<Option<String>, std::time::Instant>;
+
 #[derive(Debug, Clone)]
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
     projects: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, CachedProjectInfo>>>,
+    huddles: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, HuddleLookup>>>,
     rest_client: RestClient,
 }
 
@@ -792,8 +803,43 @@ impl ChannelInfoResolver {
         Self {
             cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
             projects: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            huddles: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             rest_client,
         }
+    }
+
+    /// The owner's kind:48106 voice instructions for `channel_id`, which mark
+    /// it as a huddle channel. The relay's answer is kept for the channel's
+    /// life: the desktop posts the instructions before it adds any member, so a
+    /// channel without them never becomes a huddle. A failed lookup is asked
+    /// again at once when `retry_failed`, and otherwise only after
+    /// [`HUDDLE_LOOKUP_RETRY`], so a slow relay stalls the listener loop at most
+    /// once per channel per window.
+    pub async fn huddle_instructions(
+        &self,
+        channel_id: Uuid,
+        owner: &nostr::PublicKey,
+        retry_failed: bool,
+    ) -> Option<String> {
+        let cached = self
+            .huddles
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&channel_id).cloned());
+        match cached {
+            Some(Ok(instructions)) => return instructions,
+            Some(Err(failed_at)) if !retry_failed && failed_at.elapsed() < HUDDLE_LOOKUP_RETRY => {
+                return None
+            }
+            _ => {}
+        }
+        let lookup = fetch_huddle_instructions(channel_id, owner, &self.rest_client)
+            .await
+            .map_err(|()| std::time::Instant::now());
+        if let Ok(mut cache) = self.huddles.write() {
+            cache.insert(channel_id, lookup.clone());
+        }
+        lookup.ok().flatten()
     }
 
     pub async fn resolve_channel_metadata(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
@@ -966,7 +1012,13 @@ impl AgentPool {
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
             held_since: HashMap::new(),
+            huddle_scopes: HashSet::new(),
         }
+    }
+
+    /// Record `scope` as a huddle's one conversation.
+    pub fn mark_huddle_conversation(&mut self, scope: SessionScope) {
+        self.huddle_scopes.insert(scope);
     }
 
     /// Record `agent_index` as the newest owner of `scope`, returning the
@@ -1064,7 +1116,12 @@ impl AgentPool {
     /// Pass 1: prefer an agent that already has a session for this exact scope
     /// (thread affinity — repeated activity in a thread reuses that thread's
     /// provider session).
-    /// Pass 2: any idle agent.
+    /// Pass 2: the lowest-index idle agent, taking one that owns a live huddle
+    /// conversation only when no other agent is idle. That scope never holds
+    /// for its busy owner (see [`hold_decision`](Self::hold_decision)), so
+    /// taking its agent for other work would start the huddle's next utterance
+    /// in a cold session on another agent. Best-effort: with every other agent
+    /// busy, the huddle's agent is still taken.
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
@@ -1080,8 +1137,19 @@ impl AgentPool {
             }
         }
 
-        // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
+        // Pass 2: `false` sorts first and `min_by_key` keeps the lowest index
+        // among equals.
+        let idx = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|agent| (i, agent)))
+            .min_by_key(|(_, agent)| {
+                self.huddle_scopes
+                    .iter()
+                    .any(|scope| self.agent_owns_scope(agent, scope))
+            })
+            .map(|(i, _)| i);
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
@@ -1373,6 +1441,8 @@ impl AgentPool {
         // reference a scope whose sessions are gone.
         self.held_since
             .retain(|scope, _| scope.channel_id() != channel_id);
+        self.huddle_scopes
+            .retain(|scope| scope.channel_id() != channel_id);
         count
     }
 
@@ -1811,11 +1881,19 @@ async fn create_session_and_apply_model(
     // creation (config options are per-session), mirroring the model-switch
     // application above. The held value comes from `BUZZ_ACP_EFFORT_LEVEL` and
     // never mutates — there is no pool-level effort state and no live switching.
+    // A huddle session (one with voice instructions) requests `HUDDLE_EFFORT`
+    // instead, for this session only.
     // Reads the post-switch snapshot so the configId is discovered on the model
     // the session is actually running; computed BEFORE the capture emission so
     // the cached configOptions tell the truth about the running session.
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
-    let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
+    let effort = session_effort(
+        agent.startup_effort.as_deref(),
+        channel.huddle_instructions.is_some(),
+    )
+    .map(str::to_owned);
+    let effort_outcome =
+        apply_startup_effort(agent, effort, effort_snapshot, &resp.session_id).await?;
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -1839,25 +1917,29 @@ async fn create_session_and_apply_model(
         }
         opts
     };
-    agent.acp.observe(
-        "session_config_captured",
-        serde_json::json!({
-            "configOptions": config_options_for_cache,
-            "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
-            // `models` must come from the SAME snapshot as configOptions — the
-            // post-switch snapshot on a successful switch, session/new otherwise.
-            // Taking it from `resp.raw` here would emit the target model's option
-            // set alongside the pre-switch model identity, so the desktop panel
-            // would report the old model as live after an applied switch. When a
-            // successful target response omits `models`, this emits Null rather
-            // than falling back to the pre-switch `resp.raw.models`.
-            "models": effort_snapshot.get("models").cloned().unwrap_or(serde_json::Value::Null),
-            "modelOverridden": agent.model_overridden && switch_succeeded,
-            // Pair identity for the desktop session-config cache, which is
-            // keyed by (agent, relay) like the lifecycle frames.
-            "relayUrl": ctx.relay_url,
-        }),
-    );
+    // A huddle session emits nothing: the desktop keeps one cache per agent,
+    // which would then show `HUDDLE_EFFORT` as the agent's running effort.
+    if channel.huddle_instructions.is_none() {
+        agent.acp.observe(
+            "session_config_captured",
+            serde_json::json!({
+                "configOptions": config_options_for_cache,
+                "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
+                // `models` must come from the SAME snapshot as configOptions — the
+                // post-switch snapshot on a successful switch, session/new otherwise.
+                // Taking it from `resp.raw` here would emit the target model's option
+                // set alongside the pre-switch model identity, so the desktop panel
+                // would report the old model as live after an applied switch. When a
+                // successful target response omits `models`, this emits Null rather
+                // than falling back to the pre-switch `resp.raw.models`.
+                "models": effort_snapshot.get("models").cloned().unwrap_or(serde_json::Value::Null),
+                "modelOverridden": agent.model_overridden && switch_succeeded,
+                // Pair identity for the desktop session-config cache, which is
+                // keyed by (agent, relay) like the lifecycle frames.
+                "relayUrl": ctx.relay_url,
+            }),
+        );
+    }
 
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
@@ -2081,7 +2163,23 @@ enum StartupEffortOutcome {
     Rejected,
 }
 
-/// Apply the worker's held `startup_effort` via `session/set_config_option`, if
+/// Effort a huddle session requests, whatever the worker's own effort is.
+/// `low` is the lowest level both claude-agent-acp (low..max) and codex-acp
+/// (low..xhigh; `minimal` only on some models) accept, and a spoken reply
+/// needs a fast first sentence more than deep reasoning.
+const HUDDLE_EFFORT: &str = "low";
+
+/// The effort to request for a new session: [`HUDDLE_EFFORT`] for a huddle
+/// session, the worker's configured startup effort for every other one.
+fn session_effort(startup_effort: Option<&str>, is_huddle: bool) -> Option<&str> {
+    if is_huddle {
+        Some(HUDDLE_EFFORT)
+    } else {
+        startup_effort
+    }
+}
+
+/// Apply `value` (see [`session_effort`]) via `session/set_config_option`, if
 /// set and the current model advertises a `thought_level` option.
 ///
 /// Returns `Ok(None)` when there is nothing to apply (no configured effort, or
@@ -2092,10 +2190,11 @@ enum StartupEffortOutcome {
 /// non-fatal: the session proceeds on the model's default effort.
 async fn apply_startup_effort(
     agent: &mut OwnedAgent,
+    value: Option<String>,
     session_new_result: &serde_json::Value,
     session_id: &str,
 ) -> Result<Option<StartupEffortOutcome>, AcpError> {
-    let Some(value) = agent.startup_effort.clone() else {
+    let Some(value) = value else {
         return Ok(None);
     };
     let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
@@ -2725,7 +2824,7 @@ pub async fn run_prompt_task(
             title_channel = resolved_channel;
             origin_channel_type = resolved_channel_type;
             if let Some(owner) = ctx.agent_owner_pubkey.as_ref() {
-                huddle_instructions = fetch_huddle_instructions(cid, owner, &ctx.rest_client).await;
+                huddle_instructions = ctx.channel_info.huddle_instructions(cid, owner, true).await;
             }
             // A confirmed DM never receives a canvas section; an undeterminable
             // channel type fails closed as a DM for the same reason.
@@ -3939,12 +4038,13 @@ pub(crate) async fn fetch_project_home_for_channel(
 ///
 /// The event is promoted into the system role, so accepting any channel member's
 /// event would be a privilege escalation. Only the configured agent owner's
-/// valid signature is accepted; absence or failure simply yields no section.
+/// valid signature is accepted; anything else yields `Ok(None)`. `Err` means
+/// the query failed, timed out, or returned no event array.
 async fn fetch_huddle_instructions(
     channel_id: Uuid,
     owner: &nostr::PublicKey,
     rest: &RestClient,
-) -> Option<String> {
+) -> Result<Option<String>, ()> {
     use nostr::{Alphabet, SingleLetterTag};
 
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
@@ -3964,14 +4064,20 @@ async fn fetch_huddle_instructions(
         Ok(Ok(json)) => json,
         Ok(Err(error)) => {
             tracing::warn!(channel = %channel_id, "huddle instructions query failed: {error}");
-            return None;
+            return Err(());
         }
         Err(_) => {
             tracing::warn!(channel = %channel_id, "huddle instructions query timed out");
-            return None;
+            return Err(());
         }
     };
-    huddle_instructions_from_query_response(json.as_array()?, channel_id, owner)
+    let Some(events) = json.as_array() else {
+        tracing::warn!(channel = %channel_id, "huddle instructions query returned no event array");
+        return Err(());
+    };
+    Ok(huddle_instructions_from_query_response(
+        events, channel_id, owner,
+    ))
 }
 
 fn huddle_instructions_from_query_response(
@@ -9336,6 +9442,45 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert_eq!(claimed.index, 1, "next turn resumes the forked session");
     }
 
+    /// New work and heartbeats leave an idle huddle conversation's agent free
+    /// while another agent is idle, so the huddle's next utterance resumes its
+    /// session; without a huddle, the lowest index is claimed as before.
+    #[tokio::test]
+    async fn new_work_avoids_an_idle_huddle_owner_and_otherwise_claims_the_lowest_index() {
+        let huddle = conv(Uuid::new_v4());
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        let mut owner = idle_agent_with_session(0, huddle.clone()).await;
+        let generation = pool.record_scope_owner(huddle.clone(), owner.index);
+        owner
+            .state
+            .set_scope_owner_generation(huddle.clone(), generation);
+        pool.return_agent(owner);
+        pool.return_agent(idle_agent_with_session(1, conv(Uuid::new_v4())).await);
+
+        let ordinary = pool.try_claim(None).expect("an idle agent");
+        assert_eq!(ordinary.index, 0, "an ordinary conversation is not avoided");
+        pool.return_agent(ordinary);
+
+        pool.mark_huddle_conversation(huddle.clone());
+        for scope in [Some(conv(Uuid::new_v4())), None] {
+            let other = pool.try_claim(scope.as_ref()).expect("an idle agent");
+            assert_eq!(other.index, 1, "the huddle's agent stays free");
+            pool.return_agent(other);
+        }
+        let next = pool.try_claim(Some(&huddle)).expect("the huddle's agent");
+        assert_eq!(next.index, 0);
+        let last = pool
+            .try_claim(Some(&conv(Uuid::new_v4())))
+            .expect("the only idle agent");
+        assert_eq!(last.index, 1);
+        pool.return_agent(next);
+        assert_eq!(
+            pool.try_claim(None).expect("the huddle's agent").index,
+            0,
+            "best-effort: the huddle's agent is taken when no other is idle"
+        );
+    }
+
     #[test]
     fn test_rotate_after_natural_completion_invalidates_channel_state() {
         let (mut s, ch_a, ch_b) = make_state();
@@ -10958,6 +11103,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         .is_none());
     }
 
+    #[test]
+    fn huddle_sessions_request_low_effort_and_others_keep_the_worker_effort() {
+        assert_eq!(session_effort(Some("xhigh"), true), Some("low"));
+        assert_eq!(session_effort(None, true), Some("low"));
+        assert_eq!(session_effort(Some("xhigh"), false), Some("xhigh"));
+        assert_eq!(session_effort(None, false), None);
+    }
+
     // ── render_canvas_section ────────────────────────────────────────────────
 
     #[test]
@@ -12004,6 +12157,35 @@ done"#
             Some("high"),
             "applied effort must overwrite the pre-set currentValue in the capture"
         );
+    }
+
+    /// A huddle session emits no capture, so the agent's config panel keeps
+    /// describing its ordinary sessions rather than `HUDDLE_EFFORT`.
+    #[tokio::test]
+    async fn test_huddle_session_emits_no_config_capture() {
+        let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp, Some("high"));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: Some("You are in a live voice huddle."),
+                canvas: None,
+                name: None,
+                scope: None,
+                channel_type: None,
+            },
+        )
+        .await
+        .expect("session creation must succeed");
+
+        let events = obs.snapshot();
+        assert!(events.iter().all(|e| e.kind != "session_config_captured"));
     }
 
     #[tokio::test]
