@@ -2436,6 +2436,48 @@ fn send_prompt_result(
     });
 }
 
+/// Who a turn answers to, decided from the batch that triggered it.
+///
+/// A batch can mix authors, so any non-owner event makes the whole turn a
+/// guest turn: the events are merged into one prompt and the model acts on
+/// all of them together, so there is no per-event authority to hand a tool
+/// call afterwards. Taking the lowest authority present is the only reading
+/// that cannot over-trust. That includes `cancelled_events`: a re-prompt after
+/// a steer or interrupt renders them in the same prompt and tells the model to
+/// continue that work, so their authors steer this turn as much as `events` do.
+///
+/// Heartbeats carry no author at all. They are the harness prompting itself
+/// on a timer, with no inbound request behind them, so they run as the
+/// owner — treating them as guest turns would make an idle agent ask for
+/// approval nobody requested.
+pub(crate) fn turn_authority_for(
+    batch: Option<&crate::queue::FlushBatch>,
+    owner: Option<&nostr::PublicKey>,
+) -> crate::acp::TurnAuthority {
+    match (batch, owner) {
+        (None, _) => crate::acp::TurnAuthority::Owner,
+        (Some(_), None) => {
+            // No owner known: nothing can be verified as the owner, so nothing
+            // is. Fails toward asking.
+            crate::acp::TurnAuthority::Guest
+        }
+        (Some(b), Some(owner)) => {
+            // The same comparison native steering applies to each event it writes
+            // into a running turn, so dispatch and steering cannot drift apart.
+            let owner_hex = owner.to_hex();
+            b.events.iter().chain(b.cancelled_events.iter()).fold(
+                crate::acp::TurnAuthority::Owner,
+                |authority, be| {
+                    authority.weaker(crate::acp::authority_for_author(
+                        &be.event.pubkey.to_hex(),
+                        Some(&owner_hex),
+                    ))
+                },
+            )
+        }
+    }
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -2465,39 +2507,7 @@ pub async fn run_prompt_task(
         None => PromptSource::Heartbeat,
     };
 
-    // Who this turn answers to, decided from the batch that triggered it.
-    //
-    // A batch can mix authors, so any non-owner event makes the whole turn a
-    // guest turn: the events are merged into one prompt and the model acts on
-    // all of them together, so there is no per-event authority to hand a tool
-    // call afterwards. Taking the lowest authority present is the only reading
-    // that cannot over-trust.
-    //
-    // Heartbeats carry no author at all. They are the harness prompting itself
-    // on a timer, with no inbound request behind them, so they run as the
-    // owner — treating them as guest turns would make an idle agent ask for
-    // approval nobody requested.
-    let turn_authority = match (&batch, ctx.agent_owner_pubkey.as_ref()) {
-        (None, _) => crate::acp::TurnAuthority::Owner,
-        (Some(_), None) => {
-            // No owner known: nothing can be verified as the owner, so nothing
-            // is. Fails toward asking.
-            crate::acp::TurnAuthority::Guest
-        }
-        (Some(b), Some(owner)) => {
-            // The same comparison native steering applies to each event it writes
-            // into a running turn, so dispatch and steering cannot drift apart.
-            let owner_hex = owner.to_hex();
-            b.events
-                .iter()
-                .fold(crate::acp::TurnAuthority::Owner, |authority, be| {
-                    authority.weaker(crate::acp::authority_for_author(
-                        &be.event.pubkey.to_hex(),
-                        Some(&owner_hex),
-                    ))
-                })
-        }
-    };
+    let turn_authority = turn_authority_for(batch.as_ref(), ctx.agent_owner_pubkey.as_ref());
     let observer_channel_id = source.channel_id();
     // Thread conversation context requires the canonical root to distinguish
     // concurrent threads in the same channel's activity.
@@ -8702,6 +8712,78 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .tags(tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    fn signed_by(keys: &Keys) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), "hi")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn batch_event(event: nostr::Event) -> crate::queue::BatchEvent {
+        crate::queue::BatchEvent {
+            edit: None,
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    /// A re-prompt after a steer renders the cancelled turn's events in the
+    /// same prompt ("continue your in-progress work"), so a guest's cancelled
+    /// request must not run on the owner's authority.
+    #[test]
+    fn merged_reprompt_runs_as_guest_when_a_cancelled_event_is_a_guests() {
+        let owner = Keys::generate();
+        let guest = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let mut batch =
+            batch_with_scope(SessionScope::Conversation { channel_id }, signed_by(&owner));
+        batch.cancelled_events = vec![batch_event(signed_by(&guest))];
+        batch.cancel_reason = Some(crate::queue::CancelReason::Steer);
+        assert_eq!(
+            turn_authority_for(Some(&batch), Some(&owner.public_key())),
+            crate::acp::TurnAuthority::Guest
+        );
+    }
+
+    #[test]
+    fn merged_reprompt_of_owner_only_events_stays_owner() {
+        let owner = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let mut batch =
+            batch_with_scope(SessionScope::Conversation { channel_id }, signed_by(&owner));
+        batch.cancelled_events = vec![batch_event(signed_by(&owner))];
+        batch.cancel_reason = Some(crate::queue::CancelReason::Interrupt);
+        assert_eq!(
+            turn_authority_for(Some(&batch), Some(&owner.public_key())),
+            crate::acp::TurnAuthority::Owner
+        );
+    }
+
+    #[test]
+    fn turn_authority_pins_heartbeat_unknown_owner_and_mixed_batch() {
+        let owner = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        // Heartbeat: no batch, no author, runs as the owner.
+        assert_eq!(
+            turn_authority_for(None, Some(&owner.public_key())),
+            crate::acp::TurnAuthority::Owner
+        );
+        // No owner known: even the would-be owner's own event is a guest's.
+        let owner_only =
+            batch_with_scope(SessionScope::Conversation { channel_id }, signed_by(&owner));
+        assert_eq!(
+            turn_authority_for(Some(&owner_only), None),
+            crate::acp::TurnAuthority::Guest
+        );
+        // Any guest event in `events` lowers the whole turn.
+        let mut mixed = owner_only;
+        mixed.events.push(batch_event(signed_by(&Keys::generate())));
+        assert_eq!(
+            turn_authority_for(Some(&mixed), Some(&owner.public_key())),
+            crate::acp::TurnAuthority::Guest
+        );
     }
 
     #[test]
