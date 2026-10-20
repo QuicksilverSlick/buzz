@@ -9,6 +9,15 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
+import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
+import { useChannelMembersQuery } from "@/features/channels/hooks";
+import { selectThreadComposerBotTypingPubkeys } from "@/features/channels/ui/ChannelPane.helpers";
+import { ChannelComposerActivityAccessory } from "@/features/channels/ui/ChannelComposerActivityAccessory";
+import { useChannelActivityTyping } from "@/features/channels/ui/useChannelActivityTyping";
 import type {
   InboxContextMessage,
   InboxItem,
@@ -43,11 +52,18 @@ import {
 } from "@/features/messages/lib/videoReviewContext";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
+import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
+import type { TypingIndicatorEntry } from "@/features/messages/useChannelTyping";
 import { UpdateIndicator } from "@/features/settings/UpdateIndicator";
-import type { Channel, UserProfileSummary } from "@/shared/api/types";
+import type {
+  Channel,
+  ManagedAgent,
+  RelayAgent,
+  UserProfileSummary,
+} from "@/shared/api/types";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -72,6 +88,14 @@ const MembersSidebar = React.lazy(async () => {
 
 const EMPTY_CONTEXT_MESSAGES: InboxContextMessage[] = [];
 const EMPTY_REPLIES: InboxReply[] = [];
+const EMPTY_TYPING_ENTRIES: TypingIndicatorEntry[] = [];
+const EMPTY_MANAGED_AGENTS: ManagedAgent[] = [];
+const EMPTY_RELAY_AGENTS: RelayAgent[] = [];
+// The dock keeps the Inbox composer's own 1rem gutter and bottom inset.
+const INBOX_COMPOSER_DOCK_STYLE = {
+  "--composer-dock-gutter": "1rem",
+  "--composer-dock-quiet-inset": "1rem",
+} as React.CSSProperties;
 
 type InboxDetailPaneProps = {
   agentPubkeys?: ReadonlySet<string>;
@@ -86,10 +110,14 @@ type InboxDetailPaneProps = {
   isSinglePanelView?: boolean;
   hasThreadContextLoadError?: boolean;
   isThreadContextLoading?: boolean;
+  /** The relay reported the thread root as deleted. */
+  isThreadRootDeleted?: boolean;
   item: InboxItem | null;
   messages?: InboxContextMessage[];
   profiles?: Record<string, UserProfileSummary>;
   replies?: InboxReply[];
+  /** Typing in the item's channel (useChannelTyping). */
+  typingEntries?: TypingIndicatorEntry[];
   channel: Channel | null;
   contextChannelName?: string | null;
   currentPubkey?: string;
@@ -176,10 +204,12 @@ function InboxMessageDetailPane({
   isSinglePanelView = false,
   hasThreadContextLoadError = false,
   isThreadContextLoading = false,
+  isThreadRootDeleted = false,
   item,
   messages = EMPTY_CONTEXT_MESSAGES,
   profiles,
   replies = EMPTY_REPLIES,
+  typingEntries = EMPTY_TYPING_ENTRIES,
   channel,
   contextChannelName = null,
   currentPubkey,
@@ -215,6 +245,29 @@ function InboxMessageDetailPane({
   const conversationId = item?.conversationId ?? null;
   const selectedChannelId = item?.item.channelId ?? null;
   const isDirectMessage = item?.item.channelType === "dm";
+  // Agent activity and typing for this thread, split as in a channel's thread
+  // panel. A DM's conversation id is no thread head, so it matches nothing.
+  const channelMembers = useChannelMembersQuery(channel?.id ?? null).data;
+  const managedAgents = useManagedAgentsQuery().data ?? EMPTY_MANAGED_AGENTS;
+  const relayAgents = useRelayAgentsQuery().data ?? EMPTY_RELAY_AGENTS;
+  const { botTypingEntries, channelAgentSessionAgents, threadTypingPubkeys } =
+    useChannelActivityTyping({
+      activeChannel: channel,
+      activeChannelId: channel?.id ?? null,
+      channelMembers,
+      managedAgents,
+      openThreadHeadId: conversationId,
+      relayAgents,
+      typingEntries,
+    });
+  const workingBotPubkeys = React.useMemo(
+    () =>
+      selectThreadComposerBotTypingPubkeys(botTypingEntries, conversationId),
+    [botTypingEntries, conversationId],
+  );
+  const hasComposerActivity =
+    workingBotPubkeys.length > 0 || threadTypingPubkeys.length > 0;
+  const { openAgentActivity } = useOpenAgentActivity();
   // Build the plain, non-virtualized timeline the shared hook anchors against.
   // Live arrivals rerun its layout compensation without changing the target.
 
@@ -251,6 +304,7 @@ function InboxMessageDetailPane({
         kind: item.item.kind,
         parentId: threadReference.parentId,
         rootId: threadReference.rootId,
+        signerPubkey: item.item.pubkey,
         tags: item.item.tags,
         timeLabel: formatTime(item.item.createdAt),
       },
@@ -478,9 +532,15 @@ function InboxMessageDetailPane({
   // Explicit sub-message reply wins. Otherwise use the captured default parent
   // (derived from the selected-event anchor at conversation entry), which does
   // not change when a live incoming message advances the representative item.
+  const defaultParentId = capturedDefaultParentId ?? item.id;
   const composerParentEventId =
     replyTarget?.id ??
-    (isDirectMessage ? null : (capturedDefaultParentId ?? item.id));
+    (isDirectMessage
+      ? null
+      : // The relay cannot resolve a deleted root as a reply's parent.
+        isThreadRootDeleted && defaultParentId === item.conversationId
+        ? (selectedEventId ?? item.id)
+        : defaultParentId);
   const composerReplyTarget =
     replyTarget && replyTarget.id !== item.id
       ? {
@@ -724,6 +784,18 @@ function InboxMessageDetailPane({
                 <span>Some message context could not be loaded.</span>
               </div>
             ) : null}
+            {isThreadRootDeleted &&
+            !displayMessages.some(
+              (message) => message.id === item.conversationId,
+            ) ? (
+              <div
+                className="mx-4 mb-2 flex items-center gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm text-muted-foreground"
+                data-testid="home-inbox-root-deleted"
+              >
+                <Trash2 className="h-4 w-4 shrink-0" />
+                <span>Original message was deleted</span>
+              </div>
+            ) : null}
             {displayMessages.map((message, index) => {
               const hasUnreadBoundary = message.id === unreadBoundaryEventId;
               const isAfterSeparator = index === 1 || hasUnreadBoundary;
@@ -802,27 +874,14 @@ function InboxMessageDetailPane({
           data-testid="home-inbox-detail-composer-overlay"
           ref={composerWrapperRef}
         >
-          <span
-            aria-hidden="true"
-            className="absolute bottom-4 left-4 h-4 w-4 bg-background"
-            style={{
-              maskImage:
-                "radial-gradient(circle at top right, transparent 0 1rem, black calc(1rem + 0.5px))",
-              WebkitMaskImage:
-                "radial-gradient(circle at top right, transparent 0 1rem, black calc(1rem + 0.5px))",
-            }}
-          />
-          <span
-            aria-hidden="true"
-            className="absolute bottom-4 right-4 h-4 w-4 bg-background"
-            style={{
-              maskImage:
-                "radial-gradient(circle at top left, transparent 0 1rem, black calc(1rem + 0.5px))",
-              WebkitMaskImage:
-                "radial-gradient(circle at top left, transparent 0 1rem, black calc(1rem + 0.5px))",
-            }}
-          />
-          <div className="pointer-events-auto">
+          <div
+            className={cn(
+              "composer-dock composer-overlay-corner-masks relative pointer-events-auto",
+              hasComposerActivity && "composer-dock--with-activity",
+            )}
+            style={INBOX_COMPOSER_DOCK_STYLE}
+          >
+            <ComposerDockBackdrop gutterClassName="inset-x-4" />
             <MessageComposer
               audienceContext={
                 isDirectMessage
@@ -835,7 +894,8 @@ function InboxMessageDetailPane({
               channelId={item.item.channelId}
               channelName={item.channelLabel ?? "channel"}
               channelType={composerChannelType}
-              containerClassName="px-4 pb-4 sm:px-4"
+              containerClassName="px-4 pb-0 sm:px-4"
+              layoutMode="dock"
               disabled={!canReply && !composerEditTarget}
               draftKey={
                 isDirectMessage
@@ -888,6 +948,19 @@ function InboxMessageDetailPane({
                     "Replies are not available for this item.")
               }
               replyTarget={composerReplyTarget}
+            />
+            <ChannelComposerActivityAccessory
+              agents={channelAgentSessionAgents}
+              channel={channel}
+              currentPubkey={currentPubkey}
+              onOpenAgentSession={(pubkey, channelId) => {
+                openAgentActivity(pubkey, { channelId });
+              }}
+              openAgentSessionPubkey={null}
+              profiles={profiles}
+              typingPubkeys={threadTypingPubkeys}
+              visible={hasComposerActivity}
+              workingBotPubkeys={workingBotPubkeys}
             />
           </div>
         </div>

@@ -140,6 +140,8 @@ export type BenchCards = { enabled: false } | BenchSnapshot;
 export type BenchCardMatch = {
   card: BenchCard;
   ownerPubkey: string | null;
+  /** A post the Bench left behind (kept history), not the live card. */
+  retired: boolean;
 };
 
 /** What a timeline row needs from the snapshot. */
@@ -157,6 +159,8 @@ export type BenchMessageRef = {
   pending?: boolean;
   /** Raw event signer, not a relay-delegated display author. */
   signerPubkey?: string;
+  /** For the card marker of a retired post. */
+  tags?: readonly (readonly string[])[];
 };
 
 const KIND_STREAM_MESSAGE = 9;
@@ -214,6 +218,36 @@ export function isBenchChannel(
   );
 }
 
+const CARD_MARKER = /^bench:card:(.+)@[^@]+$/;
+
+/**
+ * The item a Bench post's `client` tag (`bench:card:<item>@<hash>`) names,
+ * or null. The Bench marks every card post, so a retired post keeps it.
+ */
+export function benchCardMarkerItemId(
+  tags: readonly (readonly string[])[] | undefined,
+): string | null {
+  const marker = tags?.find(
+    (tag) => tag[0] === "client" && tag[1]?.startsWith("bench:card:"),
+  )?.[1];
+  return (marker && CARD_MARKER.exec(marker)?.[1]) || null;
+}
+
+/** The item a retired post marks, while that item has a live card. */
+function liveCardOfMarker(
+  snapshot: BenchSnapshot,
+  tags: BenchMessageRef["tags"],
+): BenchCard | undefined {
+  const itemId = benchCardMarkerItemId(tags);
+  const item = itemId
+    ? snapshot.items.find((candidate) => candidate.id === itemId)
+    : undefined;
+  return item?.cardEventId &&
+    benchIndex(snapshot).cards.get(item.cardEventId) === item
+    ? item
+    : undefined;
+}
+
 /** Whether a row could be a Bench card at all, before reading the snapshot. */
 export function isBenchCandidate(message: BenchMessageRef): boolean {
   return (
@@ -226,8 +260,10 @@ export function isBenchCandidate(message: BenchMessageRef): boolean {
 
 /**
  * The guard. A message renders as a Bench card only when its id is a live
- * card's event id, it is in that card's own channel, and the Bench writer
- * key signed it. Everything else renders exactly as before.
+ * card's event id (or it is a retired post of an item that has one, which
+ * then points at that live card, read-only), it is in that card's own
+ * channel, and the Bench writer key signed it. Everything else renders
+ * exactly as before.
  */
 export function benchRowState(
   cards: BenchCards | null | undefined,
@@ -243,7 +279,9 @@ export function benchRowState(
   if (!isBenchCandidate(message) || !snapshot.writerPubkey) {
     return { inBenchChannel: true, match: null };
   }
-  const card = indexBenchCards(snapshot).get(message.id);
+  const card =
+    indexBenchCards(snapshot).get(message.id) ??
+    liveCardOfMarker(snapshot, message.tags);
   const signer = normalizePubkey(message.signerPubkey ?? "");
   const signedByWriter = signer === normalizePubkey(snapshot.writerPubkey);
   const inItsChannel = (card?.channelId ?? snapshot.channelId) === channelId;
@@ -251,7 +289,11 @@ export function benchRowState(
     inBenchChannel: true,
     match:
       card && inItsChannel && signedByWriter
-        ? { card, ownerPubkey: snapshot.ownerPubkey }
+        ? {
+            card,
+            ownerPubkey: snapshot.ownerPubkey,
+            retired: card.cardEventId !== message.id,
+          }
         : null,
   };
 }

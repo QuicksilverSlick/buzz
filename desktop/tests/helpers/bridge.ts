@@ -493,7 +493,8 @@ type MockBridgeOptions = {
   /**
    * Event IDs that `get_event` should report as definitively not found.
    * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs
-   * can exercise the "Thread deleted" label / disabled-send path.
+   * can exercise the "Thread deleted" label / disabled-send path. A reply
+   * naming one as its parent fails to send, as on the relay.
    */
   deletedEventIds?: string[];
   /** Reject one identity read after the configured number of successful reads. */

@@ -175,6 +175,7 @@ export default defineConfig({
         "**/edit-agent-run-on.spec.ts",
         "**/claude-effort-picker.spec.ts",
         "**/inbox-live-update.spec.ts",
+        "**/inbox-thread-activity.spec.ts",
         "**/mesh-compute.spec.ts",
         "**/observer-archive-policy.spec.ts",
         "**/harness-management.spec.ts",
