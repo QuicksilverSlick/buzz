@@ -15,14 +15,15 @@
 //! | Reply in a channel thread           | `Thread(channel_id, canonical_root)`    |
 //! | Repeated mention in the same thread | reuse that thread scope                 |
 //! | Direct message                      | `Conversation(channel_id)`              |
-//! | Owner's message in a huddle channel | `Conversation(channel_id)`              |
+//! | Owner's top-level huddle message    | `Conversation(channel_id)`              |
 //!
 //! Under [`SessionPolicy::Channel`] (the current default / rollback path) every
 //! surface collapses to `Conversation(channel_id)`, preserving today's
 //! channel-keyed behavior exactly.
 //!
-//! A guest's message in a huddle channel follows the channel rows, so a guest's
-//! words never enter the session that the owner's turns run in.
+//! In the matrix above, a guest's message, or any thread reply, in a huddle
+//! channel follows the channel rows, so a guest's words never enter the
+//! session that the owner's huddle turns run in.
 
 use nostr::Event;
 use uuid::Uuid;
@@ -110,11 +111,11 @@ impl SessionScope {
 
     /// Derive the scope for an admitted event.
     ///
-    /// `conversation_channel` is true for a DM, or for the owner's message in a
-    /// huddle channel.
+    /// `conversation_channel` is true for a DM, or for the owner's top-level
+    /// message in a huddle channel.
     ///
     /// Resolution order:
-    /// 1. DMs and the owner's huddle messages are always [`Conversation`](Self::Conversation)
+    /// 1. DMs and the owner's top-level huddle messages are always [`Conversation`](Self::Conversation)
     ///    — the ticket keeps direct messages conversation-scoped regardless of
     ///    policy, and a huddle is one live voice conversation whose utterances
     ///    all arrive as top-level messages, so a thread per utterance would start
@@ -251,12 +252,8 @@ mod tests {
     #[test]
     fn huddle_channel_is_one_conversation_under_thread_policy() {
         let ch = Uuid::new_v4();
-        let reply = event_with_tags(vec![
-            vec!["e".into(), "a".repeat(64), String::new(), "root".into()],
-            vec!["e".into(), "b".repeat(64), String::new(), "reply".into()],
-        ]);
-        // Every utterance, top-level or threaded, joins the huddle's one session.
-        for ev in [plain_event(), plain_event(), reply.clone()] {
+        // Every utterance joins the huddle's one session.
+        for ev in [plain_event(), plain_event()] {
             let scope = SessionScope::derive(SessionPolicy::Thread, ch, true, &ev);
             assert_eq!(scope, SessionScope::Conversation { channel_id: ch });
         }
