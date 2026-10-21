@@ -613,6 +613,12 @@ pub struct CliArgs {
     /// ignored (the watermark stays at startup time).
     #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
     pub replay_floor: Option<u64>,
+
+    /// Seconds of @mentions a cold start replays: mentions sent while the
+    /// harness was down are answered when it comes back. 0 = off. Capped at
+    /// 7 days. Only #p (mentions) subscriptions in `--dedup queue` mode replay.
+    #[arg(long, env = "BUZZ_ACP_CATCH_UP_WINDOW", default_value_t = 86_400)]
+    pub catch_up_window: u64,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -722,6 +728,13 @@ pub struct Config {
     pub base_prompt_content: Option<String>,
     /// Harness-wide failure state: classes, parks and who has been told.
     pub(crate) factory: crate::factory::FactoryHandle,
+    /// Which mentions' turns finished, across restarts, and how far back a
+    /// cold start replays. Opened by the listener only (`run_harness`), so a
+    /// one-shot task or setup run never writes a ledger.
+    pub(crate) catch_up: crate::catch_up::CatchUp,
+    /// Seconds of mentions a cold start replays (`--catch-up-window`, capped
+    /// at 7 days); 0 = off.
+    pub(crate) catch_up_window: u64,
     /// How often to check every login's Claude sign-in; `0` disables it.
     pub factory_signin_check_secs: u64,
     /// The command line that texts the owner when a Critical opens.
@@ -1350,6 +1363,15 @@ impl Config {
         // all-clear it owes the owner still goes out (M2 item 4).
         factory.resume_from_saved_state(chrono::Utc::now());
         let factory = crate::factory::FactoryHandle::new(factory);
+        let catch_up_window = if args.catch_up_window > 7 * 86_400 {
+            tracing::warn!(
+                window = args.catch_up_window,
+                "catch-up window exceeds 7 days — capping at 604800s"
+            );
+            7 * 86_400
+        } else {
+            args.catch_up_window
+        };
 
         let config = Config {
             capabilities,
@@ -1404,6 +1426,8 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             factory,
+            catch_up: Default::default(),
+            catch_up_window,
             factory_signin_check_secs: args.factory_signin_check_secs,
             factory_alert_cmd: args
                 .factory_alert_cmd
@@ -1800,6 +1824,8 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            catch_up: Default::default(),
+            catch_up_window: 0,
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -3284,6 +3310,28 @@ channels = "ALL"
         .expect("clap should parse args");
         let config = Config::from_args(args).expect("from_args should accept the folder");
         assert_eq!(config.factory.lock().reporting.bench, Some(missing));
+    }
+
+    #[test]
+    fn catch_up_window_defaults_to_24h_and_caps_at_7d() {
+        let config_with = |extra: &[&str]| {
+            let mut argv = vec!["buzz-acp", "--private-key", TEST_PRIVATE_KEY];
+            argv.extend_from_slice(extra);
+            Config::from_args(CliArgs::try_parse_from(argv).expect("clap should parse args"))
+                .expect("from_args should accept the window")
+        };
+        let config = config_with(&[]);
+        assert_eq!(config.catch_up_window, 86_400);
+        assert_eq!(
+            config.catch_up.since(u64::MAX),
+            None,
+            "from_args never opens the ledger: a one-shot task must not write one"
+        );
+        assert_eq!(
+            config_with(&["--catch-up-window", "2592000"]).catch_up_window,
+            7 * 86_400
+        );
+        assert_eq!(config_with(&["--catch-up-window", "0"]).catch_up_window, 0);
     }
 
     #[test]

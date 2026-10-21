@@ -124,5 +124,7 @@ fn make_prompt_context(
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        // Set by the listener once it knows its startup watermark.
+        replayed_before: None,
     })
 }

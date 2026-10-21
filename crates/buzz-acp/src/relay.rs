@@ -56,7 +56,7 @@ const WS_SEND_TIMEOUT_SECS: u64 = 10;
 /// drop after a long healthy run retries at the short end of the ladder again.
 const STABLE_CONNECTION_SECS: u64 = 60;
 /// Seconds subtracted from `since` on resubscribe to tolerate clock skew.
-const SINCE_SKEW_SECS: u64 = 5;
+pub(crate) const SINCE_SKEW_SECS: u64 = 5;
 /// Timeout for the NIP-42 auth handshake steps.
 ///
 /// Raised from 5s to 20s (≈2 RTTs at the observed 10s max round-trip on degraded
@@ -1180,6 +1180,10 @@ struct BgState {
     /// Startup-era channels use the startup watermark; dynamic channels use
     /// the membership notification timestamp that caused the subscription.
     subscribe_since: HashMap<Uuid, u64>,
+    /// The `since` of each channel REQ still awaiting its EOSE. The relay
+    /// replays newest first, so until EOSE `last_seen` is the newest replayed
+    /// event and a reconnect from it would never ask for the older backlog.
+    awaiting_eose: HashMap<Uuid, u64>,
     /// Relay rate-limit gate deadline.
     ///
     /// While `Some(deadline)` and `Instant::now() < deadline`, outbound
@@ -1245,6 +1249,7 @@ impl BgState {
             recovery: recovery::RecoverySchedule::default(),
             startup_watermark: None,
             subscribe_since: HashMap::new(),
+            awaiting_eose: HashMap::new(),
             rate_limit_gate: None,
             rate_limited_pending: HashMap::new(),
             membership_resub_needed: false,
@@ -1287,7 +1292,7 @@ impl BgState {
     fn channel_since(&self, channel_id: &Uuid) -> Option<u64> {
         let last_seen = self.last_seen.get(channel_id).copied();
         let dropped = self.channel_dropped_since.get(channel_id).copied();
-        match (last_seen, dropped) {
+        let since = match (last_seen, dropped) {
             (Some(l), Some(d)) => Some(l.min(d)),
             (Some(l), None) => Some(l),
             (None, Some(d)) => Some(d),
@@ -1296,7 +1301,12 @@ impl BgState {
                 .get(channel_id)
                 .copied()
                 .or(self.startup_watermark),
-        }
+        };
+        // A replay cut off before its EOSE starts over from where it began.
+        since
+            .into_iter()
+            .chain(self.awaiting_eose.get(channel_id).copied())
+            .min()
     }
 
     /// Clear all per-channel state for a channel that is being unsubscribed.
@@ -1308,6 +1318,7 @@ impl BgState {
             .remove(&channel_sub_id(*channel_id));
         self.last_seen.remove(channel_id);
         self.subscribe_since.remove(channel_id);
+        self.awaiting_eose.remove(channel_id);
         self.channel_dropped_since.remove(channel_id);
         self.active_filters.remove(channel_id);
         self.rate_limited_pending.remove(channel_id);
@@ -2354,6 +2365,9 @@ async fn handle_ws_message(
                 }
                 RelayMessage::Eose { subscription_id } => {
                     debug!("EOSE for subscription {subscription_id}");
+                    if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                        state.awaiting_eose.remove(&channel_id);
+                    }
                 }
                 RelayMessage::Notice { message } => {
                     // Fix 4: NOTICE at warn level.
@@ -3348,7 +3362,7 @@ async fn wait_for_reconnect(
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
-    _state: &BgState,
+    state: &mut BgState,
     channel_id: Uuid,
     agent_pubkey_hex: &str,
     since: Option<u64>,
@@ -3388,6 +3402,10 @@ async fn send_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
+                    if let Some(since) = since {
+                        let floor = state.awaiting_eose.entry(channel_id).or_insert(since);
+                        *floor = (*floor).min(since);
+                    }
                     debug!(
                         "subscribed to channel {channel_id}{}",
                         if since.is_some() {
@@ -5466,6 +5484,125 @@ mod tests {
             state.channel_since(&channel_id),
             Some(membership_ts),
             "channel_since should use the dynamic replay floor until an event is seen"
+        );
+    }
+
+    /// A cold start's catch-up replay reaches the relay as a mentions-only
+    /// REQ from the catch-up timestamp, not from the later startup watermark.
+    #[tokio::test]
+    async fn catch_up_subscribe_sends_mention_req_from_the_catch_up_ts() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let catch_up_ts = 10_000;
+        state.startup_watermark = Some(catch_up_ts + 3_600);
+        let channel_id = Uuid::new_v4();
+        let agent = "ab".repeat(32);
+
+        let sent = execute_connected_command(
+            &mut client,
+            &mut state,
+            &agent,
+            RelayCommand::Subscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+                replay_since: Some(catch_up_ts),
+            },
+        )
+        .await;
+
+        assert!(sent);
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[2]["since"], catch_up_ts - SINCE_SKEW_SECS);
+        assert_eq!(frame[2]["#p"], serde_json::json!([agent]));
+    }
+
+    /// A socket drop before any event arrived resubscribes from the catch-up
+    /// timestamp too, so the backlog is not cut short by a reconnect.
+    #[test]
+    fn reconnect_without_last_seen_replays_from_catch_up_ts() {
+        let mut state = BgState::new();
+        state.startup_watermark = Some(13_600);
+        let channel_id = Uuid::new_v4();
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::Subscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+                replay_since: Some(10_000),
+            },
+        );
+        assert_eq!(state.channel_since(&channel_id), Some(10_000));
+    }
+
+    /// The relay replays newest first. A socket drop before EOSE must ask for
+    /// the whole backlog again, not just what is newer than the newest event.
+    #[tokio::test]
+    async fn replay_floor_holds_until_eose() {
+        let (mut client, _server) = test_ws_pair().await;
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let (observer_control_tx, _observer_control_rx) = mpsc::channel(4);
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let agent = keys.public_key().to_hex();
+        assert!(
+            execute_connected_command(
+                &mut client,
+                &mut state,
+                &agent,
+                RelayCommand::Subscribe {
+                    channel_id,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: true,
+                    },
+                    replay_since: Some(10_000),
+                },
+            )
+            .await
+        );
+
+        let newest = make_signed_channel_event(&Keys::generate(), "newest", 13_000);
+        assert!(
+            handle_test_relay_event(
+                &mut client,
+                &event_tx,
+                &observer_control_tx,
+                &mut state,
+                &channel_sub_id(channel_id),
+                &newest,
+            )
+            .await
+        );
+        assert_eq!(state.channel_since(&channel_id), Some(10_000));
+
+        let eose = serde_json::to_string(&json!(["EOSE", channel_sub_id(channel_id)]))
+            .expect("serialize EOSE");
+        assert!(
+            handle_ws_message(
+                Message::Text(eose.into()),
+                &mut client,
+                &event_tx,
+                &observer_control_tx,
+                &mut state,
+                &keys,
+                "wss://relay.example.com",
+                &agent,
+                None,
+            )
+            .await
+        );
+        assert_eq!(
+            state.channel_since(&channel_id),
+            Some(13_000),
+            "after EOSE, last_seen takes over"
         );
     }
 

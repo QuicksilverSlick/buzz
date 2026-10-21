@@ -992,6 +992,9 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// The listener's startup watermark while catch-up is on. Events sent
+    /// before it were replayed after a restart; their prompt says so.
+    pub replayed_before: Option<u64>,
 }
 
 impl AgentPool {
@@ -3332,6 +3335,7 @@ pub async fn run_prompt_task(
                 team_instructions: standing.team_instructions,
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
+                replayed_before: ctx.replayed_before,
             },
         )
     } else {
@@ -11047,6 +11051,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            replayed_before: None,
         }
     }
 
