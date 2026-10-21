@@ -1115,6 +1115,24 @@ impl EventQueue {
                 .is_some_and(|events| !events.is_empty())
     }
 
+    /// Whether `scope` still holds this event to run again: queued (requeued
+    /// or parked included), carried over from a cancelled turn, or withheld
+    /// for a native steer. A finished turn's events that are not held are done.
+    pub(crate) fn holds_event(&self, scope: &SessionScope, event_id_hex: &str) -> bool {
+        let is = |event: &Event| event.id.to_hex() == event_id_hex;
+        self.queues
+            .get(scope)
+            .is_some_and(|q| q.iter().any(|e| is(&e.event)))
+            || self
+                .cancelled_batches
+                .get(scope)
+                .is_some_and(|events| events.iter().any(|e| is(&e.event)))
+            || self
+                .withheld_native_steer
+                .get(scope)
+                .is_some_and(|events| events.iter().any(|e| is(&e.event)))
+    }
+
     /// Number of queued events for a specific scope (or channel, treated as its
     /// conversation scope). Test-only.
     #[cfg(test)]
@@ -1779,6 +1797,10 @@ fn format_prompt_actor(pubkey: &str, profile_lookup: Option<&PromptProfileLookup
     crate::prompt_framing::escape_semantic_text(&actor)
 }
 
+/// How long after it was sent an event must reach the harness before its
+/// block says it was delivered late.
+const LATE_DELIVERY_SECS: u64 = 120;
+
 /// Format the per-event `[Event]` block for a single [`BatchEvent`].
 ///
 /// Includes: event_id, channel (name + UUID), kind, sender (hex + npub),
@@ -1896,6 +1918,19 @@ pub(crate) fn format_event_block(
     }
     if !parsed_parts.is_empty() {
         block.push_str(&format!("\nParsed: {}", parsed_parts.join(", ")));
+    }
+
+    // A mention replayed after the harness was down: say so, or the agent
+    // answers a stale request as if it had just arrived.
+    let received_unix = (chrono::Utc::now().timestamp().max(0) as u64)
+        .saturating_sub(be.received_at.elapsed().as_secs());
+    let delay = received_unix.saturating_sub(be.event.created_at.as_secs());
+    if delay > LATE_DELIVERY_SECS {
+        block.push_str(&format!(
+            "\nDelivered: {} min after it was sent (you were offline). Check the thread for \
+             anything already handled, then answer and briefly acknowledge the delay.",
+            delay / 60
+        ));
     }
 
     block
@@ -7927,5 +7962,89 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
+    }
+
+    // ── Catch-up ledger: what a finished turn still leaves to run ──────────
+
+    #[test]
+    fn holds_event_sees_queued_parked_cancelled_and_withheld() {
+        let ch = Uuid::new_v4();
+        let scope = conv(ch);
+        let event = make_queued(ch, "hello");
+        let id = event.event.id.to_hex();
+        let in_flight = || {
+            let mut q = EventQueue::new(DedupMode::Queue);
+            q.push(event.clone());
+            let batch = q.flush_next().expect("flush the event");
+            (q, batch)
+        };
+
+        let mut queued = EventQueue::new(DedupMode::Queue);
+        queued.push(event.clone());
+        assert!(queued.holds_event(&scope, &id), "queued");
+        assert!(
+            !queued.holds_event(&conv(Uuid::new_v4()), &id),
+            "scope-exact"
+        );
+
+        let (q, _batch) = in_flight();
+        assert!(
+            !q.holds_event(&scope, &id),
+            "flushed into a turn, the queue no longer holds it"
+        );
+
+        let (mut q, batch) = in_flight();
+        assert!(q.requeue(batch).is_none());
+        assert!(q.holds_event(&scope, &id), "requeued for retry");
+
+        let (mut q, batch) = in_flight();
+        q.park(batch, Instant::now() + Duration::from_secs(60));
+        assert!(q.holds_event(&scope, &id), "parked on a provider limit");
+
+        let (mut q, batch) = in_flight();
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        assert!(
+            q.holds_event(&scope, &id),
+            "carried into the next merged turn"
+        );
+
+        let mut withheld = EventQueue::new(DedupMode::Queue);
+        withheld.push(event.clone());
+        assert!(withheld.mark_native_steer_pending(scope.clone(), &id));
+        assert!(
+            withheld.holds_event(&scope, &id),
+            "withheld for a native steer"
+        );
+    }
+
+    #[test]
+    fn dead_lettered_batch_not_held() {
+        let ch = Uuid::new_v4();
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let event = make_queued(ch, "poison");
+        let id = event.event.id.to_hex();
+        q.push(event);
+        let batch = q.flush_next().expect("flush the event");
+        q.set_retry_count_for_test(ch, MAX_RETRIES);
+        assert!(q.requeue(batch).is_some(), "the retry budget is spent");
+        assert!(!q.holds_event(&conv(ch), &id));
+    }
+
+    #[test]
+    fn late_delivery_line_only_when_received_long_after_sent() {
+        let ch = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let block = |queued: QueuedEvent| {
+            format_event_block(ch, None, &queued.into_batch_event(), None, None)
+        };
+
+        let late = block(make_queued_created_at(ch, "late", now - 600));
+        assert!(
+            late.contains("Delivered: 10 min after it was sent (you were offline)"),
+            "{late}"
+        );
+        assert!(block(make_queued_created_at(ch, "ancient", 1_000)).contains("Delivered: "));
+        assert!(!block(make_queued_created_at(ch, "recent", now - 60)).contains("Delivered: "));
+        assert!(!block(make_queued(ch, "live")).contains("Delivered: "));
     }
 }

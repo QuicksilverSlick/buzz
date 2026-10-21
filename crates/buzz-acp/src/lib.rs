@@ -6,6 +6,7 @@ mod git_runtime_tests;
 
 mod acp;
 mod approval_gate;
+mod catch_up;
 mod config;
 mod edit_routing;
 mod engram_fetch;
@@ -2829,9 +2830,24 @@ fn startup_watermark_with_floor(now_unix: u64, replay_floor: Option<u64>) -> u64
     }
 }
 
+/// Where a cold start replays one channel from. A mentions-only (`#p`)
+/// subscription reaches back over the catch-up window, never later than the
+/// startup watermark a publish-first floor may already have moved back.
+/// `None` keeps the startup-watermark replay — always for a subscribe-all
+/// channel, so a restart never replays a day of chat.
+fn catch_up_replay_since(
+    catch_up_since: Option<u64>,
+    startup_watermark: u64,
+    require_mention: bool,
+) -> Option<u64> {
+    catch_up_since
+        .filter(|_| require_mention)
+        .map(|since| since.min(startup_watermark))
+}
+
 #[cfg(test)]
 mod replay_floor_tests {
-    use super::{startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+    use super::{catch_up_replay_since, startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
 
     const NOW: u64 = 1_700_000_000;
 
@@ -2862,6 +2878,27 @@ mod replay_floor_tests {
     #[test]
     fn early_epoch_now_does_not_underflow() {
         assert_eq!(startup_watermark_with_floor(10, Some(0)), 0);
+    }
+
+    #[test]
+    fn catch_up_since_never_later_than_startup_watermark() {
+        // Down for an hour: mentions replay over the whole outage.
+        assert_eq!(
+            catch_up_replay_since(Some(NOW - 3600), NOW, true),
+            Some(NOW - 3600)
+        );
+        // A fresh ledger (floor = now) must not undo a publish-first floor.
+        assert_eq!(
+            catch_up_replay_since(Some(NOW), NOW - 4, true),
+            Some(NOW - 4)
+        );
+        // Catch-up off: today's startup-watermark replay.
+        assert_eq!(catch_up_replay_since(None, NOW, true), None);
+    }
+
+    #[test]
+    fn non_mention_filter_gets_no_catch_up() {
+        assert_eq!(catch_up_replay_since(Some(NOW - 3600), NOW, false), None);
     }
 }
 
@@ -3161,8 +3198,17 @@ async fn run_harness(
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
+    let catch_up_since = config.catch_up.since(now_unix);
+    if let Some(since) = catch_up_since.filter(|since| *since < startup_watermark) {
+        tracing::info!(since, "replaying mentions sent while the harness was down");
+    }
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        let replay_since =
+            catch_up_replay_since(catch_up_since, startup_watermark, filter.require_mention);
+        if let Err(e) = relay
+            .subscribe_channel_from(*channel_id, filter.clone(), replay_since)
+            .await
+        {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
@@ -3804,6 +3850,23 @@ async fn run_harness(
                                 continue;
                             }
 
+                            if config.catch_up.is_done(&buzz_event.event.id.to_hex()) {
+                                tracing::debug!(channel_id = %buzz_event.channel_id, "dropping a mention whose turn finished before a restart");
+                                continue;
+                            }
+                            // Sent while this harness was down, and replayed by
+                            // the catch-up window rather than delivered live.
+                            let inbound_backlog = buzz_event
+                                .event
+                                .created_at
+                                .as_secs()
+                                .saturating_add(relay::SINCE_SKEW_SECS)
+                                < startup_watermark;
+                            if stale_control_command(&buzz_event.event, kind_u32, &pubkey_hex, inbound_backlog) {
+                                tracing::info!(channel_id = %buzz_event.channel_id, "ignoring a control command sent while the harness was down");
+                                continue;
+                            }
+
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
@@ -3989,7 +4052,7 @@ async fn run_harness(
                                 // into a flooder. A failed lookup is not a
                                 // refusal, so it gets no notice: "not set up to
                                 // take requests from you" would be false.
-                                if gate_notice_due(refusal)
+                                if gate_notice_due(refusal, inbound_backlog)
                                     && remember_gate_notice(
                                         &mut gate_notified,
                                         (inbound_channel_id, inbound_author),
@@ -4083,14 +4146,19 @@ async fn run_harness(
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
                             // decision.
-                            let handling = turn_handling(
-                                config.multiple_event_handling,
-                                &queued,
-                                &queue,
-                                &pubkey_hex,
-                                &ctx,
-                            )
-                            .await;
+                            // Backlog never steers or interrupts a live turn.
+                            let handling = if inbound_backlog {
+                                MultipleEventHandling::Queue
+                            } else {
+                                turn_handling(
+                                    config.multiple_event_handling,
+                                    &queued,
+                                    &queue,
+                                    &pubkey_hex,
+                                    &ctx,
+                                )
+                                .await
+                            };
                             queued.steer_or_interrupt(
                                 handling,
                                 owner_cache.get(),
@@ -4098,7 +4166,11 @@ async fn run_harness(
                                 &mut queue,
                                 &steer_ack_tx,
                             );
-                            if pool_ready {
+                            // The relay replays newest first, so backlog waits
+                            // for the next live event, result or maintenance
+                            // tick: each scope's backlog then goes out as one
+                            // batch in time order.
+                            if pool_ready && !inbound_backlog {
                                 for (scope, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
                                 {
@@ -4657,6 +4729,21 @@ async fn run_harness(
     // explicitly shut them down here to reap child processes. If the grace
     // period expires, remaining tasks are aborted and fall back to
     // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
+    // A turn that still finishes here answered its mentions: record them, or
+    // the restart this shutdown is for would answer them again.
+    let mut finishing: HashMap<usize, Vec<(String, u64)>> = pool
+        .task_map()
+        .values()
+        .map(|meta| (meta.agent_index, turn_mentions(meta, &pubkey_hex)))
+        .collect();
+    let mut record_if_answered = |pr: &PromptResult| {
+        if let (PromptOutcome::Ok(_), Some(finished)) =
+            (&pr.outcome, finishing.remove(&pr.agent.index))
+        {
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            config.catch_up.record(&finished, now);
+        }
+    };
     let (rx_ref, js_ref) = pool.rx_and_join_set();
     let shutdown_result = tokio::time::timeout(grace, async {
         loop {
@@ -4670,6 +4757,7 @@ async fn run_harness(
                 }
                 maybe_result = rx_ref.recv() => {
                     if let Some(mut pr) = maybe_result {
+                        record_if_answered(&pr);
                         let idx = pr.agent.index;
                         pr.agent.acp.shutdown().await;
                         tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
@@ -4687,6 +4775,7 @@ async fn run_harness(
     // Drain any remaining results that arrived after join_set drained but
     // before tasks were aborted.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
+        record_if_answered(&pr);
         let idx = pr.agent.index;
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
@@ -4770,6 +4859,21 @@ fn is_owner_control_command(
     kind_u32 == KIND_STREAM_MESSAGE
         && event.content.trim() == command
         && event_mentions_agent(event, agent_pubkey_hex)
+}
+
+/// A `!shutdown`, `!cancel` or `!rotate` sent while the harness was down is
+/// consumed unexecuted: replayed after a restart, it would stop the agent
+/// that just came back, or cancel a turn it was never about.
+fn stale_control_command(
+    event: &nostr::Event,
+    kind_u32: u32,
+    agent_pubkey_hex: &str,
+    backlog: bool,
+) -> bool {
+    backlog
+        && ["!shutdown", "!cancel", "!rotate"]
+            .iter()
+            .any(|command| is_owner_control_command(event, kind_u32, command, agent_pubkey_hex))
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -5559,8 +5663,10 @@ fn remember_gate_notice(seen: &mut HashSet<(Uuid, String)>, key: (Uuid, String))
 }
 
 /// Whether a gate refusal earns the "not set up to take requests" notice.
-fn gate_notice_due(refusal: Option<GateRefusal>) -> bool {
-    refusal == Some(GateRefusal::Policy)
+/// Never for backlog: a refused mention is replayed on every restart inside
+/// the catch-up window, and the notice memo does not survive one.
+fn gate_notice_due(refusal: Option<GateRefusal>, backlog: bool) -> bool {
+    !backlog && refusal == Some(GateRefusal::Policy)
 }
 
 /// What someone outside the author gate is told.
@@ -5690,6 +5796,24 @@ fn shed_parked_notice() -> String {
          came in on this channel meanwhile that I could not keep holding it. {MAY_BE_DONE} \
          Please send it again."
     )
+}
+
+/// The mentions a turn covered, as `(event id, created_at)` for the catch-up
+/// ledger: its batch, the interrupted events merged into it, and what was
+/// steered into it (stamped now, as only the id is kept).
+fn turn_mentions(meta: &pool::TaskMeta, agent_pubkey_hex: &str) -> Vec<(String, u64)> {
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    meta.recoverable_batch
+        .iter()
+        .flat_map(|batch| batch.events.iter().chain(&batch.cancelled_events))
+        .filter(|be| event_mentions_agent(&be.event, agent_pubkey_hex))
+        .map(|be| (be.event.id.to_hex(), be.event.created_at.as_secs()))
+        .chain(
+            meta.successful_steer_deliveries
+                .iter()
+                .map(|delivery| (delivery.event_id.clone(), now)),
+        )
+        .collect()
 }
 
 /// Dead-letter the parked requests a depth cap had to shed.
@@ -5858,11 +5982,15 @@ fn handle_prompt_result(
     }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
-    let successful_steer_deliveries = pool
+    let meta = pool
         .task_map()
         .values()
-        .find(|meta| meta.agent_index == agent_index)
+        .find(|meta| meta.agent_index == agent_index);
+    let successful_steer_deliveries = meta
         .map(|meta| meta.successful_steer_deliveries.clone())
+        .unwrap_or_default();
+    let mut finished = meta
+        .map(|meta| turn_mentions(meta, &config.keys.public_key().to_hex()))
         .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
@@ -6134,7 +6262,15 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
+        PromptSource::Channel(scope) => {
+            // Done means the queue let go of it: answered, cancelled or
+            // dead-lettered. Requeued, parked or merged events run again.
+            finished.retain(|(id, _)| !queue.holds_event(scope, id));
+            config
+                .catch_up
+                .record(&finished, now.timestamp().max(0) as u64);
+            queue.mark_complete(scope.clone())
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -7425,6 +7561,31 @@ mod owner_control_command_tests {
             "!rotate",
             &agent
         ));
+    }
+
+    #[test]
+    fn backlog_owner_shutdown_is_consumed_not_executed() {
+        let agent = "ab".repeat(32);
+        for command in ["!shutdown", "!cancel", "!rotate"] {
+            let event = make_event(KIND_STREAM_MESSAGE, command, Some(&agent));
+            assert!(
+                stale_control_command(&event, KIND_STREAM_MESSAGE, &agent, true),
+                "a {command} sent while the harness was down must not run after a restart"
+            );
+            assert!(
+                !stale_control_command(&event, KIND_STREAM_MESSAGE, &agent, false),
+                "a live {command} still runs"
+            );
+        }
+        let chat = make_event(
+            KIND_STREAM_MESSAGE,
+            "can you !shutdown the build",
+            Some(&agent),
+        );
+        assert!(
+            !stale_control_command(&chat, KIND_STREAM_MESSAGE, &agent, true),
+            "an ordinary backlog mention is still answered"
+        );
     }
 
     #[test]
@@ -9382,13 +9543,22 @@ mod author_gate_tests {
                 .err();
                 assert_eq!(refusal, Some(expected));
                 assert_eq!(
-                    gate_notice_due(refusal),
+                    gate_notice_due(refusal, false),
                     expected == GateRefusal::Policy,
                     "{expected:?}"
                 );
             }
         }
         server.abort();
+    }
+
+    #[test]
+    fn backlog_refusal_posts_no_notice() {
+        assert!(gate_notice_due(Some(GateRefusal::Policy), false));
+        assert!(
+            !gate_notice_due(Some(GateRefusal::Policy), true),
+            "a refused mention replays on every restart; it must not re-notice each time"
+        );
     }
 
     #[test]
@@ -11355,6 +11525,7 @@ mod build_mcp_servers_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            catch_up: Default::default(),
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -12503,6 +12674,7 @@ mod error_outcome_emission_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             factory: Default::default(),
+            catch_up: Default::default(),
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -12948,6 +13120,132 @@ mod error_outcome_emission_tests {
             .state
             .deliveries
             .contains_key(&scope::SessionScope::Conversation { channel_id }));
+    }
+
+    /// Finish one turn over a batch holding a mention of the agent and a chat
+    /// line that does not mention it, then report which of the two the
+    /// catch-up ledger calls done. `returned` hands the batch back with the
+    /// result, as every failing outcome does.
+    async fn ledger_after(outcome: PromptOutcome, returned: bool) -> (bool, bool) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = test_config();
+        let agent_hex = base.keys.public_key().to_hex();
+        let catch_up = crate::catch_up::CatchUp::open(
+            dir.path(),
+            &agent_hex,
+            &base.relay_url,
+            86_400,
+            chrono::Utc::now().timestamp() as u64,
+        );
+        let config = Config { catch_up, ..base };
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ids = Vec::new();
+        for tags in [vec![nostr::Tag::parse(["p", &agent_hex]).unwrap()], vec![]] {
+            let event = EventBuilder::new(Kind::Custom(9), "hello")
+                .tags(tags)
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            ids.push(event.id.to_hex());
+            queue.push(queue::QueuedEvent {
+                edit: None,
+                channel_id,
+                scope: scope.clone(),
+                event,
+                received_at: std::time::Instant::now(),
+                prompt_tag: "t".into(),
+                parked: false,
+            });
+        }
+        let batch = queue.flush_next().expect("flush the batch");
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "catch-up".into(),
+                recoverable_batch: Some(batch.clone()),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent: dummy_agent(0).await,
+            source: PromptSource::Channel(scope),
+            turn_id: "catch-up".into(),
+            outcome,
+            batch: returned.then_some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut false,
+            &HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+        (
+            config.catch_up.is_done(&ids[0]),
+            config.catch_up.is_done(&ids[1]),
+        )
+    }
+
+    #[tokio::test]
+    async fn ok_turn_records_batch_ids() {
+        assert_eq!(
+            ledger_after(PromptOutcome::Ok(crate::acp::StopReason::EndTurn), false).await,
+            (true, false),
+            "an answered mention is done; a line that never mentioned the agent is not tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn requeued_error_records_nothing() {
+        assert_eq!(
+            ledger_after(PromptOutcome::AgentExited, true).await,
+            (false, false),
+            "a requeued mention runs again, so it is not done"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_timeout_dead_letter_records() {
+        let outcome = PromptOutcome::Timeout(TimeoutKind::Hard {
+            recently_active: false,
+        });
+        assert_eq!(
+            ledger_after(outcome, true).await,
+            (true, false),
+            "a dead-lettered mention was answered with a notice; a restart must not retry it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_requeue_records_nothing() {
+        assert_eq!(
+            ledger_after(PromptOutcome::Cancelled, true).await,
+            (false, false),
+            "a cancelled mention is merged into the next turn, so it is not done"
+        );
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how

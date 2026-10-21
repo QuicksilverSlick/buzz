@@ -56,7 +56,7 @@ const WS_SEND_TIMEOUT_SECS: u64 = 10;
 /// drop after a long healthy run retries at the short end of the ladder again.
 const STABLE_CONNECTION_SECS: u64 = 60;
 /// Seconds subtracted from `since` on resubscribe to tolerate clock skew.
-const SINCE_SKEW_SECS: u64 = 5;
+pub(crate) const SINCE_SKEW_SECS: u64 = 5;
 /// Timeout for the NIP-42 auth handshake steps.
 ///
 /// Raised from 5s to 20s (≈2 RTTs at the observed 10s max round-trip on degraded
@@ -5467,6 +5467,60 @@ mod tests {
             Some(membership_ts),
             "channel_since should use the dynamic replay floor until an event is seen"
         );
+    }
+
+    /// A cold start's catch-up replay reaches the relay as a mentions-only
+    /// REQ from the catch-up timestamp, not from the later startup watermark.
+    #[tokio::test]
+    async fn catch_up_subscribe_sends_mention_req_from_the_catch_up_ts() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let catch_up_ts = 10_000;
+        state.startup_watermark = Some(catch_up_ts + 3_600);
+        let channel_id = Uuid::new_v4();
+        let agent = "ab".repeat(32);
+
+        let sent = execute_connected_command(
+            &mut client,
+            &mut state,
+            &agent,
+            RelayCommand::Subscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+                replay_since: Some(catch_up_ts),
+            },
+        )
+        .await;
+
+        assert!(sent);
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[2]["since"], catch_up_ts - SINCE_SKEW_SECS);
+        assert_eq!(frame[2]["#p"], serde_json::json!([agent]));
+    }
+
+    /// A socket drop before any event arrived resubscribes from the catch-up
+    /// timestamp too, so the backlog is not cut short by a reconnect.
+    #[test]
+    fn reconnect_without_last_seen_replays_from_catch_up_ts() {
+        let mut state = BgState::new();
+        state.startup_watermark = Some(13_600);
+        let channel_id = Uuid::new_v4();
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::Subscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+                replay_since: Some(10_000),
+            },
+        );
+        assert_eq!(state.channel_since(&channel_id), Some(10_000));
     }
 
     /// Membership dedup must NOT contaminate per-channel `last_seen`.
