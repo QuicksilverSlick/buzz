@@ -729,8 +729,12 @@ pub struct Config {
     /// Harness-wide failure state: classes, parks and who has been told.
     pub(crate) factory: crate::factory::FactoryHandle,
     /// Which mentions' turns finished, across restarts, and how far back a
-    /// cold start replays.
+    /// cold start replays. Opened by the listener only (`run_harness`), so a
+    /// one-shot task or setup run never writes a ledger.
     pub(crate) catch_up: crate::catch_up::CatchUp,
+    /// Seconds of mentions a cold start replays (`--catch-up-window`, capped
+    /// at 7 days); 0 = off.
+    pub(crate) catch_up_window: u64,
     /// How often to check every login's Claude sign-in; `0` disables it.
     pub factory_signin_check_secs: u64,
     /// The command line that texts the owner when a Critical opens.
@@ -1353,7 +1357,7 @@ impl Config {
                 }
                 parsed
             }),
-            bench: args.factory_bench_dir.clone().or_else(default_bench_dir),
+            bench: args.factory_bench_dir.or_else(default_bench_dir),
         };
         // A harness that stopped mid-outage comes back up in it, so the
         // all-clear it owes the owner still goes out (M2 item 4).
@@ -1367,23 +1371,6 @@ impl Config {
             7 * 86_400
         } else {
             args.catch_up_window
-        };
-        // Beside the Bench root. Tests build many configs, so only one that
-        // names its bench folder gets a ledger: none writes into the real home.
-        let catch_up_dir = args
-            .factory_bench_dir
-            .or_else(|| (!cfg!(test)).then(default_bench_dir).flatten())
-            .and_then(|bench| Some(bench.parent()?.join("agent-state")));
-        // Drop mode keeps no batch to know a turn finished, so nothing replays.
-        let catch_up = match catch_up_dir {
-            Some(dir) if matches!(args.dedup, DedupMode::Queue) => crate::catch_up::CatchUp::open(
-                &dir,
-                &keys.public_key().to_hex(),
-                &args.relay_url,
-                catch_up_window,
-                chrono::Utc::now().timestamp().max(0) as u64,
-            ),
-            _ => Default::default(),
         };
 
         let config = Config {
@@ -1439,7 +1426,8 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             factory,
-            catch_up,
+            catch_up: Default::default(),
+            catch_up_window,
             factory_signin_check_secs: args.factory_signin_check_secs,
             factory_alert_cmd: args
                 .factory_alert_cmd
@@ -1837,6 +1825,7 @@ mod tests {
             base_prompt_content: None,
             factory: Default::default(),
             catch_up: Default::default(),
+            catch_up_window: 0,
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -3317,9 +3306,6 @@ channels = "ALL"
             TEST_PRIVATE_KEY,
             "--factory-bench-dir",
             missing.to_str().expect("utf-8 temp dir"),
-            // No catch-up ledger beside it, in the shared temp folder.
-            "--catch-up-window",
-            "0",
         ])
         .expect("clap should parse args");
         let config = Config::from_args(args).expect("from_args should accept the folder");
@@ -3328,56 +3314,24 @@ channels = "ALL"
 
     #[test]
     fn catch_up_window_defaults_to_24h_and_caps_at_7d() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let bench = dir.path().join("bench");
         let config_with = |extra: &[&str]| {
-            let mut argv = vec![
-                "buzz-acp",
-                "--private-key",
-                TEST_PRIVATE_KEY,
-                "--factory-bench-dir",
-                bench.to_str().expect("utf-8 temp dir"),
-            ];
+            let mut argv = vec!["buzz-acp", "--private-key", TEST_PRIVATE_KEY];
             argv.extend_from_slice(extra);
             Config::from_args(CliArgs::try_parse_from(argv).expect("clap should parse args"))
                 .expect("from_args should accept the window")
         };
-        assert_eq!(config_with(&[]).catch_up.window(), Some(86_400));
+        let config = config_with(&[]);
+        assert_eq!(config.catch_up_window, 86_400);
         assert_eq!(
-            config_with(&["--catch-up-window", "2592000"])
-                .catch_up
-                .window(),
-            Some(7 * 86_400)
+            config.catch_up.since(u64::MAX),
+            None,
+            "from_args never opens the ledger: a one-shot task must not write one"
         );
         assert_eq!(
-            config_with(&["--catch-up-window", "0"]).catch_up.window(),
-            None
+            config_with(&["--catch-up-window", "2592000"]).catch_up_window,
+            7 * 86_400
         );
-        assert!(
-            dir.path().join("agent-state").is_dir(),
-            "the ledger sits beside the Bench root"
-        );
-    }
-
-    #[test]
-    fn drop_dedup_disables_catch_up() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let bench = dir.path().join("bench");
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            TEST_PRIVATE_KEY,
-            "--factory-bench-dir",
-            bench.to_str().expect("utf-8 temp dir"),
-            "--dedup",
-            "drop",
-            "--multiple-event-handling",
-            "queue",
-        ])
-        .expect("clap should parse args");
-        let config = Config::from_args(args).expect("from_args should accept drop mode");
-        assert_eq!(config.catch_up.since(u64::MAX), None);
-        assert!(!dir.path().join("agent-state").exists());
+        assert_eq!(config_with(&["--catch-up-window", "0"]).catch_up_window, 0);
     }
 
     #[test]

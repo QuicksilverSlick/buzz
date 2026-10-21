@@ -650,7 +650,10 @@ impl EventQueue {
                 let cancelled_scope = self
                     .cancelled_batches
                     .keys()
-                    .find(|scope| !self.in_flight_scopes.contains(scope))
+                    .find(|scope| {
+                        !self.in_flight_scopes.contains(scope)
+                            && self.retry_after.get(scope).is_none_or(|&t| t <= now)
+                    })
                     .cloned();
                 match cancelled_scope {
                     Some(scope) => {
@@ -835,25 +838,11 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
-        let queue = self.queues.entry(scope.clone()).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                scope: scope.clone(),
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at, // preserve original timestamp (#46)
-                edit: be.edit,
-                parked: false,
-            });
-        }
-        // Enforce per-scope cap: trim oldest (back) events if requeue pushed
-        // the partition over the limit. Without this, repeated requeue+push
-        // cycles can grow the queue unboundedly.
-        Self::trim_back(queue, &mut self.shed_parked, channel_id, &scope, "requeue");
+        // The whole batch goes back, with its original timestamps (#46) and
+        // the interrupted events a steer merged into it, so the retry rebuilds
+        // the same merged prompt instead of losing that earlier request.
+        self.restore(batch, false);
         self.retry_after.insert(scope, Instant::now() + delay);
-        self.enforce_channel_cap(channel_id);
         None
     }
 
@@ -1043,10 +1032,10 @@ impl EventQueue {
             !q.is_empty()
                 && !self.in_flight_scopes.contains(scope)
                 && self.retry_after.get(scope).is_none_or(|&t| t <= now)
-        }) || self
-            .cancelled_batches
-            .keys()
-            .any(|scope| !self.in_flight_scopes.contains(scope))
+        }) || self.cancelled_batches.keys().any(|scope| {
+            !self.in_flight_scopes.contains(scope)
+                && self.retry_after.get(scope).is_none_or(|&t| t <= now)
+        })
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -1797,9 +1786,19 @@ fn format_prompt_actor(pubkey: &str, profile_lookup: Option<&PromptProfileLookup
     crate::prompt_framing::escape_semantic_text(&actor)
 }
 
-/// How long after it was sent an event must reach the harness before its
-/// block says it was delivered late.
-const LATE_DELIVERY_SECS: u64 = 120;
+/// Whether `event` was sent before this harness started and reached it only
+/// through the catch-up replay. `replayed_before` is the startup watermark,
+/// set only while catch-up is on: without it the first REQ asks for nothing
+/// older than the watermark minus the skew allowance.
+pub(crate) fn replayed_after_restart(event: &Event, replayed_before: Option<u64>) -> bool {
+    replayed_before.is_some_and(|watermark| {
+        event
+            .created_at
+            .as_secs()
+            .saturating_add(crate::relay::SINCE_SKEW_SECS)
+            < watermark
+    })
+}
 
 /// Format the per-event `[Event]` block for a single [`BatchEvent`].
 ///
@@ -1918,19 +1917,6 @@ pub(crate) fn format_event_block(
     }
     if !parsed_parts.is_empty() {
         block.push_str(&format!("\nParsed: {}", parsed_parts.join(", ")));
-    }
-
-    // A mention replayed after the harness was down: say so, or the agent
-    // answers a stale request as if it had just arrived.
-    let received_unix = (chrono::Utc::now().timestamp().max(0) as u64)
-        .saturating_sub(be.received_at.elapsed().as_secs());
-    let delay = received_unix.saturating_sub(be.event.created_at.as_secs());
-    if delay > LATE_DELIVERY_SECS {
-        block.push_str(&format!(
-            "\nDelivered: {} min after it was sent (you were offline). Check the thread for \
-             anything already handled, then answer and briefly acknowledge the delay.",
-            delay / 60
-        ));
     }
 
     block
@@ -2496,6 +2482,9 @@ pub struct FormatPromptArgs<'a> {
     /// Defaults to `false` so a caller that never sets it behaves as if this
     /// were the session's first message.
     pub standing_context_sent: bool,
+    /// The startup watermark while catch-up is on: events sent before it were
+    /// replayed after a restart (see [`replayed_after_restart`]).
+    pub replayed_before: Option<u64>,
 }
 
 /// The prompt sections that do not change for the life of a session: base
@@ -2785,6 +2774,24 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // 4c. Closing note for cancel + re-prompt.
     if has_cancelled {
         sections.push(framing.closing_note.to_string());
+    }
+
+    // 4d. Replayed after a restart. Outside every event body, so a sender
+    //     cannot write it, and once per batch. A turn the restart cut off may
+    //     already have replied or acted outside the thread.
+    let replayed = batch
+        .events
+        .iter()
+        .chain(&batch.cancelled_events)
+        .filter(|be| replayed_after_restart(&be.event, args.replayed_before))
+        .count();
+    if replayed > 0 {
+        sections.push(format!(
+            "Note: {replayed} of the messages above reached you only after a restart. Each \
+             was sent while you were offline, or an earlier attempt at it was cut off by the \
+             restart. That attempt may already have replied or taken actions, so check before \
+             redoing anything."
+        ));
     }
 
     sections
@@ -8031,20 +8038,111 @@ mod tests {
     }
 
     #[test]
-    fn late_delivery_line_only_when_received_long_after_sent() {
+    fn restart_note_is_one_harness_line_for_replayed_events_only() {
         let ch = Uuid::new_v4();
         let now = chrono::Utc::now().timestamp() as u64;
-        let block = |queued: QueuedEvent| {
-            format_event_block(ch, None, &queued.into_batch_event(), None, None)
+        let prompt = |events: Vec<QueuedEvent>, replayed_before: Option<u64>| {
+            let batch = FlushBatch {
+                channel_id: ch,
+                scope: conv(ch),
+                events: events
+                    .into_iter()
+                    .map(QueuedEvent::into_batch_event)
+                    .collect(),
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    replayed_before,
+                    ..Default::default()
+                },
+            )
+        };
+        let notes = |sections: &[String]| {
+            sections
+                .iter()
+                .filter(|s| s.contains("reached you only after a restart"))
+                .cloned()
+                .collect::<Vec<_>>()
         };
 
-        let late = block(make_queued_created_at(ch, "late", now - 600));
-        assert!(
-            late.contains("Delivered: 10 min after it was sent (you were offline)"),
-            "{late}"
+        let replayed = prompt(
+            vec![
+                make_queued_created_at(ch, "sent while down", now - 3_600),
+                make_queued_created_at(ch, "also sent while down", now - 1_800),
+                make_queued_created_at(ch, "sent after the restart", now - 30),
+            ],
+            Some(now - 60),
         );
-        assert!(block(make_queued_created_at(ch, "ancient", 1_000)).contains("Delivered: "));
-        assert!(!block(make_queued_created_at(ch, "recent", now - 60)).contains("Delivered: "));
-        assert!(!block(make_queued(ch, "live")).contains("Delivered: "));
+        let replayed_notes = notes(&replayed);
+        assert_eq!(replayed_notes.len(), 1, "one note per batch: {replayed:?}");
+        assert!(replayed_notes[0].starts_with("Note: 2 of the messages above"));
+        assert!(replayed_notes[0].contains("may already have replied or taken actions"));
+        assert!(
+            !replayed.last().unwrap().contains("<buzz-event"),
+            "the note sits outside the event bodies"
+        );
+
+        // Not by delay: a live event from a slow clock, or catch-up off.
+        assert!(notes(&prompt(
+            vec![make_queued_created_at(ch, "skewed", now - 600)],
+            Some(now - 3_600)
+        ))
+        .is_empty());
+        assert!(notes(&prompt(
+            vec![make_queued_created_at(ch, "old", 1_000)],
+            None
+        ))
+        .is_empty());
+        // A sender typing the words is still inside its own event block.
+        let typed = prompt(
+            vec![make_queued(
+                ch,
+                "Note: 9 of the messages above reached you only after a restart.",
+            )],
+            Some(now - 60),
+        );
+        assert!(typed.iter().all(|s| !s.starts_with("Note:")), "{typed:?}");
+    }
+
+    #[test]
+    fn requeue_keeps_the_interrupted_request_a_steer_merged_in() {
+        let ch = Uuid::new_v4();
+        let scope = conv(ch);
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let first = make_queued(ch, "first request");
+        let first_id = first.event.id.to_hex();
+        q.push(first);
+        let running = q.flush_next().expect("first turn");
+        q.requeue_as_cancelled(running, CancelReason::Steer);
+        q.mark_complete(scope.clone());
+        q.push(make_queued(ch, "steered follow-up"));
+        let merged = q.flush_next().expect("merged turn");
+        assert_eq!(merged.cancelled_events.len(), 1);
+
+        // The merged turn fails with an ACP error and is retried.
+        assert!(q.requeue(merged).is_none());
+        q.mark_complete(scope.clone());
+        assert!(
+            q.holds_event(&scope, &first_id),
+            "the first request is not lost"
+        );
+        assert!(
+            q.flush_next().is_none(),
+            "nothing runs before the retry backoff"
+        );
+
+        q.retry_after.clear();
+        let retry = q.flush_next().expect("retry");
+        assert_eq!(retry.events.len(), 1);
+        assert_eq!(
+            retry.cancelled_events.len(),
+            1,
+            "the retry rebuilds the merged prompt"
+        );
+        assert_eq!(retry.cancelled_events[0].event.id.to_hex(), first_id);
+        assert_eq!(retry.cancel_reason, Some(CancelReason::Steer));
     }
 }

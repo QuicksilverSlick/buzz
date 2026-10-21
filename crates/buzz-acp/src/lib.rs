@@ -2845,6 +2845,25 @@ fn catch_up_replay_since(
         .map(|since| since.min(startup_watermark))
 }
 
+/// The listener's catch-up ledger, beside the Bench root
+/// (`~/.dreamforge[-dev]/agent-state`). Off without a Bench root, with a
+/// zero window, or in drop mode, which keeps no batch to know a turn finished.
+fn open_catch_up(config: &Config, now: u64) -> catch_up::CatchUp {
+    let bench = config.factory.lock().reporting.bench.clone();
+    match bench.as_deref().and_then(std::path::Path::parent) {
+        Some(root) if matches!(config.dedup_mode, config::DedupMode::Queue) => {
+            catch_up::CatchUp::open(
+                &root.join("agent-state"),
+                &config.keys.public_key().to_hex(),
+                &config.relay_url,
+                config.catch_up_window,
+                now,
+            )
+        }
+        _ => Default::default(),
+    }
+}
+
 #[cfg(test)]
 mod replay_floor_tests {
     use super::{catch_up_replay_since, startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
@@ -2899,6 +2918,35 @@ mod replay_floor_tests {
     #[test]
     fn non_mention_filter_gets_no_catch_up() {
         assert_eq!(catch_up_replay_since(Some(NOW - 3600), NOW, false), None);
+    }
+
+    #[test]
+    fn listener_ledger_sits_beside_the_bench_root_in_queue_mode_only() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bench = dir.path().join("bench");
+        let open = |extra: &[&str]| {
+            let mut argv = vec![
+                "buzz-acp",
+                "--private-key",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "--factory-bench-dir",
+                bench.to_str().expect("utf-8 temp dir"),
+            ];
+            argv.extend_from_slice(extra);
+            let args = crate::config::CliArgs::try_parse_from(argv).expect("clap should parse");
+            let config = crate::config::Config::from_args(args).expect("valid config");
+            super::open_catch_up(&config, NOW)
+        };
+
+        assert_eq!(
+            open(&["--dedup", "drop", "--multiple-event-handling", "queue"]).since(NOW),
+            None
+        );
+        assert_eq!(open(&["--catch-up-window", "0"]).since(NOW), None);
+        assert!(!dir.path().join("agent-state").exists());
+        assert_eq!(open(&[]).since(NOW), Some(NOW));
+        assert!(dir.path().join("agent-state").is_dir());
     }
 }
 
@@ -3023,11 +3071,12 @@ async fn tokio_main() -> Result<()> {
 }
 
 async fn run_harness(
-    config: Config,
+    mut config: Config,
     shutdown_tx: watch::Sender<()>,
     mut shutdown_rx: watch::Receiver<()>,
     startup_ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
+    config.catch_up = open_catch_up(&config, chrono::Utc::now().timestamp().max(0) as u64);
     let runtime = AgentRuntime::prepare(config)?;
     let config = runtime.config();
 
@@ -3255,11 +3304,13 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
+    let mut ctx = runtime.prompt_context(
         relay.rest_client(),
         channel_info_map,
         SessionMode::Conversation,
-    )?);
+    )?;
+    ctx.replayed_before = catch_up_since.map(|_| startup_watermark);
+    let ctx = Arc::new(ctx);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -3850,22 +3901,24 @@ async fn run_harness(
                                 continue;
                             }
 
-                            if config.catch_up.is_done(&buzz_event.event.id.to_hex()) {
-                                tracing::debug!(channel_id = %buzz_event.channel_id, "dropping a mention whose turn finished before a restart");
-                                continue;
-                            }
-                            // Sent while this harness was down, and replayed by
-                            // the catch-up window rather than delivered live.
-                            let inbound_backlog = buzz_event
-                                .event
-                                .created_at
-                                .as_secs()
-                                .saturating_add(relay::SINCE_SKEW_SECS)
-                                < startup_watermark;
-                            if stale_control_command(&buzz_event.event, kind_u32, &pubkey_hex, inbound_backlog) {
-                                tracing::info!(channel_id = %buzz_event.channel_id, "ignoring a control command sent while the harness was down");
-                                continue;
-                            }
+                            let inbound_backlog = match catch_up_intake(
+                                &buzz_event.event,
+                                kind_u32,
+                                &pubkey_hex,
+                                &config.catch_up,
+                                ctx.replayed_before,
+                                chrono::Utc::now().timestamp().max(0) as u64,
+                                is_owner_huddle(buzz_event.channel_id, &ctx),
+                            )
+                            .await
+                            {
+                                Intake::Live => false,
+                                Intake::Backlog => true,
+                                Intake::Skip(why) => {
+                                    tracing::debug!(channel_id = %buzz_event.channel_id, "dropping an event: {why}");
+                                    continue;
+                                }
+                            };
 
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
@@ -4032,6 +4085,8 @@ async fn run_harness(
                             let inbound_kind = buzz_event.event.kind.as_u16();
                             let inbound_author = buzz_event.event.pubkey.to_hex();
                             let inbound_thread_tags = queue::parse_thread_tags(&buzz_event.event);
+                            let inbound_mention = event_mentions_agent(&buzz_event.event, &pubkey_hex)
+                                .then(|| (buzz_event.event.id.to_hex(), buzz_event.event.created_at.as_secs()));
                             let authorized = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -4043,6 +4098,12 @@ async fn run_harness(
                             )
                             .await;
                             let refusal = authorized.as_ref().err().copied();
+                            // Refused under the policy it was sent under: a
+                            // later respond-to change restarts the agent and
+                            // must not reopen it. A failed lookup retries.
+                            if let (Some(GateRefusal::Policy), Some((id, sent))) = (refusal, inbound_mention) {
+                                config.catch_up.note_refused(id, sent);
+                            }
                             let Ok(authorized_event) = authorized else {
                                 // The gate logs the drop at debug, which leaves
                                 // the sender waiting on an answer that will never
@@ -4167,9 +4228,12 @@ async fn run_harness(
                                 &steer_ack_tx,
                             );
                             // The relay replays newest first, so backlog waits
-                            // for the next live event, result or maintenance
-                            // tick: each scope's backlog then goes out as one
-                            // batch in time order.
+                            // for the next live event, result, lazy wake or
+                            // maintenance tick, by which time a scope's replay
+                            // has usually all arrived and goes out as one
+                            // batch, sorted oldest first. A dispatch that lands
+                            // mid-replay splits it: nothing is lost, but the
+                            // newer part is answered first.
                             if pool_ready && !inbound_backlog {
                                 for (scope, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
@@ -4730,16 +4794,21 @@ async fn run_harness(
     // period expires, remaining tasks are aborted and fall back to
     // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
     // A turn that still finishes here answered its mentions: record them, or
-    // the restart this shutdown is for would answer them again.
+    // the restart after this shutdown answers them again. Only this process's
+    // own shutdown (Ctrl-C, SIGTERM, an owner `!shutdown`, the inactivity
+    // bound) gets here: the desktop kills an agent's whole process tree at
+    // once, so a turn it cuts off is replayed, and the prompt's restart note
+    // tells the agent to check what that turn already did.
     let mut finishing: HashMap<usize, Vec<(String, u64)>> = pool
         .task_map()
         .values()
         .map(|meta| (meta.agent_index, turn_mentions(meta, &pubkey_hex)))
         .collect();
     let mut record_if_answered = |pr: &PromptResult| {
-        if let (PromptOutcome::Ok(_), Some(finished)) =
-            (&pr.outcome, finishing.remove(&pr.agent.index))
-        {
+        if let (true, Some(finished)) = (
+            answered_at_shutdown(&pr.outcome),
+            finishing.remove(&pr.agent.index),
+        ) {
             let now = chrono::Utc::now().timestamp().max(0) as u64;
             config.catch_up.record(&finished, now);
         }
@@ -4861,19 +4930,67 @@ fn is_owner_control_command(
         && event_mentions_agent(event, agent_pubkey_hex)
 }
 
-/// A `!shutdown`, `!cancel` or `!rotate` sent while the harness was down is
-/// consumed unexecuted: replayed after a restart, it would stop the agent
-/// that just came back, or cancel a turn it was never about.
-fn stale_control_command(
+/// Whether a turn that returned during the shutdown drain answered its
+/// mentions. A turn the shutdown itself cancelled did not, nor a refusal.
+fn answered_at_shutdown(outcome: &PromptOutcome) -> bool {
+    matches!(
+        outcome,
+        PromptOutcome::Ok(
+            acp::StopReason::EndTurn
+                | acp::StopReason::MaxTokens
+                | acp::StopReason::MaxTurnRequests
+        )
+    )
+}
+
+/// How long huddle talk may wait out a restart and still be answered. Older
+/// voice talk went to a call that has likely ended.
+const HUDDLE_BACKLOG_MAX_AGE_SECS: u64 = 180;
+
+/// What the listener does with a channel event before the author gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intake {
+    /// Delivered live: steered and dispatched as configured.
+    Live,
+    /// Replayed after a restart: queued only, never steering a live turn.
+    Backlog,
+    /// Dropped, for the reason given.
+    Skip(&'static str),
+}
+
+/// Sort one event at intake. An event whose turn already finished, in this run
+/// or before a restart, is dropped. Of what a restart replayed:
+/// - a `!shutdown`, `!cancel` or `!rotate` is consumed unexecuted, or it would
+///   stop the agent that just came back, or cancel a turn it was never about;
+/// - talk in the owner's huddle older than [`HUDDLE_BACKLOG_MAX_AGE_SECS`] is
+///   dropped, as the desktop p-tags every agent on every utterance and the
+///   call has likely ended. `in_owner_huddle` is only awaited for that.
+async fn catch_up_intake(
     event: &nostr::Event,
     kind_u32: u32,
     agent_pubkey_hex: &str,
-    backlog: bool,
-) -> bool {
-    backlog
-        && ["!shutdown", "!cancel", "!rotate"]
-            .iter()
-            .any(|command| is_owner_control_command(event, kind_u32, command, agent_pubkey_hex))
+    catch_up: &catch_up::CatchUp,
+    replayed_before: Option<u64>,
+    now: u64,
+    in_owner_huddle: impl std::future::Future<Output = bool>,
+) -> Intake {
+    if catch_up.is_done(&event.id.to_hex()) {
+        return Intake::Skip("its turn already finished");
+    }
+    if !queue::replayed_after_restart(event, replayed_before) {
+        return Intake::Live;
+    }
+    if ["!shutdown", "!cancel", "!rotate"]
+        .iter()
+        .any(|command| is_owner_control_command(event, kind_u32, command, agent_pubkey_hex))
+    {
+        return Intake::Skip("a control command sent while the harness was down");
+    }
+    let sent = event.created_at.as_secs();
+    if sent.saturating_add(HUDDLE_BACKLOG_MAX_AGE_SECS) < now && in_owner_huddle.await {
+        return Intake::Skip("huddle talk from before a restart");
+    }
+    Intake::Backlog
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -5800,18 +5917,26 @@ fn shed_parked_notice() -> String {
 
 /// The mentions a turn covered, as `(event id, created_at)` for the catch-up
 /// ledger: its batch, the interrupted events merged into it, and what was
-/// steered into it (stamped now, as only the id is kept).
+/// steered into it. Only a steer's id is kept, so it is stamped with the
+/// batch's newest send time (it was sent later) rather than the local clock,
+/// which the ledger's pruning must not depend on.
 fn turn_mentions(meta: &pool::TaskMeta, agent_pubkey_hex: &str) -> Vec<(String, u64)> {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    meta.recoverable_batch
-        .iter()
-        .flat_map(|batch| batch.events.iter().chain(&batch.cancelled_events))
+    let events = || {
+        meta.recoverable_batch
+            .iter()
+            .flat_map(|batch| batch.events.iter().chain(&batch.cancelled_events))
+    };
+    let newest = events()
+        .map(|be| be.event.created_at.as_secs())
+        .max()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp().max(0) as u64);
+    events()
         .filter(|be| event_mentions_agent(&be.event, agent_pubkey_hex))
         .map(|be| (be.event.id.to_hex(), be.event.created_at.as_secs()))
         .chain(
             meta.successful_steer_deliveries
                 .iter()
-                .map(|delivery| (delivery.event_id.clone(), now)),
+                .map(|delivery| (delivery.event_id.clone(), newest)),
         )
         .collect()
 }
@@ -7564,28 +7689,92 @@ mod owner_control_command_tests {
     }
 
     #[test]
-    fn backlog_owner_shutdown_is_consumed_not_executed() {
+    fn shutdown_drain_records_only_answered_turns() {
+        use crate::acp::StopReason;
+        assert!(answered_at_shutdown(&PromptOutcome::Ok(
+            StopReason::EndTurn
+        )));
+        assert!(answered_at_shutdown(&PromptOutcome::Ok(
+            StopReason::MaxTokens
+        )));
+        assert!(answered_at_shutdown(&PromptOutcome::Ok(
+            StopReason::MaxTurnRequests
+        )));
+        assert!(!answered_at_shutdown(&PromptOutcome::Ok(
+            StopReason::Cancelled
+        )));
+        assert!(!answered_at_shutdown(&PromptOutcome::Ok(
+            StopReason::Refusal
+        )));
+        assert!(!answered_at_shutdown(&PromptOutcome::Cancelled));
+        assert!(!answered_at_shutdown(&PromptOutcome::AgentExited));
+    }
+
+    #[tokio::test]
+    async fn catch_up_intake_table() {
         let agent = "ab".repeat(32);
-        for command in ["!shutdown", "!cancel", "!rotate"] {
-            let event = make_event(KIND_STREAM_MESSAGE, command, Some(&agent));
-            assert!(
-                stale_control_command(&event, KIND_STREAM_MESSAGE, &agent, true),
-                "a {command} sent while the harness was down must not run after a restart"
-            );
-            assert!(
-                !stale_control_command(&event, KIND_STREAM_MESSAGE, &agent, false),
-                "a live {command} still runs"
-            );
-        }
-        let chat = make_event(
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mention = make_event(
             KIND_STREAM_MESSAGE,
             "can you !shutdown the build",
             Some(&agent),
         );
-        assert!(
-            !stale_control_command(&chat, KIND_STREAM_MESSAGE, &agent, true),
-            "an ordinary backlog mention is still answered"
-        );
+        let shutdown = make_event(KIND_STREAM_MESSAGE, "!shutdown", Some(&agent));
+        let done = make_event(KIND_STREAM_MESSAGE, "answered already", Some(&agent));
+        let sent = mention.created_at.as_secs();
+        let catch_up = crate::catch_up::CatchUp::open(dir.path(), &agent, "wss://r", 86_400, sent);
+        catch_up.record(&[(done.id.to_hex(), done.created_at.as_secs())], sent);
+
+        // (event, harness started at, now, owner huddle, expected)
+        let restarted = Some(sent + 600);
+        let cases = [
+            (&mention, None, sent + 600, false, Intake::Live),
+            (&mention, Some(sent), sent, false, Intake::Live),
+            (&shutdown, Some(sent), sent, false, Intake::Live),
+            (&mention, restarted, sent + 600, false, Intake::Backlog),
+            (&mention, Some(sent + 60), sent + 60, true, Intake::Backlog),
+            (
+                &mention,
+                restarted,
+                sent + 600,
+                true,
+                Intake::Skip("huddle talk from before a restart"),
+            ),
+            (
+                &shutdown,
+                restarted,
+                sent + 600,
+                false,
+                Intake::Skip("a control command sent while the harness was down"),
+            ),
+            (
+                &done,
+                restarted,
+                sent + 600,
+                false,
+                Intake::Skip("its turn already finished"),
+            ),
+            (
+                &done,
+                Some(sent),
+                sent,
+                false,
+                Intake::Skip("its turn already finished"),
+            ),
+        ];
+        for (i, (event, replayed_before, now, huddle, expected)) in cases.into_iter().enumerate() {
+            let got = catch_up_intake(
+                event,
+                KIND_STREAM_MESSAGE,
+                &agent,
+                &catch_up,
+                replayed_before,
+                now,
+                std::future::ready(huddle),
+            )
+            .await;
+            assert_eq!(got, expected, "case {i}");
+        }
     }
 
     #[test]
@@ -11526,6 +11715,7 @@ mod build_mcp_servers_tests {
             base_prompt_content: None,
             factory: Default::default(),
             catch_up: Default::default(),
+            catch_up_window: 0,
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -12675,6 +12865,7 @@ mod error_outcome_emission_tests {
             base_prompt_content: None,
             factory: Default::default(),
             catch_up: Default::default(),
+            catch_up_window: 0,
             factory_signin_check_secs: 0,
             factory_alert_cmd: None,
             factory_alert_sms_to: None,
@@ -13125,8 +13316,10 @@ mod error_outcome_emission_tests {
     /// Finish one turn over a batch holding a mention of the agent and a chat
     /// line that does not mention it, then report which of the two the
     /// catch-up ledger calls done. `returned` hands the batch back with the
-    /// result, as every failing outcome does.
-    async fn ledger_after(outcome: PromptOutcome, returned: bool) -> (bool, bool) {
+    /// result, as every failing outcome does. `merged` runs the mention first
+    /// and steers the chat line into it, so the mention rides as the merged
+    /// turn's interrupted request.
+    async fn ledger_after(outcome: PromptOutcome, returned: bool, merged: bool) -> (bool, bool) {
         let dir = tempfile::tempdir().expect("temp dir");
         let base = test_config();
         let agent_hex = base.keys.public_key().to_hex();
@@ -13157,6 +13350,11 @@ mod error_outcome_emission_tests {
                 prompt_tag: "t".into(),
                 parked: false,
             });
+            if merged && ids.len() == 1 {
+                let first = queue.flush_next().expect("the mention's own turn");
+                queue.requeue_as_cancelled(first, queue::CancelReason::Steer);
+                queue.mark_complete(scope.clone());
+            }
         }
         let batch = queue.flush_next().expect("flush the batch");
 
@@ -13212,7 +13410,12 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn ok_turn_records_batch_ids() {
         assert_eq!(
-            ledger_after(PromptOutcome::Ok(crate::acp::StopReason::EndTurn), false).await,
+            ledger_after(
+                PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+                false,
+                false
+            )
+            .await,
             (true, false),
             "an answered mention is done; a line that never mentioned the agent is not tracked"
         );
@@ -13221,7 +13424,7 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn requeued_error_records_nothing() {
         assert_eq!(
-            ledger_after(PromptOutcome::AgentExited, true).await,
+            ledger_after(PromptOutcome::AgentExited, true, false).await,
             (false, false),
             "a requeued mention runs again, so it is not done"
         );
@@ -13233,7 +13436,7 @@ mod error_outcome_emission_tests {
             recently_active: false,
         });
         assert_eq!(
-            ledger_after(outcome, true).await,
+            ledger_after(outcome, true, false).await,
             (true, false),
             "a dead-lettered mention was answered with a notice; a restart must not retry it"
         );
@@ -13242,9 +13445,28 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn cancel_requeue_records_nothing() {
         assert_eq!(
-            ledger_after(PromptOutcome::Cancelled, true).await,
+            ledger_after(PromptOutcome::Cancelled, true, false).await,
             (false, false),
             "a cancelled mention is merged into the next turn, so it is not done"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_turn_error_keeps_the_interrupted_mention() {
+        assert_eq!(
+            ledger_after(PromptOutcome::AgentExited, true, true).await,
+            (false, false),
+            "the retry carries the interrupted mention, so it is not done"
+        );
+        assert_eq!(
+            ledger_after(
+                PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+                false,
+                true
+            )
+            .await,
+            (true, false),
+            "an answered merged turn answered its interrupted mention too"
         );
     }
 

@@ -4,7 +4,8 @@
 //! sent during a reboot, an app restart or a crash sat on the relay and was
 //! never asked for again. The harness now replays a bounded window of
 //! mentions on startup and keeps one small file per agent and relay naming
-//! the mentions whose turn finished, so a restart never answers one twice.
+//! the mentions whose turn finished or that the author gate refused, so a
+//! restart never answers one twice or reopens a refusal.
 //!
 //! The file sits beside the Bench root (`~/.dreamforge/agent-state`), is
 //! written beside its name and renamed into place, and carries a `floor`:
@@ -12,16 +13,22 @@
 //! the upgrade itself cannot re-answer mentions handled before it.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Extra time a finished id is kept past the window, so a mention sent just
 /// inside the window is still known as done when it is replayed.
 const PRUNE_MARGIN_SECS: u64 = 3600;
 
+/// How long a refused mention waits in memory before the ledger is saved for
+/// it, so a noisy sender cannot force a write per message.
+pub(crate) const REFUSED_SAVE_DELAY: Duration = Duration::from_secs(10);
+
 /// The catch-up ledger, or nothing when catch-up is off.
 #[derive(Debug, Default)]
-pub(crate) struct CatchUp(Option<Mutex<Ledger>>);
+pub(crate) struct CatchUp(Option<Arc<Mutex<Ledger>>>);
 
 #[derive(Debug)]
 struct Ledger {
@@ -30,6 +37,8 @@ struct Ledger {
     floor: u64,
     /// Finished event id (hex) and its `created_at`.
     done: HashMap<String, u64>,
+    /// Ids added since the last save, with a save already scheduled.
+    unsaved: bool,
 }
 
 impl CatchUp {
@@ -65,6 +74,7 @@ impl CatchUp {
                             .collect()
                     })
                     .unwrap_or_default(),
+                unsaved: false,
             },
             missing_or_corrupt => {
                 // Replaying from an unknown point could re-answer anything,
@@ -74,17 +84,18 @@ impl CatchUp {
                 } else {
                     tracing::info!(path = %path.display(), "starting the catch-up ledger; mentions sent before now are not replayed");
                 }
-                let ledger = Ledger {
+                let mut ledger = Ledger {
                     path,
                     window,
                     floor: now,
                     done: HashMap::new(),
+                    unsaved: false,
                 };
                 ledger.save();
                 ledger
             }
         };
-        Self(Some(Mutex::new(ledger)))
+        Self(Some(Arc::new(Mutex::new(ledger))))
     }
 
     /// Where a cold start replays mentions from: the window, never before
@@ -111,19 +122,46 @@ impl CatchUp {
         };
         let mut ledger = lock(ledger);
         ledger.done.extend(finished.iter().cloned());
-        let keep_from = now.saturating_sub(ledger.window + PRUNE_MARGIN_SECS);
+        // Measured from the newest mention, not the local clock alone: a clock
+        // that jumps ahead must not prune what the corrected clock replays.
+        let newest = ledger.done.values().copied().max().unwrap_or(now);
+        let keep_from = now
+            .min(newest)
+            .saturating_sub(ledger.window + PRUNE_MARGIN_SECS);
         ledger.done.retain(|_, ts| *ts >= keep_from);
         ledger.save();
     }
 
-    #[cfg(test)]
-    pub(crate) fn window(&self) -> Option<u64> {
-        self.0.as_ref().map(|ledger| lock(ledger).window)
+    /// Mark a mention the author gate refused as done, so the policy it was
+    /// sent under decides it: a respond-to change, which restarts the agent,
+    /// must not answer a day of refused requests. Saved with the next turn, or
+    /// [`REFUSED_SAVE_DELAY`] from now, whichever comes first. Needs a Tokio
+    /// runtime.
+    pub(crate) fn note_refused(&self, event_id_hex: String, created_at: u64) {
+        let Some(ledger) = self.0.as_ref() else {
+            return;
+        };
+        {
+            let mut guard = lock(ledger);
+            guard.done.insert(event_id_hex, created_at);
+            if std::mem::replace(&mut guard.unsaved, true) {
+                return;
+            }
+        }
+        let ledger = Arc::clone(ledger);
+        tokio::spawn(async move {
+            tokio::time::sleep(REFUSED_SAVE_DELAY).await;
+            let mut ledger = lock(&ledger);
+            if ledger.unsaved {
+                ledger.save();
+            }
+        });
     }
 }
 
 impl Ledger {
-    fn save(&self) {
+    fn save(&mut self) {
+        self.unsaved = false;
         let record = serde_json::json!({ "version": 1, "floor": self.floor, "done": self.done });
         let written = self
             .path
@@ -132,7 +170,12 @@ impl Ledger {
             .unwrap_or(Ok(()))
             .and_then(|()| {
                 let part = self.path.with_extension("json.part");
-                std::fs::write(&part, record.to_string())?;
+                let mut file = std::fs::File::create(&part)?;
+                file.write_all(record.to_string().as_bytes())?;
+                // On disk before the rename, or a power cut can leave an empty
+                // ledger that resets the floor.
+                file.sync_all()?;
+                drop(file);
                 std::fs::rename(&part, &self.path)
             });
         if let Err(e) = written {
@@ -228,12 +271,65 @@ mod tests {
         let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
         let later = NOW + 3 * DAY;
         catch_up.record(
-            &[("old".into(), later - DAY - PRUNE_MARGIN_SECS - 1)],
+            &[
+                ("fresh".into(), later),
+                ("old".into(), later - DAY - PRUNE_MARGIN_SECS - 1),
+            ],
             later,
         );
         catch_up.record(&[("edge".into(), later - DAY - PRUNE_MARGIN_SECS)], later);
         assert!(!catch_up.is_done("old"));
         assert!(catch_up.is_done("edge"));
+        assert!(catch_up.is_done("fresh"));
+    }
+
+    #[test]
+    fn clock_jumping_ahead_does_not_prune_recent_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
+        catch_up.record(&[("e1".into(), NOW + 10)], NOW + 20);
+        // The PC boots a week ahead and one turn finishes.
+        catch_up.record(&[("e2".into(), NOW + 30)], NOW + 7 * DAY);
+        drop(catch_up);
+        // NTP corrects the clock; the restart must not answer e1 again.
+        let reopened = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 60);
+        assert!(reopened.is_done("e1"));
+        assert!(reopened.is_done("e2"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_mention_is_saved_after_a_delay_or_with_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
+        let saved_ids = || {
+            let raw = std::fs::read_to_string(file(dir.path(), RELAY)).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let mut ids: Vec<String> = saved["done"].as_object().unwrap().keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+
+        catch_up.note_refused("r1".into(), NOW + 1);
+        catch_up.note_refused("r2".into(), NOW + 2);
+        assert!(catch_up.is_done("r1"), "refused now, so not answered later");
+        assert!(
+            saved_ids().is_empty(),
+            "a noisy sender does not force a write per message"
+        );
+        tokio::time::sleep(REFUSED_SAVE_DELAY + Duration::from_secs(1)).await;
+        assert_eq!(
+            saved_ids(),
+            ["r1", "r2"],
+            "one delayed save covers the burst"
+        );
+
+        catch_up.note_refused("r3".into(), NOW + 3);
+        catch_up.record(&[("e1".into(), NOW + 4)], NOW + 5);
+        assert_eq!(
+            saved_ids(),
+            ["e1", "r1", "r2", "r3"],
+            "the next turn saves it too"
+        );
     }
 
     #[test]

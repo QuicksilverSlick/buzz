@@ -213,6 +213,12 @@ impl Owner {
             .expect("recovery not woken");
         let req: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(req[0], "REQ");
+        // A relay ends every REQ's stored events with EOSE; until then the
+        // harness keeps the REQ's own `since` as its resume point.
+        self.server
+            .send(Message::Text(json!(["EOSE", req[1]]).to_string().into()))
+            .await
+            .unwrap();
         req
     }
 
