@@ -772,6 +772,59 @@ test("sends the first message from the new direct message composer", async ({
   await expect(page.getByTestId("message-timeline")).toContainText(message);
 });
 
+test("starts a huddle from a new direct message without a first message", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await openNewMessagePage(page);
+
+  const huddleButton = page
+    .getByTestId("new-message-page")
+    .getByTestId("channel-start-huddle-trigger");
+  await expect(huddleButton).toBeDisabled();
+
+  await page.getByTestId("new-dm-search").fill("charlie");
+  await page
+    .getByTestId(`new-dm-result-${TEST_IDENTITIES.charlie.pubkey}`)
+    .click();
+  await expect(huddleButton).toBeEnabled();
+
+  const baselineCommands = await readCommandLog(page);
+  const baselineCommandPayloads = await readCommandPayloadLog(page);
+  await huddleButton.click();
+
+  await expect(page.getByTestId("chat-title")).toHaveText("charlie");
+  await expect
+    .poll(async () => commandCount(await readCommandLog(page), "start_huddle"))
+    .toBe(commandCount(baselineCommands, "start_huddle") + 1);
+
+  const huddleCommands = (await readCommandLog(page)).slice(
+    baselineCommands.length,
+  );
+  expect(huddleCommands.indexOf("open_dm")).toBeGreaterThanOrEqual(0);
+  expect(huddleCommands.indexOf("open_dm")).toBeLessThan(
+    huddleCommands.indexOf("start_huddle"),
+  );
+  expect(huddleCommands).not.toContain("send_channel_message");
+
+  const startHuddlePayload = (await readCommandPayloadLog(page))
+    .slice(baselineCommandPayloads.length)
+    .find((entry) => entry.command === "start_huddle")?.payload as
+    | { parentChannelId?: string; memberPubkeys?: string[] }
+    | undefined;
+  // The mock's charlie is a relay agent, so he joins the huddle as a member,
+  // as he would from the DM header.
+  expect(startHuddlePayload?.memberPubkeys).toEqual([
+    TEST_IDENTITIES.charlie.pubkey,
+  ]);
+  await expect(
+    page.locator("[data-active='true'][data-channel-id]"),
+  ).toHaveAttribute(
+    "data-channel-id",
+    startHuddlePayload?.parentChannelId ?? "",
+  );
+});
+
 test("creates the DM before preparing a persona mention", async ({ page }) => {
   await installMockBridge(page, {
     activePersonaIds: ["builtin:fizz"],
