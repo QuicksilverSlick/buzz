@@ -1321,6 +1321,11 @@ declare global {
       pubkey: string;
       status: PresenceStatus;
     }) => void;
+    /** Store and live-publish a kind:0, as a member who just joined would. */
+    __BUZZ_E2E_EMIT_MOCK_PROFILE__?: (input: {
+      pubkey: string;
+      displayName: string;
+    }) => void;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
       channelName: string;
       content: string;
@@ -11759,6 +11764,28 @@ export function maybeInstallE2eTauriMocks() {
     const author = pubkey.toLowerCase();
     setMockPresenceStatus(author, status);
     emitMockGlobalEvent(createMockEvent(20001, status, [], author));
+  };
+  window.__BUZZ_E2E_EMIT_MOCK_PROFILE__ = ({ pubkey, displayName }) => {
+    const author = pubkey.toLowerCase();
+    mockProfiles.set(author, {
+      pubkey: author,
+      display_name: displayName,
+      avatar_url: null,
+      about: null,
+      nip05_handle: null,
+      owner_pubkey: null,
+      is_agent: false,
+      has_profile_event: true,
+    });
+    applyMockDisplayName(author, displayName);
+    emitMockGlobalEvent(
+      createMockEvent(
+        0,
+        JSON.stringify({ display_name: displayName }),
+        [],
+        author,
+      ),
+    );
   };
   window.__BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__ = (event) => {
     const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
