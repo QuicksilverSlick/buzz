@@ -224,7 +224,7 @@ test.describe("community rail", () => {
     await expect(page).toHaveURL(/#\/settings\?section=community-members$/);
     await expect(page.getByTestId("settings-community-members")).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "Invites", exact: true }),
+      page.getByRole("heading", { name: "Members", exact: true }),
     ).toBeVisible();
     await expect(page.getByTestId("community-icon-settings")).toHaveCount(0);
     await expect(

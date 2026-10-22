@@ -13,6 +13,10 @@ const SECOND_DIRECT_ADD_HEX =
   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SECOND_DIRECT_ADD_NPUB =
   "npub1424242424242424242424242424242424242424242424242424qamrcaj";
+const MOCK_VIEWER_PUBKEY = "deadbeef".repeat(8);
+const MOCK_RELAY_HOST = new URL(
+  process.env.BUZZ_E2E_RELAY_URL ?? "http://localhost:3000",
+).host;
 
 test.beforeEach(async ({ page }, testInfo) => {
   await installMockBridge(page, {
@@ -20,6 +24,20 @@ test.beforeEach(async ({ page }, testInfo) => {
     relayRole: testInfo.title.includes("admin can add members")
       ? "admin"
       : "owner",
+    ...(testInfo.title.includes("no member list")
+      ? { relayMembershipSnapshot: false }
+      : {}),
+    ...(testInfo.title.includes("hosted owner")
+      ? {
+          builderlabAuth: { expiresAt: "2099-01-01T00:00:00Z" },
+          builderlabCommunities: [
+            {
+              normalized_host: MOCK_RELAY_HOST,
+              owner_pubkey: MOCK_VIEWER_PUBKEY,
+            },
+          ],
+        }
+      : {}),
   });
   await page.route("**/api/invites", async (route) => {
     await route.fulfill({
@@ -50,14 +68,16 @@ test("capture: consolidated invites settings", async ({ page }) => {
 
   await expect(
     page.getByTestId("settings-nav-community-members"),
-  ).toContainText("Invites");
+  ).toContainText("Members");
   await expect(
-    page.getByRole("heading", { name: "Invites", exact: true }),
+    page.getByRole("heading", { name: "Members", exact: true }),
   ).toBeVisible();
+  await expect(page.getByTestId("add-relay-member")).toHaveText("Add member");
+  await expect(page.getByTestId("community-members-degraded")).toHaveCount(0);
   await expect(page.getByTestId("community-icon-settings")).toHaveCount(0);
-  await expect(
-    page.getByTestId("community-invite-dialog-trigger"),
-  ).toBeVisible();
+  await expect(page.getByTestId("community-invite-dialog-trigger")).toHaveText(
+    "Invite link",
+  );
   await expect(page.getByTestId("community-invite-email-field")).toHaveCount(0);
   await expect(page.getByTestId("copy-invite-link")).toHaveCount(0);
   await expect(page.getByText("alice", { exact: true })).toBeVisible();
@@ -230,4 +250,87 @@ test("owner can add multiple admins directly by npub from live Invites UI", asyn
       ),
     )
     .toBe(true);
+});
+
+test("owner adds a member by npub from Add member", async ({ page }) => {
+  await page.getByTestId("add-relay-member").click();
+  const dialog = page.getByTestId("add-relay-member-dialog");
+  await expect(dialog).toBeVisible();
+
+  await dialog.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
+  await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
+  await dialog.getByTestId("member-role").click();
+  await expect(
+    page.getByRole("menuitemradio", { name: "Admin" }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await dialog.getByTestId("confirm-add-member").click();
+
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByTestId(`relay-member-row-${DIRECT_ADD_HEX}`),
+  ).toBeVisible();
+});
+
+test("owner removes a member via the ... menu with confirm", async ({
+  page,
+}) => {
+  const bobRow = page.getByTestId(
+    `relay-member-row-${TEST_IDENTITIES.bob.pubkey}`,
+  );
+  await expect(bobRow).toBeVisible();
+
+  await page
+    .getByTestId(`relay-member-actions-${TEST_IDENTITIES.bob.pubkey}`)
+    .click();
+  await page.getByRole("menuitem", { name: "Remove from community" }).click();
+  const confirm = page.getByTestId("confirm-remove-member-dialog");
+  await expect(confirm).toBeVisible();
+  // Nothing is removed until the owner confirms.
+  await expect(bobRow).toBeVisible();
+
+  await confirm.getByTestId("confirm-remove-member").click();
+  await expect(confirm).toHaveCount(0);
+  await expect(bobRow).toHaveCount(0);
+});
+
+test("shows Members with a retry when the relay sends no member list", async ({
+  page,
+}) => {
+  await expect(
+    page.getByTestId("settings-nav-community-members"),
+  ).toContainText("Members");
+  const degraded = page.getByTestId("community-members-degraded");
+  await expect(degraded).toHaveText(
+    /This relay didn’t return its member list\.\s*Retry/,
+  );
+  await expect(page.getByTestId("community-members-retry")).toBeEnabled();
+  await page.getByTestId("community-members-retry").click();
+  await expect(degraded).toBeVisible();
+
+  // With no role known, Add member still works but offers members only;
+  // the relay decides whether the add is allowed.
+  await page.getByTestId("add-relay-member").click();
+  await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
+  await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
+  await page.getByTestId("member-role").click();
+  await expect(page.getByRole("menuitemradio", { name: "Admin" })).toHaveCount(
+    0,
+  );
+});
+
+test("hosted owner keeps owner controls when the relay sends no member list", async ({
+  page,
+}) => {
+  await expect(page.getByTestId("community-members-degraded")).toContainText(
+    "Your hosted community account shows you as its owner.",
+  );
+
+  await page.getByTestId("add-relay-member").click();
+  await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
+  await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
+  await page.getByTestId("member-role").click();
+  await expect(
+    page.getByRole("menuitemradio", { name: "Admin" }),
+  ).toBeVisible();
 });

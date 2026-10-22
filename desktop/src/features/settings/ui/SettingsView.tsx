@@ -4,7 +4,7 @@ import { AlertCircle, ArrowLeft, LoaderCircle, RefreshCw } from "lucide-react";
 
 import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
 import {
-  canManageCommunityMembers,
+  shouldShowCommunityMembersSettings,
   shouldWarnMissingMembershipSnapshot,
 } from "@/shared/api/relayMembers";
 import {
@@ -145,10 +145,14 @@ export function SettingsView({
           return false;
         }
       }
-      // Invites and member management require a discovered owner/admin role.
+      // Member management needs an owner/admin role, but a failed role check
+      // or a missing member list still shows the entry with a degraded state.
       // Open relays have no membership snapshot or invite controls.
       if (s.value === "community-members") {
-        return canManageCommunityMembers(myMembershipQuery.data);
+        return shouldShowCommunityMembersSettings(
+          myMembershipQuery.data,
+          myMembershipQuery.isError,
+        );
       }
       // Relay admin surfaces the relay admin console. Always reachable so an
       // operator can enter a manual origin even when NIP-11 discovery is
@@ -159,7 +163,7 @@ export function SettingsView({
       }
       return true;
     });
-  }, [myMembershipQuery.data, featureState]);
+  }, [myMembershipQuery.data, myMembershipQuery.isError, featureState]);
 
   const [isLoaded, setIsLoaded] = React.useState(false);
   const [appVersion, setAppVersion] = React.useState<string | null>(null);
@@ -259,7 +263,7 @@ export function SettingsView({
               data-testid="community-access-loading"
             >
               <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-              Checking invite permissions…
+              Checking member permissions…
             </div>
           ) : null}
           {myMembershipQuery.isError ? (
@@ -269,7 +273,7 @@ export function SettingsView({
             >
               <div className="flex items-center gap-2">
                 <AlertCircle className="h-3.5 w-3.5 text-destructive" />
-                Invite settings could not be checked.
+                Member settings could not be checked.
               </div>
               <button
                 className="flex items-center gap-1.5 font-medium text-sidebar-foreground underline-offset-2 hover:underline"
@@ -287,7 +291,7 @@ export function SettingsView({
               data-testid="community-access-snapshot-missing"
             >
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
-              Invite settings are unavailable. Relay recovery may still be in
+              The member list is unavailable. Relay recovery may still be in
               progress.
             </div>
           ) : null}

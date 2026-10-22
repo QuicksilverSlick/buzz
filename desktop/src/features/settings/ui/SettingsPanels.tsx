@@ -19,8 +19,8 @@ import {
   Smile,
   Sun,
   SunMoon,
-  Ticket,
   UserRound,
+  Users,
   Volume2,
   type LucideIcon,
 } from "lucide-react";
@@ -215,8 +215,8 @@ export const settingsSections: SettingsSectionDescriptor[] = [
   },
   {
     value: "community-members",
-    label: "Invites",
-    icon: Ticket,
+    label: "Members",
+    icon: Users,
   },
   {
     value: "relay-admin",
