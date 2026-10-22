@@ -1,12 +1,19 @@
+import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
+import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
+  channelsQueryKey,
   useOpenDmMutation,
   useUpsertCachedChannel,
 } from "@/features/channels/hooks";
+import { useHuddle } from "@/features/huddle";
+import { HuddleIndicator } from "@/features/huddle/components/HuddleIndicator";
+import { formatHuddleActionError } from "@/features/huddle/lib/huddleError";
 import type { Channel } from "@/shared/api/types";
 import { useSendMessageMutation } from "@/features/messages/hooks";
+import { startNewMessageHuddle } from "@/features/messages/lib/newMessageHuddle";
 import { getKeyboardSearchSelection } from "@/features/profile/lib/userCandidateSearch";
 import { SelectedRecipientChip } from "@/features/profile/ui/SelectedRecipientChip";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -33,6 +40,8 @@ export function NewMessageScreen() {
   const upsertCachedChannel = useUpsertCachedChannel();
   const sendMessageMutation = useSendMessageMutation(null, identityQuery.data);
   const { goChannel } = useAppNavigation();
+  const { startHuddle } = useHuddle();
+  const queryClient = useQueryClient();
 
   const [isRecipientPickerOpen, setIsRecipientPickerOpen] =
     React.useState(true);
@@ -295,6 +304,39 @@ export function NewMessageScreen() {
       upsertCachedChannel,
     ],
   );
+
+  const startDirectMessageHuddle = React.useCallback(async () => {
+    try {
+      const started = await startNewMessageHuddle({
+        currentPubkey,
+        recipients: selectedUsers,
+        openDirectMessage,
+        showDirectMessage: async (directMessage) => {
+          await upsertCachedChannel(directMessage);
+          if (!isMountedRef.current) {
+            return false;
+          }
+          await goChannel(directMessage.id, { replace: true });
+          return true;
+        },
+        startHuddle,
+      });
+      if (started) {
+        void queryClient.invalidateQueries({ queryKey: channelsQueryKey });
+      }
+    } catch (error) {
+      console.error("Failed to start huddle:", error);
+      toast.error(formatHuddleActionError(error, "start"));
+    }
+  }, [
+    currentPubkey,
+    goChannel,
+    openDirectMessage,
+    queryClient,
+    selectedUsers,
+    startHuddle,
+    upsertCachedChannel,
+  ]);
 
   const composerPlaceholder =
     selectedUsers.length === 0
@@ -582,6 +624,15 @@ export function NewMessageScreen() {
               Opening…
             </span>
           ) : null}
+          <div className="shrink-0 pl-2">
+            {/* No channel exists yet, so there is no live huddle to watch;
+                with an empty id the indicator renders only its start button. */}
+            <HuddleIndicator
+              channelId=""
+              onStart={() => void startDirectMessageHuddle()}
+              startDisabled={isPending || selectedUsers.length === 0}
+            />
+          </div>
         </div>
       </header>
 
