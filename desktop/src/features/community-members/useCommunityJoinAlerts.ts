@@ -84,8 +84,9 @@ type JoinAlertSession = {
    * revocation is observed, this session is done disclosing, whatever order the
    * remaining frames arrive in.
    *
-   * Re-promotion is unaffected: nothing invalidates the membership lookup on
-   * promotion, so regaining the panel already requires a reload today.
+   * Re-promotion is unaffected: `useLiveDirectoryUpdates` invalidates the
+   * membership lookup when a snapshot changes the viewer's role, which re-keys
+   * the effect into a new session rather than reopening this one.
    */
   revoked: boolean;
 };
