@@ -149,9 +149,11 @@ export function SettingsView({
       // or a missing member list still shows the entry with a degraded state.
       // Open relays have no membership snapshot or invite controls.
       if (s.value === "community-members") {
+        // errorUpdateCount keeps the entry while a retry after a failure
+        // runs, so the open Members page is not bounced away mid-retry.
         return shouldShowCommunityMembersSettings(
           myMembershipQuery.data,
-          myMembershipQuery.isError,
+          myMembershipQuery.isError || myMembershipQuery.errorUpdateCount > 0,
         );
       }
       // Relay admin surfaces the relay admin console. Always reachable so an
@@ -163,7 +165,12 @@ export function SettingsView({
       }
       return true;
     });
-  }, [myMembershipQuery.data, myMembershipQuery.isError, featureState]);
+  }, [
+    myMembershipQuery.data,
+    myMembershipQuery.isError,
+    myMembershipQuery.errorUpdateCount,
+    featureState,
+  ]);
 
   const [isLoaded, setIsLoaded] = React.useState(false);
   const [appVersion, setAppVersion] = React.useState<string | null>(null);

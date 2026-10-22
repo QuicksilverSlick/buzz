@@ -258,7 +258,6 @@ type E2eConfig = {
       name?: string;
       slug?: string;
       normalized_host?: string;
-      owner_pubkey?: string;
       archived_at?: string | null;
     }>;
     builderlabQuota?: {

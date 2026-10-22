@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   canManageCommunityMembers,
   loadRelayMembershipLookup,
+  relayMemberActions,
   shouldShowCommunityMembersSettings,
   shouldWarnMissingMembershipSnapshot,
 } from "./relayMembers.ts";
@@ -17,7 +18,6 @@ test("open relays skip the membership snapshot request", async () => {
     snapshotFound: false,
     membershipRequired: false,
     membership: null,
-    roleSource: null,
   });
 });
 
@@ -36,7 +36,6 @@ test("membership relays request their membership snapshot", async () => {
   assert.equal(lookup.snapshotFound, true);
   assert.equal(lookup.membershipRequired, true);
   assert.equal(lookup.membership?.role, "admin");
-  assert.equal(lookup.roleSource, "snapshot");
 });
 
 test("community member management is hidden on open relays", () => {
@@ -116,129 +115,72 @@ test("an available snapshot never warns", () => {
   );
 });
 
-const VIEWER = "a".repeat(64);
-const OTHER = "b".repeat(64);
-const RELAY_URL = "wss://greymatter.communities.example";
-const missingSnapshot = async () => null;
-const hostedOwnedBy =
-  (owner, normalizedHost = "greymatter.communities.example") =>
-  async () => ({
-    relayUrl: RELAY_URL,
-    communities: [{ normalized_host: normalizedHost, owner_pubkey: owner }],
-  });
-
-test("hosted-owner fallback grants owner when the snapshot is missing and host and key match", async () => {
-  const lookup = await loadRelayMembershipLookup(
-    VIEWER,
-    true,
-    missingSnapshot,
-    hostedOwnedBy(VIEWER.toUpperCase()),
-  );
-
-  assert.equal(lookup.snapshotFound, false);
-  assert.equal(lookup.membership?.role, "owner");
-  assert.equal(lookup.membership?.pubkey, VIEWER);
-  assert.equal(lookup.roleSource, "hosted-owner");
-  assert.equal(canManageCommunityMembers(lookup), true);
-});
-
-test("hosted-owner fallback is skipped without a Builderlab session", async () => {
-  const lookup = await loadRelayMembershipLookup(
-    VIEWER,
-    true,
-    missingSnapshot,
-    async () => {
-      throw new Error("Sign in to Builderlab first");
-    },
-  );
-
-  assert.equal(lookup.membership, null);
-  assert.equal(lookup.roleSource, null);
-  assert.equal(shouldWarnMissingMembershipSnapshot(lookup), true);
-});
-
-test("hosted-owner fallback needs the same relay host and the viewer's key", async () => {
-  for (const loadHosted of [
-    hostedOwnedBy(OTHER),
-    hostedOwnedBy(VIEWER, "someone-else.communities.example"),
-    async () => ({
-      relayUrl: RELAY_URL,
-      communities: [
-        {
-          normalized_host: "greymatter.communities.example",
-          owner_pubkey: VIEWER,
-          archived_at: "2026-10-01T00:00:00Z",
-        },
-      ],
-    }),
-  ]) {
-    const lookup = await loadRelayMembershipLookup(
-      VIEWER,
-      true,
-      missingSnapshot,
-      loadHosted,
-    );
-    assert.equal(lookup.membership, null);
-    assert.equal(lookup.roleSource, null);
-  }
-});
-
-test("a present snapshot always wins over the hosted-owner record", async () => {
-  let hostedCalls = 0;
-  const lookup = await loadRelayMembershipLookup(
-    VIEWER,
-    true,
-    async () => ({ created_at: 1, tags: [["member", VIEWER, "member"]] }),
-    async () => {
-      hostedCalls += 1;
-      return hostedOwnedBy(VIEWER)();
-    },
-  );
-
-  assert.equal(hostedCalls, 0);
-  assert.equal(lookup.membership?.role, "member");
-  assert.equal(lookup.roleSource, "snapshot");
-});
-
-test("open relays never consult the hosted-owner record", async () => {
-  const lookup = await loadRelayMembershipLookup(
-    VIEWER,
-    false,
-    () => assert.fail("open relays must not request a membership snapshot"),
-    () => assert.fail("open relays must not consult Builderlab"),
-  );
-  assert.equal(lookup.membership, null);
-});
-
-test("Members settings entry: hidden on open relays and from members, shown when degraded", () => {
+test("Members settings entry follows the known role, and shows when the role is unknown", () => {
+  const viewer = "a".repeat(64);
   const openRelay = {
     snapshotFound: false,
     membershipRequired: false,
     membership: null,
-    roleSource: null,
   };
-  const missing = { ...openRelay, membershipRequired: true };
+  const missingSnapshot = { ...openRelay, membershipRequired: true };
   const memberWithSnapshot = {
     snapshotFound: true,
     membershipRequired: true,
-    membership: { pubkey: VIEWER, role: "member" },
-    roleSource: "snapshot",
+    membership: { pubkey: viewer, role: "member" },
   };
   const adminWithSnapshot = {
     ...memberWithSnapshot,
-    membership: { pubkey: VIEWER, role: "admin" },
+    membership: { pubkey: viewer, role: "admin" },
   };
 
-  assert.equal(shouldShowCommunityMembersSettings(openRelay, false), false);
+  // Still loading: hidden.
   assert.equal(shouldShowCommunityMembersSettings(undefined, false), false);
+  // First check failed with nothing cached: shown with a warning.
+  assert.equal(shouldShowCommunityMembersSettings(undefined, true), true);
   assert.equal(
-    shouldShowCommunityMembersSettings(memberWithSnapshot, false),
-    false,
+    shouldShowCommunityMembersSettings(missingSnapshot, false),
+    true,
   );
   assert.equal(
     shouldShowCommunityMembersSettings(adminWithSnapshot, false),
     true,
   );
-  assert.equal(shouldShowCommunityMembersSettings(missing, false), true);
-  assert.equal(shouldShowCommunityMembersSettings(undefined, true), true);
+  assert.equal(
+    shouldShowCommunityMembersSettings(adminWithSnapshot, true),
+    true,
+  );
+  // A failed refetch never overrides what the cached data already says.
+  for (const failed of [false, true]) {
+    assert.equal(
+      shouldShowCommunityMembersSettings(memberWithSnapshot, failed),
+      false,
+    );
+    assert.equal(shouldShowCommunityMembersSettings(openRelay, failed), false);
+  }
+});
+
+test("row actions need a known owner or admin viewer", () => {
+  const none = { canRemove: false, canPromote: false, canDemote: false };
+  for (const viewerRole of [null, "member"]) {
+    for (const memberRole of ["owner", "admin", "member"]) {
+      assert.deepEqual(relayMemberActions(viewerRole, memberRole, false), none);
+    }
+  }
+  assert.deepEqual(relayMemberActions("admin", "member", false), {
+    ...none,
+    canRemove: true,
+  });
+  assert.deepEqual(relayMemberActions("admin", "admin", false), none);
+  assert.deepEqual(relayMemberActions("owner", "member", false), {
+    canRemove: true,
+    canPromote: true,
+    canDemote: false,
+  });
+  assert.deepEqual(relayMemberActions("owner", "admin", false), {
+    canRemove: true,
+    canPromote: false,
+    canDemote: true,
+  });
+  assert.deepEqual(relayMemberActions("owner", "owner", true), none);
+  assert.deepEqual(relayMemberActions("admin", "member", true), none);
 });

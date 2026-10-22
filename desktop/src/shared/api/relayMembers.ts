@@ -1,10 +1,5 @@
-import {
-  type HostedCommunitiesResponse,
-  type HostedCommunity,
-  hostedCommunityRelayUrl,
-} from "@/features/communities/hostedCommunityApi";
 import { relayClient } from "@/shared/api/relayClient";
-import { getRelayWsUrl, invokeTauri, signRelayEvent } from "@/shared/api/tauri";
+import { invokeTauri, signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import type {
   RelayEvent,
@@ -41,12 +36,6 @@ export type RelayMembershipLookup = {
   snapshotFound: boolean;
   membershipRequired: boolean;
   membership: RelayMember | null;
-  /**
-   * Where `membership` came from. `hosted-owner` means the relay sent no
-   * snapshot and the viewer's Builderlab account lists them as this hosted
-   * community's owner. The relay still authorizes every admin event itself.
-   */
-  roleSource: "snapshot" | "hosted-owner" | null;
 };
 
 export function canManageCommunityMembers(
@@ -54,6 +43,27 @@ export function canManageCommunityMembers(
 ): boolean {
   const role = lookup?.membership?.role;
   return role === "owner" || role === "admin";
+}
+
+/**
+ * Row actions the viewer gets for one member: none unless the viewer is a
+ * known owner or admin. Admins may only remove members. The relay re-checks.
+ */
+export function relayMemberActions(
+  viewerRole: RelayMemberRole | null,
+  memberRole: RelayMemberRole,
+  isSelf: boolean,
+) {
+  const isOwner = viewerRole === "owner";
+  return {
+    canRemove:
+      (isOwner || viewerRole === "admin") &&
+      !isSelf &&
+      memberRole !== "owner" &&
+      (isOwner || memberRole === "member"),
+    canPromote: isOwner && memberRole === "member",
+    canDemote: isOwner && memberRole === "admin",
+  };
 }
 
 export function shouldWarnMissingMembershipSnapshot(
@@ -64,18 +74,17 @@ export function shouldWarnMissingMembershipSnapshot(
 
 /**
  * The Members settings entry shows for owners and admins, and also when the
- * role check failed or the relay sent no member list, so a degraded relay
- * never hides member management without saying why. Open relays stay hidden.
+ * role is unknown (the relay sent no member list, or the first check failed)
+ * so it never vanishes without saying why. Cached data wins over a failed
+ * refetch, and open relays stay hidden.
  */
 export function shouldShowCommunityMembersSettings(
   lookup: RelayMembershipLookup | undefined,
   lookupFailed: boolean,
 ): boolean {
-  return (
-    lookupFailed ||
-    canManageCommunityMembers(lookup) ||
-    shouldWarnMissingMembershipSnapshot(lookup)
-  );
+  if (!lookup) return lookupFailed;
+  if (!lookup.membershipRequired) return false;
+  return lookup.snapshotFound ? canManageCommunityMembers(lookup) : true;
 }
 
 export function relayMembersFromEvent(event: RelayEvent): RelayMember[] {
@@ -116,20 +125,17 @@ export function relayMembershipLookupFromEvent(
       snapshotFound: false,
       membershipRequired,
       membership: null,
-      roleSource: null,
     };
   }
 
   const normalizedPubkey = normalizePubkey(pubkey);
-  const membership =
-    relayMembersFromEvent(event).find(
-      (member) => normalizePubkey(member.pubkey) === normalizedPubkey,
-    ) ?? null;
   return {
     snapshotFound: true,
     membershipRequired,
-    membership,
-    roleSource: membership ? "snapshot" : null,
+    membership:
+      relayMembersFromEvent(event).find(
+        (member) => normalizePubkey(member.pubkey) === normalizedPubkey,
+      ) ?? null,
   };
 }
 
@@ -140,92 +146,16 @@ async function fetchMembershipListEvent(): Promise<RelayEvent | null> {
   });
 }
 
-export type HostedCommunitiesSource = () => Promise<{
-  relayUrl: string;
-  communities: HostedCommunity[];
-}>;
-
-/**
- * Lists the viewer's Builderlab communities without ever prompting: with no
- * Builderlab session the native command rejects locally ("Sign in to
- * Builderlab first") before any request is sent.
- */
-async function loadHostedCommunities() {
-  const [relayUrl, response] = await Promise.all([
-    getRelayWsUrl(),
-    invokeTauri<HostedCommunitiesResponse>("list_builderlab_communities"),
-  ]);
-  return { relayUrl, communities: response.communities ?? [] };
-}
-
-function relayHost(url: string | null): string | null {
-  if (!url) return null;
-  try {
-    return new URL(url).host;
-  } catch {
-    return null;
-  }
-}
-
-async function isHostedCommunityOwner(
-  pubkey: string,
-  loadHosted: HostedCommunitiesSource,
-): Promise<boolean> {
-  try {
-    const { relayUrl, communities } = await loadHosted();
-    const host = relayHost(relayUrl);
-    const viewer = normalizePubkey(pubkey);
-    return (
-      host !== null &&
-      communities.some(
-        (community) =>
-          !community.archived_at &&
-          relayHost(hostedCommunityRelayUrl(community)) === host &&
-          normalizePubkey(community.owner_pubkey ?? "") === viewer,
-      )
-    );
-  } catch {
-    // No Builderlab session, or Builderlab is unreachable: no second source.
-    return false;
-  }
-}
-
-/**
- * Loads the NIP-43 snapshot only when the relay advertises membership support.
- *
- * When a membership relay sends no snapshot, the viewer's Builderlab record
- * is the only other place that knows a role, and it only knows owners.
- */
+/** Loads the NIP-43 snapshot only when the relay advertises membership support. */
 export async function loadRelayMembershipLookup(
   pubkey: string,
   membershipRequired: boolean,
   fetchSnapshot: () => Promise<RelayEvent | null> = fetchMembershipListEvent,
-  loadHosted: HostedCommunitiesSource = loadHostedCommunities,
 ): Promise<RelayMembershipLookup> {
   if (!membershipRequired) {
     return relayMembershipLookupFromEvent(null, pubkey, false);
   }
-  const lookup = relayMembershipLookupFromEvent(
-    await fetchSnapshot(),
-    pubkey,
-    true,
-  );
-  if (
-    lookup.snapshotFound ||
-    !(await isHostedCommunityOwner(pubkey, loadHosted))
-  ) {
-    return lookup;
-  }
-  return {
-    ...lookup,
-    membership: {
-      pubkey: normalizePubkey(pubkey),
-      role: "owner",
-      addedBy: null,
-      createdAt: new Date().toISOString(),
-    },
-    roleSource: "hosted-owner",
-  };
+  return relayMembershipLookupFromEvent(await fetchSnapshot(), pubkey, true);
 }
 
 export async function listRelayMembers(): Promise<RelayMember[]> {
