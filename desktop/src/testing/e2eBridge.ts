@@ -369,7 +369,6 @@ type E2eConfig = {
     addChannelMembersDelayMs?: number;
     /** Sequenced add-member failures. A string fails that call; null succeeds. */
     addChannelMembersErrors?: (string | null)[];
-    channelMembersReadDelayMs?: number;
     /** Hold `get_channel_members` responses until the E2E release seam is invoked. */
     deferChannelMembersReads?: boolean;
     createManagedAgentDelayMs?: number;
@@ -7596,10 +7595,6 @@ async function handleGetChannelMembers(
     await new Promise<void>((resolve) => {
       deferredChannelMembersReadQueue.push(resolve);
     });
-  }
-  const delayMs = config?.mock?.channelMembersReadDelayMs ?? 0;
-  if (delayMs > 0) {
-    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
   }
 
   const identity = getIdentity(config);

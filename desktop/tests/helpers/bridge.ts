@@ -275,7 +275,6 @@ type MockBridgeOptions = {
   addChannelMembersDelayMs?: number;
   /** Sequenced add-member failures. A string fails that call; null succeeds. */
   addChannelMembersErrors?: (string | null)[];
-  channelMembersReadDelayMs?: number;
   /** Hold `get_channel_members` responses until `releaseChannelMembersReads` runs. */
   deferChannelMembersReads?: boolean;
   channelsReadError?: string;
