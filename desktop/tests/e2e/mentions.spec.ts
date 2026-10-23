@@ -7,6 +7,7 @@ import { waitForAnimations } from "../helpers/animations";
 import {
   installMockBridge,
   openChannelBrowser,
+  releaseChannelMembersReads,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
 
@@ -982,7 +983,7 @@ test("defers agent mentions until DM members finish loading", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    channelMembersReadDelayMs: 5_000,
+    deferChannelMembersReads: true,
     managedAgents: [
       {
         pubkey: TEST_IDENTITIES.alice.pubkey,
@@ -1028,7 +1029,7 @@ test("defers agent mentions until DM members finish loading", async ({
   );
   await expect(input).toContainText("before members resolve");
 
-  await page.waitForTimeout(5_100);
+  await releaseChannelMembersReads(page);
   await threadPanel.getByTestId("send-message").click();
 
   await expect(page.getByText(DM_THREAD_AGENT_MENTION_ERROR_TEXT)).toHaveCount(

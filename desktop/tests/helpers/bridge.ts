@@ -276,6 +276,8 @@ type MockBridgeOptions = {
   /** Sequenced add-member failures. A string fails that call; null succeeds. */
   addChannelMembersErrors?: (string | null)[];
   channelMembersReadDelayMs?: number;
+  /** Hold `get_channel_members` responses until `releaseChannelMembersReads` runs. */
+  deferChannelMembersReads?: boolean;
   channelsReadError?: string;
   /** Reject successive mock `get_channels` calls, then resume. */
   channelsReadErrors?: (string | null)[];
@@ -1042,6 +1044,20 @@ export async function installRelayBridge(
     relayWsUrl: DEFAULT_RELAY_WS_URL,
     seedPreviewFeatures: options?.seedPreviewFeatures,
   });
+}
+
+/** Release every `get_channel_members` read held by `deferChannelMembersReads`. */
+export async function releaseChannelMembersReads(page: Page): Promise<number> {
+  return page.evaluate(
+    () => window.__BUZZ_E2E_RELEASE_CHANNEL_MEMBERS_READS__?.() ?? 0,
+  );
+}
+
+/** Number of `get_channel_members` reads still held by `deferChannelMembersReads`. */
+export async function pendingChannelMembersReads(page: Page): Promise<number> {
+  return page.evaluate(
+    () => window.__BUZZ_E2E_CHANNEL_MEMBERS_READS_PENDING__?.() ?? 0,
+  );
 }
 
 // The sidebar no longer renders a "browse channels" icon button; the channel
