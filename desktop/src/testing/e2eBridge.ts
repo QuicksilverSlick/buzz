@@ -524,6 +524,8 @@ type E2eConfig = {
     relayRequiresMembershipError?: string;
     /** Delay EOSE for membership snapshots after delivering the event. */
     relayMembershipEoseDelayMs?: number;
+    /** False: answer kind:13534 REQs with EOSE only, as a relay with no snapshot does. */
+    relayMembershipSnapshot?: boolean;
     relayRole?: "owner" | "admin" | "member" | null;
     // Descriptors returned by the mocked `pick_and_upload_media` /
     // `upload_media_bytes` commands. Lets a spec drive the attachment flow
@@ -11029,6 +11031,10 @@ function sendToMockSocket(args: {
 
     const filter = rest[1] as MockFilter;
     if (filter.kinds?.includes(13534)) {
+      if (getConfig()?.mock?.relayMembershipSnapshot === false) {
+        sendWsText(socket.handler, ["EOSE", subId]);
+        return;
+      }
       sendWsText(socket.handler, [
         "EVENT",
         subId,

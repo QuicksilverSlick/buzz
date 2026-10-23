@@ -17,21 +17,30 @@ export function ConfirmRemoveDialog({
   member,
   displayName,
   open,
+  onCloseAutoFocus,
   onOpenChange,
 }: {
   member: RelayMember | null;
   displayName: string | null;
   open: boolean;
+  onCloseAutoFocus?: (event: Event) => void;
   onOpenChange: (open: boolean) => void;
 }) {
   const removeMutation = useRemoveRelayMemberMutation();
   const label = displayName || (member ? truncateNpub(member.pubkey) : "");
 
+  function close() {
+    removeMutation.reset();
+    onOpenChange(false);
+  }
+
   function handleOpenChange(next: boolean) {
-    if (!next) {
-      removeMutation.reset();
+    if (next) {
+      onOpenChange(true);
+    } else if (!removeMutation.isPending) {
+      // Closing mid-request would reset the mutation and drop its error toast.
+      close();
     }
-    onOpenChange(next);
   }
 
   return (
@@ -39,11 +48,12 @@ export function ConfirmRemoveDialog({
       <DialogContent
         className="max-w-sm"
         data-testid="confirm-remove-member-dialog"
+        onCloseAutoFocus={onCloseAutoFocus}
       >
         <DialogHeader>
           <DialogTitle>Remove {label}?</DialogTitle>
           <DialogDescription>
-            This will immediately revoke their access to the relay.
+            This will immediately revoke their access to the community.
           </DialogDescription>
           {member ? (
             <PubKey
@@ -55,6 +65,7 @@ export function ConfirmRemoveDialog({
         </DialogHeader>
         <div className="flex justify-end gap-2">
           <Button
+            disabled={removeMutation.isPending}
             onClick={() => handleOpenChange(false)}
             size="sm"
             variant="outline"
@@ -69,7 +80,7 @@ export function ConfirmRemoveDialog({
               removeMutation.mutate(member.pubkey, {
                 onSuccess: () => {
                   toast.success("Member removed");
-                  handleOpenChange(false);
+                  close();
                 },
                 onError: (error) => {
                   toast.error(
