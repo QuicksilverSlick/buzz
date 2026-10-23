@@ -1,6 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { installMockBridge } from "../helpers/bridge";
+import {
+  installMockBridge,
+  pendingChannelMembersReads,
+  releaseChannelMembersReads,
+} from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "buzz-sidebar-width";
@@ -313,7 +317,7 @@ test("joins a community URL without an API token field", async ({ page }) => {
     .toMatchObject({ relayUrl: "wss://token.example.com" });
 });
 
-test("hides Invites settings on open relays", async ({ page }) => {
+test("hides Members settings on open relays", async ({ page }) => {
   await page.goto("/");
   await openSettings(page);
 
@@ -387,19 +391,30 @@ test("channel context menu only shows owner actions to the owner", async ({
 test("channel context menu explains when owner actions are loading", async ({
   page,
 }) => {
-  await installMockBridge(page, { channelMembersReadDelayMs: 500 });
+  await installMockBridge(page, { deferChannelMembersReads: true });
   await page.goto("/");
 
-  await page.getByTestId("channel-general").click({ button: "right" });
-  await expect(
-    page.getByRole("menuitem", { name: "Loading channel actions..." }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("menuitem", { name: "Archive channel" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("menuitem", { name: "Loading channel actions..." }),
-  ).toHaveCount(0);
+  try {
+    await page.getByTestId("channel-general").click({ button: "right" });
+    await expect(
+      page.getByRole("menuitem", { name: "Loading channel actions..." }),
+    ).toBeVisible();
+    // The loading row is only shown while a members read is held by the gate.
+    await expect
+      .poll(() => pendingChannelMembersReads(page))
+      .toBeGreaterThan(0);
+
+    await releaseChannelMembersReads(page);
+    await expect(
+      page.getByRole("menuitem", { name: "Archive channel" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("menuitem", { name: "Loading channel actions..." }),
+    ).toHaveCount(0);
+  } finally {
+    // A failed assertion must not leave the gate closed for the rest of the page.
+    await releaseChannelMembersReads(page).catch(() => 0);
+  }
 });
 
 test("channel owner can archive from the context menu", async ({ page }) => {

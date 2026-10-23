@@ -7,6 +7,7 @@ import { waitForAnimations } from "../helpers/animations";
 import {
   installMockBridge,
   openChannelBrowser,
+  releaseChannelMembersReads,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
 
@@ -982,7 +983,7 @@ test("defers agent mentions until DM members finish loading", async ({
   page,
 }) => {
   await installMockBridge(page, {
-    channelMembersReadDelayMs: 5_000,
+    deferChannelMembersReads: true,
     managedAgents: [
       {
         pubkey: TEST_IDENTITIES.alice.pubkey,
@@ -1028,17 +1029,28 @@ test("defers agent mentions until DM members finish loading", async ({
   );
   await expect(input).toContainText("before members resolve");
 
-  await page.waitForTimeout(5_100);
-  await threadPanel.getByTestId("send-message").click();
+  // The DM header's huddle button is disabled while the same members query is
+  // pending, so its enabled state proves the members render has committed.
+  const startHuddle = page.getByTestId("channel-start-huddle-trigger");
+  await expect(startHuddle).toBeDisabled();
+  await releaseChannelMembersReads(page);
+  await expect(startHuddle).toBeEnabled();
+  // Enter rather than the send button: the first send's error toast is still
+  // on screen and intercepts pointer events aimed at the composer's corner.
+  await input.press("Enter");
 
+  await expect(input).toHaveText("@alice ");
+  await expect(
+    threadPanel
+      .getByTestId("message-row")
+      .filter({ hasText: "before members resolve" }),
+  ).toBeVisible();
   await expect(page.getByText(DM_THREAD_AGENT_MENTION_ERROR_TEXT)).toHaveCount(
     0,
   );
   expect(commandCount(await readCommandLog(page), "add_channel_members")).toBe(
     commandCount(baselineCommands, "add_channel_members"),
   );
-  await expect(input).toHaveText("@alice ");
-  await expect(threadPanel).toContainText("before members resolve");
 });
 
 test("autocomplete filters managed-agent suggestions as user types", async ({

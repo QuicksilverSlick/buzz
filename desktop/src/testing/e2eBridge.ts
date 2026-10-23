@@ -369,7 +369,8 @@ type E2eConfig = {
     addChannelMembersDelayMs?: number;
     /** Sequenced add-member failures. A string fails that call; null succeeds. */
     addChannelMembersErrors?: (string | null)[];
-    channelMembersReadDelayMs?: number;
+    /** Hold `get_channel_members` responses until the E2E release seam is invoked. */
+    deferChannelMembersReads?: boolean;
     createManagedAgentDelayMs?: number;
     channelTemplates?: ChannelTemplate[];
     channelsReadError?: string;
@@ -524,6 +525,8 @@ type E2eConfig = {
     relayRequiresMembershipError?: string;
     /** Delay EOSE for membership snapshots after delivering the event. */
     relayMembershipEoseDelayMs?: number;
+    /** False: answer kind:13534 REQs with EOSE only, as a relay with no snapshot does. */
+    relayMembershipSnapshot?: boolean;
     relayRole?: "owner" | "admin" | "member" | null;
     // Descriptors returned by the mocked `pick_and_upload_media` /
     // `upload_media_bytes` commands. Lets a spec drive the attachment flow
@@ -1639,6 +1642,10 @@ declare global {
     __BUZZ_E2E_RELEASE_PROFILE_READS__?: () => number;
     /** Number of `get_profile` responses currently held. */
     __BUZZ_E2E_PROFILE_READS_PENDING__?: () => number;
+    /** Release every `get_channel_members` response held by `deferChannelMembersReads`. */
+    __BUZZ_E2E_RELEASE_CHANNEL_MEMBERS_READS__?: () => number;
+    /** Number of `get_channel_members` responses currently held. */
+    __BUZZ_E2E_CHANNEL_MEMBERS_READS_PENDING__?: () => number;
     /** Uploads that passed mock-native registration and began relay work. */
     __BUZZ_E2E_LINK_PREVIEW_UPLOAD_STARTS__?: number;
     /** Hold renderer-owned media fetches until their cancellation command. */
@@ -1771,6 +1778,9 @@ type DeferredProfileRead = {
 };
 let deferredProfileReadQueue: DeferredProfileRead[] = [];
 let profileReadsReleased = false;
+// Held by `deferChannelMembersReads`. Module state, so each page starts empty.
+let deferredChannelMembersReadQueue: Array<() => void> = [];
+let channelMembersReadsReleased = false;
 // ── get_users_batch hold seam ───────────────────────────────────────────────
 // Toggled at runtime by `__BUZZ_E2E_HOLD_USERS_BATCH__(hold)` rather than fixed
 // at boot by a mock-config flag, because a mention-identity spec needs both
@@ -7583,9 +7593,10 @@ async function handleGetChannelMembers(
   args: { channelId: string; readYourWrites?: boolean },
   config: E2eConfig | undefined,
 ): Promise<RawChannelMembersResponse> {
-  const delayMs = config?.mock?.channelMembersReadDelayMs ?? 0;
-  if (delayMs > 0) {
-    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  if (config?.mock?.deferChannelMembersReads && !channelMembersReadsReleased) {
+    await new Promise<void>((resolve) => {
+      deferredChannelMembersReadQueue.push(resolve);
+    });
   }
 
   const identity = getIdentity(config);
@@ -11029,6 +11040,10 @@ function sendToMockSocket(args: {
 
     const filter = rest[1] as MockFilter;
     if (filter.kinds?.includes(13534)) {
+      if (getConfig()?.mock?.relayMembershipSnapshot === false) {
+        sendWsText(socket.handler, ["EOSE", subId]);
+        return;
+      }
       sendWsText(socket.handler, [
         "EVENT",
         subId,
@@ -11473,6 +11488,8 @@ export function maybeInstallE2eTauriMocks() {
   deferredThreadRepliesQueue = [];
   deferredProfileReadQueue = [];
   profileReadsReleased = false;
+  deferredChannelMembersReadQueue = [];
+  channelMembersReadsReleased = false;
   holdUsersBatch = false;
   heldUsersBatchReleases = [];
   cancelledMediaUploadIds = new Set<string>();
@@ -11511,6 +11528,14 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_PROFILE_READS_PENDING__ = () =>
     deferredProfileReadQueue.length;
+  window.__BUZZ_E2E_RELEASE_CHANNEL_MEMBERS_READS__ = () => {
+    channelMembersReadsReleased = true;
+    const queued = deferredChannelMembersReadQueue.splice(0);
+    for (const release of queued) release();
+    return queued.length;
+  };
+  window.__BUZZ_E2E_CHANNEL_MEMBERS_READS_PENDING__ = () =>
+    deferredChannelMembersReadQueue.length;
   window.__BUZZ_E2E_HOLD_USERS_BATCH__ = (hold: boolean) => {
     holdUsersBatch = hold;
     // Releasing on the way out of the hold, not on the way in, is what lets a

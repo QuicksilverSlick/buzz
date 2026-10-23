@@ -19,7 +19,15 @@ test.beforeEach(async ({ page }, testInfo) => {
     relayRequiresMembership: true,
     relayRole: testInfo.title.includes("admin can add members")
       ? "admin"
-      : "owner",
+      : testInfo.title.includes("regular member")
+        ? "member"
+        : "owner",
+    ...(testInfo.title.includes("no member list")
+      ? { relayMembershipSnapshot: false }
+      : {}),
+    ...(testInfo.title.includes("role check fails")
+      ? { relayRequiresMembershipError: "relay info returned 502" }
+      : {}),
   });
   await page.route("**/api/invites", async (route) => {
     await route.fulfill({
@@ -50,14 +58,16 @@ test("capture: consolidated invites settings", async ({ page }) => {
 
   await expect(
     page.getByTestId("settings-nav-community-members"),
-  ).toContainText("Invites");
+  ).toContainText("Members");
   await expect(
-    page.getByRole("heading", { name: "Invites", exact: true }),
+    page.getByRole("heading", { name: "Members", exact: true }),
   ).toBeVisible();
+  await expect(page.getByTestId("add-relay-member")).toHaveText("Add member");
+  await expect(page.getByTestId("community-members-degraded")).toHaveCount(0);
   await expect(page.getByTestId("community-icon-settings")).toHaveCount(0);
-  await expect(
-    page.getByTestId("community-invite-dialog-trigger"),
-  ).toBeVisible();
+  await expect(page.getByTestId("community-invite-dialog-trigger")).toHaveText(
+    "Invite link",
+  );
   await expect(page.getByTestId("community-invite-email-field")).toHaveCount(0);
   await expect(page.getByTestId("copy-invite-link")).toHaveCount(0);
   await expect(page.getByText("alice", { exact: true })).toBeVisible();
@@ -86,33 +96,21 @@ test("capture: consolidated invites settings", async ({ page }) => {
   await panel.screenshot({ path: `${OUTDIR}/01-invites-settings.png` });
 });
 
-test("capture: share-style community invite dialog", async ({ page }) => {
+test("capture: invite link dialog", async ({ page }) => {
   await page.getByTestId("community-invite-dialog-trigger").click();
 
   const dialog = page.getByTestId("community-invite-dialog");
   await expect(dialog).toBeVisible();
   await expect(
-    dialog.getByRole("heading", { name: "Invite to community" }),
+    dialog.getByRole("heading", { name: "Invite link" }),
   ).toBeVisible();
   await expect(page.getByTestId("community-invite-email-field")).toHaveCount(0);
   await expect(page.getByPlaceholder("Type an email address")).toHaveCount(0);
-  await expect(
-    dialog.getByText(
-      "Add someone directly or share a link they can use to join.",
-    ),
-  ).toBeVisible();
-  await expect(
-    dialog.getByRole("heading", { name: "Add someone", exact: true }),
-  ).toHaveCount(0);
-  await expect(dialog.getByTestId("invite-options-divider")).toBeVisible();
-  await expect(
-    dialog.getByText("Or, copy a link", { exact: true }),
-  ).toBeVisible();
   await expect(dialog.getByText("Link settings", { exact: true })).toHaveCount(
     0,
   );
-  await expect(page.getByTestId("member-pubkey-input")).toBeVisible();
-  await expect(page.getByTestId("member-role")).toHaveCount(0);
+  // Adding someone directly lives in Add member, not here.
+  await expect(page.getByTestId("member-pubkey-input")).toHaveCount(0);
   await expect(page.getByTestId("confirm-add-member")).toHaveCount(0);
   await expect(page.getByTestId("invite-link-url")).toHaveValue(
     "https://alpha.example.com/invite/community-email-test",
@@ -121,6 +119,18 @@ test("capture: share-style community invite dialog", async ({ page }) => {
   await expect(page.getByTestId("invite-link-ttl-trigger")).toHaveText(
     "3 days",
   );
+  await waitForAnimations(page);
+  await page.mouse.move(0, 0);
+  await dialog.screenshot({ path: `${OUTDIR}/02-invite-dialog.png` });
+});
+
+test("capture: add member dialog", async ({ page }) => {
+  await page.getByTestId("add-relay-member").click();
+
+  const dialog = page.getByTestId("add-relay-member-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page.getByTestId("member-role")).toHaveCount(0);
+  await expect(page.getByTestId("confirm-add-member")).toHaveCount(0);
 
   await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
   await expect(page.getByTestId("member-search-popover")).toBeVisible();
@@ -130,16 +140,10 @@ test("capture: share-style community invite dialog", async ({ page }) => {
     `member-search-selection-remove-${DIRECT_ADD_HEX}`,
   );
   await expect(memberRole).toHaveText("Member");
-  const inviteButton = page.getByTestId("confirm-add-member");
-  await expect(inviteButton).toHaveText("Invite");
+  const addButton = page.getByTestId("confirm-add-member");
+  await expect(addButton).toHaveText("Add member");
   await waitForAnimations(page);
-  await expect(inviteButton).toHaveCSS("height", "44px");
-  await expect(inviteButton).toHaveJSProperty(
-    "offsetHeight",
-    await page
-      .getByTestId("member-recipient-field")
-      .evaluate((field) => Math.round(field.getBoundingClientRect().height)),
-  );
+  await expect(addButton).toHaveCSS("height", "44px");
   const selectedChipRemoveIcon = selectedChip.locator("span.absolute");
   await expect(selectedChipRemoveIcon).toHaveCSS("opacity", "0");
   await selectedChip.hover();
@@ -163,13 +167,13 @@ test("capture: share-style community invite dialog", async ({ page }) => {
   await expect(page.getByTestId("confirm-add-member")).toBeEnabled();
   await waitForAnimations(page);
   await page.mouse.move(0, 0);
-  await dialog.screenshot({ path: `${OUTDIR}/02-invite-dialog.png` });
+  await dialog.screenshot({ path: `${OUTDIR}/03-add-member-dialog.png` });
 });
 
 test("admin can add members but cannot assign the admin role", async ({
   page,
 }) => {
-  await page.getByTestId("community-invite-dialog-trigger").click();
+  await page.getByTestId("add-relay-member").click();
 
   await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
   await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
@@ -182,10 +186,8 @@ test("admin can add members but cannot assign the admin role", async ({
   await page.keyboard.press("Escape");
 });
 
-test("owner can add multiple admins directly by npub from live Invites UI", async ({
-  page,
-}) => {
-  await page.getByTestId("community-invite-dialog-trigger").click();
+test("owner can add multiple admins directly by npub", async ({ page }) => {
+  await page.getByTestId("add-relay-member").click();
   await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
   await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
   await page.getByTestId("member-pubkey-input").fill(SECOND_DIRECT_ADD_NPUB);
@@ -230,4 +232,95 @@ test("owner can add multiple admins directly by npub from live Invites UI", asyn
       ),
     )
     .toBe(true);
+});
+
+test("owner adds a member by npub from Add member", async ({ page }) => {
+  await page.getByTestId("add-relay-member").click();
+  const dialog = page.getByTestId("add-relay-member-dialog");
+  await expect(dialog).toBeVisible();
+
+  await dialog.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
+  await page.getByTestId(`member-search-result-${DIRECT_ADD_HEX}`).click();
+  await dialog.getByTestId("member-role").click();
+  await expect(
+    page.getByRole("menuitemradio", { name: "Admin" }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await dialog.getByTestId("confirm-add-member").click();
+
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByTestId(`relay-member-row-${DIRECT_ADD_HEX}`),
+  ).toBeVisible();
+});
+
+test("owner removes a member via the ... menu with confirm", async ({
+  page,
+}) => {
+  const bobRow = page.getByTestId(
+    `relay-member-row-${TEST_IDENTITIES.bob.pubkey}`,
+  );
+  await expect(bobRow).toBeVisible();
+
+  await page
+    .getByTestId(`relay-member-actions-${TEST_IDENTITIES.bob.pubkey}`)
+    .click();
+  await page.getByRole("menuitem", { name: "Remove from community" }).click();
+  const confirm = page.getByTestId("confirm-remove-member-dialog");
+  await expect(confirm).toBeVisible();
+  // Nothing is removed until the owner confirms.
+  await expect(bobRow).toBeVisible();
+
+  await confirm.getByTestId("confirm-remove-member").click();
+  await expect(confirm).toHaveCount(0);
+  await expect(bobRow).toHaveCount(0);
+  // The removed row's menu is gone, so focus lands on the search field.
+  await expect(page.getByTestId("community-members-search")).toBeFocused();
+});
+
+test("shows Members with a retry when the relay sends no member list", async ({
+  page,
+}) => {
+  await expect(
+    page.getByTestId("settings-nav-community-members"),
+  ).toContainText("Members");
+  const degraded = page.getByTestId("community-members-degraded");
+  await expect(degraded).toHaveText(
+    /This relay didn’t return its member list\.\s*Retry/,
+  );
+  const retry = page.getByTestId("community-members-retry");
+  await expect(retry).toBeEnabled();
+  await retry.click();
+  await expect(retry).toHaveText("Retry");
+  await expect(retry).toBeEnabled();
+  await expect(degraded).toBeVisible();
+
+  // With no role known there are no admin controls until a retry succeeds.
+  await expect(page.getByTestId("add-relay-member")).toHaveCount(0);
+  await expect(page.getByTestId("community-invite-dialog-trigger")).toHaveCount(
+    0,
+  );
+});
+
+test("a regular member sees no admin controls when the role check fails", async ({
+  page,
+}) => {
+  await expect(page.getByTestId("community-members-degraded")).toContainText(
+    "Couldn’t check your role on this community.",
+  );
+  await expect(page.getByTestId("add-relay-member")).toHaveCount(0);
+  await expect(page.getByTestId("community-invite-dialog-trigger")).toHaveCount(
+    0,
+  );
+  await expect(page.locator('[data-testid^="relay-member-row-"]')).toHaveCount(
+    0,
+  );
+  await expect(
+    page.locator('[data-testid^="relay-member-actions-"]'),
+  ).toHaveCount(0);
+
+  // A retry that fails again keeps the Members page open with the warning.
+  await page.getByTestId("community-members-retry").click();
+  await expect(page.getByTestId("community-members-degraded")).toBeVisible();
+  await expect(page.getByTestId("add-relay-member")).toHaveCount(0);
 });

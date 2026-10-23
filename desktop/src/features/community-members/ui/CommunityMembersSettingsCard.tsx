@@ -1,4 +1,12 @@
-import { Crown, MoreHorizontal, Search, Shield } from "lucide-react";
+import {
+  AlertCircle,
+  Crown,
+  MoreHorizontal,
+  Plus,
+  RefreshCw,
+  Search,
+  Shield,
+} from "lucide-react";
 import { nip19 } from "nostr-tools";
 import * as React from "react";
 import { toast } from "sonner";
@@ -7,13 +15,18 @@ import {
   useChangeRelayMemberRoleMutation,
   useMyRelayMembershipLookupQuery,
   useRelayMembersQuery,
-  useRemoveRelayMemberMutation,
 } from "@/features/community-members/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
+import {
+  canManageCommunityMembers,
+  relayMemberActions,
+  shouldShowCommunityMembersSettings,
+  shouldWarnMissingMembershipSnapshot,
+} from "@/shared/api/relayMembers";
 import type {
   RelayMember,
   RelayMemberRole,
@@ -33,7 +46,15 @@ import {
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
+import { AddMemberDialog } from "./AddMemberDialog";
 import { CommunityInviteDialog } from "./CommunityInviteDialog";
+import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
+
+const ROLE_ORDER: Record<RelayMemberRole, number> = {
+  owner: 0,
+  admin: 1,
+  member: 2,
+};
 
 function formatDisplayName(member: RelayMember, displayName?: string | null) {
   const trimmedDisplayName = displayName?.trim();
@@ -91,26 +112,27 @@ function HoverMemberIdentity({
 function RelayMemberRow({
   currentRole,
   currentPubkey,
+  onRemove,
   profile,
   member,
 }: {
-  currentRole: RelayMemberRole;
+  /** Null when the role is unknown: the row then offers no actions. */
+  currentRole: RelayMemberRole | null;
   currentPubkey?: string;
+  onRemove: (member: RelayMember) => void;
   profile?: UserProfileSummary;
   member: RelayMember;
 }) {
-  const removeMutation = useRemoveRelayMemberMutation();
   const changeRoleMutation = useChangeRelayMemberRoleMutation();
   const isSelf = currentPubkey
     ? normalizePubkey(currentPubkey) === normalizePubkey(member.pubkey)
     : false;
-  const isBusy = removeMutation.isPending || changeRoleMutation.isPending;
-  const canRemove =
-    !isSelf &&
-    member.role !== "owner" &&
-    (currentRole === "owner" || member.role === "member");
-  const canPromote = currentRole === "owner" && member.role === "member";
-  const canDemote = currentRole === "owner" && member.role === "admin";
+  const isBusy = changeRoleMutation.isPending;
+  const { canRemove, canPromote, canDemote } = relayMemberActions(
+    currentRole,
+    member.role,
+    isSelf,
+  );
   const hasActions = canRemove || canPromote || canDemote;
   const displayName = formatDisplayName(member, profile?.displayName);
 
@@ -232,12 +254,7 @@ function RelayMemberRow({
             {canRemove ? (
               <DropdownMenuItem
                 className="text-destructive focus:text-destructive"
-                onClick={() =>
-                  void mutateWithToast(
-                    () => removeMutation.mutateAsync(member.pubkey),
-                    "Removed community member",
-                  )
-                }
+                onClick={() => onRemove(member)}
               >
                 Remove from community
               </DropdownMenuItem>
@@ -255,22 +272,45 @@ export function CommunityMembersSettingsCard({
   currentPubkey?: string;
 }) {
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
-  const currentRole = myMembershipQuery.data?.membership?.role ?? null;
-  const canManageRelay = currentRole === "owner" || currentRole === "admin";
-  const membersQuery = useRelayMembersQuery(canManageRelay);
+  const lookup = myMembershipQuery.data;
+  const currentRole = lookup?.membership?.role ?? null;
+  const showCard = shouldShowCommunityMembersSettings(
+    lookup,
+    myMembershipQuery.isError || myMembershipQuery.errorUpdateCount > 0,
+  );
+  // Only a known owner or admin sees the list and its controls; an unknown
+  // role gets the warning and Retry.
+  const canManage = canManageCommunityMembers(lookup);
+  const degradedMessage = myMembershipQuery.isError
+    ? "Couldn’t check your role on this community."
+    : shouldWarnMissingMembershipSnapshot(lookup)
+      ? "This relay didn’t return its member list."
+      : null;
+  const membersQuery = useRelayMembersQuery(canManage);
+  const isRetrying = myMembershipQuery.isFetching || membersQuery.isFetching;
   const members = React.useMemo(
-    () => membersQuery.data ?? [],
+    () =>
+      [...(membersQuery.data ?? [])].sort(
+        (a, b) => ROLE_ORDER[a.role] - ROLE_ORDER[b.role],
+      ),
     [membersQuery.data],
   );
   const profilesQuery = useUsersBatchQuery(
     members.map((member) => member.pubkey),
     {
-      enabled: canManageRelay && members.length > 0,
+      enabled: canManage && members.length > 0,
     },
   );
   const profiles = profilesQuery.data?.profiles;
   const [inviteDialogOpen, setInviteDialogOpen] = React.useState(false);
+  const [addDialogOpen, setAddDialogOpen] = React.useState(false);
+  // Kept after close so the dialog title holds its name while it animates out.
+  const [removeTarget, setRemoveTarget] = React.useState<RelayMember | null>(
+    null,
+  );
+  const [removeOpen, setRemoveOpen] = React.useState(false);
   const [search, setSearch] = React.useState("");
+  const searchInputRef = React.useRef<HTMLInputElement>(null);
 
   const filteredMembers = React.useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -295,13 +335,13 @@ export function CommunityMembersSettingsCard({
     return (
       <section className="min-w-0" data-testid="settings-community-members">
         <p className="text-sm text-muted-foreground">
-          Checking invite permissions…
+          Checking member permissions…
         </p>
       </section>
     );
   }
 
-  if (!canManageRelay || !currentRole) {
+  if (!showCard) {
     return null;
   }
 
@@ -309,16 +349,54 @@ export function CommunityMembersSettingsCard({
     <section className="min-w-0" data-testid="settings-community-members">
       <SettingsSectionHeader
         action={
-          <Button
-            data-testid="community-invite-dialog-trigger"
-            onClick={() => setInviteDialogOpen(true)}
-          >
-            Invite to community
-          </Button>
+          canManage ? (
+            <div className="flex gap-2">
+              <Button
+                data-testid="community-invite-dialog-trigger"
+                onClick={() => setInviteDialogOpen(true)}
+                variant="outline"
+              >
+                Invite link
+              </Button>
+              <Button
+                data-testid="add-relay-member"
+                onClick={() => setAddDialogOpen(true)}
+              >
+                <Plus className="h-4 w-4" />
+                Add member
+              </Button>
+            </div>
+          ) : null
         }
-        title="Invites"
+        title="Members"
         description="Manage members and community access."
       />
+
+      {degradedMessage ? (
+        <div
+          className="mb-6 flex items-start gap-2 rounded-lg border border-amber-500/40 px-3 py-2.5 text-sm"
+          data-testid="community-members-degraded"
+          role="status"
+        >
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <p className="min-w-0 flex-1">{degradedMessage}</p>
+          <Button
+            data-testid="community-members-retry"
+            disabled={isRetrying}
+            onClick={() =>
+              void Promise.all([
+                myMembershipQuery.refetch(),
+                canManage ? membersQuery.refetch() : null,
+              ])
+            }
+            size="sm"
+            variant="outline"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {isRetrying ? "Retrying…" : "Retry"}
+          </Button>
+        </div>
+      ) : null}
 
       <SettingsOptionGroup
         title={
@@ -339,6 +417,7 @@ export function CommunityMembersSettingsCard({
               className="w-full rounded-lg border border-border/70 bg-background py-2 pl-9 pr-3 text-sm placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
               data-testid="community-members-search"
               onChange={(event) => setSearch(event.target.value)}
+              ref={searchInputRef}
               placeholder="Search members"
               spellCheck={false}
               type="text"
@@ -358,7 +437,9 @@ export function CommunityMembersSettingsCard({
             </p>
           ) : members.length === 0 ? (
             <p className="rounded-lg border border-dashed border-border/70 px-3 py-6 text-center text-sm text-muted-foreground">
-              No community members yet.
+              {degradedMessage
+                ? "No member list to show."
+                : "No community members yet."}
             </p>
           ) : filteredMembers.length === 0 ? (
             <p className="rounded-lg border border-dashed border-border/70 px-3 py-6 text-center text-sm text-muted-foreground">
@@ -375,6 +456,10 @@ export function CommunityMembersSettingsCard({
                   currentPubkey={currentPubkey}
                   currentRole={currentRole}
                   member={member}
+                  onRemove={(target) => {
+                    setRemoveTarget(target);
+                    setRemoveOpen(true);
+                  }}
                   profile={profiles?.[normalizePubkey(member.pubkey)]}
                 />
               )}
@@ -383,10 +468,31 @@ export function CommunityMembersSettingsCard({
         </div>
       </SettingsOptionGroup>
 
-      <CommunityInviteDialog
+      <AddMemberDialog
         isOwner={currentRole === "owner"}
+        onOpenChange={setAddDialogOpen}
+        open={addDialogOpen}
+      />
+      <CommunityInviteDialog
         onOpenChange={setInviteDialogOpen}
         open={inviteDialogOpen}
+      />
+      <ConfirmRemoveDialog
+        displayName={
+          removeTarget
+            ? (profiles?.[normalizePubkey(removeTarget.pubkey)]?.displayName ??
+              null)
+            : null
+        }
+        member={removeTarget}
+        onCloseAutoFocus={(event) => {
+          // The menu item that opened the dialog is gone, so Radix would drop
+          // focus to the page body.
+          event.preventDefault();
+          searchInputRef.current?.focus();
+        }}
+        onOpenChange={setRemoveOpen}
+        open={removeOpen}
       />
     </section>
   );
