@@ -7,19 +7,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
-import { DirectAddMemberForm } from "./AddMemberDialog";
 import {
   DEFAULT_INVITE_TTL_SECS,
   InviteLinkSection,
 } from "./InviteLinkSection";
-import { Separator } from "@/shared/ui/separator";
 
+/** Invite link only: adding someone directly has its own Add member dialog. */
 export function CommunityInviteDialog({
-  isOwner,
   onOpenChange,
   open,
 }: {
-  isOwner: boolean;
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
@@ -38,31 +35,13 @@ export function CommunityInviteDialog({
         data-testid="community-invite-dialog"
       >
         <DialogHeader>
-          <DialogTitle>Invite to community</DialogTitle>
+          <DialogTitle>Invite link</DialogTitle>
           <DialogDescription>
-            Add someone directly or share a link they can use to join.
+            Share a link people can use to join as members.
           </DialogDescription>
         </DialogHeader>
 
         <section className="mt-2 space-y-3">
-          <DirectAddMemberForm
-            isOwner={isOwner}
-            showLabel={false}
-            submitLabel="Invite"
-          />
-        </section>
-
-        <div
-          className="relative flex items-center py-2"
-          data-testid="invite-options-divider"
-        >
-          <Separator className="bg-input/40" />
-          <span className="absolute left-1/2 -translate-x-1/2 bg-background px-3 text-sm text-muted-foreground">
-            Or, copy a link
-          </span>
-        </div>
-
-        <section className="space-y-3">
           <InviteLinkSection onTtlSecsChange={setTtlSecs} ttlSecs={ttlSecs} />
         </section>
       </DialogContent>

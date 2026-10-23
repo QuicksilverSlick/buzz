@@ -317,7 +317,7 @@ test("joins a community URL without an API token field", async ({ page }) => {
     .toMatchObject({ relayUrl: "wss://token.example.com" });
 });
 
-test("hides Invites settings on open relays", async ({ page }) => {
+test("hides Members settings on open relays", async ({ page }) => {
   await page.goto("/");
   await openSettings(page);
 

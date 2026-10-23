@@ -45,10 +45,46 @@ export function canManageCommunityMembers(
   return role === "owner" || role === "admin";
 }
 
+/**
+ * Row actions the viewer gets for one member: none unless the viewer is a
+ * known owner or admin. Admins may only remove members. The relay re-checks.
+ */
+export function relayMemberActions(
+  viewerRole: RelayMemberRole | null,
+  memberRole: RelayMemberRole,
+  isSelf: boolean,
+) {
+  const isOwner = viewerRole === "owner";
+  return {
+    canRemove:
+      (isOwner || viewerRole === "admin") &&
+      !isSelf &&
+      memberRole !== "owner" &&
+      (isOwner || memberRole === "member"),
+    canPromote: isOwner && memberRole === "member",
+    canDemote: isOwner && memberRole === "admin",
+  };
+}
+
 export function shouldWarnMissingMembershipSnapshot(
   lookup: RelayMembershipLookup | undefined,
 ): boolean {
   return lookup?.membershipRequired === true && !lookup.snapshotFound;
+}
+
+/**
+ * The Members settings entry shows for owners and admins, and also when the
+ * role is unknown (the relay sent no member list, or the first check failed)
+ * so it never vanishes without saying why. Cached data wins over a failed
+ * refetch, and open relays stay hidden.
+ */
+export function shouldShowCommunityMembersSettings(
+  lookup: RelayMembershipLookup | undefined,
+  lookupFailed: boolean,
+): boolean {
+  if (!lookup) return lookupFailed;
+  if (!lookup.membershipRequired) return false;
+  return lookup.snapshotFound ? canManageCommunityMembers(lookup) : true;
 }
 
 export function relayMembersFromEvent(event: RelayEvent): RelayMember[] {

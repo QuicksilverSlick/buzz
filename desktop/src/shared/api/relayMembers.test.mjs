@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   canManageCommunityMembers,
   loadRelayMembershipLookup,
+  relayMemberActions,
+  shouldShowCommunityMembersSettings,
   shouldWarnMissingMembershipSnapshot,
 } from "./relayMembers.ts";
 
@@ -111,4 +113,74 @@ test("an available snapshot never warns", () => {
     }),
     false,
   );
+});
+
+test("Members settings entry follows the known role, and shows when the role is unknown", () => {
+  const viewer = "a".repeat(64);
+  const openRelay = {
+    snapshotFound: false,
+    membershipRequired: false,
+    membership: null,
+  };
+  const missingSnapshot = { ...openRelay, membershipRequired: true };
+  const memberWithSnapshot = {
+    snapshotFound: true,
+    membershipRequired: true,
+    membership: { pubkey: viewer, role: "member" },
+  };
+  const adminWithSnapshot = {
+    ...memberWithSnapshot,
+    membership: { pubkey: viewer, role: "admin" },
+  };
+
+  // Still loading: hidden.
+  assert.equal(shouldShowCommunityMembersSettings(undefined, false), false);
+  // First check failed with nothing cached: shown with a warning.
+  assert.equal(shouldShowCommunityMembersSettings(undefined, true), true);
+  assert.equal(
+    shouldShowCommunityMembersSettings(missingSnapshot, false),
+    true,
+  );
+  assert.equal(
+    shouldShowCommunityMembersSettings(adminWithSnapshot, false),
+    true,
+  );
+  assert.equal(
+    shouldShowCommunityMembersSettings(adminWithSnapshot, true),
+    true,
+  );
+  // A failed refetch never overrides what the cached data already says.
+  for (const failed of [false, true]) {
+    assert.equal(
+      shouldShowCommunityMembersSettings(memberWithSnapshot, failed),
+      false,
+    );
+    assert.equal(shouldShowCommunityMembersSettings(openRelay, failed), false);
+  }
+});
+
+test("row actions need a known owner or admin viewer", () => {
+  const none = { canRemove: false, canPromote: false, canDemote: false };
+  for (const viewerRole of [null, "member"]) {
+    for (const memberRole of ["owner", "admin", "member"]) {
+      assert.deepEqual(relayMemberActions(viewerRole, memberRole, false), none);
+    }
+  }
+  assert.deepEqual(relayMemberActions("admin", "member", false), {
+    ...none,
+    canRemove: true,
+  });
+  assert.deepEqual(relayMemberActions("admin", "admin", false), none);
+  assert.deepEqual(relayMemberActions("owner", "member", false), {
+    canRemove: true,
+    canPromote: true,
+    canDemote: false,
+  });
+  assert.deepEqual(relayMemberActions("owner", "admin", false), {
+    canRemove: true,
+    canPromote: false,
+    canDemote: true,
+  });
+  assert.deepEqual(relayMemberActions("owner", "owner", true), none);
+  assert.deepEqual(relayMemberActions("admin", "member", true), none);
 });

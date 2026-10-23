@@ -422,6 +422,8 @@ type MockBridgeOptions = {
   relayRequiresMembership?: boolean;
   /** Delay EOSE for membership snapshots after delivering the event. */
   relayMembershipEoseDelayMs?: number;
+  /** False: answer kind:13534 REQs with EOSE only, as a relay with no snapshot does. */
+  relayMembershipSnapshot?: boolean;
   /**
    * Active identity's role in the seeded `mockRelayMembers`. `null` removes
    * the active identity from the membership list entirely (admin-path branch
