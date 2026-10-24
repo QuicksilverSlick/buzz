@@ -7,10 +7,17 @@
 # past the job timeout without failing. This kills each attempt after a
 # deadline, stops any apt-get/dpkg the attempt left behind, and retries.
 # Downloaded .debs stay in /var/cache/apt/archives, so a retry resumes where
-# the last attempt stopped. It retries the same mirror, so
-# against a mirror that stays degraded this bounds each invocation (about 25m
-# with the defaults) rather than recovering it. Size job timeouts to fit the
-# bound of every invocation in the job plus the job's real work.
+# the last attempt stopped.
+#
+# Between attempts it also repairs packages a killed dpkg left half-unpacked
+# (`dpkg --configure -a` alone can't, and every later install then fails on
+# unmet dependencies), backs off, demotes the mirror apt tries first in
+# /etc/apt/apt-mirrors.txt, and refreshes the package index. apt fails over to
+# the next mirror on errors but never on a mirror that is merely slow, and a
+# fresh index clears version skew from a mirror caught mid-sync. Each step has
+# its own deadline, so this bounds each invocation (about 31m with the
+# defaults). Size job timeouts to fit the bound of every invocation in the job
+# plus the job's real work. An attempt that passes skips all of this.
 #
 # Ephemeral hosted runners only: between attempts it stops every apt-get/dpkg
 # on the machine, not just the ones it started. Don't use it on a self-hosted
@@ -27,14 +34,19 @@
 #   CI_APT_ATTEMPT_SECONDS  Deadline per attempt (default: 420). Healthy apt
 #                           steps finish in under 4 minutes; degraded ones run
 #                           past 13.
-#   CI_APT_REPAIR_SECONDS   Deadline for the dpkg repair between attempts
-#                           (default: 60).
+#   CI_APT_REPAIR_SECONDS   Deadline for each repair and index refresh step
+#                           between attempts (default: 60).
+#   CI_APT_BACKOFF_SECONDS  Pause before retry N is N times this (default: 15).
+#   CI_APT_MIRRORS          Mirror list to rotate between attempts (default:
+#                           /etc/apt/apt-mirrors.txt; skipped if missing).
 # =============================================================================
 set -euo pipefail
 
 attempts="${CI_APT_ATTEMPTS:-3}"
 deadline="${CI_APT_ATTEMPT_SECONDS:-420}"
 repair_deadline="${CI_APT_REPAIR_SECONDS:-60}"
+backoff="${CI_APT_BACKOFF_SECONDS:-15}"
+mirrors="${CI_APT_MIRRORS:-/etc/apt/apt-mirrors.txt}"
 
 if [ "$#" -eq 0 ]; then
   echo "usage: $0 <command> [args...]" >&2
@@ -58,6 +70,24 @@ reap_package_managers() {
   sudo pkill -KILL -x 'apt-get|dpkg' || true
 }
 
+# apt tries the mirror with the lowest priority:N first. Give that one a
+# priority past the others, so each retry starts on a different mirror.
+rotate_mirrors() {
+  local rotated
+  rotated=$(awk '
+    match($0, /priority:[0-9]+/) {
+      p = substr($0, RSTART + 9, RLENGTH - 9) + 0
+      if (first == "" || p < min) { min = p; first = NR }
+      if (p > max) max = p
+    }
+    { line[NR] = $0 }
+    END {
+      if (first != "") sub(/priority:[0-9]+/, "priority:" (max + 1), line[first])
+      for (i = 1; i <= NR; i++) print line[i]
+    }' "$mirrors" 2>/dev/null) && [ -n "$rotated" ] || return 0
+  printf '%s\n' "$rotated" | sudo tee "$mirrors" >/dev/null
+}
+
 for attempt in $(seq 1 "$attempts"); do
   rc=0
   timeout --kill-after=15s "$deadline" "$@" || rc=$?
@@ -75,9 +105,17 @@ for attempt in $(seq 1 "$attempts"); do
   # before giving up so no apt-get outlives the step.
   reap_package_managers
   [ "$attempt" -eq "$attempts" ] && break
-  # A killed apt/dpkg run can leave dpkg half-configured; repair before
-  # retrying, under its own deadline so a stuck repair can't eat the job.
+  # A killed apt/dpkg run can leave dpkg half-configured, or a package
+  # half-unpacked that only apt-get -f install (from the cached .debs) fixes.
+  # Repair before retrying, each step under its own deadline so a stuck repair
+  # can't eat the job.
   timeout --kill-after=15s "$repair_deadline" sudo dpkg --configure -a || true
+  timeout --kill-after=15s "$repair_deadline" sudo apt-get -f install -y || true
+  # Give a degraded or mid-sync mirror time, retry on another one, and resolve
+  # the retry against a fresh index.
+  sleep $((backoff * attempt))
+  rotate_mirrors || true
+  timeout --kill-after=15s "$repair_deadline" sudo apt-get update || true
 done
 echo "::error::all $attempts attempts failed: $*"
 exit 1

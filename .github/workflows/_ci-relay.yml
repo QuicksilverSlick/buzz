@@ -229,9 +229,9 @@ jobs:
     name: Desktop E2E Integration (${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
     # A shard needs ~10m; Playwright install-deps is bounded by
-    # ci-apt-retry.sh (~25m worst case), so a degraded mirror fails with its
+    # ci-apt-retry.sh (~31m worst case), so a degraded mirror fails with its
     # own error instead of the job timeout.
-    timeout-minutes: 40
+    timeout-minutes: 45
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
       fail-fast: false
