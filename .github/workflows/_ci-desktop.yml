@@ -67,10 +67,10 @@ jobs:
   desktop-tauri:
     name: Desktop Tauri (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    # A lane needs up to ~15m. ci-apt-retry.sh bounds the apt step at ~34m worst
-    # case (update ~8.5m + install ~25m); 55m fits both, so a degraded mirror
+    # A lane needs up to ~15m. ci-apt-retry.sh bounds the apt step at ~45m worst
+    # case (update ~14m + install ~31m); 65m fits both, so a degraded mirror
     # fails with the wrapper's error instead of the job timeout.
-    timeout-minutes: 55
+    timeout-minutes: 65
     # Keep in sync with RUST_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
     if: github.event_name == 'push' || inputs.desktop_rust || inputs.rust
     strategy:
@@ -129,9 +129,9 @@ jobs:
     name: Desktop Smoke E2E (${{ matrix.shard }})
     runs-on: ubuntu-latest
     # A smoke shard needs ~12m, and Chromium dependency setup is bounded by
-    # ci-apt-retry.sh (~25m worst case). Leave time for the full suite
+    # ci-apt-retry.sh (~31m worst case). Leave time for the full suite
     # and its reports to finish.
-    timeout-minutes: 45
+    timeout-minutes: 50
     # Keep in sync with FRONTEND_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
     if: github.event_name == 'push' || inputs.desktop
     strategy:

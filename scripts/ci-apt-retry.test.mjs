@@ -14,19 +14,33 @@ const skip =
   process.platform !== "linux" &&
   "needs Linux (GNU timeout, flock, setsid, procps)";
 
+// The mirror list GitHub's Ubuntu x64 images write (actions/runner-images
+// images/ubuntu/scripts/build/configure-apt-sources.sh).
+const RUNNER_MIRRORS = [
+  "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1",
+  "https://archive.ubuntu.com/ubuntu/\tpriority:2",
+  "https://security.ubuntu.com/ubuntu/\tpriority:3",
+  "",
+].join("\n");
+
 // Run the wrapper with a fake `sudo` on PATH that records each call instead
-// of touching the system's apt or dpkg state.
+// of touching the system's apt or dpkg state. `apt-get -f install` records
+// "fix" and `apt-get update` "refresh", each also touching $FAKE_DIR/<name>
+// so a command can depend on it; a mirror list rewrite records "rotate".
 function run(args, { PATH: extraPath, ...env } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ci-apt-retry-"));
   const calls = join(dir, "calls");
+  const mirrors = join(dir, "apt-mirrors.txt");
   writeFileSync(calls, "");
+  writeFileSync(mirrors, RUNNER_MIRRORS);
   writeFileSync(
     join(dir, "sudo"),
     `#!/usr/bin/env bash
 case "$1" in
-  tee) cat > "${dir}/conf" ;;
+  tee) if [ "$2" = "${mirrors}" ]; then echo rotate >> "${calls}"; cat > "$2"; else cat > "${dir}/conf"; fi ;;
   pkill) "$@" ;;
   dpkg) echo repair >> "${calls}"; [ -n "\${STALL_REPAIR:-}" ] && sleep 30; true ;;
+  apt-get) step=fix; [ "$2" = update ] && step=refresh; echo $step >> "${calls}"; [ -n "\${STALL_APT:-}" ] && sleep 30; touch "${dir}/$step" ;;
   *) echo cmd >> "${calls}"; "$@" ;;
 esac
 `,
@@ -41,6 +55,9 @@ esac
       PATH: [dir, extraPath, process.env.PATH].filter(Boolean).join(":"),
       CI_APT_ATTEMPT_SECONDS: "1",
       CI_APT_REPAIR_SECONDS: "1",
+      CI_APT_BACKOFF_SECONDS: "0",
+      CI_APT_MIRRORS: mirrors,
+      FAKE_DIR: dir,
       ...env,
     },
   });
@@ -55,52 +72,98 @@ esac
         return "";
       }
     })(),
+    mirrors: readFileSync(mirrors, "utf8"),
     stdout: result.stdout,
   };
 }
 
+const RETRY = ["repair", "fix", "rotate", "refresh"];
+
 test("success runs the command once and writes apt options", { skip }, () => {
-  const r = run(["sudo", "true"]);
+  // A long backoff proves the success path never sleeps.
+  const r = run(["sudo", "true"], { CI_APT_BACKOFF_SECONDS: "30" });
   assert.equal(r.status, 0);
   assert.deepEqual(r.calls, ["cmd"]);
+  assert.equal(r.mirrors, RUNNER_MIRRORS);
   assert.match(r.conf, /Acquire::https::Timeout "30";/);
+  assert.ok(r.seconds < 5, `took ${r.seconds}s`);
 });
 
-test("a failed attempt is repaired and retried", { skip }, () => {
+test("a failed attempt is repaired, backs off, switches mirror and refreshes before the retry", { skip }, () => {
   const dir = mkdtempSync(join(tmpdir(), "ci-apt-retry-flaky-"));
   const marker = join(dir, "seen");
+  const r = run(
+    ["sudo", "bash", "-c", `[ -e ${marker} ] || { touch ${marker}; exit 1; }`],
+    { CI_APT_BACKOFF_SECONDS: "1" },
+  );
+  assert.equal(r.status, 0);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
+  // azure.archive.ubuntu.com drops behind the others; archive.ubuntu.com is
+  // now apt's first choice.
+  assert.equal(r.mirrors, RUNNER_MIRRORS.replace("priority:1", "priority:4"));
+  assert.ok(r.seconds >= 1, `backoff skipped: took ${r.seconds}s`);
+});
+
+// A mirror caught mid-sync serves an index its dependencies can't meet yet;
+// the install fails until the index is refreshed.
+test("a mid-sync index skew passes once the index is refreshed", { skip }, () => {
   const r = run([
     "sudo",
     "bash",
     "-c",
-    `[ -e ${marker} ] || { touch ${marker}; exit 1; }`,
+    '[ -e "$FAKE_DIR/refresh" ] || { echo "xvfb : Depends: xserver-common (>= 2:21.1.12-1ubuntu1.9) but 2:21.1.12-1ubuntu1.8 is to be installed"; exit 100; }',
   ]);
-  assert.equal(r.status, 0);
-  assert.deepEqual(r.calls, ["cmd", "repair", "cmd"]);
+  assert.equal(r.status, 0, r.stdout);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
+  assert.match(r.stdout, /attempt 1\/3 failed \(exit 100\)/);
+});
+
+// 23 Oct 2026, train #69: attempt 1 was killed mid-unpack, leaving
+// libglib2.0-0t64 half-installed, which `dpkg --configure -a` can't fix.
+test("a package left half-unpacked by a killed attempt is fixed before the retry", { skip }, () => {
+  const r = run(["sudo", "bash", "-c", '[ -e "$FAKE_DIR/fix" ] || exit 100']);
+  assert.equal(r.status, 0, r.stdout);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
 });
 
 test("persistent failure stops after the attempt budget, without a final repair", { skip }, () => {
   const r = run(["sudo", "false"]);
   assert.equal(r.status, 1);
-  assert.deepEqual(r.calls, ["cmd", "repair", "cmd", "repair", "cmd"]);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd", ...RETRY, "cmd"]);
   assert.match(r.stdout, /::error::all 3 attempts failed/);
+  // Each retry starts on a different mirror: archive, then security.
+  assert.equal(
+    r.mirrors,
+    RUNNER_MIRRORS.replace("priority:1", "priority:4").replace("priority:2", "priority:5"),
+  );
+});
+
+test("without a mirror list the retry still repairs and refreshes", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-apt-retry-nomirrors-"));
+  const r = run(["sudo", "bash", "-c", '[ -e "$FAKE_DIR/refresh" ] || exit 1'], {
+    CI_APT_MIRRORS: join(dir, "absent"),
+  });
+  assert.equal(r.status, 0, r.stdout);
+  // Nothing is rotated, or written, when the list is missing.
+  assert.deepEqual(r.calls, ["cmd", "repair", "fix", "refresh", "cmd"]);
 });
 
 test("a stalled attempt is killed at its deadline and retried", { skip }, () => {
   const r = run(["sudo", "sleep", "30"], { CI_APT_ATTEMPTS: "2" });
   assert.equal(r.status, 1);
-  assert.deepEqual(r.calls, ["cmd", "repair", "cmd"]);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
   assert.match(r.stdout, /timed out after 1s/);
   assert.ok(r.seconds < 10, `took ${r.seconds}s`);
 });
 
-test("a stalled dpkg repair is bounded and the next attempt still runs", { skip }, () => {
+test("a stalled repair, fix or refresh is bounded and the next attempt still runs", { skip }, () => {
   const r = run(["sudo", "bash", "-c", "exit 23"], {
     CI_APT_ATTEMPTS: "2",
     STALL_REPAIR: "1",
+    STALL_APT: "1",
   });
   assert.equal(r.status, 1);
-  assert.deepEqual(r.calls, ["cmd", "repair", "cmd"]);
+  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
   assert.ok(r.seconds < 10, `took ${r.seconds}s`);
 });
 
