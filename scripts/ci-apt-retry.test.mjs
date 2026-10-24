@@ -26,7 +26,7 @@ const RUNNER_MIRRORS = [
 // Run the wrapper with a fake `sudo` on PATH that records each call instead
 // of touching the system's apt or dpkg state. `apt-get -f install` records
 // "fix" and `apt-get update` "refresh", each also touching $FAKE_DIR/<name>
-// so a command can depend on it.
+// so a command can depend on it; a mirror list rewrite records "rotate".
 function run(args, { PATH: extraPath, ...env } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ci-apt-retry-"));
   const calls = join(dir, "calls");
@@ -37,10 +37,10 @@ function run(args, { PATH: extraPath, ...env } = {}) {
     join(dir, "sudo"),
     `#!/usr/bin/env bash
 case "$1" in
-  tee) if [ "$2" = "${mirrors}" ]; then cat > "$2"; else cat > "${dir}/conf"; fi ;;
+  tee) if [ "$2" = "${mirrors}" ]; then echo rotate >> "${calls}"; cat > "$2"; else cat > "${dir}/conf"; fi ;;
   pkill) "$@" ;;
   dpkg) echo repair >> "${calls}"; [ -n "\${STALL_REPAIR:-}" ] && sleep 30; true ;;
-  apt-get) step=fix; [ "$2" = update ] && step=refresh; echo $step >> "${calls}"; touch "${dir}/$step" ;;
+  apt-get) step=fix; [ "$2" = update ] && step=refresh; echo $step >> "${calls}"; [ -n "\${STALL_APT:-}" ] && sleep 30; touch "${dir}/$step" ;;
   *) echo cmd >> "${calls}"; "$@" ;;
 esac
 `,
@@ -77,7 +77,7 @@ esac
   };
 }
 
-const RETRY = ["repair", "fix", "refresh"];
+const RETRY = ["repair", "fix", "rotate", "refresh"];
 
 test("success runs the command once and writes apt options", { skip }, () => {
   // A long backoff proves the success path never sleeps.
@@ -104,8 +104,8 @@ test("a failed attempt is repaired, backs off, switches mirror and refreshes bef
   assert.ok(r.seconds >= 1, `backoff skipped: took ${r.seconds}s`);
 });
 
-// 23 Oct 2026, train #69: a mirror served xvfb 1.9 before xserver-common 1.9.
-// The install fails on unmet dependencies until the index is refreshed.
+// A mirror caught mid-sync serves an index its dependencies can't meet yet;
+// the install fails until the index is refreshed.
 test("a mid-sync index skew passes once the index is refreshed", { skip }, () => {
   const r = run([
     "sudo",
@@ -118,7 +118,7 @@ test("a mid-sync index skew passes once the index is refreshed", { skip }, () =>
   assert.match(r.stdout, /attempt 1\/3 failed \(exit 100\)/);
 });
 
-// The same run's real cause: attempt 1 was killed mid-unpack, leaving
+// 23 Oct 2026, train #69: attempt 1 was killed mid-unpack, leaving
 // libglib2.0-0t64 half-installed, which `dpkg --configure -a` can't fix.
 test("a package left half-unpacked by a killed attempt is fixed before the retry", { skip }, () => {
   const r = run(["sudo", "bash", "-c", '[ -e "$FAKE_DIR/fix" ] || exit 100']);
@@ -144,7 +144,8 @@ test("without a mirror list the retry still repairs and refreshes", { skip }, ()
     CI_APT_MIRRORS: join(dir, "absent"),
   });
   assert.equal(r.status, 0, r.stdout);
-  assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
+  // Nothing is rotated, or written, when the list is missing.
+  assert.deepEqual(r.calls, ["cmd", "repair", "fix", "refresh", "cmd"]);
 });
 
 test("a stalled attempt is killed at its deadline and retried", { skip }, () => {
@@ -155,10 +156,11 @@ test("a stalled attempt is killed at its deadline and retried", { skip }, () => 
   assert.ok(r.seconds < 10, `took ${r.seconds}s`);
 });
 
-test("a stalled dpkg repair is bounded and the next attempt still runs", { skip }, () => {
+test("a stalled repair, fix or refresh is bounded and the next attempt still runs", { skip }, () => {
   const r = run(["sudo", "bash", "-c", "exit 23"], {
     CI_APT_ATTEMPTS: "2",
     STALL_REPAIR: "1",
+    STALL_APT: "1",
   });
   assert.equal(r.status, 1);
   assert.deepEqual(r.calls, ["cmd", ...RETRY, "cmd"]);
