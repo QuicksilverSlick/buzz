@@ -26,10 +26,12 @@ const NEW_MEMBER = "a".repeat(64);
 const OTHER = "b".repeat(64);
 const VIEWER = "c".repeat(64);
 const DIRECTORY = ["user-search", "infinite", "", 50];
+const ROSTER = ["channels", "agents", "members"];
 
 let QueryClient;
 let start;
 let windowMs;
+let rosterDisplayName;
 
 before(async () => {
   dom.window.__TAURI_INTERNALS__ = {
@@ -43,8 +45,11 @@ before(async () => {
     window: dom.window,
   });
   ({ QueryClient } = await import("@tanstack/react-query"));
-  ({ startLiveDirectoryUpdates: start, DIRECTORY_REFRESH_WINDOW_MS: windowMs } =
-    await import("./useLiveDirectoryUpdates.ts"));
+  ({
+    startLiveDirectoryUpdates: start,
+    DIRECTORY_REFRESH_WINDOW_MS: windowMs,
+    rosterDisplayName,
+  } = await import("./useLiveDirectoryUpdates.ts"));
 });
 
 after(() => dom.window.close());
@@ -63,9 +68,13 @@ function fakeRelay({ failures = 0 } = {}) {
   return relay;
 }
 
-function event(kind, pubkey, { createdAt = 100, tags = [] } = {}) {
+function event(
+  kind,
+  pubkey,
+  { content = "", createdAt = 100, tags = [] } = {},
+) {
   return {
-    content: "",
+    content,
     created_at: createdAt,
     id: "e".repeat(64),
     kind,
@@ -102,9 +111,19 @@ describe("startLiveDirectoryUpdates", () => {
       ["users-batch", NEW_MEMBER, OTHER],
       ["users-batch", OTHER],
       ["users-batch-entry", NEW_MEMBER],
+      ["profile"],
     ]) {
       client.setQueryData(key, {});
     }
+    client.setQueryData(ROSTER, [
+      {
+        displayName: "Old name",
+        isAgent: false,
+        joinedAt: null,
+        pubkey: NEW_MEMBER,
+        role: "member",
+      },
+    ]);
     // A directory scrolled three pages deep.
     client.setQueryData(DIRECTORY, {
       pages: [{ users: [] }, { users: [] }, { users: [] }],
@@ -160,6 +179,35 @@ describe("startLiveDirectoryUpdates", () => {
     mock.timers.tick(windowMs);
 
     assert.deepEqual(client.getQueryData(DIRECTORY).pageParams, [null]);
+  });
+
+  it("renames the member in cached channel rosters", async () => {
+    relay.onEvent(
+      event(0, NEW_MEMBER, { content: '{"display_name":"New name"}' }),
+    );
+    mock.timers.tick(windowMs);
+    await settle();
+
+    assert.equal(client.getQueryData(ROSTER)[0].displayName, "New name");
+  });
+
+  it("clears a roster name the profile dropped, as a refetch would", async () => {
+    relay.onEvent(event(0, NEW_MEMBER, { content: '{"about":"no name"}' }));
+    mock.timers.tick(windowMs);
+    await settle();
+
+    assert.equal(client.getQueryData(ROSTER)[0].displayName, null);
+    assert.ok(invalidated(client, ["user-profile", NEW_MEMBER]));
+  });
+
+  it("refreshes the viewer's own profile on their kind:0 only", () => {
+    relay.onEvent(event(0, OTHER));
+    mock.timers.tick(windowMs);
+    assert.equal(invalidated(client, ["profile"]), false);
+
+    relay.onEvent(event(0, VIEWER.toUpperCase()));
+    mock.timers.tick(windowMs);
+    assert.ok(invalidated(client, ["profile"]));
   });
 
   it("does not let a burst postpone the refresh", () => {
@@ -240,5 +288,21 @@ describe("startLiveDirectoryUpdates", () => {
     assert.equal(typeof flaky.onEvent, "function");
     stopFlaky();
     assert.equal(flaky.unsubscribed, 1);
+  });
+});
+
+describe("rosterDisplayName", () => {
+  it("follows Rust's profile_info_from_event rule", () => {
+    assert.equal(
+      rosterDisplayName('{"display_name":"Quill","name":"q"}'),
+      "Quill",
+    );
+    assert.equal(rosterDisplayName('{"name":"q"}'), "q");
+    // An empty display_name still wins, as it does in Rust.
+    assert.equal(rosterDisplayName('{"display_name":"","name":"q"}'), "");
+    assert.equal(rosterDisplayName('{"display_name":7}'), null);
+    assert.equal(rosterDisplayName("[1]"), null);
+    assert.equal(rosterDisplayName("null"), null);
+    assert.equal(rosterDisplayName("not json"), null);
   });
 });

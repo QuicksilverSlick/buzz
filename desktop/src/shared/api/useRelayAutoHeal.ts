@@ -7,7 +7,7 @@ import {
   isRelayConnectionDegraded,
   type ConnectionState,
 } from "@/shared/api/relayClientShared";
-import { isRelayDependentQuery } from "@/shared/api/relayQueryInvalidation";
+import { invalidateRelayQueries } from "@/shared/api/relayQueryInvalidation";
 import {
   isRateLimited,
   waitForRateLimit,
@@ -110,14 +110,10 @@ export function useRelayAutoHeal(): void {
           // Defer the invalidate until the rate-limit window clears so queries
           // don't immediately refetch and generate another burst.
           void waitForRateLimit().then(() => {
-            void queryClient.invalidateQueries({
-              predicate: isRelayDependentQuery,
-            });
+            void invalidateRelayQueries(queryClient);
           });
         } else {
-          void queryClient.invalidateQueries({
-            predicate: isRelayDependentQuery,
-          });
+          void invalidateRelayQueries(queryClient);
         }
       },
       AUTO_HEAL_MIN_INTERVAL_MS,
