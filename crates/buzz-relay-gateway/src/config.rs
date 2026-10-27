@@ -1,6 +1,6 @@
 //! Environment configuration (all public values) and the fixed limits.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use nostr::PublicKey;
 use url::Url;
@@ -90,7 +90,7 @@ fn relay_urls(raw: &str) -> Option<(Url, Url)> {
     bare.then_some((ws, http))
 }
 
-/// Fixed limits (design §5). Not configurable by env; tests pass smaller values.
+/// Fixed limits and timeouts (design §5). Not configurable by env; tests pass smaller values.
 #[derive(Clone, Debug)]
 pub struct Limits {
     /// Links open at once; the next upgrade gets 503.
@@ -99,6 +99,32 @@ pub struct Limits {
     pub max_auth_header: usize,
     /// Bearer ids remembered for replay protection; when full, new bearers get 503.
     pub replay_entries: usize,
+    /// Largest Worker frame; a bigger one closes the link with 1009.
+    pub max_frame: usize,
+    /// Largest decoded request body (the relay's own API limit).
+    pub max_request_body: usize,
+    /// Largest relay response body; the read stops there.
+    pub max_response_body: usize,
+    /// Largest `ws_send` text (the relay's frame limit).
+    pub max_ws_text: usize,
+    /// HTTP requests in flight per link.
+    pub max_http_inflight: usize,
+    /// Relay sockets per link.
+    pub max_sockets: usize,
+    /// Frames queued for the Worker; a full queue closes the link with 4003.
+    pub out_frames: usize,
+    /// Serialized bytes queued for the Worker, with the same rule.
+    pub out_bytes: usize,
+    /// How long a link lives before it closes with 4001.
+    pub link_lifetime: Duration,
+    /// How long before that the gateway sends `rotate`.
+    pub rotate_before: Duration,
+    /// Gateway `ping` interval.
+    pub ping_every: Duration,
+    /// A link with no Worker frame for this long closes with 4002.
+    pub idle: Duration,
+    /// How long shutdown waits for in-flight HTTP requests.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for Limits {
@@ -107,6 +133,19 @@ impl Default for Limits {
             max_links: 4,
             max_auth_header: 8 << 10,
             replay_entries: 1024,
+            max_frame: 2 << 20,
+            max_request_body: 1 << 20,
+            max_response_body: 4 << 20,
+            max_ws_text: 512 << 10,
+            max_http_inflight: 16,
+            max_sockets: 8,
+            out_frames: 1024,
+            out_bytes: 16 << 20,
+            link_lifetime: Duration::from_secs(3600),
+            rotate_before: Duration::from_secs(300),
+            ping_every: Duration::from_secs(20),
+            idle: Duration::from_secs(60),
+            shutdown_grace: Duration::from_secs(10),
         }
     }
 }
