@@ -10,6 +10,7 @@ pub mod frame;
 mod http_forward;
 mod link;
 pub mod policy;
+mod relay_ws;
 
 use std::{
     future::IntoFuture,

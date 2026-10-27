@@ -1,5 +1,5 @@
 //! One task per link: `hello`, frame dispatch, pings, rotation, idle and
-//! backpressure, and the link's close.
+//! backpressure, and the teardown of everything the link opened.
 
 use std::{
     collections::HashMap,
@@ -19,10 +19,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     frame::{ErrorCode, HelloLimits, HttpFrame, Id, Inbound, Out},
-    http_forward, policy, AppState,
+    http_forward, policy,
+    relay_ws::{Cmd, Socket},
+    AppState,
 };
 
-// Teardown waits this long for the Worker to take the close frame.
+// Teardown waits this long for the relay sockets, then for the Worker to take the close frame.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 const SHUTDOWN: (u16, &str) = (1012, "gateway restarting");
 
@@ -69,6 +71,11 @@ impl Outbox {
     }
 }
 
+struct SocketHandle {
+    tx: mpsc::Sender<Cmd>,
+    overflow: CancellationToken,
+}
+
 struct Link {
     state: Arc<AppState>,
     id: String,
@@ -76,6 +83,9 @@ struct Link {
     draining: bool,
     http: JoinSet<()>,
     inflight: HashMap<Id, AbortHandle>,
+    sockets: HashMap<Id, SocketHandle>,
+    socket_tasks: JoinSet<()>,
+    sockets_closed: CancellationToken,
 }
 
 /// Runs one link until it closes. `_permit` holds its slot under the link cap.
@@ -114,6 +124,9 @@ pub(crate) async fn run(socket: WebSocket, state: Arc<AppState>, _permit: OwnedS
         draining: false,
         http: JoinSet::new(),
         inflight: HashMap::new(),
+        sockets: HashMap::new(),
+        socket_tasks: JoinSet::new(),
+        sockets_closed: CancellationToken::new(),
     };
     let (code, reason) = link
         .serve(&mut stream, opened + lim.link_lifetime, opened + rotate_in)
@@ -125,7 +138,14 @@ pub(crate) async fn run(socket: WebSocket, state: Arc<AppState>, _permit: OwnedS
         ms = ms(opened),
         "link closing"
     );
+    // No relay socket outlives its link.
     link.http.abort_all();
+    link.sockets_closed.cancel();
+    let _ = timeout(CLOSE_WAIT, async {
+        while link.socket_tasks.join_next().await.is_some() {}
+    })
+    .await;
+    link.socket_tasks.abort_all();
     let close = Message::Close(Some(CloseFrame {
         code,
         reason: reason.into(),
@@ -201,6 +221,9 @@ impl Link {
                         return SHUTDOWN;
                     }
                 }
+                Some(_) = self.socket_tasks.join_next(), if !self.socket_tasks.is_empty() => {
+                    self.sockets.retain(|_, socket| !socket.tx.is_closed());
+                }
             }
         }
     }
@@ -218,10 +241,34 @@ impl Link {
                     self.refuse(code, Some(id), None);
                 }
             }
-            // Relay sockets land in the next change.
-            Inbound::WsOpen { sid, .. } => self.refuse(ErrorCode::NotSupported, None, Some(sid)),
-            Inbound::WsSend { sid, .. } | Inbound::WsClose { sid, .. } => {
-                self.refuse(ErrorCode::UnknownSocket, None, Some(sid))
+            Inbound::WsOpen { sid, path } => {
+                if let Err(code) = self.ws_open(sid.clone(), &path) {
+                    self.refuse(code, None, Some(sid));
+                }
+            }
+            Inbound::WsSend { sid, text } => {
+                let result = if text.len() > self.state.limits.max_ws_text {
+                    Err(ErrorCode::FrameTooLarge)
+                } else {
+                    self.to_socket(&sid, Cmd::Send(text))
+                };
+                if let Err(code) = result {
+                    self.refuse(code, None, Some(sid));
+                }
+            }
+            Inbound::WsClose { sid, code, reason } => {
+                let code = code.unwrap_or(1000);
+                let reason = reason.unwrap_or_default();
+                // A close frame allows 1000 or an application code, and a 123-byte reason.
+                let result =
+                    if (code == 1000 || (3000..=4999).contains(&code)) && reason.len() <= 123 {
+                        self.to_socket(&sid, Cmd::Close(code, reason))
+                    } else {
+                        Err(ErrorCode::NotAllowed)
+                    };
+                if let Err(code) = result {
+                    self.refuse(code, None, Some(sid));
+                }
             }
             Inbound::Ping { ts } => self.out.send(&Out::Pong { ts }),
             Inbound::Pong => {}
@@ -304,5 +351,55 @@ impl Link {
         });
         self.inflight.insert(f.id, task);
         Ok(())
+    }
+
+    fn ws_open(&mut self, sid: Id, path: &str) -> Result<(), ErrorCode> {
+        let lim = &self.state.limits;
+        if self.draining {
+            return Err(ErrorCode::ShuttingDown);
+        }
+        if self.sockets.contains_key(&sid) {
+            return Err(ErrorCode::DuplicateId);
+        }
+        if self.sockets.len() >= lim.max_sockets {
+            return Err(ErrorCode::Busy);
+        }
+        let url = self
+            .state
+            .config
+            .relay_ws
+            .join(policy::ws_route(path)?)
+            .map_err(|_| ErrorCode::NotAllowed)?;
+        let (tx, cmds) = mpsc::channel(lim.relay_queue);
+        let overflow = CancellationToken::new();
+        let socket = Socket {
+            link_id: self.id.clone(),
+            sid: sid.clone(),
+            url,
+            out: self.out.clone(),
+            cmds,
+            overflow: overflow.clone(),
+            link_closed: self.sockets_closed.clone(),
+            shutdown: self.state.shutdown.clone(),
+            connect_timeout: lim.connect_timeout,
+            silence: lim.relay_silence,
+            max_frame: lim.max_relay_frame,
+        };
+        self.socket_tasks.spawn(socket.run());
+        self.sockets.insert(sid, SocketHandle { tx, overflow });
+        Ok(())
+    }
+
+    fn to_socket(&self, sid: &Id, cmd: Cmd) -> Result<(), ErrorCode> {
+        let socket = self.sockets.get(sid).ok_or(ErrorCode::UnknownSocket)?;
+        match socket.tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(ErrorCode::UnknownSocket),
+            // The relay is not taking frames: close that socket, not the link.
+            Err(TrySendError::Full(_)) => {
+                socket.overflow.cancel();
+                Ok(())
+            }
+        }
     }
 }

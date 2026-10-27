@@ -107,6 +107,8 @@ pub struct Limits {
     pub max_response_body: usize,
     /// Largest `ws_send` text (the relay's frame limit).
     pub max_ws_text: usize,
+    /// Largest frame the gateway accepts from the relay.
+    pub max_relay_frame: usize,
     /// HTTP requests in flight per link.
     pub max_http_inflight: usize,
     /// Relay sockets per link.
@@ -115,6 +117,8 @@ pub struct Limits {
     pub out_frames: usize,
     /// Serialized bytes queued for the Worker, with the same rule.
     pub out_bytes: usize,
+    /// Worker frames queued for one relay socket; a full queue closes that socket.
+    pub relay_queue: usize,
     /// How long a link lives before it closes with 4001.
     pub link_lifetime: Duration,
     /// How long before that the gateway sends `rotate`.
@@ -123,10 +127,12 @@ pub struct Limits {
     pub ping_every: Duration,
     /// A link with no Worker frame for this long closes with 4002.
     pub idle: Duration,
-    /// Reaching the relay: TCP and TLS.
+    /// Reaching the relay: TCP, TLS and, for sockets, the upgrade.
     pub connect_timeout: Duration,
     /// One whole HTTP exchange with the relay.
     pub request_timeout: Duration,
+    /// A relay socket with no frame (pings included) for this long is closed.
+    pub relay_silence: Duration,
     /// How long shutdown waits for in-flight HTTP requests.
     pub shutdown_grace: Duration,
 }
@@ -141,16 +147,19 @@ impl Default for Limits {
             max_request_body: 1 << 20,
             max_response_body: 4 << 20,
             max_ws_text: 512 << 10,
+            max_relay_frame: 1 << 20,
             max_http_inflight: 16,
             max_sockets: 8,
             out_frames: 1024,
             out_bytes: 16 << 20,
+            relay_queue: 64,
             link_lifetime: Duration::from_secs(3600),
             rotate_before: Duration::from_secs(300),
             ping_every: Duration::from_secs(20),
             idle: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
+            relay_silence: Duration::from_secs(90),
             shutdown_grace: Duration::from_secs(10),
         }
     }

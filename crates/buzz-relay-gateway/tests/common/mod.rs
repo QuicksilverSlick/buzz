@@ -1,5 +1,4 @@
-//! Shared harness: the gateway in-process, a mock relay (HTTP side), a mock Worker
-//! and a bearer signer.
+//! Shared harness: the gateway in-process, a mock relay, a mock Worker and a bearer signer.
 #![allow(dead_code)]
 
 use std::{
@@ -11,7 +10,10 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{
+        ws::{rejection::WebSocketUpgradeRejection, Message as AxMessage, WebSocket},
+        State, WebSocketUpgrade,
+    },
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Router,
@@ -211,6 +213,39 @@ impl Worker {
         )
         .await
     }
+
+    /// Opens relay socket `sid` and returns the relay's AUTH challenge.
+    pub async fn open(&mut self, sid: &str) -> String {
+        self.send(json!({"type": "ws_open", "sid": sid, "path": "/"}))
+            .await;
+        let opened = self.frame().await;
+        assert_eq!(
+            (opened["type"].as_str(), opened["sid"].as_str()),
+            (Some("ws_opened"), Some(sid))
+        );
+        let msg = self.frame().await;
+        assert_eq!(
+            (msg["type"].as_str(), msg["sid"].as_str()),
+            (Some("ws_msg"), Some(sid))
+        );
+        let auth: Value = serde_json::from_str(msg["text"].as_str().unwrap()).unwrap();
+        assert_eq!(auth[0], "AUTH");
+        auth[1].as_str().unwrap().to_owned()
+    }
+
+    /// Sends `text` on relay socket `sid` without waiting for an answer.
+    pub async fn ws_send(&mut self, sid: &str, text: &str) {
+        self.send(json!({"type": "ws_send", "sid": sid, "text": text}))
+            .await;
+    }
+
+    /// Sends `text` on socket `sid` and returns the relay's next frame on the link.
+    pub async fn say(&mut self, sid: &str, text: Value) -> Value {
+        self.ws_send(sid, &text.to_string()).await;
+        let msg = self.frame().await;
+        assert_eq!(msg["type"], "ws_msg", "{msg}");
+        serde_json::from_str(msg["text"].as_str().unwrap()).unwrap()
+    }
 }
 
 /// A mock relay, a gateway pointed at it, and a Worker on a fresh link.
@@ -231,7 +266,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// How the mock relay answers HTTP.
+/// How the mock relay answers HTTP (and socket upgrades, for `Reply`).
 #[derive(Clone, Default)]
 pub enum Mode {
     /// Report the hash, length and headers of what arrived.
@@ -251,10 +286,12 @@ pub enum Mode {
 pub struct RelayState {
     pub mode: Mutex<Mode>,
     pub hits: Mutex<HashMap<String, usize>>,
+    pub open_sockets: Mutex<usize>,
+    pub socket_closes: Mutex<Vec<Option<u16>>>,
     pub url: Mutex<String>,
 }
 
-/// The mock relay: HTTP routes on every path.
+/// The mock relay: HTTP routes on every path and NIP-42 sockets on `/`.
 pub struct Relay {
     pub addr: SocketAddr,
     pub state: Arc<RelayState>,
@@ -288,6 +325,14 @@ impl Relay {
             .copied()
             .unwrap_or(0)
     }
+
+    pub fn open_sockets(&self) -> usize {
+        *self.state.open_sockets.lock().unwrap()
+    }
+
+    pub fn socket_closes(&self) -> Vec<Option<u16>> {
+        self.state.socket_closes.lock().unwrap().clone()
+    }
 }
 
 async fn handle(
@@ -295,11 +340,15 @@ async fn handle(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     body: Bytes,
 ) -> Response {
     let path = uri.path().to_owned();
     *s.hits.lock().unwrap().entry(path.clone()).or_default() += 1;
     let mode = s.mode.lock().unwrap().clone();
+    if let (Ok(upgrade), Mode::Echo) = (upgrade, &mode) {
+        return upgrade.on_upgrade(move |ws| relay_socket(ws, s));
+    }
     match mode {
         Mode::Echo if method == Method::GET => {
             json!({ "name": "mock relay", "accept": headers["accept"].to_str().unwrap() })
@@ -344,4 +393,54 @@ async fn handle(
             Body::from_stream(futures_util::stream::iter(chunks)).into_response()
         }
     }
+}
+
+/// A relay socket: AUTH challenge first, then commands from the test.
+async fn relay_socket(mut ws: WebSocket, s: Arc<RelayState>) {
+    *s.open_sockets.lock().unwrap() += 1;
+    let challenge = buzz_auth::generate_challenge();
+    let relay_url = s.url.lock().unwrap().clone();
+    let reply = |v: Value| AxMessage::text(v.to_string());
+    let _ = ws.send(reply(json!(["AUTH", challenge]))).await;
+    while let Some(Ok(msg)) = ws.recv().await {
+        let AxMessage::Text(text) = msg else {
+            if let AxMessage::Close(frame) = msg {
+                s.socket_closes.lock().unwrap().push(frame.map(|f| f.code));
+                break;
+            }
+            continue;
+        };
+        let cmd: Value = serde_json::from_str(&text).unwrap_or_default();
+        let out = match cmd[0].as_str() {
+            Some("AUTH") => {
+                let event: nostr::Event = serde_json::from_value(cmd[1].clone()).unwrap();
+                let ok = buzz_auth::verify_nip42_event(&event, &challenge, &relay_url).is_ok();
+                vec![reply(json!(["OK", event.id, ok, ""]))]
+            }
+            Some("REQ") => vec![reply(json!(["EOSE", cmd[1]]))],
+            Some("CLOSE_WITH") => {
+                let code = cmd[1].as_u64().unwrap() as u16;
+                let frame = axum::extract::ws::CloseFrame {
+                    code,
+                    reason: "relay restarting".into(),
+                };
+                vec![AxMessage::Close(Some(frame))]
+            }
+            Some("SEND") => {
+                let (n, size) = (cmd[1].as_u64().unwrap(), cmd[2].as_u64().unwrap() as usize);
+                (0..n).map(|_| AxMessage::text("x".repeat(size))).collect()
+            }
+            Some("SILENT") => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                vec![]
+            }
+            _ => vec![],
+        };
+        for msg in out {
+            if ws.send(msg).await.is_err() {
+                break;
+            }
+        }
+    }
+    *s.open_sockets.lock().unwrap() -= 1;
 }
