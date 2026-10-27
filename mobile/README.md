@@ -5,6 +5,36 @@ Flutter mobile client for Buzz.
 See [VISION_MOBILE.md](../VISION_MOBILE.md) for intended behavior and
 architecture.
 
+## Optional Builderlab login
+
+`BUZZ_AUTH_DOMAINS` is a comma-separated build-time environment setting, passed
+with Flutter's `--dart-define` (shell environment variables alone are not read):
+
+```bash
+flutter run --dart-define=BUZZ_AUTH_DOMAINS=communities.buzz.xyz,communities.public.builderlabstaging.xyz
+```
+
+Unset or empty means **Builderlab features are disabled**: no account login,
+community creation, backup/recovery UI, reconnect prompts, or background account
+restoration. QR/code pairing, community links and invites use Nostr-only entry.
+Saved account keys and sessions are retained for a later enabled build.
+
+A nonempty list enables Builderlab features and requires account setup only for
+matching domains. Those features need their backend endpoints. Normal relay key
+authentication remains in place. `BUZZ_BUILDERLAB_URL` selects the backend; setting
+it alone does not enable Builderlab features.
+
+Entries match the domain itself and its subdomains, case-insensitively. Use DNS
+names, not URLs or wildcards. The list does not add trusted account servers:
+configured domains outside the supported Builderlab realm cannot use hosted
+setup. `BUZZ_BUILDERLAB_URL` still selects the trusted account environment.
+
+## Hosted relay authentication
+
+`--dart-define=BUZZ_HOSTED_RELAY_AUTH=true` enables Builderlab relay assertions
+and reconnect sign-in **only for `BUZZ_AUTH_DOMAINS` matches**. It defaults off: configure backend assertion issuance
+before enabling mobile authentication, and enable relay enforcement last.
+
 ## Setup
 
 Use the Flutter SDK pinned by the repository. Activate Hermit from the repo
@@ -20,6 +50,34 @@ cd /path/to/buzz
 external Flutter SDK has touched `mobile/.dart_tool`, rerun `mobile-install`
 with the pinned SDK before building so `flutter_test`, `sky_engine`, and the
 engine all come from the same Flutter version.
+
+### iOS toolchain
+
+Use Xcode 27.0 for iOS development and build validation on an Apple silicon
+Mac running macOS Tahoe 26.6 or later, as required by the
+[Xcode 27 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-27-release-notes).
+On Intel Macs or hosts that cannot meet those requirements, use a compatible
+Xcode 26 version, which remains supported. Activate the repository's pinned
+Flutter SDK with Hermit as described above.
+
+When multiple Xcode versions are installed, select the intended version for
+the command with `DEVELOPER_DIR`, for example:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode-27.0.0.app/Contents/Developer xcodebuild -version
+```
+
+Adjust the path to your installation. Keep the compiler and SDK from the same
+Xcode installation. The pinned Flutter native-assets tooling can discover the
+globally selected SDK even when `DEVELOPER_DIR` selects another compiler, so
+use a build machine with a matching default Xcode when validating either
+Xcode 26 or Xcode 27.
+
+The native cryptography dependency is pinned upstream C source in
+`ios/BuzzPushKit/Sources/CSecp256k1`; it requires no Swift build-plugin approval.
+GitHub's mobile CI currently uses the Xcode default of its `macos-latest`
+runner. The internal release toolchain is configured separately in
+[buzz-releases](https://github.com/squareup/buzz-releases).
 
 ## Run
 
@@ -181,6 +239,10 @@ flutter test --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.example
 ```
 
 Or from the repo root: `just mobile-check` and `just mobile-test`.
+
+When writing tests, favor a few journey tests that drive real user flows over
+many small logic tests. See
+[Testing Conventions](../AGENTS.md#testing-conventions).
 
 ## Android release signing
 

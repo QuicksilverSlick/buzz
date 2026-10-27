@@ -87,6 +87,12 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
+  # Mesh JWKS proxy-bypass regression: infra-free loopback I/O with
+  # child-process environment isolation. --lib does not select its binary.
+  # Keep this fallback in step with `just test-unit`.
+  run_test_step "buzz-auth mesh JWKS proxy regression" \
+    cargo test -p buzz-auth --test mesh_jwks_proxy -- --nocapture
+
   # Cross-pod disconnect payload tests (NIP-FI and community archive fence;
   # infra-free). Mirrors `just test-unit`.
   run_test_step "buzz-pubsub conn_control tests" \
@@ -94,6 +100,10 @@ run_unit_tests() {
 
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
+
+  # Inter-relay mesh crate (infra-free). Mirrors `just test-unit`.
+  run_test_step "buzz-relay-mesh tests" \
+    cargo test -p buzz-relay-mesh -- --nocapture
 
   run_test_step "buzz-cli tests" \
     cargo test -p buzz-cli -- --nocapture
@@ -137,6 +147,12 @@ run_unit_tests() {
 
   run_test_step "buzz-admin partition audit outcome contract test" \
     cargo test -p buzz-admin tests::partition_audit_outcomes_keep_their_json_names_and_exit_codes -- --exact --nocapture
+
+  run_test_step "buzz-admin NIP-FI binding command tests" \
+    cargo test -p buzz-admin nip_fi::tests -- --nocapture
+
+  run_test_step "buzz-admin user-deletion intake command tests" \
+    cargo test -p buzz-admin user_deletions::tests -- --nocapture
 
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
@@ -190,6 +206,12 @@ run_unit_tests() {
   run_test_step "buzz-relay side-effects helper tests" \
     cargo test -p buzz-relay --lib handlers::side_effects::tests:: -- --nocapture
 
+  run_test_step "buzz-relay system channel scope tests" \
+    cargo test -p buzz-relay --lib handlers::system_channels::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-11 document tests" \
+    cargo test -p buzz-relay --lib nip11::tests:: -- --nocapture
+
   run_test_step "buzz-relay storage snapshot tests" \
     cargo test -p buzz-relay --lib storage_sweep::tests:: -- --nocapture
 
@@ -218,6 +240,9 @@ run_unit_tests() {
   run_test_step "buzz-relay startup step tests" \
     cargo test -p buzz-relay --lib startup_steps::tests:: -- --nocapture
 
+  run_test_step "buzz-relay mesh boot tests" \
+    cargo test -p buzz-relay --lib mesh_boot::tests:: -- --nocapture
+
   # telemetry and config tests mutate process env. libtest runs one process
   # with many threads (nextest, used by `just test-unit`, isolates each test),
   # so run them single-threaded here. `--skip` keeps the substring filter
@@ -233,6 +258,9 @@ run_unit_tests() {
   run_test_step "buzz-relay NIP-FI config tests" \
     cargo test -p buzz-relay --lib nip_fi_config:: -- --nocapture
 
+  run_test_step "buzz-relay NIP-FI resolver tests" \
+    cargo test -p buzz-relay --lib nip_fi_resolver:: -- --nocapture
+
   # Infra-free REQ subscription-lifecycle tests, by exact name: the rest of
   # handlers::req needs a database.
   run_test_step "buzz-relay REQ subscription lifecycle tests" \
@@ -246,7 +274,15 @@ run_unit_tests() {
       handlers::req::tests::claims_after_connection_cleanup_are_refused \
       handlers::req::tests::dropped_terminal_frame_cancels_connection \
       handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection \
-      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions
+      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions \
+      handlers::req::tests::group_state_t_and_creator_tags_reach_sql_only_for_group_state_kinds
+
+  # Infra-free bridge search extension parser tests, by exact name: the rest of
+  # api::bridge::postgres_tests needs a database.
+  run_test_step "buzz-relay bridge search extension tests" \
+    cargo test -p buzz-relay --lib -- --exact --nocapture \
+      api::bridge::postgres_tests::bridge_search_mode_extension_accepts_prefix_snake_or_camel_case \
+      api::bridge::postgres_tests::bridge_search_sort_extension_selects_newest_only_when_named
 
   run_test_step "buzz-relay readiness tests" \
     cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture
@@ -281,6 +317,9 @@ run_unit_tests() {
   run_test_step "buzz-relay API query parsing tests" \
     cargo test -p buzz-relay --lib api::parse_query_tests:: -- --nocapture
 
+  run_test_step "buzz-relay profile search request tests" \
+    cargo test -p buzz-relay --lib api::profiles:: -- --nocapture
+
   run_test_step "buzz-relay Git transport Off-mode precedence tests" \
     cargo test -p buzz-relay --lib api::git::transport::off_mode_precedence_tests:: -- --nocapture
 
@@ -314,12 +353,26 @@ run_unit_tests() {
     connection::tests::expiry_notice_queued_on_ctrl_before_cancel
     connection::tests::f3_root_outer_wrapper_delivers_denial_on_bootstrap_cancellation
     connection::tests::f3_root_pre_built_expired_gate_terminates_connection
+    connection::terminal_close_delivery_tests::key_pairing_mismatch_closes_with_1008_on_real_socket
+    connection::terminal_close_delivery_tests::session_expiry_denial_closes_with_1008_on_real_socket
+    connection::terminal_close_delivery_tests::server_holds_socket_for_client_close_reply
+    connection::terminal_close_delivery_tests::server_finishes_promptly_when_client_answers_close
+    connection::terminal_close_delivery_tests::stalled_cleanup_does_not_hold_socket_open
+    connection::terminal_close_delivery_tests::bootstrap_drain_holds_socket_for_client_close_reply
+    connection::terminal_close_delivery_tests::stalled_expiry_barrier_does_not_hold_socket_open
+    connection::terminal_close_delivery_tests::blocked_frame_handler_does_not_hold_socket_open
+    connection::terminal_close_delivery_tests::refused_bootstrap_holds_connection_slot_until_socket_ends
+    connection::terminal_close_delivery_tests::stalled_bootstrap_holds_connection_slot
+    connection::terminal_close_delivery_tests::peer_wait_replies_to_client_initiated_close
     handlers::auth::tests::b2_pre_cancelled_connection_never_becomes_authenticated
     handlers::auth::tests::fi_ban_check_error_emits_terminal_authorization_unavailable
     handlers::auth::tests::fi_root_authorization_denied_rows_emit_identical_frames
     handlers::auth::tests::fi_invalid_nip42_proof_emits_terminal_evidence_rejected
     handlers::auth::tests::handle_auth_pairing_mismatch_runs_full_root_denial_path
     handlers::auth::tests::shadow_root_auth_records_pairing_denial
+    handlers::auth::tests::shadow_root_auth_records_unavailable_owner_read
+    handlers::ingest::postgres_tests::relay_admin_ban_maps_to_blocked_auth_failure
+    handlers::ingest::postgres_tests::relay_admin_internal_maps_to_error_not_client_fault
     handlers::auth::tests::shadow_root_invalid_nip42_retires_without_record
     handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence
     handlers::event::tests::fanout_access::owner_only_kinds_keep_only_the_owner
@@ -332,6 +385,7 @@ run_unit_tests() {
     state::tests::conn_manager_disconnect_nip_fi_is_issuer_scoped
     state::tests::conn_manager_disconnect_nip_fi_sets_authorization_denied_reason
     state::tests::nip_fi_disconnect_audio_is_issuer_scoped
+    state::tests::nip_fi_owner_disconnect_closes_owned_agent_sockets_on_root_and_audio
     state::tests::nip_fi_disconnect_closes_proven_audio_socket_and_sends_policy_close_reason
     state::tests::nip_fi_disconnect_closes_target_audio_only_and_preserves_collocated_peer
     state::tests::nip_fi_disconnect_does_not_close_different_pubkey_audio_socket
