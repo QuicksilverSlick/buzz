@@ -102,7 +102,11 @@ async function createWorkflow(
   await expect(
     stepInspector.getByRole("button", { name: "Action", exact: true }),
   ).toBeVisible();
-  await stepInspector.getByLabel("Message text").fill("Workflow notification");
+  // The header swaps first; the body keeps the trigger's "Message text"
+  // field until its exit animation ends (AnimatePresence mode="wait").
+  const messageText = stepInspector.getByLabel("Message text");
+  await expect(messageText).toHaveAttribute("id", /^wf-step-/);
+  await messageText.fill("Workflow notification");
   if (options?.stepName) {
     await dialog.getByRole("button", { name: "Step details" }).click();
     await dialog.getByLabel("Name (optional)").fill(options.stepName);
