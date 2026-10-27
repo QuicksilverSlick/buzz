@@ -80,8 +80,12 @@ pub fn verify_link_bearer(
     }
 }
 
-/// Event ids of accepted bearers, each kept for the relay's replay TTL
-/// (twice the ±60 s window). A restart empties it.
+/// How long a claimed id is kept: the relay's replay TTL (twice the ±60 s
+/// window) plus 2 s, because the window is inclusive and counts whole seconds,
+/// so a bearer dated 60 s ahead stays valid for up to 121 s.
+const REPLAY_TTL: Duration = Duration::from_secs(DEFAULT_REPLAY_TTL_SECS + 2);
+
+/// Event ids of accepted bearers, each kept for `REPLAY_TTL`. A restart empties it.
 pub struct ReplayCache {
     cap: usize,
     seen: Mutex<HashMap<EventId, Instant>>,
@@ -98,9 +102,8 @@ impl ReplayCache {
 
     /// Claims `id` once. Refuses a replay, and refuses every id while full.
     pub fn claim(&self, id: EventId, now: Instant) -> Result<(), Reject> {
-        let ttl = Duration::from_secs(DEFAULT_REPLAY_TTL_SECS);
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.retain(|_, at| now.saturating_duration_since(*at) < ttl);
+        seen.retain(|_, at| now.saturating_duration_since(*at) < REPLAY_TTL);
         if seen.contains_key(&id) {
             return Err(Reject::Replayed);
         }
@@ -245,7 +248,9 @@ mod tests {
         assert_eq!(cache.claim(a, now), Ok(()));
         assert_eq!(cache.claim(a, now), Err(Reject::Replayed));
         assert_eq!(cache.claim(b, now), Err(Reject::CacheFull));
-        let later = now + Duration::from_secs(DEFAULT_REPLAY_TTL_SECS);
-        assert_eq!(cache.claim(b, later), Ok(()));
+        // Still held when the relay's own 120 s would have let it go.
+        let relay_ttl = now + Duration::from_secs(DEFAULT_REPLAY_TTL_SECS);
+        assert_eq!(cache.claim(a, relay_ttl), Err(Reject::Replayed));
+        assert_eq!(cache.claim(b, now + REPLAY_TTL), Ok(()));
     }
 }
