@@ -123,6 +123,10 @@ pub struct Limits {
     pub ping_every: Duration,
     /// A link with no Worker frame for this long closes with 4002.
     pub idle: Duration,
+    /// Reaching the relay: TCP and TLS.
+    pub connect_timeout: Duration,
+    /// One whole HTTP exchange with the relay.
+    pub request_timeout: Duration,
     /// How long shutdown waits for in-flight HTTP requests.
     pub shutdown_grace: Duration,
 }
@@ -145,6 +149,8 @@ impl Default for Limits {
             rotate_before: Duration::from_secs(300),
             ping_every: Duration::from_secs(20),
             idle: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(10),
         }
     }

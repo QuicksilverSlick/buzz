@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod config;
 pub mod frame;
+mod http_forward;
 mod link;
 pub mod policy;
 
@@ -41,6 +42,7 @@ struct AppState {
     links: Arc<Semaphore>,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    client: reqwest::Client,
 }
 
 /// Serves `/healthz` and `/v1/link` on `listener`. Once `shutdown` is
@@ -52,6 +54,7 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     let state = Arc::new(AppState {
+        client: http_forward::client(&config, &limits).map_err(std::io::Error::other)?,
         replay: auth::ReplayCache::new(limits.replay_entries),
         links: Arc::new(Semaphore::new(limits.max_links)),
         shutdown: shutdown.clone(),

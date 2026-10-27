@@ -22,6 +22,7 @@ base64             = { workspace = true }
 buzz-auth          = { workspace = true }
 futures-util       = { workspace = true }
 nostr              = { workspace = true }
+reqwest            = { workspace = true }
 # Explicit ring provider, installed in main(): a workspace-wide build unifies
 # ring and aws-lc-rs, and rustls then panics on the first wss:// connect.
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -36,5 +37,6 @@ url                = { workspace = true }
 uuid               = { workspace = true }
 
 [dev-dependencies]
-reqwest            = { workspace = true }
+hex                = { workspace = true }
+sha2               = { workspace = true }
 tokio-tungstenite  = { workspace = true }
