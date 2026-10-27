@@ -63,7 +63,8 @@ pub(crate) async fn forward(
 }
 
 fn upstream(e: reqwest::Error) -> ErrorCode {
-    if e.is_timeout() {
+    // An expired connect_timeout is also a timeout, but then nothing reached the relay.
+    if e.is_timeout() && !e.is_connect() {
         ErrorCode::UpstreamTimeout
     } else {
         ErrorCode::UpstreamConnect
