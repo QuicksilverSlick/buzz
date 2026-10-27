@@ -147,6 +147,8 @@ impl Socket {
                         }
                         Some(Ok(Message::Close(frame))) => {
                             let (code, reason) = frame.map_or((None, String::new()), |f| (Some(f.code.into()), f.reason.as_str().to_owned()));
+                            // tungstenite only queues the close reply; flushing sends it.
+                            let _ = timeout(CLOSE_CAP, ws.flush()).await;
                             return Closed { by: Side::Relay, code, reason, http_status: None };
                         }
                         Some(Ok(_)) => continue,
@@ -162,10 +164,18 @@ impl Socket {
                             tracing::info!(link_id, sid, auth_reply_ms = ms(at), "worker answered AUTH");
                             challenge = None;
                         }
-                        if ws.send(Message::Text(text.into())).await.is_err() {
-                            return Closed { by: Side::Relay, code: None, reason: "connection_lost".into(), http_status: None };
+                        // A relay that stops reading stalls this write, so the socket's other ends still apply.
+                        tokio::select! {
+                            sent = ws.send(Message::Text(text.into())) => {
+                                if sent.is_err() {
+                                    return Closed { by: Side::Relay, code: None, reason: "connection_lost".into(), http_status: None };
+                                }
+                                continue;
+                            }
+                            _ = self.overflow.cancelled() => (1000, "backpressure"),
+                            _ = self.link_closed.cancelled() => self.end(),
+                            _ = sleep_until(silent_at) => (1001, "relay_silent"),
                         }
-                        continue;
                     }
                     Some(Cmd::Close(code, reason)) => {
                         let frame = CloseFrame { code: code.into(), reason: reason.clone().into() };

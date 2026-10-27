@@ -37,7 +37,7 @@ limits in `src/config.rs`, and the link close codes in `src/link.rs`.
 | `BUZZ_RELAY_GATEWAY_RELAY_URL` | yes | `wss://host[:port]`; `ws://` only on loopback |
 | `BUZZ_RELAY_GATEWAY_LINK_URL` | yes | the `u` every link bearer must carry |
 | `BUZZ_RELAY_GATEWAY_LINK_PUBKEY` | yes | the gateway-auth public key, 64 lowercase hex |
-| `RUST_LOG` | no | `info` |
+| `RUST_LOG` | no | `info`; `tungstenite` and `tokio_tungstenite` stay off at any level, since at trace they print whole frames |
 
 `GET /healthz` answers `ok`, or 503 once shutdown has begun. SIGTERM or
 Ctrl-C drains in-flight requests for up to 10 s, closes every relay socket,

@@ -46,6 +46,11 @@ async fn closes_reach_the_other_side() {
         w.frame().await,
         json!({"type":"ws_closed","sid":"r","by":"relay","code":1012,"reason":"relay restarting"})
     );
+    // RFC 6455 5.5.1: the relay gets its close echoed back.
+    wait_for("the close echo", || {
+        relay.socket_closes().contains(&Some(1012))
+    })
+    .await;
     w.open("w").await;
     w.send(json!({"type":"ws_close","sid":"w","code":4000,"reason":"done"}))
         .await;
@@ -134,6 +139,30 @@ async fn relay_side_limits_close_one_socket() {
     w.open("quiet").await;
     w.ws_send("quiet", r#"["SILENT"]"#).await;
     assert_eq!(w.frame().await["reason"], "relay_silent");
+}
+
+#[tokio::test]
+async fn a_relay_that_stops_reading_closes_that_socket() {
+    // A queue that never fills, so only the silence timer can end the socket.
+    let stalled = Limits {
+        relay_queue: 1024,
+        relay_silence: Duration::from_secs(5),
+        ..limits()
+    };
+    let (_relay, _gw, mut w) = setup(stalled).await;
+    w.open("stuck").await;
+    // The mock relay stops reading and sending; the write stalls once the TCP buffers fill.
+    w.ws_send("stuck", r#"["SILENT"]"#).await;
+    let big = "x".repeat(256 << 10);
+    for _ in 0..100 {
+        w.ws_send("stuck", &big).await;
+    }
+    let closed = w.frame().await;
+    assert_eq!(
+        (closed["type"].as_str(), closed["reason"].as_str()),
+        (Some("ws_closed"), Some("relay_silent")),
+        "{closed}"
+    );
 }
 
 #[tokio::test]

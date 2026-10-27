@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use buzz_relay_gateway::Limits;
-use common::{body_of, limits, setup, sha256_hex, Mode};
+use common::{body_of, limits, setup, sha256_hex, Gateway, Mode};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use serde_json::{json, Value};
 
@@ -201,6 +201,27 @@ async fn in_flight_cap_duplicates_and_timeouts() {
     }
     relay.set(Mode::Echo);
     assert_eq!(w.post("after", "/query", b"[]").await["status"], 200);
+}
+
+#[tokio::test]
+async fn a_handshake_that_never_ends_is_upstream_connect() {
+    // Takes the TCP connection and never answers, so the TLS handshake stalls.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = silent.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = silent.accept().await {
+            held.push(tcp);
+        }
+    });
+    let quick = Limits {
+        connect_timeout: Duration::from_millis(300),
+        ..limits()
+    };
+    let gw = Gateway::start(&format!("wss://{addr}"), quick).await;
+    let mut w = gw.worker().await;
+    let res = w.post("c", "/query", b"[]").await;
+    assert_eq!(res["code"], "upstream_connect", "{res}");
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
-//! Its own test binary: tracing caches callsite interest process-wide, so a
-//! scoped subscriber misses events while other tests run on other threads.
+//! Its own test binary, because it installs the global subscriber the way
+//! main.rs does: fmt().init() also bridges `log` records, which is how
+//! tungstenite and reqwest log.
 mod common;
 
 use std::{
@@ -24,18 +25,17 @@ impl Write for Capture {
     }
 }
 
-// current_thread (the tokio::test default) keeps every task under this thread's subscriber.
 #[tokio::test]
 async fn logs_never_carry_bearers_bodies_or_frames() {
     const MARK: &str = "MARK7f3a";
     let capture = Capture::default();
     let writer = capture.clone();
-    let subscriber = tracing_subscriber::fmt()
+    // RUST_LOG=trace: the most anyone can turn on.
+    tracing_subscriber::fmt()
         .json()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter(buzz_relay_gateway::log_filter("trace"))
         .with_writer(move || writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+        .init();
 
     let relay = Relay::start().await;
     let gw = Gateway::start(&relay.ws_url(), limits()).await;
@@ -65,6 +65,8 @@ async fn logs_never_carry_bearers_bodies_or_frames() {
 
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("auth_reply_ms"), "the AUTH timing was logged");
+    // reqwest logs through `log`, so this line shows the bridge is live.
+    assert!(logs.contains("starting new connection"), "no `log` records");
     assert!(!logs.contains(MARK), "marker leaked into logs");
     assert!(!logs.contains("Nostr "), "a bearer leaked into logs");
 }
