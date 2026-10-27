@@ -1506,6 +1506,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-relay-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "nostr 0.44.7",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-relay-mesh"
 version = "0.1.0"
 dependencies = [
