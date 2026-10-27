@@ -34,6 +34,7 @@ impl Id {
 }
 
 /// An `http` frame: one request to forward to the relay.
+#[derive(Deserialize)]
 pub struct HttpFrame {
     /// Unique among this link's requests in flight.
     pub id: Id,
@@ -48,8 +49,12 @@ pub struct HttpFrame {
 }
 
 /// A frame from the Worker.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
-    /// Forward one HTTP request.
+    /// Forward one HTTP request. Parsed on its own: `RawValue` does not
+    /// survive serde's internally tagged enums.
+    #[serde(skip)]
     Http(HttpFrame),
     /// Open a relay socket on `path`.
     WsOpen { sid: Id, path: String },
@@ -66,6 +71,7 @@ pub enum Inbound {
     /// The answer to a gateway `ping`.
     Pong,
     /// A `type` this version does not know; the link stays open.
+    #[serde(other)]
     Unknown,
 }
 
@@ -73,70 +79,23 @@ pub enum Inbound {
 #[derive(Debug, PartialEq, Eq)]
 pub struct BadFrame;
 
-// Flat on purpose: `RawValue` does not survive serde's internally tagged enums.
-#[derive(Deserialize)]
-struct Raw {
-    #[serde(rename = "type")]
-    kind: String,
-    id: Option<Id>,
-    sid: Option<Id>,
-    method: Option<String>,
-    path: Option<String>,
-    headers: Option<Box<RawValue>>,
-    body_b64: Option<String>,
-    text: Option<String>,
-    code: Option<u16>,
-    reason: Option<String>,
-    ts: Option<Number>,
-}
-
 #[derive(Deserialize)]
 struct TypeOnly {
     #[serde(rename = "type")]
     kind: String,
 }
 
-const KNOWN: [&str; 6] = ["http", "ws_open", "ws_send", "ws_close", "ping", "pong"];
-
 impl Inbound {
-    /// Parses one text frame.
+    /// Parses one text frame. Each type reads only its own fields, so a field
+    /// that belongs to another type is ignored like any unknown field.
     pub fn parse(text: &str) -> Result<Self, BadFrame> {
-        let raw: Raw = match serde_json::from_str(text) {
-            Ok(raw) => raw,
-            // A newer frame type may use a known field name with another type.
-            Err(_) => {
-                return match serde_json::from_str::<TypeOnly>(text) {
-                    Ok(t) if !KNOWN.contains(&t.kind.as_str()) => Ok(Self::Unknown),
-                    _ => Err(BadFrame),
-                }
-            }
+        let TypeOnly { kind } = serde_json::from_str(text).map_err(|_| BadFrame)?;
+        let frame = if kind == "http" {
+            serde_json::from_str(text).map(Self::Http)
+        } else {
+            serde_json::from_str(text)
         };
-        let sid = || raw.sid.clone().ok_or(BadFrame);
-        Ok(match raw.kind.as_str() {
-            "http" => Self::Http(HttpFrame {
-                id: raw.id.ok_or(BadFrame)?,
-                method: raw.method.ok_or(BadFrame)?,
-                path: raw.path.ok_or(BadFrame)?,
-                headers: raw.headers,
-                body_b64: raw.body_b64,
-            }),
-            "ws_open" => Self::WsOpen {
-                sid: sid()?,
-                path: raw.path.ok_or(BadFrame)?,
-            },
-            "ws_send" => Self::WsSend {
-                sid: sid()?,
-                text: raw.text.ok_or(BadFrame)?,
-            },
-            "ws_close" => Self::WsClose {
-                sid: sid()?,
-                code: raw.code,
-                reason: raw.reason,
-            },
-            "ping" => Self::Ping { ts: raw.ts },
-            "pong" => Self::Pong,
-            _ => Self::Unknown,
-        })
+        frame.map_err(|_| BadFrame)
     }
 }
 
@@ -327,6 +286,16 @@ mod tests {
             Inbound::parse(r#"{"type":"later","code":"x"}"#),
             Ok(Inbound::Unknown)
         ));
+        // Another frame type's field, of another type, is still an unknown field here.
+        for foreign in [
+            r#"{"type":"ping","ts":1,"code":"later"}"#,
+            r#"{"type":"ping","ts":1,"id":7}"#,
+            r#"{"type":"pong","sid":[]}"#,
+            r#"{"type":"ws_send","sid":"s1","text":"x","path":5}"#,
+            r#"{"type":"http","id":"q","method":"GET","path":"/","ts":"x","text":1}"#,
+        ] {
+            assert!(Inbound::parse(foreign).is_ok(), "{foreign}");
+        }
     }
 
     #[test]
@@ -340,6 +309,8 @@ mod tests {
             r#"{"type":"ws_open","sid":"has space","path":"/"}"#,
             r#"{"type":"ws_open","sid":"","path":"/"}"#,
             r#"{"type":"ping","ts":"soon"}"#,
+            r#"{"type":5}"#,
+            r#"{"type":"ws_open","sid":"s1","sid":"s2","path":"/"}"#,
         ] {
             assert!(Inbound::parse(bad).is_err(), "{bad}");
         }
