@@ -51,8 +51,7 @@ cargo clippy -p buzz-relay-gateway --all-targets -- -D warnings
 ```
 
 The tests run offline against an in-process mock relay (HTTP routes and a
-NIP-42 socket) and a mock Worker. They are not yet in the `Justfile` unit-test
-list, so CI does not run them; run them locally on every change.
+NIP-42 socket) and a mock Worker. CI runs them through `just test-unit`.
 
 The image builds from the repo root. Pushing it is a deployment step, not a
 build step:
