@@ -725,7 +725,7 @@ fn answer_by(option: usize, by_name: Option<&str>, hhmm: &str) -> Option<Answer>
         answered_at: 1,
         by: hex('1'),
         by_name: by_name.map(str::to_string),
-        role: Some(AnswerRole::Decider).filter(|_| by_name.is_some()),
+        role: by_name.is_some().then_some(AnswerRole::Decider),
         source: AnswerSource::Tap,
         hhmm: hhmm.to_string(),
     })
