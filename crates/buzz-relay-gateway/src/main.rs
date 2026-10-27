@@ -1,17 +1,15 @@
 use buzz_relay_gateway::Config;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Workspace builds unify ring and aws-lc-rs; rustls then needs an explicit provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(buzz_relay_gateway::log_filter(&directives))
         .init();
     let config = match Config::from_env() {
         Ok(config) => config,
