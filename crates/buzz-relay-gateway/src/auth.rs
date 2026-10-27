@@ -46,14 +46,14 @@ impl Reject {
     }
 }
 
-/// Checks the link bearer on an upgrade request and returns its event id,
-/// which the caller then claims in the [`ReplayCache`].
+/// Checks the link bearer on an upgrade request and returns its event id and
+/// `created_at` (unix seconds), which the caller then claims in the [`ReplayCache`].
 pub fn verify_link_bearer(
     headers: &HeaderMap,
     link_url: &str,
     pubkey: &PublicKey,
     max_len: usize,
-) -> Result<EventId, Reject> {
+) -> Result<(EventId, u64), Reject> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let (value, None) = (values.next().ok_or(Reject::Missing)?, values.next()) else {
         return Err(Reject::Malformed);
@@ -75,7 +75,9 @@ pub fn verify_link_bearer(
         .map(|t| t.as_slice())
         .filter(|t| t.first().is_some_and(|n| n == "nonce"));
     match (nonces.next(), nonces.next()) {
-        (Some([_, n, ..]), None) if (16..=128).contains(&n.chars().count()) => Ok(event.id),
+        (Some([_, n, ..]), None) if (16..=128).contains(&n.chars().count()) => {
+            Ok((event.id, event.created_at.as_secs()))
+        }
         _ => Err(Reject::NoNonce),
     }
 }
@@ -85,10 +87,15 @@ pub fn verify_link_bearer(
 /// so a bearer dated 60 s ahead stays valid for up to 121 s.
 const REPLAY_TTL: Duration = Duration::from_secs(DEFAULT_REPLAY_TTL_SECS + 2);
 
-/// Event ids of accepted bearers, each kept for `REPLAY_TTL`. A restart empties it.
+/// `verify_nip98_event`'s ±60 s window on `created_at` (the relay's TTL is twice it).
+const WINDOW_SECS: u64 = DEFAULT_REPLAY_TTL_SECS / 2;
+
+/// Event ids of accepted bearers, each kept for `REPLAY_TTL` of monotonic time
+/// and, if the wall clock steps back, for as long as the window could still
+/// accept its `created_at`. A restart empties it.
 pub struct ReplayCache {
     cap: usize,
-    seen: Mutex<HashMap<EventId, Instant>>,
+    seen: Mutex<HashMap<EventId, (Instant, u64)>>,
 }
 
 impl ReplayCache {
@@ -100,17 +107,26 @@ impl ReplayCache {
         }
     }
 
-    /// Claims `id` once. Refuses a replay, and refuses every id while full.
-    pub fn claim(&self, id: EventId, now: Instant) -> Result<(), Reject> {
+    /// Claims a bearer `(id, created_at)` once, `now` being monotonic and `wall`
+    /// unix seconds. Refuses a replay, and refuses every id while full.
+    pub fn claim(
+        &self,
+        (id, created_at): (EventId, u64),
+        now: Instant,
+        wall: u64,
+    ) -> Result<(), Reject> {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.retain(|_, at| now.saturating_duration_since(*at) < REPLAY_TTL);
+        seen.retain(|_, (at, created)| {
+            now.saturating_duration_since(*at) < REPLAY_TTL
+                || wall <= created.saturating_add(WINDOW_SECS + 1)
+        });
         if seen.contains_key(&id) {
             return Err(Reject::Replayed);
         }
         if seen.len() >= self.cap {
             return Err(Reject::CacheFull);
         }
-        seen.insert(id, now);
+        seen.insert(id, (now, created_at));
         Ok(())
     }
 }
@@ -151,7 +167,7 @@ mod tests {
         ))
     }
 
-    fn check(keys: &Keys, values: &[&str]) -> Result<EventId, Reject> {
+    fn check(keys: &Keys, values: &[&str]) -> Result<(EventId, u64), Reject> {
         let mut headers = HeaderMap::new();
         for v in values {
             headers.append(AUTHORIZATION, HeaderValue::from_str(v).unwrap());
@@ -244,13 +260,30 @@ mod tests {
             check(&k, &[&good(&k)]).unwrap(),
         );
         let cache = ReplayCache::new(1);
-        let now = Instant::now();
-        assert_eq!(cache.claim(a, now), Ok(()));
-        assert_eq!(cache.claim(a, now), Err(Reject::Replayed));
-        assert_eq!(cache.claim(b, now), Err(Reject::CacheFull));
+        let (now, wall) = (Instant::now(), a.1);
+        assert_eq!(cache.claim(a, now, wall), Ok(()));
+        assert_eq!(cache.claim(a, now, wall), Err(Reject::Replayed));
+        assert_eq!(cache.claim(b, now, wall), Err(Reject::CacheFull));
         // Still held when the relay's own 120 s would have let it go.
         let relay_ttl = now + Duration::from_secs(DEFAULT_REPLAY_TTL_SECS);
-        assert_eq!(cache.claim(a, relay_ttl), Err(Reject::Replayed));
-        assert_eq!(cache.claim(b, now + REPLAY_TTL), Ok(()));
+        assert_eq!(cache.claim(a, relay_ttl, wall + 120), Err(Reject::Replayed));
+        assert_eq!(cache.claim(b, now + REPLAY_TTL, wall + 122), Ok(()));
+    }
+
+    #[test]
+    fn a_wall_clock_step_back_keeps_the_id_while_the_window_accepts_it() {
+        let k = Keys::generate();
+        let a = check(&k, &[&good(&k)]).unwrap();
+        let cache = ReplayCache::new(4);
+        let now = Instant::now();
+        assert_eq!(cache.claim(a, now, a.1), Ok(()));
+        // Monotonic time is past REPLAY_TTL, but the wall clock reads
+        // created_at + 60 s, which the verifier still accepts.
+        let later = now + REPLAY_TTL;
+        assert_eq!(
+            cache.claim(a, later, a.1 + WINDOW_SECS),
+            Err(Reject::Replayed)
+        );
+        assert_eq!(cache.claim(a, later, a.1 + WINDOW_SECS + 2), Ok(()));
     }
 }

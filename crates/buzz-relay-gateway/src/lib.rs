@@ -21,6 +21,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use nostr::Timestamp;
 use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -102,7 +103,10 @@ async fn link(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
         &s.config.link_pubkey,
         s.limits.max_auth_header,
     )
-    .and_then(|id| s.replay.claim(id, Instant::now()));
+    .and_then(|bearer| {
+        s.replay
+            .claim(bearer, Instant::now(), Timestamp::now().as_secs())
+    });
     match claimed {
         Err(reject) => {
             tracing::warn!(reason = reject.code(), "link bearer refused");
