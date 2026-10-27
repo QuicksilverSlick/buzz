@@ -57,11 +57,6 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
-    # webpki-roots 0.26.11 bundles no certificates: it re-exports webpki-roots 1,
-    # which the lockfile pins at the patched 1.0.10. tokio-tungstenite 0.28/0.29
-    # (via axum and nostr-sdk) still require ^0.26, and no patched 0.26 release
-    # exists. Remove when those consumers move to webpki-roots 1.
-    { id = "RUSTSEC-2026-0381", reason = "only webpki-roots 0.26.11 remains: a shim re-exporting the patched 1.0.10; required by tokio-tungstenite 0.28/0.29" },
 ]
 
 [licenses]
