@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod frame;
 pub mod policy;
 
 use std::{
