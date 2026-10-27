@@ -1511,7 +1511,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "buzz-auth",
  "nostr 0.44.7",
+ "reqwest 0.13.4",
  "rustls",
  "serde",
  "serde_json",

@@ -1,4 +1,4 @@
-//! Environment configuration. Every value is public.
+//! Environment configuration (all public values) and the fixed limits.
 
 use std::net::SocketAddr;
 
@@ -88,6 +88,27 @@ fn relay_urls(raw: &str) -> Option<(Url, Url)> {
     let mut http = ws.clone();
     http.set_scheme(scheme).ok()?;
     bare.then_some((ws, http))
+}
+
+/// Fixed limits (design §5). Not configurable by env; tests pass smaller values.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Links open at once; the next upgrade gets 503.
+    pub max_links: usize,
+    /// Longest `Authorization` value, on the link bearer and on forwarded requests.
+    pub max_auth_header: usize,
+    /// Bearer ids remembered for replay protection; when full, new bearers get 503.
+    pub replay_entries: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_links: 4,
+            max_auth_header: 8 << 10,
+            replay_entries: 1024,
+        }
+    }
 }
 
 #[cfg(test)]

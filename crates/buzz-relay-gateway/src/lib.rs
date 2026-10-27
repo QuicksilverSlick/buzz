@@ -4,33 +4,59 @@
 //! link bearer and forwards bytes. It holds no secret.
 #![deny(unsafe_code)]
 
+pub mod auth;
 pub mod config;
 pub mod policy;
 
-use std::{future::IntoFuture, time::Duration};
+use std::{
+    future::IntoFuture,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-pub use config::Config;
+pub use config::{Config, Limits};
 
 // hyper's graceful wait never ends for a connection that stopped mid-request,
 // so once the work is done the open connections get this long.
 const LAST_REQUESTS: Duration = Duration::from_secs(2);
 
-/// Serves `/healthz` on `listener` until `shutdown` is cancelled.
-pub async fn serve(listener: TcpListener, shutdown: CancellationToken) -> std::io::Result<()> {
+struct AppState {
+    config: Config,
+    limits: Limits,
+    replay: auth::ReplayCache,
+    links: Arc<Semaphore>,
+    shutdown: CancellationToken,
+}
+
+/// Serves `/healthz` and `/v1/link` on `listener` until `shutdown` is cancelled.
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    limits: Limits,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let state = Arc::new(AppState {
+        replay: auth::ReplayCache::new(limits.replay_entries),
+        links: Arc::new(Semaphore::new(limits.max_links)),
+        shutdown: shutdown.clone(),
+        config,
+        limits,
+    });
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .with_state(shutdown.clone());
+        .route("/v1/link", get(link))
+        .with_state(state);
     let server =
         axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
     tokio::select! {
@@ -55,10 +81,38 @@ pub fn log_filter(directives: &str) -> EnvFilter {
         .fold(filter, EnvFilter::add_directive)
 }
 
-async fn healthz(State(shutdown): State<CancellationToken>) -> Response {
-    if shutdown.is_cancelled() {
+async fn healthz(State(s): State<Arc<AppState>>) -> Response {
+    if s.shutdown.is_cancelled() {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
     } else {
         "ok".into_response()
+    }
+}
+
+async fn link(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if s.shutdown.is_cancelled() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Ok(_permit) = s.links.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let claimed = auth::verify_link_bearer(
+        &headers,
+        &s.config.link_url,
+        &s.config.link_pubkey,
+        s.limits.max_auth_header,
+    )
+    .and_then(|id| s.replay.claim(id, Instant::now()));
+    match claimed {
+        Err(reject) => {
+            tracing::warn!(reason = reject.code(), "link bearer refused");
+            if reject == auth::Reject::CacheFull {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let body = Json(serde_json::json!({ "error": "unauthorized" }));
+            (StatusCode::UNAUTHORIZED, body).into_response()
+        }
+        // The link's frame loop lands in a later change.
+        Ok(()) => StatusCode::NOT_IMPLEMENTED.into_response(),
     }
 }

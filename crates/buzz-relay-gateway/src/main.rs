@@ -1,4 +1,4 @@
-use buzz_relay_gateway::Config;
+use buzz_relay_gateway::{Config, Limits};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
             shutdown.cancel();
         }
     });
-    buzz_relay_gateway::serve(listener, shutdown).await?;
+    buzz_relay_gateway::serve(listener, config, Limits::default(), shutdown).await?;
     Ok(())
 }
 
