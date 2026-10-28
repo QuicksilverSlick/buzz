@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'hosted_app_gate.dart';
+import 'onboarding_app_entry.dart';
 import 'shared/widgets/ios_navigation_metrics.dart';
 import 'shared/community/paired_community_landing.dart';
 import 'shared/community/community_loading_surface.dart';
@@ -20,14 +22,15 @@ import 'features/channels/channel_management_provider.dart';
 import 'features/channels/channels_provider.dart';
 import 'features/channels/unread_badge/unread_badge_provider.dart';
 import 'features/home/home_page.dart';
+import 'features/channels/me/me_page.dart';
+import 'features/channels/me/me_unread_provider.dart';
 import 'features/invites/invite_create_page.dart';
 import 'features/invites/invite_join_provider.dart';
 import 'features/pairing/pairing_page.dart';
 import 'features/pairing/pairing_provider.dart';
 import 'features/channels/agent_activity/observer_subscription.dart';
 import 'features/channels/channel_detail_page.dart';
-import 'features/channels/deep_link_dispatcher.dart';
-import 'features/channels/voice_note_recording.dart';
+import 'shared/widgets/app_route_observer.dart';
 import 'features/profile/user_status_cache_provider.dart';
 import 'features/profile/settings_profile_header.dart';
 import 'features/profile/set_status_sheet.dart';
@@ -39,8 +42,6 @@ import 'features/settings/theme_picker_page.dart';
 import 'shared/auth/auth.dart';
 import 'shared/deeplink/pending_deep_link_provider.dart';
 import 'shared/emoji/emoji_burst.dart';
-import 'shared/push/push_subscription_provider.dart';
-import 'shared/push/push_relay_capability_provider.dart';
 import 'shared/relay/relay.dart';
 import 'shared/read_state/read_state_provider.dart';
 import 'shared/theme/theme.dart';
@@ -244,9 +245,9 @@ InviteJoinRecovery buildMobileInviteJoinRecovery(
           .read(_inviteRelayConnectedProvider(scope.relayHttpOrigin).future)
           .timeout(const Duration(seconds: 15));
       ensureScopeCurrent();
-      await ref.read(channelsProvider.notifier).refresh(fetchDirectory: true);
-      ensureScopeCurrent();
-      final channels = await ref.read(channelsProvider.future);
+      final channels = await ref
+          .read(channelsProvider.notifier)
+          .fetchFresh(fetchDirectory: true);
       ensureScopeCurrent();
       return channels;
     },
@@ -311,11 +312,6 @@ class App extends HookConsumerWidget {
         ? ref.watch(communityThemeProvider)
         : defaultCommunityTheme;
     final themeMode = communityTheme.mode;
-    final accentIndex = effectiveAccentIndex(
-      communityTheme.theme,
-      communityTheme.accent,
-    );
-    final schemeName = communityTheme.theme;
     final authState = ref.watch(authProvider);
     final pairedCommunity = ref.watch(pairedCommunityLandingProvider);
 
@@ -326,40 +322,22 @@ class App extends HookConsumerWidget {
       return null;
     }, const []);
 
-    final resolved = resolveSchemes(schemeName, themeMode);
-    final lightScheme = applyAccent(resolved.light, accentIndex);
-    final darkScheme = applyAccent(resolved.dark, accentIndex);
-    // Light/Dark modes pin the brightness; System leaves it null so Flutter
-    // follows the OS across the selected theme and its pair.
-    final effectiveMode = resolved.forcedMode ?? themeMode;
-
-    // Derive the gradient from the themes that produced each color scheme.
-    // This keeps fallbacks and pinned brightness changes aligned with the
-    // rendered palette rather than the raw persisted selection.
-    final buzzLightGradient = buzzTopSectionGradient(
-      resolved.lightTheme?.name ?? '',
-      lightScheme.brightness,
-    );
-    final buzzDarkGradient = buzzTopSectionGradient(
-      resolved.darkTheme?.name ?? '',
-      darkScheme.brightness,
-    );
-
     // Eagerly initialize websocket session and lifecycle observer when
     // authenticated. These providers connect and manage the websocket.
     var hasUnreadInbox = false;
+    var hasUnreadSolo = false;
     if (ageSignalState != AgeSignalState.restricted &&
         authState.value?.status == AuthStatus.authenticated) {
       ref.watch(relaySessionProvider);
-      ref.watch(observerRelayProvider);
+      // Listen, not watch: these publish often, and an App rebuild rebuilds
+      // every route, including an open chat.
+      ref.listen(observerRelayProvider, (_, _) {});
       ref.watch(appLifecycleProvider);
-      ref.watch(userStatusCacheProvider);
-      if (ref.watch(activeCommunityProvider).value?.pushNotificationsEnabled ==
-              true &&
-          ref.watch(currentRelayPushDescriptorProvider).value != null) {
-        ref.watch(pushSubscriptionSyncProvider);
-      }
+      ref.listen(userStatusCacheProvider, (_, _) {});
       hasUnreadInbox = ref.watch(_unreadInboxItemCountProvider) > 0;
+      hasUnreadSolo = ref.watch(
+        meUnreadChannelIdsProvider.select((ids) => ids.isNotEmpty),
+      );
     }
 
     // Start listening for buzz:// links immediately (even pre-auth) so a
@@ -392,17 +370,11 @@ class App extends HookConsumerWidget {
 
     return MaterialApp(
       navigatorKey: _mobileRootNavigatorKey,
-      navigatorObservers: [voiceNoteRouteObserver],
+      navigatorObservers: [appRouteObserver],
       title: 'Buzz',
-      theme: AppTheme.light(
-        colorScheme: lightScheme,
-        topSectionGradient: buzzLightGradient,
-      ),
-      darkTheme: AppTheme.dark(
-        colorScheme: darkScheme,
-        topSectionGradient: buzzDarkGradient,
-      ),
-      themeMode: effectiveMode,
+      theme: mobileAppearanceTheme(Brightness.light, communityTheme.accent),
+      darkTheme: mobileAppearanceTheme(Brightness.dark, communityTheme.accent),
+      themeMode: themeMode,
       // Above the navigator, so an age restriction cannot be bypassed by a
       // route that was pushed while the store signal request was in flight.
       builder: (context, child) => switch (ageSignalState) {
@@ -440,17 +412,20 @@ class App extends HookConsumerWidget {
         loading: () => const _SplashScreen(),
         error: (_, _) => const PairingPage(),
         data: (state) => switch (state.status) {
-          AuthStatus.authenticated => DeepLinkDispatcher(
+          AuthStatus.authenticated => HostedAppGate(
+            authenticated: true,
             child: HomePage(
+              mePageBuilder: (_, action) => MePage(newChatAction: action),
               settingsPageBuilder: _buildSettingsPage,
               communityInvitePageBuilder: (_) => const CommunityInvitePage(),
               communityAppearancePageBuilder: (_) => const ThemePickerPage(),
               hasUnreadInbox: hasUnreadInbox,
+              hasUnreadSolo: hasUnreadSolo,
             ),
           ),
-          _ => const DeepLinkDispatcher(
-            dispatchMessageLinks: false,
-            child: PairingPage(),
+          _ => const HostedAppGate(
+            authenticated: false,
+            child: OnboardingAppEntry(),
           ),
         },
       ),

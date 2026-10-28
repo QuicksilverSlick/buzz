@@ -145,7 +145,7 @@ buzz-admin          (operator CLI: relay membership + key generation)
 buzz-test-client    (integration test harness + manual CLI)
 ```
 
-**Key architectural principle:** The relay is the single source of truth. `buzz-relay` orchestrates all subsystems by calling them directly — it imports `buzz-db`, `buzz-auth`, `buzz-pubsub`, `buzz-search`, `buzz-audit`, and `buzz-workflow`. However, those subsystems are isolated from each other: `buzz-workflow` never calls `buzz-pubsub`, `buzz-search` never calls `buzz-db`, etc. Cross-subsystem coordination happens only through the relay. In multi-community mode, the relay also owns propagation of `TenantContext`; service crates should receive community-scoped inputs rather than independently deriving tenancy from client-controlled event tags.
+**Key architectural principle:** The relay is the single source of truth. `buzz-relay` orchestrates all subsystems by calling them directly — it imports `buzz-db`, `buzz-auth`, `buzz-pubsub`, `buzz-search`, `buzz-audit`, and `buzz-workflow`. However, those subsystems are isolated from each other: `buzz-workflow` never calls `buzz-pubsub`, `buzz-search` never calls `buzz-db`, etc. The one sanctioned exception is `buzz-audit`, which calls `buzz_db::deletion::guard_community_write` to admit each audit append into its community before taking the chain lock. Cross-subsystem coordination happens only through the relay. In multi-community mode, the relay also owns propagation of `TenantContext`; service crates should receive community-scoped inputs rather than independently deriving tenancy from client-controlled event tags.
 
 ---
 
@@ -474,7 +474,7 @@ All database access. Uses `sqlx::query()` (runtime, not compile-time macros) —
 | `user.rs` | User profile storage |
 | `error.rs` | Database error types |
 
-**Channel types:** `Stream`, `Forum`, `Dm`, `Workflow`  
+**Channel types:** `Stream`, `Forum`, `Dm`, `Workflow`, `System`  
 **Member roles:** `Owner`, `Admin`, `Member`, `Guest`, `Bot`  
 **Workflow statuses:** `Active`, `Disabled`, `Archived`  
 **Run statuses:** `Pending`, `Running`, `WaitingApproval`, `Completed`, `Failed`, `Cancelled`
@@ -501,8 +501,9 @@ shape is an explicit transition, not a flag day:
 - **Community fence (transition foundation):** runtime admission APIs now offer
   one shared community deletion lock per transaction, while deletion lifecycle
   transitions take the matching exclusive lock. A supported serving transaction
-  never spans communities; unmigrated paths still rely on trigger/function
-  backstops.
+  never spans communities. Serving leases use the same application admission.
+  Startup and deletion catalog validation tolerate the universal fence objects
+  being absent; inventories still record live fences for older executors.
 - **Replica floor (transition foundation):** runtime now provides a shared
   replica-floor lock helper for compliant channel-event writers, and the writer
   probe handshake takes the exclusive counterpart before sampling `S`, scanning
@@ -513,7 +514,8 @@ shape is an explicit transition, not a flag day:
 - **Dual enforcement (current):** application-owned lock+precheck paths run in
   front of the existing trigger/function enforcement; commit-time trigger checks
   remain authoritative during this phase. Removing those backstops is a separate
-  gated migration, not part of the lock foundation.
+  gated migration, after every pod tolerates their absence and no rollback below
+  that version is expected.
 - **Role separation:** relay/runtime code owns admission and lock protocols;
   operator maintenance/backfill workflows must either use those protocols or run
   under explicit reviewed procedures that keep routing fences closed.
@@ -522,6 +524,11 @@ shape is an explicit transition, not a flag day:
 - **Fleet gates and reconciliation:** startup/fence probes verify guard catalog +
   behavior, pgschema bootstraps run reconciliation, and lock/pool metrics remain
   the operational evidence path for rollout safety.
+
+The database end state (a declarative schema source, applied out of band at
+scale; no triggers, functions, or foreign keys; backfills outside migrations)
+and the expand → deploy → backfill → contract rules every schema change follows
+are in [docs/database.md](docs/database.md).
 
 **Does NOT:** cache queries, implement connection pooling logic (delegated to sqlx), or make network calls outside Postgres.
 
@@ -596,7 +603,7 @@ Tamper-evident append-only log with SHA-256 hash chaining.
 
 **Hash covers:** seq (big-endian bytes), timestamp (RFC3339), event_id, event_kind (big-endian), actor_pubkey, action string, channel_id (16 bytes or 16 zero bytes if None), canonical metadata JSON (BTreeMap for deterministic key ordering), prev_hash.
 
-**Single-writer guarantee:** `pg_advisory_lock` before each transaction. Lock released in all branches including panic (`catch_unwind`).
+**Single-writer guarantee:** each append runs in one transaction that first passes community write admission (the shared community deletion lock plus the active/undeleted check, via `buzz-db`'s `DeletionStore::guard_transaction`), then takes a per-community `pg_advisory_xact_lock`. Both locks release on commit or rollback, including a dropped future.
 
 **10 audit actions:** `EventCreated`, `EventDeleted`, `ChannelCreated`, `ChannelUpdated`, `ChannelDeleted`, `MemberAdded`, `MemberRemoved`, `AuthSuccess`, `AuthFailure`, `RateLimitExceeded`.
 
@@ -872,6 +879,18 @@ Every security-sensitive operation uses an explicit, verified pattern. No implic
 
 Applied in: `buzz-auth` (JWKS boundary), `buzz-workflow` (CallWebhook action),
 desktop `link_preview` (SSRF check).
+
+JWKS uses `public_https` by default and applies this public-address check to
+every resolved answer before pinning the first permitted address. Explicit
+`mesh` mode accepts HTTP only for a DNS hostname (not an IP literal) without
+userinfo, query, fragment, or backslash. It checks every DNS answer against the
+positive address allow-list in the
+[NIP-FI JWKS snapshot contract](docs/nips/NIP-FI.md#jwks-snapshot), rejects
+empty or mixed answers, and pins the first checked address. Mesh selection is
+an operator assertion, not a transport property the Rust relay verifies.
+Operators must enforce mutual TLS peer authentication and integrity
+protection, authorize the JWKS endpoint, and restrict egress. Unauthenticated
+HTTP permits key substitution and issuer impersonation.
 
 ### Audit Integrity
 
