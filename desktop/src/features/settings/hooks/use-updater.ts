@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { isAutoUpdateSupported } from "@/shared/api/tauri";
 
 export type UpdateStatus =
@@ -20,7 +21,9 @@ export type UpdateStatus =
       releaseUrl: string;
     };
 
-const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// Dreamforge publishes main's head 1-2 h after every merge, so a 6 h gap
+// meant a running app almost never noticed a release before a restart.
+const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
   "checking",
   "available",
@@ -59,6 +62,7 @@ export function useUpdater() {
   const downloadInFlightRef = useRef(false);
   const installInFlightRef = useRef(false);
   const manualResultRequestedRef = useRef(false);
+  const lastCheckStartedAtRef = useRef(0);
 
   const setStatus = useCallback((nextStatus: UpdateStatus) => {
     statusRef.current = nextStatus;
@@ -136,6 +140,7 @@ export function useUpdater() {
       }
 
       checkInFlightRef.current = true;
+      lastCheckStartedAtRef.current = Date.now();
       manualResultRequestedRef.current = false;
 
       try {
@@ -210,14 +215,30 @@ export function useUpdater() {
   }, [runUpdateCheck]);
 
   useEffect(() => {
+    // Huddle pop-outs mount their own provider; only the main window checks,
+    // so an update is downloaded once.
+    if (huddleWindowChannelId() !== null) return;
+
     void checkForUpdateInBackground();
 
     const intervalId = window.setInterval(() => {
       void checkForUpdateInBackground();
     }, BACKGROUND_UPDATE_CHECK_INTERVAL_MS);
 
+    // The interval stalls while the PC sleeps; check on return instead.
+    const checkIfStale = () => {
+      if (
+        Date.now() - lastCheckStartedAtRef.current >=
+        BACKGROUND_UPDATE_CHECK_INTERVAL_MS
+      ) {
+        void checkForUpdateInBackground();
+      }
+    };
+    window.addEventListener("focus", checkIfStale);
+
     return () => {
       window.clearInterval(intervalId);
+      window.removeEventListener("focus", checkIfStale);
       closeUpdate();
     };
   }, [checkForUpdateInBackground, closeUpdate]);
