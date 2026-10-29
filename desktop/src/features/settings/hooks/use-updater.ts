@@ -24,12 +24,16 @@ export type UpdateStatus =
 // Dreamforge publishes main's head 1-2 h after every merge, so a 6 h gap
 // meant a running app almost never noticed a release before a restart.
 const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+// A failed download is retried in the background no more often than the old
+// 6 h cadence, so a mis-signed release is not fetched in full every 30 min.
+const FAILED_DOWNLOAD_RETRY_MS = 6 * 60 * 60 * 1000;
+// "ready" is not blocked: a downloaded update is re-checked against the feed,
+// so a rollback or a newer release replaces it before the click.
 const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
   "checking",
   "available",
   "downloading",
   "installing",
-  "ready",
   "manual-required",
 ]);
 
@@ -63,6 +67,9 @@ export function useUpdater() {
   const installInFlightRef = useRef(false);
   const manualResultRequestedRef = useRef(false);
   const lastCheckStartedAtRef = useRef(0);
+  const failedDownloadRef = useRef<{ version: string; at: number } | null>(
+    null,
+  );
 
   const setStatus = useCallback((nextStatus: UpdateStatus) => {
     statusRef.current = nextStatus;
@@ -86,8 +93,8 @@ export function useUpdater() {
     }
 
     downloadInFlightRef.current = true;
+    const update = updateRef.current;
     try {
-      const update = updateRef.current;
       if (!update) {
         return;
       }
@@ -96,6 +103,9 @@ export function useUpdater() {
       await update.download();
       setStatus({ state: "ready" });
     } catch (err) {
+      if (update) {
+        failedDownloadRef.current = { version: update.version, at: Date.now() };
+      }
       setStatus({ state: "error", message: toErrorMessage(err) });
     } finally {
       downloadInFlightRef.current = false;
@@ -142,9 +152,14 @@ export function useUpdater() {
       checkInFlightRef.current = true;
       lastCheckStartedAtRef.current = Date.now();
       manualResultRequestedRef.current = false;
+      // Keep a downloaded update until the feed says it is no longer current.
+      const heldReady =
+        statusRef.current.state === "ready" ? updateRef.current : null;
 
       try {
-        await closeUpdate();
+        if (!heldReady) {
+          await closeUpdate();
+        }
 
         if (!background) {
           setStatus({ state: "checking" });
@@ -155,6 +170,30 @@ export function useUpdater() {
         });
         const shouldShowQuietResult =
           !background || manualResultRequestedRef.current;
+
+        if (heldReady) {
+          if (
+            installInFlightRef.current ||
+            update?.version === heldReady.version
+          ) {
+            await update?.close();
+            return;
+          }
+          // The feed rolled back or moved on: drop the held download.
+          await closeUpdate();
+          setStatus({ state: "idle" });
+        }
+
+        const failed = failedDownloadRef.current;
+        if (
+          update &&
+          background &&
+          failed?.version === update.version &&
+          Date.now() - failed.at < FAILED_DOWNLOAD_RETRY_MS
+        ) {
+          await update.close();
+          return;
+        }
 
         if (update) {
           // Check support BEFORE exposing any actionable state — on a Linux
