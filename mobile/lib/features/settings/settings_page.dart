@@ -10,9 +10,11 @@ import 'package:nostr/nostr.dart' as nostr;
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../shared/auth/auth.dart';
+import '../../shared/identity_transfer/nsec_export_sheet.dart';
 import '../../shared/clipboard_utils.dart';
 import '../../shared/success_haptic.dart';
 import '../../shared/push/push_relay_capability_provider.dart';
+import '../../shared/push/push_bootstrap.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/utils/string_utils.dart';
 import '../pairing/pairing_provider.dart';

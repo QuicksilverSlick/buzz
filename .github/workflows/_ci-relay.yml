@@ -111,6 +111,7 @@ jobs:
             --lib \
             --test e2e_event_reminder \
             --test e2e_author_only_deletion \
+            --test e2e_existence_oracle \
             --archive-file target/ci/backend-integration-tests.tar.zst
       - name: Build PostgreSQL test archive
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true' && matrix.artifact == 'postgres-tests'
@@ -581,7 +582,7 @@ jobs:
         run: |
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'binary(e2e_event_reminder) | binary(e2e_author_only_deletion)' \
+            -E 'binary(e2e_event_reminder) | binary(e2e_author_only_deletion) | binary(e2e_existence_oracle)' \
             --run-ignored ignored-only
         env:
           RELAY_URL: ws://localhost:3000
@@ -626,6 +627,13 @@ jobs:
           cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip29_departure_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_batch_put_user_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_announce_channel_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_unlisted_channel_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_solo_share_and_convert_wire -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_member_raises_guest_agent -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_guest_is_read_only_in_normal_channel -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip29_relay_rejects_role_change_by_unprivileged_actor -- --ignored --nocapture
         env:
           RELAY_URL: ws://localhost:3000
           GIT_CREDENTIAL_NOSTR_BIN: ${{ github.workspace }}/target/ci/git-credential-nostr
