@@ -74,6 +74,48 @@ test("deleteChannel stops when the archived channel cannot be restored", async (
   assert.deepEqual(calls, ["delete_channel", "unarchive_channel"]);
 });
 
+test("deleteChannel re-archives when the unarchive outcome is unknown", async () => {
+  const { calls, error } = await runDelete({
+    delete_channel: [ARCHIVED],
+    unarchive_channel: ["relay unreachable: network error"],
+  });
+  assert.doesNotMatch(error.message, /Nothing was changed/);
+  assert.match(error.message, /network error\. It is still archived\./);
+  assert.deepEqual(calls, [
+    "delete_channel",
+    "unarchive_channel",
+    "archive_channel",
+  ]);
+});
+
+test("deleteChannel treats an already-archived refusal as still archived", async () => {
+  const { error } = await runDelete({
+    delete_channel: [ARCHIVED],
+    unarchive_channel: ["relay returned 504 Gateway Timeout"],
+    archive_channel: [
+      "relay returned 400 Bad Request: invalid: channel is already archived",
+    ],
+  });
+  assert.match(error.message, /504 Gateway Timeout\. It is still archived\./);
+});
+
+test("deleteChannel reports a likely delete when the re-archive finds no channel", async () => {
+  const { calls, error } = await runDelete({
+    delete_channel: [ARCHIVED, "relay unreachable: network error"],
+    archive_channel: [
+      "relay returned 400 Bad Request: invalid: channel not found",
+    ],
+  });
+  assert.doesNotMatch(error.message, /channel settings/);
+  assert.match(error.message, /appears to be deleted/);
+  assert.deepEqual(calls, [
+    "delete_channel",
+    "unarchive_channel",
+    "delete_channel",
+    "archive_channel",
+  ]);
+});
+
 test("deleteChannel re-archives when the second delete fails", async () => {
   const { calls, error } = await runDelete({
     delete_channel: [ARCHIVED, "relay returned 500 Internal Server Error"],

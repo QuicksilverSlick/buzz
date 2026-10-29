@@ -280,6 +280,9 @@ export async function unarchiveChannel(channelId: string): Promise<void> {
 // and re-archive if the delete still fails. Remove once the relay exempts 9008
 // from its archive gate (block/buzz#7569 or equivalent).
 const ARCHIVED_REFUSAL = /\bchannel is archived\b/;
+// Only an answer from the relay proves an event was not applied. A lost
+// response (timeout, reset, proxy 5xx) can follow a commit.
+const RELAY_REFUSAL = /^relay (returned 4\d\d|rejected event|rate-limited)/;
 
 export async function deleteChannel(channelId: string): Promise<void> {
   try {
@@ -294,26 +297,46 @@ export async function deleteChannel(channelId: string): Promise<void> {
   try {
     await unarchiveChannel(channelId);
   } catch (error) {
-    throw new Error(
-      `This channel is archived and could not be restored so it can be deleted: ${toTauriError(error).message}. Nothing was changed.`,
-    );
+    const reason = toTauriError(error).message;
+    const failure = `This channel is archived and could not be restored so it can be deleted: ${reason}`;
+    if (RELAY_REFUSAL.test(reason)) {
+      throw new Error(`${failure}. Nothing was changed.`);
+    }
+    throw await rearchiveAfterFailure(channelId, failure);
   }
 
   try {
     await invokeTauri("delete_channel", { channelId });
   } catch (error) {
-    const reason = toTauriError(error).message;
-    try {
-      await archiveChannel(channelId);
-    } catch (archiveError) {
-      throw new Error(
-        `Couldn't delete the channel: ${reason}. It was restored to try the delete and could not be archived again (${toTauriError(archiveError).message}). Archive it from channel settings.`,
-      );
-    }
-    throw new Error(
-      `Couldn't delete the channel: ${reason}. It is still archived.`,
+    throw await rearchiveAfterFailure(
+      channelId,
+      `Couldn't delete the channel: ${toTauriError(error).message}`,
     );
   }
+}
+
+// Best-effort re-archive once the fallback may have left the channel restored.
+// Returns the error for the caller to throw.
+async function rearchiveAfterFailure(
+  channelId: string,
+  failure: string,
+): Promise<Error> {
+  try {
+    await archiveChannel(channelId);
+  } catch (error) {
+    const reason = toTauriError(error).message;
+    if (/\bchannel not found\b/.test(reason)) {
+      return new Error(
+        `${failure}. The channel appears to be deleted; refresh the channel list to check.`,
+      );
+    }
+    if (!/\bchannel is already archived\b/.test(reason)) {
+      return new Error(
+        `${failure}. It may have been restored and could not be archived again (${reason}). Check it in channel settings.`,
+      );
+    }
+  }
+  return new Error(`${failure}. It is still archived.`);
 }
 
 type RawChannelMessagesPageResponse = {
