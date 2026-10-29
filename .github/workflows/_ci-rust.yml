@@ -109,8 +109,10 @@ jobs:
     name: Windows Rust (x86_64-pc-windows-msvc)
     runs-on: windows-latest
     # Windows runners are slow and this compiles the workspace + Tauri crate
-    # cold across four steps; budget generously.
-    timeout-minutes: 45
+    # cold across four steps; budget generously. A toolchain bump empties the
+    # cache and a cold run takes 41-46 min, and the cache only saves after a
+    # finished run, so 45 left main stuck red.
+    timeout-minutes: 60
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust)
     permissions:
       contents: read
