@@ -275,8 +275,45 @@ export async function unarchiveChannel(channelId: string): Promise<void> {
   await invokeTauri("unarchive_channel", { channelId });
 }
 
+// ponytail: the hosted relay refuses kind 9008 on an archived channel (huddle
+// channels are archived automatically), so on that refusal restore, delete,
+// and re-archive if the delete still fails. Remove once the relay exempts 9008
+// from its archive gate (block/buzz#7569 or equivalent).
+const ARCHIVED_REFUSAL = /\bchannel is archived\b/;
+
 export async function deleteChannel(channelId: string): Promise<void> {
-  await invokeTauri("delete_channel", { channelId });
+  try {
+    await invokeTauri("delete_channel", { channelId });
+    return;
+  } catch (error) {
+    if (!ARCHIVED_REFUSAL.test(toTauriError(error).message)) {
+      throw error;
+    }
+  }
+
+  try {
+    await unarchiveChannel(channelId);
+  } catch (error) {
+    throw new Error(
+      `This channel is archived and could not be restored so it can be deleted: ${toTauriError(error).message}. Nothing was changed.`,
+    );
+  }
+
+  try {
+    await invokeTauri("delete_channel", { channelId });
+  } catch (error) {
+    const reason = toTauriError(error).message;
+    try {
+      await archiveChannel(channelId);
+    } catch (archiveError) {
+      throw new Error(
+        `Couldn't delete the channel: ${reason}. It was restored to try the delete and could not be archived again (${toTauriError(archiveError).message}). Archive it from channel settings.`,
+      );
+    }
+    throw new Error(
+      `Couldn't delete the channel: ${reason}. It is still archived.`,
+    );
+  }
 }
 
 type RawChannelMessagesPageResponse = {
