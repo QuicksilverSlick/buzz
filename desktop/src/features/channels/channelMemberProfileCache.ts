@@ -13,13 +13,16 @@ function isChannelMembersQuery(query: Query): boolean {
   );
 }
 
-function queryContainsMember(query: Query, normalizedPubkey: string): boolean {
+function queryContainsAnyMember(
+  query: Query,
+  names: ReadonlyMap<string, string | null>,
+): boolean {
   if (!isChannelMembersQuery(query) || !Array.isArray(query.state.data)) {
     return false;
   }
 
-  return (query.state.data as ChannelMember[]).some(
-    (member) => normalizePubkey(member.pubkey) === normalizedPubkey,
+  return (query.state.data as ChannelMember[]).some((member) =>
+    names.has(normalizePubkey(member.pubkey)),
   );
 }
 
@@ -29,19 +32,42 @@ function queryContainsMember(query: Query, normalizedPubkey: string): boolean {
  * update immediately while a rename never fans out into one relay query per
  * cached channel.
  */
-export async function updateCachedChannelMemberDisplayName(
+export function updateCachedChannelMemberDisplayName(
   queryClient: QueryClient,
   pubkey: string,
   displayName: string | null,
 ): Promise<void> {
-  const normalizedPubkey = normalizePubkey(pubkey);
+  return updateCachedChannelMemberDisplayNames(queryClient, [
+    [pubkey, displayName],
+  ]);
+}
+
+/**
+ * Applies several renames in one pass. Batch them rather than looping the
+ * single form: each pass cancels and restarts in-flight roster fetches, so N
+ * calls would re-issue the same `get_channel_members` N times.
+ */
+export async function updateCachedChannelMemberDisplayNames(
+  queryClient: QueryClient,
+  renames: ReadonlyArray<readonly [pubkey: string, displayName: string | null]>,
+): Promise<void> {
+  const names = new Map(
+    renames.map(([pubkey, displayName]) => [
+      normalizePubkey(pubkey),
+      displayName,
+    ]),
+  );
+  const renamed = (member: ChannelMember) => {
+    const pubkey = normalizePubkey(member.pubkey);
+    return names.has(pubkey) && member.displayName !== names.get(pubkey);
+  };
   const matchingMemberPredicate = (query: Query) =>
-    queryContainsMember(query, normalizedPubkey);
+    queryContainsAnyMember(query, names);
+  const matchingMemberQueries = queryClient
+    .getQueryCache()
+    .findAll({ predicate: matchingMemberPredicate });
   const matchingMemberQueryHashes = new Set(
-    queryClient
-      .getQueryCache()
-      .findAll({ predicate: matchingMemberPredicate })
-      .map((query) => query.queryHash),
+    matchingMemberQueries.map((query) => query.queryHash),
   );
   const fetchingMemberQueryHashes = new Set(
     queryClient
@@ -53,6 +79,14 @@ export async function updateCachedChannelMemberDisplayName(
       })
       .map((query) => query.queryHash),
   );
+
+  // Nothing to rename and nothing in flight that could land an old name:
+  // leave every roster's freshness alone, so a republished but unchanged
+  // kind:0 does not force a roster refetch on the next channel visit.
+  const hasOutdatedRow = matchingMemberQueries.some((query) =>
+    (query.state.data as ChannelMember[]).some(renamed),
+  );
+  if (!hasOutdatedRow && fetchingMemberQueryHashes.size === 0) return;
 
   // A first-load query has no rows to inspect yet, so cancel every member
   // fetch already in flight. Restart only requests without a matching cached
@@ -71,9 +105,11 @@ export async function updateCachedChannelMemberDisplayName(
       }
 
       return current.map((member) =>
-        normalizePubkey(member.pubkey) === normalizedPubkey &&
-        member.displayName !== displayName
-          ? { ...member, displayName }
+        renamed(member)
+          ? {
+              ...member,
+              displayName: names.get(normalizePubkey(member.pubkey)) ?? null,
+            }
           : member,
       );
     },
