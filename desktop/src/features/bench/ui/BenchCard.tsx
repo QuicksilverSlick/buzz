@@ -12,6 +12,7 @@ import {
   INITIAL_BENCH_ANSWER_STATE,
   benchAnswerReducer,
   benchCardMode,
+  benchCreatedSeconds,
   benchDeadlineSeconds,
   benchForLabel,
   benchOptionViews,
@@ -21,6 +22,7 @@ import {
   benchSeverityChip,
   benchStateLabel,
   benchValidityLabel,
+  formatBenchCreated,
   safeBenchLinks,
 } from "@/features/bench/lib/benchCards";
 import {
@@ -53,10 +55,10 @@ function formatBenchTime(unixSeconds: number): string {
  * markdown, never HTML. Option buttons answer through `bench_answer` with the
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
  * it. `onOther` opens the card's thread: Other, where a reply is the
- * answer, and Open thread, on every card that has one. A closed card is its
- * receipt: the question, the answer and the outcome. A `retiredPost` (one a
- * newer card replaced) is read-only, from its own text, so it never answers
- * twice.
+ * answer, and Open thread, on every card that has one, beside when the card
+ * was created. A closed card is its receipt: the question, the answer and
+ * the outcome. A `retiredPost` (one a newer card replaced) is read-only, from
+ * its own text, so it never answers twice.
  */
 export function BenchCard({
   card,
@@ -233,7 +235,7 @@ function BenchQuestionCard({
           <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
         ) : null}
       </div>
-      <BenchOpenThread card={card} onOpenThread={onOther} />
+      <BenchCardFooter card={card} onOpenThread={onOther} />
     </Card>
   );
 }
@@ -289,7 +291,7 @@ function BenchReceiptCard({
         <p className="text-xs text-muted-foreground">{receipt.outcomeLine}</p>
         <BenchCardText card={card} />
       </section>
-      <BenchOpenThread card={card} onOpenThread={onOther} />
+      <BenchCardFooter card={card} onOpenThread={onOther} />
     </Card>
   );
 }
@@ -391,25 +393,43 @@ function BenchPostNotes({ notes }: { notes: readonly string[] }) {
   ));
 }
 
-/** Hidden until the card has a live (or kept) message to thread on. */
-function BenchOpenThread({
+/**
+ * Open thread at the left, hidden until the card has a live (or kept)
+ * message to thread on; when the card was created at the right.
+ */
+function BenchCardFooter({
   card,
   onOpenThread,
 }: {
   card: BenchCardData;
   onOpenThread?: () => void;
 }) {
-  if (!onOpenThread || !card.cardEventId) return null;
+  const thread = onOpenThread && card.cardEventId;
+  const created = benchCreatedSeconds(card);
+  if (!thread && created === null) return null;
   return (
-    <Button
-      className="-ml-2 mt-1.5 h-7 px-2 text-xs"
-      onClick={onOpenThread}
-      size="sm"
-      type="button"
-      variant="ghost"
-    >
-      Open thread
-    </Button>
+    <div className="mt-1.5 flex items-center gap-2">
+      {thread ? (
+        <Button
+          className="-ml-2 h-7 px-2 text-xs"
+          onClick={onOpenThread}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
+          Open thread
+        </Button>
+      ) : null}
+      {created === null ? null : (
+        <time
+          className="ml-auto text-xs tabular-nums text-muted-foreground"
+          data-testid="bench-card-created"
+          dateTime={new Date(created * 1_000).toISOString()}
+        >
+          {formatBenchCreated(created)}
+        </time>
+      )}
+    </div>
   );
 }
 

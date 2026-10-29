@@ -74,7 +74,7 @@ test("sections: each item lands in exactly one section, like the board", () => {
   assert.equal(sections.retiring, 2, "stale and superseded are folded");
 });
 
-test("sections: needs you sorts by severity, then order, then id", () => {
+test("sections: one tick's needs you cards sort by severity, then order, then id", () => {
   const sections = benchSections(
     snapshot([
       card("w/none", { severity: null }),
@@ -97,7 +97,7 @@ test("sections: needs you sorts by severity, then order, then id", () => {
   ]);
 });
 
-test("sections: answered is oldest answer first; decided and status by area", () => {
+test("sections: one tick's answered cards are oldest answer first; decided and status by area", () => {
   const sections = benchSections(
     snapshot([
       card("w/later", { answer: { option: 0, answeredAt: 200 } }),
@@ -116,6 +116,54 @@ test("sections: answered is oldest answer first; decided and status by area", ()
     "w/d-ops",
   ]);
   assert.deepEqual(ids(sections.status), ["w/s-api", "w/s-web"]);
+});
+
+test("sections: every section is newest created first; a receipt by its question's", () => {
+  const at = (hour) => `2026-10-12T${hour}:00:00Z`;
+  const sections = benchSections(
+    snapshot([
+      card("w/old-critical", { severity: "critical", updatedAt: at("08") }),
+      card("w/new-info", { severity: "info", updatedAt: at("11") }),
+      card("w/garbage", { severity: "critical", updatedAt: "soon" }),
+      card("w/asked-first", {
+        updatedAt: at("08"),
+        answer: { option: 0, answeredAt: 200 },
+      }),
+      card("w/asked-last", {
+        updatedAt: at("11"),
+        answer: { option: 0, answeredAt: 100 },
+      }),
+      card("w/d-app-old", {
+        kind: "decision",
+        area: "app",
+        updatedAt: at("08"),
+      }),
+      card("w/d-ops-new", {
+        kind: "decision",
+        area: "ops",
+        updatedAt: at("11"),
+      }),
+      // Its outcome is the newest drop; its card is the oldest question's.
+      card("w/receipt", {
+        kind: "status",
+        options: [],
+        state: "done",
+        updatedAt: at("12"),
+        request: card("w/receipt", { updatedAt: at("07") }),
+      }),
+    ]),
+  );
+  assert.deepEqual(ids(sections.needsYou), [
+    "w/new-info",
+    "w/old-critical",
+    "w/garbage",
+  ]);
+  assert.deepEqual(ids(sections.answered), ["w/asked-last", "w/asked-first"]);
+  assert.deepEqual(ids(sections.decided), [
+    "w/d-ops-new",
+    "w/d-app-old",
+    "w/receipt",
+  ]);
 });
 
 test("sections: no snapshot is four empty sections", () => {
