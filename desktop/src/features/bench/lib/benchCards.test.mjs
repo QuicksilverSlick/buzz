@@ -576,14 +576,11 @@ test("created: the card's drop time, a receipt's question's; local date and time
   assert.equal(benchCreatedSeconds(asked), 1_791_806_400);
   assert.equal(benchCreatedSeconds(receipt), 1_791_806_400);
   assert.equal(benchCreatedSeconds(card({ updatedAt: "soon" })), null);
-  // Midday UTC is Oct 12 in every usual zone; ICU may print U+202F before PM.
-  const now = 1_791_806_400;
-  assert.match(formatBenchCreated(now, now), /^Oct 12, \d{1,2}:\d{2}\s[AP]M$/);
-  const lastYear = Date.parse("2025-10-12T12:00:00Z") / 1_000;
-  assert.match(
-    formatBenchCreated(lastYear, now),
-    /^Oct 12, 2025, \d{1,2}:\d{2}\s[AP]M$/,
-  );
+  // Local noon, so the day is Oct 12 in every zone; ICU may print U+202F.
+  const now = new Date(2026, 9, 12, 12).getTime() / 1_000;
+  assert.match(formatBenchCreated(now, now), /^Oct 12, 12:00\sPM$/);
+  const lastYear = new Date(2025, 9, 12, 12).getTime() / 1_000;
+  assert.match(formatBenchCreated(lastYear, now), /^Oct 12, 2025, 12:00\sPM$/);
 });
 
 // ---------------------------------------------------------------------------
