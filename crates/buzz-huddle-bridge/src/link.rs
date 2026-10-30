@@ -529,21 +529,22 @@ mod tests {
         let (_cmd, mut cmds) = mpsc::channel(64);
         let (outs, _talos) = mpsc::channel(1024);
         let dials = vec![Err(VERSION.into()), Ok((client, Vec::new()))];
-        let room = async {
-            let (end, at) = bridge(dials, &mut cmds, &outs).await;
-            assert_eq!(end, End::Refused(VERSION.into()));
-            assert_eq!(at.len(), 2, "no retry after the refusal");
-            assert!(at[1] - at[0] <= SPREAD);
-        };
-        let restart = async {
+        let restart = async move {
             let frame = CloseFrame {
                 code: CloseCode::Restart,
                 reason: "".into(),
             };
             relay.close(Some(frame)).await.unwrap();
             while let Some(Ok(_)) = relay.next().await {}
+            // The pod goes with its socket, so the bridge's drain ends here and the wait starts.
+            drop(relay);
+            Instant::now()
         };
-        tokio::join!(room, restart);
+        let ((end, at), closed) = tokio::join!(bridge(dials, &mut cmds, &outs), restart);
+        assert_eq!(end, End::Refused(VERSION.into()));
+        assert_eq!(at.len(), 2, "no retry after the refusal");
+        // Only the wait, on the paused clock: every draw in [0, 1) is inside the spread.
+        assert!(at[1] - closed <= SPREAD, "{:?}", at[1] - closed);
     }
 
     #[tokio::test(start_paused = true)]

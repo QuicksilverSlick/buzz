@@ -234,8 +234,14 @@ impl Input {
 
     /// Rebuild the peer map from a full snapshot after a gap: a new socket's after a reconnect,
     /// or the relay's `roster` resync after missed deltas. An index whose occupant changed, or
-    /// is new, is not heard for 500 ms.
+    /// is new, is not heard for 500 ms. One the snapshot no longer lists is a `left` missed in
+    /// the gap, so a `joined` reusing it within 500 ms is held back as after a `left`.
     pub fn rejoin(&mut self, peers: &[Peer], now_ms: u64) {
+        for &i in self.roster.keys() {
+            if !peers.iter().any(|p| p.index == i) {
+                self.quarantine.insert(i, now_ms + QUARANTINE_MS);
+            }
+        }
         for p in peers {
             if self.roster.get(&p.index) != Some(&key(p)) {
                 self.quarantine.insert(p.index, now_ms + QUARANTINE_MS);
@@ -245,8 +251,8 @@ impl Input {
     }
 
     /// Add or replace peers; a slot whose occupant changed loses its state. An index that
-    /// changed hands, or that `left` freed under 500 ms ago, is not heard for 500 ms from `now_ms`;
-    /// one never used, or whose occupant stayed, is heard at once.
+    /// changed hands, or that `left` or a snapshot freed under 500 ms ago, is not heard for
+    /// 500 ms from `now_ms`; one never used, or whose occupant stayed, is heard at once.
     fn add_peers(&mut self, peers: &[Peer], now_ms: u64) {
         for p in peers {
             let changed = match self.roster.insert(p.index, key(p)) {
@@ -1182,6 +1188,60 @@ mod tests {
             assert!(frames(&out).is_empty(), "quarantined ({gap:?})");
             let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
             assert_eq!(frames(&out), [&onset]);
+        }
+    }
+
+    /// A frame on `index` at `at` is taken in as `pubkey`'s: the hold, probed directly.
+    fn takes(input: &mut Input, index: u8, pubkey: &str, at: u64) -> bool {
+        input.on_audio(&talker(index, 0.3, None).frame(), at);
+        input.slots.get(&index).is_some_and(|s| s.key.0 == pubkey)
+    }
+
+    /// `index` is `pubkey`'s exactly 500 ms after `at`: refused at +499, taken at +500.
+    fn held_500_ms(input: &mut Input, index: u8, pubkey: &str, at: u64) -> bool {
+        !takes(input, index, pubkey, at + 499) && takes(input, index, pubkey, at + 500)
+    }
+
+    #[test]
+    fn every_hold_is_500_ms_to_the_ms() {
+        let peers = |list: &[(u8, &str)]| -> Vec<Peer> {
+            let peer = |&(index, pk): &(u8, &str)| Peer {
+                index,
+                pubkey: pk.into(),
+                epoch: 0,
+            };
+            list.iter().map(peer).collect()
+        };
+        // The owner's index goes to the guest, in a reconnect's snapshot or live in `joined`.
+        let mut swapped = input();
+        swapped.rejoin(&peers(&[(1, GUEST), (2, OWNER)]), T0);
+        assert!(held_500_ms(&mut swapped, 1, GUEST, T0), "rejoin");
+        let mut swapped = input();
+        swapped.on_control(&joined(&[(1, GUEST)]), T0);
+        assert!(held_500_ms(&mut swapped, 1, GUEST, T0), "joined");
+        // `left` frees it, or a resync or a reconnect's snapshot no longer lists it (a `left`
+        // missed in the gap). A `joined` reusing it under 500 ms later is held 500 ms from the
+        // `joined`; one 500 ms later is heard at once.
+        let resync =
+            serde_json::json!({"type": "roster", "peers": [{"pubkey": GUEST, "peer_index": 2}]});
+        let left = serde_json::json!({"type": "left", "peer_index": 1});
+        for what in ["left", "resync", "reconnect"] {
+            for gap in [0, 250, 499, 500] {
+                let mut input = input();
+                match what {
+                    "left" => input.on_control(&left, T0),
+                    "resync" => input.on_control(&resync, T0),
+                    _ => input.rejoin(&peers(&[(2, GUEST)]), T0),
+                }
+                let at = T0 + gap;
+                input.on_control(&joined(&[(1, GUEST)]), at);
+                let ok = if gap < 500 {
+                    held_500_ms(&mut input, 1, GUEST, at)
+                } else {
+                    takes(&mut input, 1, GUEST, at)
+                };
+                assert!(ok, "{what}, then joined at +{gap} ms");
+            }
         }
     }
 
