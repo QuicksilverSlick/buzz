@@ -147,6 +147,7 @@ pub(crate) async fn connect_audio_relay(
     // Slice 9: voiced agents read this desktop's output route from a file.
     super::audio_output::spawn_output_route_writer(
         app_handle.clone(),
+        channel_id.to_owned(),
         output_device_name.clone(),
         cancel.clone(),
     );

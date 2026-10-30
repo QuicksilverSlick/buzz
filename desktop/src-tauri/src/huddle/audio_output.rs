@@ -150,10 +150,12 @@ pub(crate) fn output_route_is_isolated(preferred: Option<&str>) -> bool {
 
 /// Keep the route file current while one huddle audio connection runs and a
 /// local agent has voice on; remove it otherwise and when the connection is
-/// cancelled. Rewritten every 5 s so `updated_at` doubles as a heartbeat: a
-/// reader treats a stale file as not isolated, which also covers a crash.
+/// cancelled (leaving the huddle). Rewritten every 5 s so `updated_at` doubles
+/// as a heartbeat: a reader treats a stale file as not here and not isolated,
+/// which also covers a crash.
 pub(crate) fn spawn_output_route_writer(
     app: Option<tauri::AppHandle>,
+    huddle: String,
     output_device: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -164,27 +166,37 @@ pub(crate) fn spawn_output_route_writer(
         return;
     };
     tauri::async_runtime::spawn(async move {
+        // A fixed beat, so a slow device query never stretches the period past 5 s.
+        let mut beat = tokio::time::interval(std::time::Duration::from_secs(5));
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                _ = beat.tick() => {}
+            }
             // The store read and the device query both block, so off the runtime.
-            let (app, path, device) = (app.clone(), path.clone(), output_device.clone());
+            let (app, path, huddle, device) = (
+                app.clone(),
+                path.clone(),
+                huddle.clone(),
+                output_device.clone(),
+            );
             let _ = tauri::async_runtime::spawn_blocking(move || {
                 let isolated = voice_profile::any_voice_enabled(&app)
                     .then(|| output_route_is_isolated(device.as_deref()));
-                sync_output_route_file(&path, isolated);
+                sync_output_route_file(&path, &huddle, isolated);
             })
             .await;
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-            }
         }
         let _ = std::fs::remove_file(&path);
     });
 }
 
-/// Write `{isolated, updated_at}` (unix seconds), or remove the file when no
-/// voice needs it (`None`).
-fn sync_output_route_file(path: &std::path::Path, isolated: Option<bool>) {
+/// Write `{isolated, huddle, updated_at}` (`huddle` is the huddle channel id,
+/// `updated_at` unix seconds), or remove the file when no voice needs it
+/// (`None`). This is the shape `buzz_huddle_bridge::input::read_route` reads.
+fn sync_output_route_file(path: &std::path::Path, huddle: &str, isolated: Option<bool>) {
     let Some(isolated) = isolated else {
         let _ = std::fs::remove_file(path);
         return;
@@ -192,7 +204,12 @@ fn sync_output_route_file(path: &std::path::Path, isolated: Option<bool>) {
     let updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let body = serde_json::json!({ "isolated": isolated, "updated_at": updated_at }).to_string();
+    let body = serde_json::json!({
+        "isolated": isolated,
+        "huddle": huddle,
+        "updated_at": updated_at,
+    })
+    .to_string();
     if let Err(error) =
         crate::managed_agents::storage::atomic_write_json_restricted(path, body.as_bytes())
     {
@@ -216,16 +233,32 @@ mod route_isolation_tests {
         assert!(!device_type_is_isolated(DeviceType::Unknown));
     }
 
+    /// Pins the exact shape the bridge reads; its reader side is
+    /// `route_file_counts_only_for_this_huddle_while_fresh` in
+    /// `crates/buzz-huddle-bridge/src/input.rs`. Change both together.
     #[test]
-    fn output_route_file_is_written_then_removed() {
+    fn output_route_file_has_the_bridge_shape_then_is_removed() {
+        const HUDDLE: &str = "5b6f8c2e-1d3a-4c8e-9f21-7a0b3c4d5e6f";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huddle-output-route.json");
-        sync_output_route_file(&path, Some(true));
+        sync_output_route_file(&path, HUDDLE, Some(true));
         let body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(body["isolated"], true);
-        assert!(body["updated_at"].as_u64().is_some_and(|secs| secs > 0));
-        sync_output_route_file(&path, None);
+        let updated_at = body["updated_at"].as_u64().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Unix seconds, not milliseconds: the reader multiplies by 1000.
+        assert!(
+            now.abs_diff(updated_at) <= 5,
+            "updated_at={updated_at} now={now}"
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({ "isolated": true, "huddle": HUDDLE, "updated_at": updated_at })
+        );
+        sync_output_route_file(&path, HUDDLE, None);
         assert!(!path.exists());
     }
 }

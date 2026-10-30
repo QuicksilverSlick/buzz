@@ -110,7 +110,7 @@ pub(crate) fn apply_voice_env(
     }
 }
 
-/// Where the desktop keeps `{isolated, updated_at}` for its live huddle output
+/// Where the desktop keeps `{isolated, huddle, updated_at}` for its live huddle output
 /// route (design 3.3). Passed to voiced agents as `BUZZ_ACP_AUDIO_ROUTE_FILE`;
 /// a missing or stale file means not isolated.
 pub(crate) fn output_route_file<R: tauri::Runtime>(
