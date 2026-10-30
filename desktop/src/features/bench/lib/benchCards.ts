@@ -865,6 +865,40 @@ export function benchDeadlineSeconds(deadline: string | null): number | null {
   return Number.isFinite(ms) ? Math.floor(ms / 1_000) : null;
 }
 
+/**
+ * When the card was created, in unix seconds: when the Bench took its drop
+ * (a changed re-drop is a new card), or for a receipt its question's, whose
+ * card it kept. Null if unparseable.
+ */
+export function benchCreatedSeconds(card: BenchCard): number | null {
+  return benchDeadlineSeconds((card.request ?? card).updatedAt);
+}
+
+const CREATED_THIS_YEAR = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+const CREATED_OTHER_YEAR = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+/** Local "Oct 29, 5:44 PM"; "Oct 29, 2025, 5:44 PM" from another year. */
+export function formatBenchCreated(
+  unixSeconds: number,
+  nowSeconds = Date.now() / 1_000,
+): string {
+  const date = new Date(unixSeconds * 1_000);
+  const thisYear =
+    date.getFullYear() === new Date(nowSeconds * 1_000).getFullYear();
+  return (thisYear ? CREATED_THIS_YEAR : CREATED_OTHER_YEAR).format(date);
+}
+
 const MONTHS = [
   "january",
   "february",

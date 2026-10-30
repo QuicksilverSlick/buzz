@@ -12,7 +12,8 @@
  * - Plain fields and labels a writer typed show as bold-labelled fields in
  *   the phone's order, the action as the command one tap approves, details
  *   apart (long ones folded); a card without them renders as before.
- * - Open thread shows on every card that has a thread.
+ * - Open thread shows on every card that has a thread, with when the card
+ *   was created at the right of its row.
  * - A retired post is read-only, from its own text: the card's layout, no
  *   answer buttons, a link to the live card when there is one.
  */
@@ -42,6 +43,7 @@ let QueryClient;
 let QueryClientProvider;
 let TooltipProvider;
 let BenchCard;
+let formatBenchCreated;
 let useBenchCardForMessage;
 
 const CHANNEL = "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10";
@@ -175,6 +177,7 @@ before(async () => {
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
   ({ BenchCard } = await import("./BenchCard.tsx"));
+  ({ formatBenchCreated } = await import("../lib/benchCards.ts"));
   ({ useBenchCardForMessage } = await import("../useBenchCards.ts"));
 });
 
@@ -823,6 +826,42 @@ test("Open thread is on question, status and receipt cards with a thread", async
     assert.equal(thread(), null);
     cleanup();
   }
+});
+
+test("when the card was created shows at the bottom right, on Open thread's row", async () => {
+  const created = () => screen.getByTestId("bench-card-created");
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: card(), onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  const stamp = created();
+  const button = screen.getByRole("button", { name: "Open thread" });
+  assert.equal(stamp.dateTime, "2026-10-12T10:00:00.000Z");
+  // The helper's own text: its format test pins the format, and a fixed
+  // pattern would break when the clock leaves the fixture's year.
+  assert.equal(
+    stamp.textContent,
+    formatBenchCreated(Date.parse("2026-10-12T10:00:00Z") / 1_000),
+  );
+  assert.equal(stamp.parentElement, button.parentElement, "one row");
+  assert.equal(stamp.parentElement, root.lastElementChild, "the card's last");
+  assert.equal(button.nextElementSibling, stamp, "Open thread at the left");
+  assert.ok(stamp.className.includes("ml-auto"), "pushed to the right");
+  cleanup();
+  // No thread: the stamp alone. A receipt's is its question's.
+  const receipt = card({
+    kind: "status",
+    options: [],
+    state: "done",
+    updatedAt: "2026-10-14T10:00:00Z",
+    request: scoped({ cardEventId: null }),
+  });
+  await act(async () => {
+    render(wrap(benchCard({ card: receipt })));
+  });
+  assert.equal(created().dateTime, "2026-10-12T10:00:00.000Z");
+  assert.equal(screen.queryByRole("button", { name: "Open thread" }), null);
 });
 
 test("a retired post is read-only, from its own text, with a link to the live card", async () => {
