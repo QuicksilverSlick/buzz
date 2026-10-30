@@ -2,10 +2,11 @@
 //! frame per 20 ms, commands from the voice module applied in between, a clean Close on leave,
 //! and rejoins after a drop. A rolling relay deploy closes with 1012 or 1001, so the first
 //! rejoin waits a random 0-10 s, as upstream PR 8653 does for buzz-acp, and a room's voices
-//! don't all return at once. Otherwise it backs off 1, 2, 4 ... 30 s. A version refusal is final.
+//! don't all return at once. Otherwise, and after a second restart in a row, it backs off 1, 2,
+//! 4 ... 30 s. A version refusal, or a huddle that has ended, is final.
 
 use crate::frames::ToTalos;
-use crate::input::{Input, Out, Policy, Route};
+use crate::input::{Input, Out, Policy, Route, STALL_MS};
 use crate::output::Output;
 use buzz_audio_client::connection::Peer;
 use futures_util::{SinkExt, StreamExt};
@@ -13,19 +14,25 @@ use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{timeout, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 
 const STEP_MS: u64 = 10;
-/// More steps behind than this and the loop skips ahead; Input drops what queued in the gap.
-const CATCH_UP: u64 = 4;
+/// More steps behind than this and the loop skips ahead, past Input's stall, so Input drops
+/// what queued in the gap.
+const CATCH_UP: u64 = STALL_MS / STEP_MS;
 const SPREAD: Duration = Duration::from_secs(10);
 const MAX_WAIT: Duration = Duration::from_secs(30);
 /// A socket joined this long resets the backoff.
 const STABLE: Duration = Duration::from_secs(30);
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// A relay that takes no frame for this long has stopped reading.
+const SEND_WAIT: Duration = Duration::from_millis(500);
+/// The relay pings every 30 s, so a socket silent this long is dead: a roam, a NAT rebind, a
+/// resume. ponytail: a client Ping every 10 s would notice in 20 s, if 75 s proves too slow.
+const SILENT: Duration = Duration::from_secs(75);
 
 /// From the voice module, applied between steps.
 #[derive(Debug)]
@@ -59,8 +66,10 @@ pub enum End {
     /// The relay's Close code, or `None` for a dropped socket.
     Closed(Option<u16>),
     /// The dial failed or the relay refused the join, with its message. `buzz-audio-client`
-    /// keeps only the relay's message, and both version refusals (`upgrade_required`,
-    /// `unsupported_version`) say "audio protocol v".
+    /// keeps only the relay's message, so its words are the contract: both version refusals
+    /// (`upgrade_required`, `unsupported_version`) say "audio protocol v", and `room_ended`
+    /// says "huddle has ended". A test pins them. ponytail: carry the relay's `code` when that
+    /// upstream crate is next touched.
     Refused(String),
 }
 
@@ -68,7 +77,9 @@ impl End {
     fn is_final(&self) -> bool {
         match self {
             End::Left => true,
-            End::Refused(message) => message.contains("audio protocol v"),
+            End::Refused(message) => {
+                message.contains("audio protocol v") || message.contains("huddle has ended")
+            }
             End::Closed(_) => false,
         }
     }
@@ -99,6 +110,8 @@ impl Backoff {
             self.failures = 0;
         }
         if self.failures == 0 && end.restarting() {
+            // A relay that keeps restarting climbs the ladder from here.
+            self.failures = 1;
             return Some(SPREAD.mul_f64(unit.clamp(0.0, 1.0)));
         }
         let wait = Duration::from_secs(1 << self.failures.min(5)).min(MAX_WAIT);
@@ -215,18 +228,24 @@ impl Room<'_> {
     {
         let mut wake = tokio::time::interval(Duration::from_millis(STEP_MS));
         wake.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut heard = Instant::now();
         loop {
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
                     None | Some(Cmd::Leave) => {
                         let frame = CloseFrame { code: CloseCode::Normal, reason: "".into() };
-                        let _ = socket.close(Some(frame)).await;
+                        let _ = timeout(CLOSE_WAIT, socket.close(Some(frame))).await;
                         drain(socket).await;
                         return End::Left;
                     }
                     Some(cmd) => self.apply(cmd).await,
                 },
-                msg = socket.next() => match msg {
+                _ = tokio::time::sleep_until(heard + SILENT) => {
+                    tracing::warn!("huddle bridge: the relay went silent");
+                    return End::Closed(None);
+                }
+                // Any frame, a Ping too, shows the relay is there.
+                msg = socket.next() => match msg.inspect(|_| heard = Instant::now()) {
                     Some(Ok(Message::Binary(data))) => self.input.on_audio(&data, self.clock.now()),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                         Ok(msg) => {
@@ -275,7 +294,9 @@ impl Room<'_> {
             self.output.hear(self.input.levels(), now);
             if self.step.is_multiple_of(2) {
                 if let Some(frame) = self.output.tick(now) {
-                    socket.send(Message::Binary(frame.into())).await?;
+                    let send = socket.send(Message::Binary(frame.into()));
+                    let timed_out = |_| WsError::Io(std::io::ErrorKind::TimedOut.into());
+                    timeout(SEND_WAIT, send).await.map_err(timed_out)??;
                 }
             }
             self.input.set_output_until(self.output.until());
@@ -317,7 +338,11 @@ impl Room<'_> {
                 let outs = self.input.replay(index, from_ms, to_ms, now);
                 self.emit(outs).await;
             }
-            Cmd::Policy(policy) => self.input.set_policy(policy),
+            Cmd::Policy(policy) => {
+                // The policy decides who is a human and who a voice.
+                self.input.set_policy(policy);
+                self.roster(false).await;
+            }
             Cmd::Route(route) => self.input.set_route(route),
             Cmd::Leave => {}
         }
@@ -342,7 +367,7 @@ impl Room<'_> {
     }
 }
 
-/// Read to the end of the close handshake, for at most 2 s.
+/// Read to the end of the close handshake, for at most 2 s after the Close is sent.
 async fn drain<S: AsyncRead + AsyncWrite + Unpin>(mut socket: WebSocketStream<S>) {
     let _ = tokio::time::timeout(CLOSE_WAIT, async {
         while let Some(Ok(_)) = socket.next().await {}
@@ -370,8 +395,8 @@ mod tests {
         relay.next().await.expect("closed").expect("socket error")
     }
 
-    async fn pair() -> (Socket, Socket) {
-        let (a, b) = tokio::io::duplex(1 << 16);
+    async fn pair(buffer: usize) -> (Socket, Socket) {
+        let (a, b) = tokio::io::duplex(buffer);
         let client = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
         (
             client,
@@ -407,10 +432,12 @@ mod tests {
             b.next(&End::Closed(Some(1012)), s(60), 0.25),
             Some(s(10) / 4)
         );
-        let ladder: Vec<_> = (0..7)
+        // A second restart in a row climbs the ladder.
+        assert_eq!(b.next(&End::Closed(Some(1012)), s(5), 0.25), Some(s(2)));
+        let ladder: Vec<_> = (0..5)
             .map(|_| b.next(&failed, s(0), 0.5).unwrap())
             .collect();
-        assert_eq!(ladder, [1, 2, 4, 8, 16, 30, 30].map(s));
+        assert_eq!(ladder, [4, 8, 16, 30, 30].map(s));
         // A 1001 mid-ladder doesn't spread; after a stable socket the ladder restarts.
         assert_eq!(b.next(&End::Closed(Some(1001)), s(5), 1.0), Some(s(30)));
         assert_eq!(b.next(&End::Closed(Some(1001)), s(30), 1.0), Some(s(10)));
@@ -420,13 +447,15 @@ mod tests {
         assert_eq!(b.next(&End::Refused(VERSION.into()), s(0), 0.5), None);
         let unsupported = "huddle audio protocol v3 not supported; relay max is v2";
         assert_eq!(b.next(&End::Refused(unsupported.into()), s(0), 0.5), None);
+        let ended = End::Refused("huddle has ended".into());
+        assert_eq!(b.next(&ended, s(0), 0.5), None);
         assert_eq!(b.next(&End::Left, s(0), 0.5), None);
         assert!((0..100).map(|_| unit()).all(|u| (0.0..1.0).contains(&u)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn output_is_paced_20_ms_apart_and_leave_closes_with_1000() {
-        let (client, mut relay) = pair().await;
+        let (client, mut relay) = pair(1 << 16).await;
         let (cmd, mut cmds) = mpsc::channel(64);
         let (outs, mut talos) = mpsc::channel(1024);
         let room = async {
@@ -452,6 +481,21 @@ mod tests {
                 .unwrap();
             let next = timeout(second, talos.recv()).await;
             assert_eq!(next.expect("a roster"), roster(&[ME]));
+            // A new policy can make a human a voice.
+            let agents = [ME.to_string()].into();
+            let policy = Policy {
+                agents,
+                ..Policy::default()
+            };
+            cmd.send(Cmd::Policy(policy)).await.unwrap();
+            let voices = Some(Out::Frame(ToTalos::Roster {
+                humans: Vec::new(),
+                voices: vec![ME.into()],
+            }));
+            assert_eq!(
+                timeout(second, talos.recv()).await.expect("a roster"),
+                voices
+            );
             // The voice gets the floor and 200 ms.
             let floor = Cmd::Floor {
                 holder: Some(ME.into()),
@@ -481,7 +525,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_1012_rejoins_within_the_spread_and_a_version_refusal_ends_it() {
-        let (client, mut relay) = pair().await;
+        let (client, mut relay) = pair(1 << 16).await;
         let (_cmd, mut cmds) = mpsc::channel(64);
         let (outs, _talos) = mpsc::channel(1024);
         let dials = vec![Err(VERSION.into()), Ok((client, Vec::new()))];
@@ -500,6 +544,62 @@ mod tests {
             while let Some(Ok(_)) = relay.next().await {}
         };
         tokio::join!(room, restart);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_goes_silent_or_stops_reading_is_dropped() {
+        let (silent, mut quiet_relay) = pair(1 << 16).await;
+        // Room for a frame or two, and a relay that never reads them.
+        let (stuck, _stuck_relay) = pair(256).await;
+        let (cmd, mut cmds) = mpsc::channel(64);
+        let (outs, mut talos) = mpsc::channel(1024);
+        let dials = vec![
+            Err(VERSION.into()),
+            Ok((stuck, Vec::new())),
+            Ok((silent, Vec::new())),
+        ];
+        let room = async {
+            let run = timeout(Duration::from_secs(300), bridge(dials, &mut cmds, &outs));
+            let (end, at) = run.await.expect("never dropped");
+            assert_eq!(end, End::Refused(VERSION.into()));
+            let s = Duration::from_secs;
+            assert_eq!(at[1] - at[0], s(90) + SILENT + s(1), "pinged, then silent");
+            assert!(at[2] - at[1] < s(3), "{:?}", at[2] - at[1]);
+        };
+        let check = async {
+            talos.recv().await;
+            // The relay pings every 30 s, which keeps the socket, then goes silent.
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let ping = Message::Ping(Vec::new().into());
+                quiet_relay.send(ping).await.unwrap();
+            }
+            while let Some(Ok(_)) = quiet_relay.next().await {}
+            // The second join's voice plays into a socket that takes nothing.
+            talos.recv().await;
+            let floor = Cmd::Floor {
+                holder: Some(ME.into()),
+                token: 1,
+            };
+            cmd.send(floor).await.unwrap();
+            cmd.send(Cmd::Pcm(vec![0x40; 9_600])).await.unwrap();
+        };
+        tokio::join!(room, check);
+    }
+
+    /// `buzz-audio-client` keeps only the relay's words, so what is final rests on them.
+    #[test]
+    fn the_relay_still_says_what_ends_a_join_for_good() {
+        let relay = include_str!("../../buzz-relay/src/audio/handler.rs");
+        let words = [
+            "audio protocol v{pinned}",
+            "audio protocol v{requested_version}",
+            "\"huddle has ended\"",
+            "relay is draining",
+        ];
+        for words in words {
+            assert!(relay.contains(words), "{words}");
+        }
     }
 
     /// 8a spawns the room on buzz-acp's runtime, so its future must be `Send`.

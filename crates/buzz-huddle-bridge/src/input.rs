@@ -26,7 +26,7 @@ const CHUNK: usize = 480; // 20 ms at 24 kHz.
 const SENT_CAP: usize = 4_096;
 const TAPS: usize = 31;
 /// A tick gap past this is a stall: audio queued through it is dropped, never played late.
-const STALL_MS: u64 = 5 * TICK_MS;
+pub(crate) const STALL_MS: u64 = 5 * TICK_MS;
 /// How long a rejoin holds back an index that changed hands. v2 frames carry no occupancy
 /// epoch, so a delayed frame of the old occupant would otherwise be heard as the new one.
 const QUARANTINE_MS: u64 = 500;
@@ -232,8 +232,9 @@ impl Input {
         self.add_peers(peers);
     }
 
-    /// Rebuild the peer map from a new socket's snapshot after a reconnect. An index whose
-    /// occupant changed, or is new, is not heard for 500 ms.
+    /// Rebuild the peer map from a full snapshot after a gap: a new socket's after a reconnect,
+    /// or the relay's `roster` resync after missed deltas. An index whose occupant changed, or
+    /// is new, is not heard for 500 ms.
     pub fn rejoin(&mut self, peers: &[Peer], now_ms: u64) {
         for p in peers {
             if self.roster.get(&p.index) != Some(&(p.pubkey.clone(), p.epoch)) {
@@ -255,7 +256,9 @@ impl Input {
     pub fn on_control(&mut self, msg: &serde_json::Value) {
         match msg["type"].as_str() {
             Some(kind @ ("joined" | "roster")) => match parse_peers(msg) {
-                Ok(peers) if kind == "roster" => self.set_roster(&peers),
+                Ok(peers) if kind == "roster" => {
+                    self.rejoin(&peers, self.last_tick_ms.unwrap_or(0))
+                }
                 Ok(peers) => self.add_peers(&peers),
                 Err(e) => tracing::warn!(error = %e, "huddle bridge: bad roster"),
             },
@@ -1100,6 +1103,14 @@ mod tests {
         // An index whose occupant stayed is heard at once.
         input.rejoin(&peers, now);
         let out = run(&mut input, &mut now, 400, &mut [talker(2, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(OWNER)]);
+        // The relay's resync after missed deltas is the same stale view.
+        let swap = [(1, OWNER), (2, GUEST)]
+            .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}));
+        input.on_control(&serde_json::json!({"type": "roster", "peers": swap}));
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert!(frames(&out).is_empty(), "quarantined");
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
         assert_eq!(frames(&out), [&onset(OWNER)]);
     }
 
