@@ -199,18 +199,24 @@ impl Input {
 
     /// Replace the peer map from a relay snapshot (the initial `Joined::peers`).
     pub fn set_roster(&mut self, peers: &[Peer]) {
-        self.roster = peers
-            .iter()
-            .map(|p| (p.index, (p.pubkey.clone(), p.epoch)))
-            .collect();
+        self.roster.clear();
+        self.add_peers(peers);
+    }
+
+    /// Add or replace peers; a slot whose occupant changed loses its state.
+    fn add_peers(&mut self, peers: &[Peer]) {
+        let entries = peers.iter().map(|p| (p.index, (p.pubkey.clone(), p.epoch)));
+        self.roster.extend(entries);
         self.prune();
     }
 
-    /// Apply a relay control message: `joined` and `roster` carry the full snapshot.
+    /// Apply a relay control message. `roster` is the full snapshot; `joined` adds its peers
+    /// (all of them locally, only the newcomer from another pod); `left` drops one.
     pub fn on_control(&mut self, msg: &serde_json::Value) {
         match msg["type"].as_str() {
-            Some("joined" | "roster") => match parse_peers(msg) {
-                Ok(peers) => self.set_roster(&peers),
+            Some(kind @ ("joined" | "roster")) => match parse_peers(msg) {
+                Ok(peers) if kind == "roster" => self.set_roster(&peers),
+                Ok(peers) => self.add_peers(&peers),
                 Err(e) => tracing::warn!(error = %e, "huddle bridge: bad roster"),
             },
             Some("left") => {
@@ -271,7 +277,11 @@ impl Input {
     /// The voice's session opened (`awake`) or closed (`quiet`). Waking starts a new session
     /// clock and send log; while quiet only `onset` goes out.
     pub fn set_awake(&mut self, awake: bool) {
-        if awake && !self.awake {
+        // A repeated `awake` keeps the clock, the floor and the audio already counted.
+        if awake == self.awake {
+            return;
+        }
+        if awake {
             self.session_ms = 0;
             self.sent.clear();
         }
@@ -659,6 +669,15 @@ mod tests {
             .iter()
             .all(|o| !matches!(o, Out::Pcm(b) if b.len() != 2 * CHUNK)));
         assert!(input.who_said(0, u64::MAX).all(|s| s.pubkey == OWNER));
+        // A repeated `awake` keeps the span and the audio already counted.
+        let mut chunks = 0;
+        for _ in 0..10 {
+            input.set_awake(true);
+            let out = run(&mut input, &mut now, 10, &mut owner);
+            chunks += out.iter().filter(|o| matches!(o, Out::Pcm(_))).count();
+        }
+        assert_eq!(chunks, 5);
+        assert!(input.who_said(0, u64::MAX).all(|s| s.span == 1));
     }
 
     #[test]
@@ -673,23 +692,28 @@ mod tests {
         ];
         let out = run(&mut input, &mut now, 400, &mut others);
         assert!(frames(&out).is_empty() && !voiced(&out));
-        // A new occupant of slot 4 that the gate admits is heard; the roster follows the relay.
-        let peers = serde_json::json!([{"pubkey": OWNER, "peer_index": 1}, {"pubkey": AGENT, "peer_index": 3},
-            {"pubkey": GUEST, "peer_index": 4, "epoch": 1}]);
+        // A new occupant of slot 4 that the gate admits is heard. From another pod `joined`
+        // lists only the newcomer, and everyone else stays.
+        let peers = serde_json::json!([{"pubkey": GUEST, "peer_index": 4, "epoch": 1}]);
         input.on_control(&serde_json::json!({"type": "joined", "peers": peers}));
         let out = run(&mut input, &mut now, 400, &mut others);
-        assert_eq!(
-            frames(&out)[0],
-            &ToTalos::Onset {
-                pubkey: GUEST.into()
-            }
+        let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
+        assert_eq!(frames(&out)[0], &onset(GUEST));
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert!(
+            frames(&out).contains(&&onset(OWNER)),
+            "the owner is still heard"
         );
-        input.on_control(&serde_json::json!({"type": "left", "peer_index": 4}));
-        let roster = ToTalos::Roster {
-            humans: vec![OWNER.into()],
-            voices: vec![AGENT.into()],
+        let roster = |humans: &[&str], voices: &[&str]| ToTalos::Roster {
+            humans: humans.iter().map(|pk| pk.to_string()).collect(),
+            voices: voices.iter().map(|pk| pk.to_string()).collect(),
         };
-        assert_eq!(input.roster_frame(), roster);
+        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}));
+        assert_eq!(input.roster_frame(), roster(&[OWNER, GUEST], &[AGENT]));
+        // `roster` is the full snapshot.
+        let peers = serde_json::json!([{"pubkey": OWNER, "peer_index": 1}]);
+        input.on_control(&serde_json::json!({"type": "roster", "peers": peers}));
+        assert_eq!(input.roster_frame(), roster(&[OWNER], &[]));
     }
 
     #[test]
