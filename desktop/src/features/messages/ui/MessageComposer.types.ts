@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
+import type { ThreadParticipantSource } from "@/features/messages/lib/oneOnOneThreadAgent";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
@@ -27,6 +28,10 @@ export type MessageComposerEditTarget = {
 
 export type MessageComposerProps = {
   audienceContext?: {
+    /** Thread messages (and collapsed-reply authors); null while loading. */
+    participants?: readonly ThreadParticipantSource[] | null;
+    /** Authors of the root and of the parent being replied to. */
+    replyToPubkeys?: readonly (string | null | undefined)[];
     rootTags?: readonly string[][];
     type: "thread";
   } | null;

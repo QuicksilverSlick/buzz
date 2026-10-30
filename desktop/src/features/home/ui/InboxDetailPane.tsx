@@ -558,10 +558,17 @@ function InboxMessageDetailPane({
       : null;
   const isThreadContext =
     !isDirectMessage && hasInboxThreadContext(item, messages);
-  const threadRootTags = isThreadContext
-    ? (displayMessages.find((message) => message.id === item.conversationId)
-        ?.tags ?? [])
-    : [];
+  const conversationRoot = displayMessages.find(
+    (message) => message.id === item.conversationId,
+  );
+  const threadRootTags = isThreadContext ? (conversationRoot?.tags ?? []) : [];
+  const threadParticipants =
+    isThreadContextLoading || hasThreadContextLoadError || !conversationRoot
+      ? null
+      : displayMessages.map(({ authorPubkey, tags }) => ({
+          pubkey: authorPubkey,
+          tags,
+        }));
   const contextLabel = isThreadContext
     ? isDirectMessage
       ? `Thread with ${item.senderLabel}`
@@ -889,6 +896,13 @@ function InboxMessageDetailPane({
                   : {
                       type: "thread",
                       rootTags: threadRootTags,
+                      participants: threadParticipants,
+                      replyToPubkeys: [
+                        conversationRoot?.authorPubkey,
+                        displayMessages.find(
+                          (message) => message.id === composerParentEventId,
+                        )?.authorPubkey,
+                      ],
                     }
               }
               channelId={item.item.channelId}

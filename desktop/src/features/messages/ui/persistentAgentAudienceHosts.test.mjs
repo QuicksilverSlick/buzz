@@ -25,6 +25,10 @@ test("only thread conversation hosts opt into persistent audiences", async () =>
   assert.match(inboxDetail, /type: "thread"/);
   assert.doesNotMatch(threadPanel, /audienceContext=\{[\s\S]*threadRootId/);
   assert.doesNotMatch(inboxDetail, /audienceContext=\{[\s\S]*threadRootId/);
+  // Both thread reply paths feed the one-on-one agent rule.
+  for (const host of [threadPanel, inboxDetail]) {
+    assert.match(host, /participants: threadParticipants,\s+replyToPubkeys:/);
+  }
 });
 
 test("video review remains explicitly outside persistent audience routing", async () => {
