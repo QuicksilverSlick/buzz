@@ -378,13 +378,14 @@ fn scan_inbox(
 
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
-/// new question after an answer, a reply or the owner's word leaves the old
-/// card on the relay as it is and gets a card of its own with nothing told
-/// yet, which comes back to whoever answered (`item::Previous`); anything
-/// else keeps the card for publish to refresh. Each keeps the owner's word
-/// told on the old item, or a notice of the owner's still owed there, to be
-/// ended or withdrawn (`item::Item::ends`), whether its card is there or not
-/// (crowded out, deleted by hand).
+/// new question after an answer, a scoped card's reply or the owner's word
+/// leaves the old card on the relay as it is and gets a card of its own with
+/// nothing told yet, which comes back to whoever answered (`item::Previous`);
+/// anything else (a reply on a card that is not scoped asked nothing of its
+/// own) keeps the card for publish to refresh or close. Each keeps the
+/// owner's word told on the old item, or a notice of the owner's still owed
+/// there, to be ended or withdrawn (`item::Item::ends`), whether its card is
+/// there or not (crowded out, deleted by hand).
 fn carry_card(
     old: Option<&item::Item>,
     mut new: item::Item,
@@ -403,7 +404,12 @@ fn carry_card(
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
-    } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
+    } else if asking
+        && (o.answer.is_some()
+            || (o.scoped() && o.reply.is_some())
+            || o.request.is_some()
+            || o.owner_told())
+    {
         let asked = o.request.as_deref().unwrap_or(o);
         if let Some(c) = &o.card {
             kept.push(c.event_id.clone());
@@ -946,7 +952,8 @@ fn named(
 }
 
 /// Re-derive every answer from the kind-7 taps (and, on scoped cards, the
-/// kind-9 thread replies) on the live cards, from the owner's keys and the
+/// kind-9 thread replies) on the live cards, and each card's Other (scoped,
+/// or its writer routed), from the owner's keys and the
 /// cards' answerers only. The whole set comes back each tick, so a
 /// retraction is an event that stopped coming back and nothing is ever
 /// double-applied. The outbox file lands before state records the answer: a
@@ -1007,7 +1014,11 @@ async fn poll_answers(
     answerers.dedup();
     let chans: std::collections::BTreeSet<String> =
         live.iter().map(|i| channels::card_channel(s, i)).collect();
-    let kinds = if live.iter().any(|i| i.scoped()) {
+    // Thread replies count on scoped cards, and reach a routed writer's agent.
+    let kinds = if live
+        .iter()
+        .any(|i| i.scoped() || channels::reads_replies(s, i, routes))
+    {
         serde_json::json!([7, 9])
     } else {
         serde_json::json!([7])
@@ -1079,6 +1090,7 @@ async fn poll_answers(
             continue;
         }
         let until = item::root_until(&s.items[&id], s.items.values(), &s.kept, &s.kept_at);
+        let routed = channels::reads_replies(s, &s.items[&id], routes);
         let item = s.items.get_mut(&id).expect("live id");
         let card = live_card(item).expect("live card").event_id.clone();
         // Their page was cut, so an answer or reply of theirs here may be
@@ -1086,6 +1098,9 @@ async fn poll_answers(
         // still decides once the owner spoke, and an answer of the owner's
         // that stopped coming back was withdrawn.
         let unread = cut(false, &id) && !item::owner_spoke(item, &card, &events, owner_set, until);
+        // The first read of an unscoped card as routed: its reply is older.
+        let seed = routed && !item.scoped() && !item.routed_seen;
+        item.routed_seen |= seed;
         for e in item::refused_taps(item, &events, owner_set, &writer_hex, until) {
             let by = e.pubkey.to_hex();
             let why = if item.needs == item::Needs::You && agents.contains(&by) {
@@ -1102,10 +1117,11 @@ async fn poll_answers(
                 why: why.to_string(),
             });
         }
-        // The person's Other: kept while it is the newest, so its first-seen
-        // time holds; publish (a3) routes it unless it already pings the agent.
+        // The person's Other: kept while it is the newest; publish (a3)
+        // routes it unless it is marked told here. An unscoped card has one
+        // only while `channels::reads_replies`.
         let picked = (!unread)
-            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until))
+            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until, routed))
             .flatten();
         item.reply = match picked {
             Some(e)
@@ -1119,12 +1135,8 @@ async fn poll_answers(
             Some(e) => {
                 let by = e.pubkey.to_hex();
                 let (by_name, role) = named(item, &by, owner_set);
-                let pinged = routes.get(&item.writer).is_some_and(|to| {
-                    e.tags
-                        .iter()
-                        .any(|t| matches!(t.as_slice(), [k, p, ..] if k == "p" && p == to))
-                });
-                if pinged {
+                let at = e.created_at.as_secs().min(now);
+                if seed || !item::tell_reply(item, e, at, owner_set, &writer_hex) {
                     item.routed_reply = Some(e.id.to_hex());
                 }
                 Some(item::Reply {
@@ -1132,8 +1144,8 @@ async fn poll_answers(
                     by,
                     by_name,
                     role,
-                    at: now,
-                    hhmm: hhmm.clone(),
+                    at,
+                    hhmm: local_hhmm(at),
                 })
             }
             None if unread => item

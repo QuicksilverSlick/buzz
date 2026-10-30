@@ -201,8 +201,8 @@ pub(crate) enum AnswerSource {
     Reply,
 }
 
-/// The newest free-text reply on a scoped card from someone who may answer
-/// it: their "Other", routed to the writer like an answer.
+/// The newest free-text reply on a scoped or routed card from someone who
+/// may answer it: their "Other", routed to the writer like an answer.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Reply {
@@ -211,6 +211,7 @@ pub(crate) struct Reply {
     /// None: the owner's own keys.
     pub by_name: Option<String>,
     pub role: Option<AnswerRole>,
+    /// The reply's own created_at, never past the Bench clock.
     pub at: u64,
     pub hhmm: String,
 }
@@ -326,6 +327,12 @@ pub(crate) struct Item {
     /// The reply event id last routed to the writer's route target.
     #[serde(default)]
     pub routed_reply: Option<String>,
+    /// Unscoped: its card was posted, or first read, while its writer was
+    /// routed. The replies already on it when it was first read predate the
+    /// route (or this build): they are marked told, never told, so old,
+    /// settled work never starts the agent.
+    #[serde(default)]
+    pub routed_seen: bool,
     /// Someone answered or replied on this Drop's card, even if that was
     /// taken back since (set by `restamp`): a new stamp edits the card in
     /// place, never reposts it.
@@ -636,6 +643,7 @@ pub(crate) fn validate(
         pinged: Vec::new(),
         recorded_by: None,
         routed_reply: None,
+        routed_seen: false,
         was_engaged: false,
         request: None,
         previous: None,
@@ -1206,7 +1214,7 @@ pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
 
 pub(crate) use super::pick::{
     answer_option, eligible, owner_spoke, parent, pick_answer, pick_reply, reaction_target,
-    refused_taps, root_until,
+    refused_taps, root_until, tell_reply,
 };
 pub(crate) use super::route::{
     owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
