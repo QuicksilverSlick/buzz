@@ -542,7 +542,14 @@ test.describe("community rail", () => {
       ),
     );
     expect(publications).toHaveLength(0);
-    await expect(page.getByTestId("message-input")).toHaveText("");
+    // Community B lands on the Inbox, whose one-on-one agent thread may
+    // pre-address that agent; only the cancelled send must not carry over.
+    await expect(page.getByTestId("message-input")).not.toContainText(
+      "SlowBot",
+    );
+    await expect(page.getByTestId("message-input")).not.toContainText(
+      previewUrl,
+    );
   });
 
   test("community switch stops preview media before it reaches the new community", async ({

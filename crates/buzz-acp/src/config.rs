@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use buzz_core::kind::{
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_REMINDER,
-    KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use clap::Parser;
 use clap::ValueEnum;
@@ -1603,12 +1603,18 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 /// Message edits are included because Desktop emits `p` tags only for
 /// recipients newly added by an edit. Receiving kind 40003 therefore wakes an
 /// agent once for a newly added mention without re-waking it for ordinary edits.
+///
+/// Forum posts and comments are included so a tagged forum post or comment
+/// wakes the agent; the mention requirement still applies, so untagged forum
+/// activity does not.
 pub(crate) fn default_mention_kinds() -> Vec<u32> {
     vec![
         KIND_STREAM_MESSAGE,
         KIND_STREAM_MESSAGE_EDIT,
         KIND_WORKFLOW_APPROVAL_REQUESTED,
         KIND_STREAM_REMINDER,
+        KIND_FORUM_POST,
+        KIND_FORUM_COMMENT,
     ]
 }
 

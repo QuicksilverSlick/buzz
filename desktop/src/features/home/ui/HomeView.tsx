@@ -2,8 +2,15 @@ import * as React from "react";
 import { RefreshCcw } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import {
+  useChannelMembersQuery,
+  useChannelsQuery,
+} from "@/features/channels/hooks";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
 import {
@@ -52,6 +59,7 @@ import {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTimelineMessages";
+import { inboxReplyRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
@@ -477,6 +485,14 @@ export function HomeView({
     }
     return null;
   }, [filteredItems, selectedConversationId, selectedEventId]);
+  // A group-DM reply tells its agents apart by these (inboxReplyRecipientPubkeys).
+  const replyMembersQuery = useChannelMembersQuery(
+    selectedItem?.item.channelType === "dm"
+      ? selectedItem.item.channelId
+      : null,
+  );
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const relayAgentsQuery = useRelayAgentsQuery();
   const {
     canOpenSelected,
     handleOpenDirect,
@@ -823,6 +839,7 @@ export function HomeView({
               isSinglePanelView={isSinglePanelDetailView}
               hasThreadContextLoadError={threadContext.hasLoadError}
               isThreadContextLoading={threadContext.isLoading}
+              isThreadContextTruncated={threadContext.isTruncated}
               isThreadRootDeleted={threadContext.isRootDeleted}
               item={selectedItem}
               latchedDefaultParentId={latchedDefaultParentId}
@@ -864,6 +881,24 @@ export function HomeView({
                 if (!selectedItem || !channelId || !canReply) {
                   throw new Error("Replies are not available for this item.");
                 }
+                if (!currentPubkey) {
+                  throw new Error(
+                    "No identity available for sending messages.",
+                  );
+                }
+                // Inbox replies skip useSendMessage, so add the DM recipient
+                // tags here; without them an agent in the DM never hears it.
+                const recipientPubkeys = inboxReplyRecipientPubkeys({
+                  channel: channels?.find(
+                    (channel) => channel.id === channelId,
+                  ),
+                  senderPubkey: currentPubkey,
+                  explicitMentions: mentionPubkeys,
+                  members: replyMembersQuery,
+                  managedAgents: managedAgentsQuery,
+                  relayAgents: relayAgentsQuery,
+                  knownAgentPubkeys: inboxAgentPubkeys,
+                });
 
                 const itemToReply = selectedItem;
                 setIsSendingReply(true);
@@ -878,7 +913,7 @@ export function HomeView({
                     content,
                     parentEventId,
                     imetaTags,
-                    mentionPubkeys,
+                    recipientPubkeys,
                     undefined,
                     emojiTags,
                     mentionTags,

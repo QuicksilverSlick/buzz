@@ -3642,7 +3642,12 @@ pub async fn run_prompt_task(
             let thread_tags = b
                 .events
                 .first()
-                .map(|be| crate::queue::parse_thread_tags(&be.event))
+                .map(|be| {
+                    crate::queue::notice_thread_tags(
+                        &be.event,
+                        crate::queue::parse_thread_tags(&be.event),
+                    )
+                })
                 .unwrap_or_default();
             let mentions = ctx
                 .agent_owner_pubkey
@@ -4702,10 +4707,12 @@ where
     // #h=channel plus a sentinel, and (3) the agent's newest reply for pinning.
     let root_filter = nostr::Filter::new().id(nostr::EventId::from_hex(root_event_id).ok()?);
     let reply_fetch_limit = thread_reply_fetch_limit(limit, session_delta.overfetch);
+    // Forum comments are the replies under a forum post (the root).
     let replies_filter = nostr::Filter::new()
         .kinds([
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_FORUM_COMMENT as u16),
         ])
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
@@ -7291,14 +7298,14 @@ pub(crate) mod tests {
         assert!(root.get("limit").is_none());
 
         let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
-        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(replies.get("#e"), Some(&json!([root_id])));
         assert_eq!(replies.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(replies.get("limit"), Some(&json!(reply_limit)));
         assert!(replies.get("authors").is_none());
 
         let agent = serde_json::to_value(&filters[2]).expect("serialize agent filter");
-        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(agent.get("#e"), Some(&json!([root_id])));
         assert_eq!(agent.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(agent.get("authors"), Some(&json!([agent_pubkey.to_hex()])));
@@ -7309,7 +7316,7 @@ pub(crate) mod tests {
         assert_eq!(filters.len(), 1, "count should query only matching replies");
 
         let count = serde_json::to_value(&filters[0]).expect("serialize count filter");
-        assert_eq!(count.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(count.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(count.get("#e"), Some(&json!([root_id])));
         assert_eq!(count.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(count.get("limit"), Some(&json!(0)));

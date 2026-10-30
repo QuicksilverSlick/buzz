@@ -1,7 +1,8 @@
 /**
  * Pure logic for the Bench screen and its sidebar badge: which section each
- * item belongs in, in the order the pinned #bench board uses (item.rs
- * render_board), and how many items need the owner.
+ * item belongs in, newest created first, and how many items need the owner.
+ * Cards created in the same second (one tick's drops) keep the order the
+ * pinned #bench board uses (item.rs render_board).
  */
 
 import {
@@ -9,28 +10,29 @@ import {
   type BenchCards,
   type BenchSeverity,
   type BenchSnapshot,
+  benchCreatedSeconds,
   enabledBenchSnapshot,
 } from "@/features/bench/lib/benchCards";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSections = {
   /**
-   * Pending, current and unanswered, by severity, then order: the owner's
-   * own cards, or for any other viewer every one.
+   * Pending, current and unanswered, newest first, then by severity and
+   * order: the owner's own cards, or for any other viewer every one.
    */
   needsYou: BenchCard[];
   /** The owner's view only: unanswered cards that name other answerers. */
   waitingOnOthers: BenchCard[];
-  /** Pending and current with an answer: oldest answer first. */
+  /** Pending and current with an answer: newest, then oldest answer, first. */
   answered: BenchCard[];
-  /** Current decisions and every receipt not on hold: by area, then order. */
+  /** Current decisions and every receipt not on hold: newest, then by area. */
   decided: BenchCard[];
   /**
    * Current status items on hold (blocked or inactive), receipts too, next to
-   * Decided: a Hold answer's close-out lands here. By area, then order.
+   * Decided: a Hold answer's close-out lands here. Newest, then by area.
    */
   held: BenchCard[];
-  /** Every other current status item: by area, then order. */
+  /** Every other current status item: newest first, then by area. */
   status: BenchCard[];
   /** Stale or superseded items. The board folds them; so does the screen. */
   retiring: number;
@@ -71,16 +73,22 @@ function byKeys(...keys: Array<(card: BenchCard) => number | string>) {
   };
 }
 
+/** Newest created first, so every section reads top down; unparseable last. */
+const newest = (card: BenchCard) => -(benchCreatedSeconds(card) ?? 0);
+
 const byNeed = byKeys(
+  newest,
   (card) => benchSeverityRank(card.severity),
   (card) => card.order,
   (card) => card.id,
 );
 const byAnswerTime = byKeys(
+  newest,
   (card) => card.answer?.answeredAt ?? 0,
   (card) => card.id,
 );
 const byArea = byKeys(
+  newest,
   (card) => card.area,
   (card) => card.order,
   (card) => card.id,

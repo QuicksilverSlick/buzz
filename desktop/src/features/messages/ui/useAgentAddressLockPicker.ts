@@ -148,11 +148,16 @@ export function useAgentAddressLockPicker({
     },
     [audience.excludePubkey, audience.removePubkey, audienceScope],
   );
-  const removeAddressedAgent = React.useCallback(
-    (pubkey: string) => {
+  /** `revoke`: the app, not the user, drops the chip; nothing is excluded. */
+  const dropAddressedAgent = React.useCallback(
+    (pubkey: string, revoke: boolean) => {
       const normalized = normalizePubkey(pubkey);
       if (!audienceScope || !normalized) return;
-      unpinAddressedAgent(normalized);
+      if (revoke) {
+        audience.removePubkey(normalized);
+      } else {
+        unpinAddressedAgent(normalized);
+      }
       const text = richText.getPlainTextAndCursor().text;
       const first = mentionOccurrences(
         text,
@@ -168,6 +173,12 @@ export function useAgentAddressLockPicker({
         return;
       const label = text.slice(first.start, first.end);
       const implicitPrefix = `${label}${text === label ? "" : " "}`;
+      // A revoke keeps the mention in a reply the user is still writing, as
+      // authored text, so a saved draft keeps it too.
+      if (revoke && text !== implicitPrefix) {
+        onImplicitPrefixRemoved?.(normalized);
+        return;
+      }
       const strippedText = stripImplicitAgentMentionPrefix(
         text,
         implicitPrefix,
@@ -183,12 +194,21 @@ export function useAgentAddressLockPicker({
     },
     [
       applyAutocompleteEdit,
+      audience.removePubkey,
       audienceScope,
       mentions.getDraftMentionRefs,
       onImplicitPrefixRemoved,
       richText.getPlainTextAndCursor,
       unpinAddressedAgent,
     ],
+  );
+  const removeAddressedAgent = React.useCallback(
+    (pubkey: string) => dropAddressedAgent(pubkey, false),
+    [dropAddressedAgent],
+  );
+  const revokeAddressedAgent = React.useCallback(
+    (pubkey: string) => dropAddressedAgent(pubkey, true),
+    [dropAddressedAgent],
   );
   const toggleAlwaysAddressAgent = React.useCallback(
     (
@@ -447,6 +467,7 @@ export function useAgentAddressLockPicker({
     lockedAgentPubkeys,
     removeAddressedAgent,
     restoreAddressedAgentMentions,
+    revokeAddressedAgent,
     selectMentionSuggestion,
     syncAddressedAgentsFromText,
     toggleAlwaysAddressAgent,
