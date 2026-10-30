@@ -625,7 +625,7 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_VOICE_PROFILE", value_parser = crate::voice_profile::parse_voice_profile)]
     pub voice_profile: Option<crate::voice_profile::VoiceProfile>,
 
-    /// File where the desktop keeps `{isolated, updated_at}` for its huddle
+    /// File where the desktop keeps `{isolated, huddle, updated_at}` for its huddle
     /// output route. Set alongside `--voice-profile`.
     #[arg(long, env = "BUZZ_ACP_AUDIO_ROUTE_FILE")]
     pub audio_route_file: Option<PathBuf>,
