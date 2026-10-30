@@ -1273,6 +1273,7 @@ dependencies = [
  "buzz-audio-client",
  "futures-util",
  "nostr 0.44.7",
+ "opus",
  "serde",
  "serde_json",
  "tokio",
