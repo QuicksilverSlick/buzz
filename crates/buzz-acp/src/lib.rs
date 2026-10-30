@@ -28,6 +28,9 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod usage;
+// Huddle voices' typed tools; the voice module (slice 8a) is its first caller.
+#[cfg_attr(not(test), allow(dead_code))]
+mod voice_tools;
 
 pub use usage::TurnUsage;
 
