@@ -10,7 +10,9 @@
 //! The file sits beside the Bench root (`~/.dreamforge/agent-state`), is
 //! written beside its name and renamed into place, and carries a `floor`:
 //! the first boot with this ledger. Nothing older than that is replayed, so
-//! the upgrade itself cannot re-answer mentions handled before it.
+//! the upgrade itself cannot re-answer mentions handled before it. Each kind
+//! has its own floor, the first boot that listened for it, so a release that
+//! adds a kind does not replay a day of it as new work.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -21,6 +23,15 @@ use std::time::Duration;
 /// Extra time a finished id is kept past the window, so a mention sent just
 /// inside the window is still known as done when it is replayed.
 const PRUNE_MARGIN_SECS: u64 = 3600;
+
+/// The kinds a ledger saved before kinds were recorded listened for: the
+/// default mention kinds of that release.
+const UNRECORDED_KINDS: [u32; 4] = [
+    buzz_core::kind::KIND_STREAM_MESSAGE,
+    buzz_core::kind::KIND_STREAM_MESSAGE_EDIT,
+    buzz_core::kind::KIND_WORKFLOW_APPROVAL_REQUESTED,
+    buzz_core::kind::KIND_STREAM_REMINDER,
+];
 
 /// How long a refused mention waits in memory before the ledger is saved for
 /// it, so a noisy sender cannot force a write per message.
@@ -37,6 +48,8 @@ struct Ledger {
     floor: u64,
     /// Finished event id (hex) and its `created_at`.
     done: HashMap<String, u64>,
+    /// Each kind listened for, and the first boot that listened for it.
+    kinds: HashMap<u32, u64>,
     /// Ids added since the last save, with a save already scheduled.
     unsaved: bool,
 }
@@ -74,6 +87,16 @@ impl CatchUp {
                             .collect()
                     })
                     .unwrap_or_default(),
+                kinds: match saved["kinds"].as_object() {
+                    Some(kinds) => kinds
+                        .iter()
+                        .filter_map(|(kind, ts)| Some((kind.parse().ok()?, ts.as_u64()?)))
+                        .collect(),
+                    None => {
+                        let floor = saved["floor"].as_u64().unwrap_or(now);
+                        UNRECORDED_KINDS.iter().map(|&kind| (kind, floor)).collect()
+                    }
+                },
                 unsaved: false,
             },
             missing_or_corrupt => {
@@ -89,6 +112,7 @@ impl CatchUp {
                     window,
                     floor: now,
                     done: HashMap::new(),
+                    kinds: HashMap::new(),
                     unsaved: false,
                 };
                 ledger.save();
@@ -104,6 +128,35 @@ impl CatchUp {
         self.0.as_ref().map(|ledger| {
             let ledger = lock(ledger);
             now.saturating_sub(ledger.window).max(ledger.floor)
+        })
+    }
+
+    /// Record that this boot listens for `kinds`. A kind not heard before
+    /// gets `now` as its floor.
+    pub(crate) fn listen_for(&self, kinds: &[u32], now: u64) {
+        let Some(ledger) = self.0.as_ref() else {
+            return;
+        };
+        let mut ledger = lock(ledger);
+        let before = ledger.kinds.len();
+        for &kind in kinds {
+            ledger.kinds.entry(kind).or_insert(now);
+        }
+        if ledger.kinds.len() > before {
+            ledger.save();
+        }
+    }
+
+    /// Whether the harness already listened for `kind` when an event was
+    /// sent at `sent`. A replayed event of a kind first heard later is not
+    /// backlog: nothing would have answered it then. A kind never recorded
+    /// is not held back.
+    pub(crate) fn heard_when_sent(&self, kind: u32, sent: u64) -> bool {
+        self.0.as_ref().is_none_or(|ledger| {
+            lock(ledger)
+                .kinds
+                .get(&kind)
+                .is_none_or(|&floor| floor <= sent)
         })
     }
 
@@ -162,7 +215,12 @@ impl CatchUp {
 impl Ledger {
     fn save(&mut self) {
         self.unsaved = false;
-        let record = serde_json::json!({ "version": 1, "floor": self.floor, "done": self.done });
+        let record = serde_json::json!({
+            "version": 1,
+            "floor": self.floor,
+            "done": self.done,
+            "kinds": self.kinds,
+        });
         let written = self
             .path
             .parent()
@@ -330,6 +388,32 @@ mod tests {
             ["e1", "r1", "r2", "r3"],
             "the next turn saves it too"
         );
+    }
+
+    /// A release that adds a kind must not replay a day of it as new work.
+    /// A ledger saved before kinds were recorded keeps replaying its old
+    /// kinds; a new kind replays only from the boot that first heard it.
+    #[test]
+    fn a_new_kind_replays_only_from_the_boot_that_first_heard_it() {
+        const FORUM_COMMENT: u32 = buzz_core::kind::KIND_FORUM_COMMENT;
+        let dir = tempfile::tempdir().unwrap();
+        let unrecorded = serde_json::json!({ "version": 1, "floor": NOW - 2 * DAY, "done": {} });
+        std::fs::write(file(dir.path(), RELAY), unrecorded.to_string()).unwrap();
+        let hour_ago = NOW - 3600;
+
+        let upgraded = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
+        upgraded.listen_for(&[9, FORUM_COMMENT], NOW);
+        assert!(upgraded.heard_when_sent(9, hour_ago));
+        assert!(!upgraded.heard_when_sent(FORUM_COMMENT, hour_ago));
+        drop(upgraded);
+
+        let restarted = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 7200);
+        restarted.listen_for(&[9, FORUM_COMMENT], NOW + 7200);
+        assert!(
+            !restarted.heard_when_sent(FORUM_COMMENT, hour_ago),
+            "the next restart remembers when the kind was first heard"
+        );
+        assert!(restarted.heard_when_sent(FORUM_COMMENT, NOW + 60));
     }
 
     #[test]

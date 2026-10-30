@@ -2852,13 +2852,22 @@ fn open_catch_up(config: &Config, now: u64) -> catch_up::CatchUp {
     let bench = config.factory.lock().reporting.bench.clone();
     match bench.as_deref().and_then(std::path::Path::parent) {
         Some(root) if matches!(config.dedup_mode, config::DedupMode::Queue) => {
-            catch_up::CatchUp::open(
+            let catch_up = catch_up::CatchUp::open(
                 &root.join("agent-state"),
                 &config.keys.public_key().to_hex(),
                 &config.relay_url,
                 config.catch_up_window,
                 now,
-            )
+            );
+            // The kinds the `#p` replay asks for: those of the mention rules.
+            let kinds: Vec<u32> = startup_subscription_rules(config)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rule| rule.require_mention)
+                .flat_map(|rule| rule.kinds)
+                .collect();
+            catch_up.listen_for(&kinds, now);
+            catch_up
         }
         _ => Default::default(),
     }
@@ -4084,7 +4093,10 @@ async fn run_harness(
                             let inbound_channel_id = buzz_event.channel_id;
                             let inbound_kind = buzz_event.event.kind.as_u16();
                             let inbound_author = buzz_event.event.pubkey.to_hex();
-                            let inbound_thread_tags = queue::parse_thread_tags(&buzz_event.event);
+                            let inbound_thread_tags = queue::notice_thread_tags(
+                                &buzz_event.event,
+                                queue::parse_thread_tags(&buzz_event.event),
+                            );
                             let inbound_mention = event_mentions_agent(&buzz_event.event, &pubkey_hex)
                                 .then(|| (buzz_event.event.id.to_hex(), buzz_event.event.created_at.as_secs()));
                             let authorized = authorize_normal_listener_event(
@@ -4960,6 +4972,8 @@ enum Intake {
 
 /// Sort one event at intake. An event whose turn already finished, in this run
 /// or before a restart, is dropped. Of what a restart replayed:
+/// - an event sent before the harness first listened for its kind is dropped,
+///   so a release that adds a kind does not answer a day of it;
 /// - a `!shutdown`, `!cancel` or `!rotate` is consumed unexecuted, or it would
 ///   stop the agent that just came back, or cancel a turn it was never about;
 /// - talk in the owner's huddle older than [`HUDDLE_BACKLOG_MAX_AGE_SECS`] is
@@ -4979,6 +4993,9 @@ async fn catch_up_intake(
     }
     if !queue::replayed_after_restart(event, replayed_before) {
         return Intake::Live;
+    }
+    if !catch_up.heard_when_sent(kind_u32, event.created_at.as_secs()) {
+        return Intake::Skip("sent before the harness listened for its kind");
     }
     if ["!shutdown", "!cancel", "!rotate"]
         .iter()
@@ -5744,7 +5761,7 @@ fn failure_notice_thread_tags(
             parent_event_id: Some(target),
             mentioned_pubkeys: tags.mentioned_pubkeys,
         },
-        _ => tags,
+        _ => queue::notice_thread_tags(&last.event, tags),
     }
 }
 
@@ -7779,6 +7796,40 @@ mod owner_control_command_tests {
             .await;
             assert_eq!(got, expected, "case {i}");
         }
+    }
+
+    /// The first restart after a release that adds forum kinds must not answer
+    /// a day of old forum tags, while mentions of the old kinds still replay.
+    #[tokio::test]
+    async fn catch_up_skips_a_kind_sent_before_it_was_heard() {
+        use buzz_core::kind::KIND_FORUM_COMMENT;
+        let agent = "ab".repeat(32);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let comment = make_event(KIND_FORUM_COMMENT, "@agent FYI", Some(&agent));
+        let mention = make_event(KIND_STREAM_MESSAGE, "@agent FYI", Some(&agent));
+        let sent = comment.created_at.as_secs();
+        let (booted, upgraded) = (sent - 2 * 86_400, sent + 600);
+        let open = |now| crate::catch_up::CatchUp::open(dir.path(), &agent, "wss://r", 86_400, now);
+        open(booted).listen_for(&[KIND_STREAM_MESSAGE], booted);
+        let catch_up = open(upgraded);
+        catch_up.listen_for(&[KIND_STREAM_MESSAGE, KIND_FORUM_COMMENT], upgraded);
+
+        let intake = |event, kind| {
+            catch_up_intake(
+                event,
+                kind,
+                &agent,
+                &catch_up,
+                Some(upgraded),
+                upgraded,
+                std::future::ready(false),
+            )
+        };
+        assert_eq!(
+            intake(&comment, KIND_FORUM_COMMENT).await,
+            Intake::Skip("sent before the harness listened for its kind")
+        );
+        assert_eq!(intake(&mention, KIND_STREAM_MESSAGE).await, Intake::Backlog);
     }
 
     #[test]
@@ -12214,6 +12265,47 @@ mod edit_mention_admission_tests {
             "an edit that does not mention the agent must not wake it"
         );
     }
+
+    /// Default normal-mode admission for forum activity: the relay is asked
+    /// for tagged forum posts and comments, and the local rule wakes the agent
+    /// on a forum comment only when it tags the agent.
+    #[tokio::test]
+    async fn default_mentions_wake_on_tagged_forum_comments_only() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.subscribe_mode = SubscribeMode::Mentions;
+        let agent = config.keys.public_key().to_hex();
+        let rules = startup_subscription_rules(&config).expect("mentions rules");
+        let channel_id = Uuid::new_v4();
+        let post = "cd".repeat(32);
+        let comment = |p: Option<&str>| {
+            let mut tags = vec![nostr::Tag::parse(["e", &post, "", "reply"]).unwrap()];
+            tags.extend(p.map(|p| nostr::Tag::parse(["p", p]).unwrap()));
+            nostr::EventBuilder::new(nostr::Kind::Custom(45003), "comment")
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap()
+        };
+
+        let relay = config::resolve_channel_filters(&config, &[channel_id], &rules);
+        let relay = &relay[&channel_id];
+        assert!(relay.require_mention, "the relay filter keeps #p");
+        let kinds = relay.kinds.as_ref().expect("mentions mode lists kinds");
+        assert!(kinds.contains(&buzz_core::kind::KIND_FORUM_POST));
+        assert!(kinds.contains(&buzz_core::kind::KIND_FORUM_COMMENT));
+
+        assert!(
+            filter::match_event(&comment(Some(&agent)), channel_id, &rules, &agent)
+                .await
+                .is_some(),
+            "a forum comment that tags the agent must wake it"
+        );
+        assert!(
+            filter::match_event(&comment(None), channel_id, &rules, &agent)
+                .await
+                .is_none(),
+            "an untagged forum comment must not wake the agent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15632,6 +15724,40 @@ mod error_outcome_emission_tests {
             values.first().map(String::as_str) == Some("e")
                 && values.get(1).map(String::as_str) == Some(event_id)
         })
+    }
+
+    /// A notice about a forum post replies to the post: the forum list shows
+    /// only posts, so a top-level kind:9 there is never seen, while the post's
+    /// thread lists kind:9 replies. The author gate builds its tags from the
+    /// bare post; a failed turn builds them from its batch event.
+    #[test]
+    fn notice_for_a_forum_post_replies_to_the_post() {
+        let keys = Keys::generate();
+        let post = EventBuilder::new(Kind::Custom(45001), "@bot thoughts?")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let post_id = post.id.to_hex();
+        let gate = queue::notice_thread_tags(&post, queue::parse_thread_tags(&post));
+        let batch_event = BatchEvent {
+            event: post,
+            prompt_tag: "@mention".into(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        };
+        let failed = failure_notice_thread_tags(&batch_event, None);
+        for tags in [gate, failed] {
+            let notice =
+                pool::build_failure_notice_event(&keys, Uuid::new_v4(), &tags, "notice", &[])
+                    .expect("notice builds");
+            assert!(
+                notice
+                    .tags
+                    .iter()
+                    .any(|tag| tag.as_slice() == ["e", post_id.as_str(), "", "reply"]),
+                "{:?}",
+                notice.tags
+            );
+        }
     }
 
     /// A non-auth application error (e.g. usage credits) must still follow the
