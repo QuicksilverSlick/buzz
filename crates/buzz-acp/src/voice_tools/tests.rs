@@ -353,17 +353,18 @@ async fn git_runs_in_the_checkout_and_a_missing_program_is_a_failure() {
         log.text
     );
     // Code search reads tracked files only: never ignored, untracked or .git.
-    for glob in [json!(null), json!("*"), json!(".env"), json!("**/config")] {
+    let globs = [(json!(null), "a.rs:1:TOKEN"), (json!("*"), "a.rs:1:TOKEN")];
+    let none = [
+        (json!(".env"), "(nothing found)"),
+        (json!("**/config"), "(nothing found)"),
+    ];
+    for (glob, want) in globs.into_iter().chain(none) {
         let args = json!({ "pattern": "TOKEN", "glob": glob });
         let found = tools.run("search_code", args, &room, None).await;
         let text = &found.text;
         let leaked = ["secret.txt", ".env", "example.invalid"];
-        assert!(
-            found.ok && !leaked.iter().any(|l| text.contains(l)),
-            "{text}"
-        );
-        let tracked = text.contains("a.rs:1:TOKEN") || text.contains("(nothing found)");
-        assert!(tracked, "{text}");
+        let clean = !leaked.iter().any(|l| text.contains(l));
+        assert!(found.ok && clean && text.contains(want), "{text}");
     }
     let bad = tools
         .run("git_show", json!({ "rev": "nope" }), &room, None)
