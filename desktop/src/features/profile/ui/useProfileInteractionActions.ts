@@ -15,6 +15,7 @@ import {
   mergeTimelineCacheMessages,
 } from "@/features/messages/hooks";
 import { channelMessagesKey } from "@/features/messages/lib/messageQueryKeys";
+import { directMessageRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { buildWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { useProfileQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -204,6 +205,16 @@ export function useProfileInteractionActions({
           targetPubkey,
           identity.pubkey,
         ) ?? (await openDm({ pubkeys: [targetPubkey] }));
+      // A wave DM is one-on-one, so it tags the person waved at.
+      const recipientPubkeys = directMessageRecipientPubkeys(
+        dm,
+        identity.pubkey,
+        [],
+        () => false,
+      );
+      if (!recipientPubkeys) {
+        throw new Error("Couldn't send the wave.");
+      }
       const senderName =
         selfProfileQuery.data?.displayName?.trim() ||
         identity.displayName.trim() ||
@@ -232,7 +243,13 @@ export function useProfileInteractionActions({
           onClose();
         }
 
-        const result = await sendChannelMessage(dm.id, content);
+        const result = await sendChannelMessage(
+          dm.id,
+          content,
+          null,
+          undefined,
+          recipientPubkeys,
+        );
         queryClient.setQueryData<RelayEvent[]>(queryKey, (current = []) =>
           mergeTimelineCacheMessages(current, {
             id: result.eventId,

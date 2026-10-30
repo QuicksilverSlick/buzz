@@ -115,3 +115,41 @@ test("an incoming DM produces exactly one desktop notification", async ({
   // sender name), not the home-feed mention duplicate ("… mentioned you in …").
   expect(notifications[0].title).toBe("alice");
 });
+
+test("an Inbox reply to a one-on-one DM with no @ tags the DM partner", async ({
+  page,
+}) => {
+  await installRelayBridge(page, "tyler");
+  await page.goto("/");
+  await expect(page.getByTestId("dm-list")).toContainText("alice-tyler");
+
+  // The DM lands in tyler's Home Inbox as a mention (it p-tags tyler).
+  const incoming = `inbox reply probe ${Date.now()}`;
+  await publishAliceDm(incoming);
+  await page
+    .locator('[data-testid^="home-inbox-item-"]')
+    .filter({ hasText: "alice" })
+    .first()
+    .click();
+  const detail = page.getByTestId("home-inbox-detail");
+  await expect(detail).toContainText(incoming);
+
+  const reply = `inbox reply with no mention ${Date.now()}`;
+  const sent = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith("/events") &&
+      (request.postData() ?? "").includes(reply),
+  );
+  await detail.getByTestId("message-input").fill(reply);
+  await detail.getByRole("button", { name: /send/i }).click();
+
+  // Agent harnesses subscribe with #p, so without this tag an agent in a
+  // one-on-one DM never hears an Inbox reply.
+  const event = JSON.parse((await sent).postData() ?? "{}") as {
+    kind: number;
+    tags: string[][];
+  };
+  expect(event.kind).toBe(9);
+  expect(event.tags).toContainEqual(["p", TEST_IDENTITIES.alice.pubkey]);
+});

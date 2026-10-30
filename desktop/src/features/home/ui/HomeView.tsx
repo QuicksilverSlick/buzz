@@ -52,6 +52,7 @@ import {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTimelineMessages";
+import { directMessageRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
@@ -864,6 +865,27 @@ export function HomeView({
                 if (!selectedItem || !channelId || !canReply) {
                   throw new Error("Replies are not available for this item.");
                 }
+                if (!currentPubkey) {
+                  throw new Error(
+                    "No identity available for sending messages.",
+                  );
+                }
+                // Inbox replies skip useSendMessage, so add the DM recipient
+                // tags here; without them an agent in the DM never hears it.
+                const replyChannel = channels?.find(
+                  (channel) => channel.id === channelId,
+                );
+                const recipientPubkeys = replyChannel
+                  ? directMessageRecipientPubkeys(
+                      replyChannel,
+                      currentPubkey,
+                      mentionPubkeys,
+                      (pubkey) => inboxAgentPubkeys.has(pubkey),
+                    )
+                  : null;
+                if (!recipientPubkeys) {
+                  throw new Error("Open the linked channel to reply.");
+                }
 
                 const itemToReply = selectedItem;
                 setIsSendingReply(true);
@@ -878,7 +900,7 @@ export function HomeView({
                     content,
                     parentEventId,
                     imetaTags,
-                    mentionPubkeys,
+                    recipientPubkeys,
                     undefined,
                     emojiTags,
                     mentionTags,
