@@ -250,7 +250,7 @@ impl Room<'_> {
                     Some(Ok(Message::Binary(data))) => self.input.on_audio(&data, self.clock.now()),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                         Ok(msg) => {
-                            self.input.on_control(&msg);
+                            self.input.on_control(&msg, self.clock.now());
                             self.roster(false).await;
                         }
                         Err(e) => tracing::warn!(error = %e, "huddle bridge: bad relay text"),
