@@ -27,6 +27,9 @@ const SENT_CAP: usize = 4_096;
 const TAPS: usize = 31;
 /// A tick gap past this is a stall: audio queued through it is dropped, never played late.
 const STALL_MS: u64 = 5 * TICK_MS;
+/// How long a rejoin holds back an index that changed hands. v2 frames carry no occupancy
+/// epoch, so a delayed frame of the old occupant would otherwise be heard as the new one.
+const QUARANTINE_MS: u64 = 500;
 
 /// Who the voice may hear. The caller computes `admitted` with the agent's author gate and
 /// `agents` from the room's `bot` roles, trusted 30177 records, Talos, and this agent itself.
@@ -201,6 +204,8 @@ pub struct Input {
     secret: Vec<Range<u64>>,
     last_tick_ms: Option<u64>,
     levels: Vec<Level>,
+    /// Index to the unix ms its frames are heard again.
+    quarantine: HashMap<u8, u64>,
 }
 
 impl Input {
@@ -225,6 +230,17 @@ impl Input {
     pub fn set_roster(&mut self, peers: &[Peer]) {
         self.roster.clear();
         self.add_peers(peers);
+    }
+
+    /// Rebuild the peer map from a new socket's snapshot after a reconnect. An index whose
+    /// occupant changed, or is new, is not heard for 500 ms.
+    pub fn rejoin(&mut self, peers: &[Peer], now_ms: u64) {
+        for p in peers {
+            if self.roster.get(&p.index) != Some(&(p.pubkey.clone(), p.epoch)) {
+                self.quarantine.insert(p.index, now_ms + QUARANTINE_MS);
+            }
+        }
+        self.set_roster(peers);
     }
 
     /// Add or replace peers; a slot whose occupant changed loses its state.
@@ -262,6 +278,13 @@ impl Input {
         let Some((index, header, opus)) = parse_relay_frame(data) else {
             return;
         };
+        if self
+            .quarantine
+            .get(&index)
+            .is_some_and(|&until| now_ms < until)
+        {
+            return;
+        }
         let Some(key) = self.roster.get(&index) else {
             return;
         };
@@ -1060,6 +1083,28 @@ mod tests {
             input.tick(late);
             assert!(input.slots[&1].ring.iter().all(|(t, _)| *t == late));
         }
+    }
+
+    #[test]
+    fn a_rejoin_holds_back_indices_that_changed_hands_for_500_ms() {
+        let mut input = input();
+        let mut now = T0;
+        // The new socket's snapshot swaps the owner and the guest.
+        let peers = [(1, GUEST), (2, OWNER)].map(|(index, pk)| Peer {
+            index,
+            pubkey: pk.into(),
+            epoch: 0,
+        });
+        input.rejoin(&peers, now);
+        let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert!(frames(&out).is_empty(), "quarantined");
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(GUEST)]);
+        // An index whose occupant stayed is heard at once.
+        input.rejoin(&peers, now);
+        let out = run(&mut input, &mut now, 400, &mut [talker(2, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(OWNER)]);
     }
 
     #[test]

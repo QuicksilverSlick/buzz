@@ -1271,9 +1271,11 @@ name = "buzz-huddle-bridge"
 version = "0.1.0"
 dependencies = [
  "buzz-audio-client",
+ "futures-util",
  "nostr 0.44.7",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-tungstenite 0.29.0",
  "tracing",
  "uuid",
