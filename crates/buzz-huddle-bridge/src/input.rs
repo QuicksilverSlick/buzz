@@ -234,10 +234,12 @@ impl Input {
 
     /// Rebuild the peer map from a full snapshot after a gap: a new socket's after a reconnect,
     /// or the relay's `roster` resync after missed deltas. An index whose occupant changed, or
-    /// is new, is not heard for 500 ms. One the snapshot no longer lists is a `left` missed in
-    /// the gap, so a `joined` reusing it within 500 ms is held back as after a `left`.
+    /// is new, is not heard for 500 ms. Every index the snapshot does not list counts as a `left`
+    /// missed in the gap, even one never seen (its `joined` may have been missed too), so a
+    /// `joined` reusing it within 500 ms is held back as after a `left`.
     pub fn rejoin(&mut self, peers: &[Peer], now_ms: u64) {
-        for &i in self.roster.keys() {
+        // ponytail: holds all 256 indices, so a brand-new join right after a resync waits 500 ms.
+        for i in 0..=u8::MAX {
             if !peers.iter().any(|p| p.index == i) {
                 self.quarantine.insert(i, now_ms + QUARANTINE_MS);
             }
@@ -1242,6 +1244,20 @@ mod tests {
                 };
                 assert!(ok, "{what}, then joined at +{gap} ms");
             }
+        }
+        // An index the bridge never saw (its `joined` and `left` both missed) is held too.
+        for resync in [true, false] {
+            let mut input = input();
+            if resync {
+                input.on_control(&serde_json::json!({"type": "roster", "peers": []}), T0);
+            } else {
+                input.rejoin(&[], T0);
+            }
+            input.on_control(&joined(&[(5, GUEST)]), T0 + 10);
+            assert!(
+                held_500_ms(&mut input, 5, GUEST, T0 + 10),
+                "never-seen index, resync {resync}"
+            );
         }
     }
 
