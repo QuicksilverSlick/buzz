@@ -460,7 +460,8 @@ async fn a_join_or_a_launch_holds_notices_one_settle() {
 }
 
 /// Free text on a card that is not scoped reaches its writer's route target
-/// too, once per reply; a card whose writer has no route is not read for it.
+/// too, once per reply made since the Bench first read it as routed; a card
+/// whose writer has no route is not read for it.
 #[tokio::test]
 async fn free_text_on_any_routed_card_reaches_the_route_target() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
@@ -504,9 +505,16 @@ async fn free_text_on_any_routed_card_reaches_the_route_target() {
     );
     assert!(b.s.items[ITEM].answer.is_none());
     assert!(b.s.items["claude-ai/other"].reply.is_none());
-    // Held one settle after the join, then one notice, with no reply text.
+    // r1 predates the route: it stays the card's Other, never told.
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(r1.id.to_hex()));
+
+    // A reply after the first routed read: one notice, with no reply text.
+    let r2 = thread_reply(&b.ctx.owner, &card, "Actually, move it", b.now, &[]);
+    reply(&b, &[&r1, &aside, &r2]);
     let n = settle_past(&mut b, 2).await;
     assert_eq!(n.len(), 1);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
     let ev = &n[0];
     assert_eq!(
         content(ev),
@@ -516,7 +524,7 @@ async fn free_text_on_any_routed_card_reaches_the_route_target() {
              them there, and when it is settled close the card by re-dropping {ITEM} as a \
              decision or status with the outcome.\nOpen thread: buzz://message?channel={}&id={card}",
             local_hhmm(r.at),
-            r1.id.to_hex(),
+            r2.id.to_hex(),
             b.channel()
         )
     );
@@ -529,28 +537,28 @@ async fn free_text_on_any_routed_card_reaches_the_route_target() {
         "df-answer",
         "other",
         b.owner_hex(),
-        r1.id.to_hex()
+        r2.id.to_hex()
     ])));
     assert_eq!(
         tag_value(ev, "client").unwrap(),
-        format!("bench:route:{ITEM}@r{}", &r1.id.to_hex()[..16])
+        format!("bench:route:{ITEM}@r{}", &r2.id.to_hex()[..16])
     );
 
-    // A second reply is a second notice, and each is told once.
-    let r2 = thread_reply(&b.ctx.owner, &card, "Actually, move it", b.now, &[]);
-    reply(&b, &[&r1, &aside, &r2]);
+    // A third reply is a second notice, and each is told once.
+    let r3 = thread_reply(&b.ctx.owner, &card, "Or after lunch", b.now, &[]);
+    reply(&b, &[&r1, &aside, &r2, &r3]);
     let before = b.posts().len();
     b.settle(2).await;
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
-    assert!(content(&n[0]).contains(&r2.id.to_hex()));
+    assert!(content(&n[0]).contains(&r3.id.to_hex()));
     assert!(settle_past(&mut b, 2).await.is_empty());
-    assert_eq!(b.s.items[ITEM].routed_reply, Some(r2.id.to_hex()));
-    // r2 withdrawn: r1 is the newest again, and it was told already.
-    reply(&b, &[&r1, &aside]);
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(r3.id.to_hex()));
+    // r3 withdrawn: r2 is the newest again, and it was told already.
+    reply(&b, &[&r1, &aside, &r2]);
     assert!(settle_past(&mut b, 2).await.is_empty());
     let r = b.s.items[ITEM].reply.as_ref().map(|r| r.event_id.clone());
-    assert_eq!(r, Some(r1.id.to_hex()));
+    assert_eq!(r, Some(r2.id.to_hex()));
 }
 
 /// The seeded bench with its writer routed, the target joined and the
@@ -630,20 +638,21 @@ async fn a_nested_reply_on_an_unscoped_card_reaches_the_route_target() {
     assert_eq!(b.s.items[ITEM].routed_reply, Some(nested.id.to_hex()));
 }
 
-/// A reply older than the Bench's first read of it (made before the route,
-/// or before this build) is told at its own time, dated when not today.
+/// A reply that reaches the relay late (made on a phone that was offline)
+/// is told at its own time, dated when not today.
 #[tokio::test]
 async fn an_old_reply_is_told_at_its_own_time() {
-    let mut b = seeded_bench(Gate::Open, &[]).await;
-    let card = b.card(ITEM).event_id;
+    let (mut b, _agent, card) = routed_bench().await;
     let at = b.now;
+    b.tick().await.unwrap();
+    b.now += 3 * 86_400 + 3600;
     let old = thread_reply(&b.ctx.owner, &card, "Hold on", at, &[]);
     reply(&b, &[&old]);
-    b.now += 3 * 86_400 + 3600;
-    route(&mut b);
+    let before = b.posts().len();
     b.tick().await.unwrap();
     assert_eq!(b.s.items[ITEM].reply.as_ref().map(|r| r.at), Some(at));
-    let n = settle_past(&mut b, 2).await;
+    settle_past(&mut b, 2).await;
+    let n = notices(&b, before);
     assert_eq!(n.len(), 1);
     let local = chrono::DateTime::from_timestamp(at as i64, 0)
         .unwrap()
@@ -724,4 +733,76 @@ async fn a_reword_closes_a_routed_card_with_only_a_reply() {
     assert_eq!(tag_value(closed, "e").unwrap(), old_card.event_id);
     assert!(content(closed).contains("\n\nClosed: a tap or reply here is no longer read."));
     assert_eq!(b.s.kept, [old_card.event_id]);
+}
+
+/// Owner decision, 29 Oct 2026: the replies already on an unscoped card
+/// when the Bench first reads it as routed (made before the route, or
+/// before this build) are never told, so old, settled work never starts
+/// the agent. They stay the card's Other; the next reply is told, once.
+#[tokio::test]
+async fn a_reply_from_before_the_route_is_never_told() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Hold on", b.now - 1, &[]);
+    let r2 = thread_reply(&b.ctx.owner, &card, "Actually, stay", b.now, &[]);
+    reply(&b, &[&r1, &r2]);
+    b.tick().await.unwrap();
+    route(&mut b);
+    b.tick().await.unwrap();
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    let i = &b.s.items[ITEM];
+    let r = i.reply.as_ref().map(|r| r.event_id.clone());
+    assert_eq!(r, Some(r2.id.to_hex()));
+    assert_eq!(i.routed_reply, Some(r2.id.to_hex()));
+    // r2 withdrawn: r1 is older still, so it is not told either.
+    reply(&b, &[&r1]);
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    // A reply made after that first read is told, once.
+    let r3 = thread_reply(&b.ctx.owner, &card, "Move it after all", b.now, &[]);
+    reply(&b, &[&r1, &r3]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&r3.id.to_hex()));
+    assert!(settle_past(&mut b, 2).await.is_empty());
+}
+
+/// A scoped card's reply from before the route is told once the route
+/// comes, as before, even when the Bench first reads it as routed.
+#[tokio::test]
+async fn a_scoped_reply_from_before_the_route_is_told_as_before() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let scoped = drop_json(&[("decision", json!("relay"))]);
+    b.drop_file("orchestrator", "relay-choice", &scoped);
+    b.settle(4).await;
+    let card = b.card(ITEM).event_id;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Hold on", b.now, &[]);
+    reply(&b, &[&r1]);
+    route(&mut b);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ITEM].scoped() && b.s.items[ITEM].reply.is_some());
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&r1.id.to_hex()));
+    assert!(settle_past(&mut b, 2).await.is_empty());
+}
+
+/// A card posted while its writer is routed has no reply older than the
+/// route: one made before the Bench's first poll of it is still told.
+#[tokio::test]
+async fn a_reply_on_a_card_posted_while_routed_is_told() {
+    const SECOND: &str = "orchestrator/second";
+    let (mut b, _agent, _card) = routed_bench().await;
+    b.drop_file(
+        "orchestrator",
+        "second",
+        &drop_json(&[("title", json!("Second"))]),
+    );
+    // Posted at the end of this tick; the next one is its first poll.
+    b.tick().await.unwrap();
+    let card = b.card(SECOND).event_id;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Hold on", b.now, &[]);
+    reply(&b, &[&r1]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&r1.id.to_hex()));
 }

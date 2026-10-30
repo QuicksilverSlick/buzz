@@ -327,6 +327,12 @@ pub(crate) struct Item {
     /// The reply event id last routed to the writer's route target.
     #[serde(default)]
     pub routed_reply: Option<String>,
+    /// Unscoped: its card was posted, or first read, while its writer was
+    /// routed. The replies already on it when it was first read predate the
+    /// route (or this build): they are marked told, never told, so old,
+    /// settled work never starts the agent.
+    #[serde(default)]
+    pub routed_seen: bool,
     /// Someone answered or replied on this Drop's card, even if that was
     /// taken back since (set by `restamp`): a new stamp edits the card in
     /// place, never reposts it.
@@ -637,6 +643,7 @@ pub(crate) fn validate(
         pinged: Vec::new(),
         recorded_by: None,
         routed_reply: None,
+        routed_seen: false,
         was_engaged: false,
         request: None,
         previous: None,

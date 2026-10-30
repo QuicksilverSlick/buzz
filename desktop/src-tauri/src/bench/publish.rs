@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use super::channels::{card_channel, channel_ready, joined};
+use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
     forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
     same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
@@ -713,6 +713,8 @@ pub(super) async fn publish(
             Err(e) => return Err(e),
             Ok(Outcome::Accepted { event_id }) => {
                 let created_at = s.last_created_at;
+                // Posted while routed: no reply on it predates the route.
+                let seen = reads_replies(s, &item, routes);
                 let i = s.items.get_mut(id).expect("wanted id");
                 i.card = Some(Posted {
                     event_id,
@@ -720,6 +722,7 @@ pub(super) async fn publish(
                     hash,
                     seeded: 0,
                 });
+                i.routed_seen |= seen;
                 i.quiet_repost = false;
                 i.pinged.extend(pings);
                 s.board_dirty = true;

@@ -1098,6 +1098,9 @@ async fn poll_answers(
         // still decides once the owner spoke, and an answer of the owner's
         // that stopped coming back was withdrawn.
         let unread = cut(false, &id) && !item::owner_spoke(item, &card, &events, owner_set, until);
+        // The first read of an unscoped card as routed: its reply is older.
+        let seed = routed && !item.scoped() && !item.routed_seen;
+        item.routed_seen |= seed;
         for e in item::refused_taps(item, &events, owner_set, &writer_hex, until) {
             let by = e.pubkey.to_hex();
             let why = if item.needs == item::Needs::You && agents.contains(&by) {
@@ -1133,7 +1136,7 @@ async fn poll_answers(
                 let by = e.pubkey.to_hex();
                 let (by_name, role) = named(item, &by, owner_set);
                 let at = e.created_at.as_secs().min(now);
-                if !item::tell_reply(item, e, at, owner_set, &writer_hex) {
+                if seed || !item::tell_reply(item, e, at, owner_set, &writer_hex) {
                     item.routed_reply = Some(e.id.to_hex());
                 }
                 Some(item::Reply {
