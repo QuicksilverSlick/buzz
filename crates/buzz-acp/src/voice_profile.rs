@@ -3,6 +3,10 @@
 //! The desktop sets `BUZZ_ACP_VOICE_PROFILE` only while the definition's
 //! switch is on. Read-only until the voice module (slice 8a): today only the
 //! startup summary mentions it.
+//!
+//! Not bounded here. Before persona or aliases reach GPT-Live instructions or
+//! name matching, slice 8a must re-apply the desktop's length, count and
+//! visible-text checks, since any launcher can set this env value.
 
 use serde::Deserialize;
 

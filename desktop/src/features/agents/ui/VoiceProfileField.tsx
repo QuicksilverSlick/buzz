@@ -10,17 +10,19 @@ const TEXT_FIELDS = [
     label: "Voice",
     placeholder: "marin",
     help: "A GPT-Live voice name or custom voice id. Empty uses the default.",
+    maxLength: 128,
   },
   {
     key: "persona",
     label: "How it sounds",
     placeholder: "Warm and brief. Answers in a sentence or two.",
+    maxLength: 1000,
   },
   {
     key: "aliases",
     label: "Also answers to",
     placeholder: "Orch, O",
-    help: "Other names, separated by commas. Its own name always works.",
+    help: "Up to 8 other names, separated by commas. Its own name always works.",
   },
 ] as const;
 
@@ -57,8 +59,9 @@ export function VoiceProfileField({
             className="block text-xs text-muted-foreground"
             id="persona-voice-enabled-description"
           >
-            Lets this agent talk in huddles in its own voice. While it is in a
-            huddle, what you say there is not also posted as text.
+            Not live yet. While it is on, what you say in a huddle with this
+            agent is not posted as text, so agents there only see typed
+            messages.
           </span>
         </label>
       </div>
@@ -74,7 +77,7 @@ export function VoiceProfileField({
                 </label>
                 <Control
                   id={id}
-                  maxLength={field.key === "persona" ? 1000 : undefined}
+                  maxLength={"maxLength" in field ? field.maxLength : undefined}
                   onChange={(event) =>
                     onChange({ ...value, [field.key]: event.target.value })
                   }

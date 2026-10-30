@@ -74,7 +74,12 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
 
 #[test]
 fn in_app_persona_matches_existing_uuid_and_patches() {
+    let voice = crate::managed_agents::VoiceProfile {
+        enabled: true,
+        ..Default::default()
+    };
     let mut personas = vec![local_in_app()];
+    personas[0].voice_profile = Some(voice.clone());
     let mut inbound = inbound_for(UUID, "Remote");
     inbound.acp_command = Some("buzz-janet-acp".to_string());
     apply_inbound_persona(&mut personas, inbound);
@@ -92,6 +97,8 @@ fn in_app_persona_matches_existing_uuid_and_patches() {
     assert_eq!(p.source_team, Some("team-1".to_string()));
     assert_eq!(p.source_team_persona_slug, None);
     assert_eq!(p.created_at, "2025-01-01T00:00:00Z");
+    // The huddle voice is local only: another device's 30175 never touches it.
+    assert_eq!(p.voice_profile, Some(voice));
 }
 
 #[test]

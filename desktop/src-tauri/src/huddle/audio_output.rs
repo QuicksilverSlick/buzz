@@ -165,11 +165,14 @@ pub(crate) fn spawn_output_route_writer(
     };
     tauri::async_runtime::spawn(async move {
         loop {
-            if voice_profile::any_voice_enabled(&app) {
-                write_output_route(&path, output_device.clone()).await;
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
+            // The store read and the device query both block, so off the runtime.
+            let (app, path, device) = (app.clone(), path.clone(), output_device.clone());
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let isolated = voice_profile::any_voice_enabled(&app)
+                    .then(|| output_route_is_isolated(device.as_deref()));
+                sync_output_route_file(&path, isolated);
+            })
+            .await;
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -179,11 +182,13 @@ pub(crate) fn spawn_output_route_writer(
     });
 }
 
-async fn write_output_route(path: &std::path::Path, output_device: Option<String>) {
-    let isolated =
-        tokio::task::spawn_blocking(move || output_route_is_isolated(output_device.as_deref()))
-            .await
-            .unwrap_or(false);
+/// Write `{isolated, updated_at}` (unix seconds), or remove the file when no
+/// voice needs it (`None`).
+fn sync_output_route_file(path: &std::path::Path, isolated: Option<bool>) {
+    let Some(isolated) = isolated else {
+        let _ = std::fs::remove_file(path);
+        return;
+    };
     let updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -197,7 +202,7 @@ async fn write_output_route(path: &std::path::Path, output_device: Option<String
 
 #[cfg(test)]
 mod route_isolation_tests {
-    use super::device_type_is_isolated;
+    use super::{device_type_is_isolated, sync_output_route_file};
     use rodio::cpal::DeviceType;
 
     #[test]
@@ -209,5 +214,18 @@ mod route_isolation_tests {
         assert!(!device_type_is_isolated(DeviceType::Speaker));
         assert!(!device_type_is_isolated(DeviceType::Virtual));
         assert!(!device_type_is_isolated(DeviceType::Unknown));
+    }
+
+    #[test]
+    fn output_route_file_is_written_then_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huddle-output-route.json");
+        sync_output_route_file(&path, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["isolated"], true);
+        assert!(body["updated_at"].as_u64().is_some_and(|secs| secs > 0));
+        sync_output_route_file(&path, None);
+        assert!(!path.exists());
     }
 }

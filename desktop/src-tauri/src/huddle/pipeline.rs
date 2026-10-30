@@ -700,6 +700,9 @@ pub(crate) fn spawn_transcription_task(
     let app = state.app_handle.lock().ok().and_then(|g| g.clone());
 
     tauri::async_runtime::spawn(async move {
+        // Slice 9: the last voiced-huddle answer, kept when the agent store
+        // can't be read. Unknown until the first read, so it starts closed.
+        let mut voiced = true;
         // recv().await yields (not blocks) until text arrives or sender is dropped.
         // When the STT worker exits and drops its Sender, recv() returns None → loop ends.
         while let Some(t) = text_rx.recv().await {
@@ -718,16 +721,6 @@ pub(crate) fn spawn_transcription_task(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            // Slice 9: a voiced local agent hears the huddle live, so speech
-            // is not also posted as text (design 3.4).
-            if app.as_ref().is_some_and(|app| {
-                crate::managed_agents::voice_profile::huddle_has_voiced_local_agent(
-                    app,
-                    &agent_pubkeys,
-                )
-            }) {
-                continue;
-            }
 
             let p_tags: Vec<&str> = agent_pubkeys.iter().map(|s| s.as_str()).collect();
             let builder = match events::build_message(
@@ -753,6 +746,25 @@ pub(crate) fn spawn_transcription_task(
             // the kind event and build NIP-98 auth after the wait so both
             // timestamps are fresh — single clean order: wait → sign → auth → send.
             crate::relay_admission::wait_for_rate_limit().await;
+            // Slice 9: a voiced local agent hears the huddle live, so speech
+            // is not also posted as text (design 3.4). Checked after the wait,
+            // against the agents in the huddle now.
+            if let Some(app) = app.clone() {
+                let agents = agent_pubkeys_arc
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let last = voiced;
+                voiced = tokio::task::spawn_blocking(move || {
+                    use crate::managed_agents::voice_profile::huddle_has_voiced_local_agent;
+                    huddle_has_voiced_local_agent(&app, &agents, last)
+                })
+                .await
+                .unwrap_or(last);
+                if voiced {
+                    continue;
+                }
+            }
             let body_bytes = match sign_and_guard_stt_body(builder, &keys) {
                 Ok(b) => b,
                 Err(e) => {

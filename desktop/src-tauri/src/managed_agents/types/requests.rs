@@ -310,6 +310,10 @@ mod tests {
         record.respond_to = Some("allowlist".to_string());
         record.respond_to_allowlist = vec!["a".repeat(64)];
         record.parallelism = Some(4);
+        record.voice_profile = Some(crate::managed_agents::VoiceProfile {
+            enabled: true,
+            ..Default::default()
+        });
         record
     }
 
@@ -354,6 +358,7 @@ mod tests {
         assert_eq!(record.respond_to.as_deref(), Some("allowlist"));
         assert_eq!(record.respond_to_allowlist, vec!["a".repeat(64)]);
         assert_eq!(record.parallelism, Some(4));
+        assert!(record.voice_profile.is_some_and(|voice| voice.enabled));
     }
 
     #[test]
@@ -376,6 +381,8 @@ mod tests {
         assert!(record.respond_to_allowlist.is_empty());
         assert_eq!(record.parallelism, None);
         assert_eq!(record.session_policy, AcpSessionPolicy::Channel);
+        // A group without a voice switches it off and clears it.
+        assert_eq!(record.voice_profile, None);
     }
 
     #[test]

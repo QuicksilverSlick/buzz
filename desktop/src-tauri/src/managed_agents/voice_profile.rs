@@ -9,7 +9,7 @@ use std::{path::Path, process::Command};
 
 use serde::{Deserialize, Serialize};
 
-use super::{AgentDefinition, ManagedAgentRecord};
+use super::{AgentDefinition, BackendKind, ManagedAgentRecord};
 
 pub(crate) const VOICE_PROFILE_ENV_VAR: &str = "BUZZ_ACP_VOICE_PROFILE";
 pub(crate) const AUDIO_ROUTE_FILE_ENV_VAR: &str = "BUZZ_ACP_AUDIO_ROUTE_FILE";
@@ -43,11 +43,13 @@ pub(crate) fn normalize_voice_profile(
         return Ok(None);
     };
     let trimmed = |value: String| Some(value.trim().to_string()).filter(|v| !v.is_empty());
-    let plain = |text: &str, max: usize, newlines: bool, what: &str| {
-        let bad = |c: char| c.is_control() && !(newlines && c == '\n');
-        let ok = text.chars().count() <= max && !text.chars().any(bad);
-        ok.then_some(())
-            .ok_or_else(|| format!("voice {what} must be plain text of at most {max} characters"))
+    // The definition text rule: no control, zero-width or bidi characters.
+    let plain = |text: &str, max: usize, multiline: bool, what: &str| {
+        if text.chars().count() > max {
+            return Err(format!("voice {what} is longer than {max} characters"));
+        }
+        let label = format!("Voice {what}");
+        super::definition_validation::validate_visible_text(text, &label, multiline)
     };
     let voice = profile.voice.and_then(trimmed);
     if let Some(voice) = &voice {
@@ -76,22 +78,30 @@ pub(crate) fn normalize_voice_profile(
     Ok((profile != VoiceProfile::default()).then_some(profile))
 }
 
-/// Stamp the voice env at spawn: the linked definition's profile, only while
-/// switched on. Both keys are reserved, so user env can't switch a voice on.
-pub(crate) fn apply_voice_env(
-    command: &mut Command,
+/// The `BUZZ_ACP_VOICE_PROFILE` value for an agent: its definition's profile
+/// as JSON, only while switched on. The spawn snapshot records the same value,
+/// so a voice edit on a running agent raises restart-required.
+pub(crate) fn enabled_voice_json(
     persona_id: Option<&str>,
     definitions: &[AgentDefinition],
-    route_file: Option<&Path>,
-) {
-    command.env_remove(VOICE_PROFILE_ENV_VAR);
-    command.env_remove(AUDIO_ROUTE_FILE_ENV_VAR);
-    let profile = definitions
+) -> Option<String> {
+    definitions
         .iter()
         .find(|definition| Some(definition.id.as_str()) == persona_id)
         .and_then(|definition| definition.voice_profile.as_ref())
         .filter(|profile| profile.enabled)
-        .and_then(|profile| serde_json::to_string(profile).ok());
+        .and_then(|profile| serde_json::to_string(profile).ok())
+}
+
+/// Stamp the voice env at spawn from [`enabled_voice_json`]. Both keys are
+/// reserved, so user env can't switch a voice on.
+pub(crate) fn apply_voice_env(
+    command: &mut Command,
+    profile: Option<&str>,
+    route_file: Option<&Path>,
+) {
+    command.env_remove(VOICE_PROFILE_ENV_VAR);
+    command.env_remove(AUDIO_ROUTE_FILE_ENV_VAR);
     if let Some(profile) = profile {
         command.env(VOICE_PROFILE_ENV_VAR, profile);
         if let Some(route_file) = route_file {
@@ -123,8 +133,9 @@ pub(crate) fn any_voice_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) ->
     super::storage::load_agent_store(app).is_ok_and(|store| store.iter().any(voice_on))
 }
 
-/// Whether any of `huddle_agents` is one of this desktop's agents with voice
-/// switched on. `store` is the unified agent store (definitions and instances).
+/// Whether any of `huddle_agents` is one of this desktop's locally run agents
+/// with voice switched on. `store` is the unified agent store (definitions and
+/// instances). Provider-deployed agents never get the voice env, so they don't count.
 fn any_local_agent_voiced(store: &[ManagedAgentRecord], huddle_agents: &[String]) -> bool {
     let voiced = |slug: &str| {
         store.iter().any(|definition| {
@@ -135,6 +146,7 @@ fn any_local_agent_voiced(store: &[ManagedAgentRecord], huddle_agents: &[String]
     };
     store.iter().any(|agent| {
         !agent.pubkey.is_empty()
+            && agent.backend == BackendKind::Local
             && huddle_agents
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(&agent.pubkey))
@@ -142,16 +154,31 @@ fn any_local_agent_voiced(store: &[ManagedAgentRecord], huddle_agents: &[String]
     })
 }
 
-/// For the huddle speech-to-text poster. A store read failure posts as
-/// before: the switch can't be confirmed on.
+/// The speech-to-text gate for one utterance. A store that can't be read
+/// keeps `last`, the previous answer (the poster starts it at `true`), so a
+/// read error never lets a voiced huddle post (design section 4, item 1).
+fn voiced_or_last(
+    store: Result<Vec<ManagedAgentRecord>, String>,
+    huddle_agents: &[String],
+    last: bool,
+) -> bool {
+    match store {
+        Ok(store) => any_local_agent_voiced(&store, huddle_agents),
+        Err(error) => {
+            eprintln!("buzz-desktop: huddle voice check: {error}");
+            last
+        }
+    }
+}
+
+/// For the huddle speech-to-text poster: whether to hold this utterance back.
 pub(crate) fn huddle_has_voiced_local_agent<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     huddle_agents: &[String],
+    last: bool,
 ) -> bool {
     !huddle_agents.is_empty()
-        && super::storage::load_agent_store(app)
-            .inspect_err(|error| eprintln!("buzz-desktop: huddle voice check: {error}"))
-            .is_ok_and(|store| any_local_agent_voiced(&store, huddle_agents))
+        && voiced_or_last(super::storage::load_agent_store(app), huddle_agents, last)
 }
 
 #[cfg(test)]
@@ -182,6 +209,8 @@ mod tests {
             json!({ "persona": "x\u{7}" }),
             json!({ "persona": "x".repeat(1_001) }),
             json!({ "aliases": ["a\nb"] }),
+            json!({ "aliases": ["O\u{200B}"] }),
+            json!({ "persona": "x\u{202E}y" }),
             json!({ "aliases": nine }),
         ] {
             assert!(check(bad.clone()).is_err(), "{bad}");
@@ -206,12 +235,22 @@ mod tests {
         assert!(voiced(profile(true)) && !voiced(profile(false)) && !voiced(None));
         let theirs = ["cd".repeat(32)];
         assert!(!any_local_agent_voiced(&store(profile(true)), &theirs));
+        let mut deployed = store(profile(true));
+        deployed[1].backend = BackendKind::Provider {
+            id: "p".into(),
+            config: json!({}),
+        };
+        assert!(!any_local_agent_voiced(&deployed, &ours));
+        // An unreadable store keeps the last answer instead of posting.
+        let unreadable = |last| voiced_or_last(Err("busy".into()), &ours, last);
+        assert!(unreadable(true) && !unreadable(false));
+        assert!(!voiced_or_last(Ok(store(None)), &ours, true));
 
         let env = |voice, key: &str| {
             let definitions = [store(voice)[0].to_definition_view().unwrap()];
-            let route = Some(Path::new("r.json"));
+            let profile = enabled_voice_json(Some("orch"), &definitions);
             let mut command = Command::new("x");
-            apply_voice_env(&mut command, Some("orch"), &definitions, route);
+            apply_voice_env(&mut command, profile.as_deref(), Some(Path::new("r.json")));
             let value = command.get_envs().find(|(k, _)| *k == key);
             value
                 .and_then(|(_, v)| v)
