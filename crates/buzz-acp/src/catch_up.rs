@@ -37,6 +37,9 @@ struct Ledger {
     floor: u64,
     /// Finished event id (hex) and its `created_at`.
     done: HashMap<String, u64>,
+    /// Owner DM (channel UUID) and when it first got the exemption from `#p`
+    /// (see [`CatchUp::owner_dm_floor`]).
+    dm_floors: HashMap<String, u64>,
     /// Ids added since the last save, with a save already scheduled.
     unsaved: bool,
 }
@@ -74,6 +77,7 @@ impl CatchUp {
                             .collect()
                     })
                     .unwrap_or_default(),
+                dm_floors: serde_json::from_value(saved["dm_floors"].clone()).unwrap_or_default(),
                 unsaved: false,
             },
             missing_or_corrupt => {
@@ -89,6 +93,7 @@ impl CatchUp {
                     window,
                     floor: now,
                     done: HashMap::new(),
+                    dm_floors: HashMap::new(),
                     unsaved: false,
                 };
                 ledger.save();
@@ -132,6 +137,24 @@ impl CatchUp {
         ledger.save();
     }
 
+    /// The time untagged messages in the owner DM `channel` must not predate:
+    /// the one saved when it first got the exemption from `#p`, or else
+    /// `first`, saved now. A restart keeps it, so what the owner sent while
+    /// the harness was down is replayed, but nothing from before the
+    /// exemption is. With catch-up off nothing is replayed, and it is `first`.
+    pub(crate) fn owner_dm_floor(&self, channel: uuid::Uuid, first: u64) -> u64 {
+        let Some(ledger) = self.0.as_ref() else {
+            return first;
+        };
+        let mut ledger = lock(ledger);
+        if let Some(floor) = ledger.dm_floors.get(&channel.to_string()) {
+            return *floor;
+        }
+        ledger.dm_floors.insert(channel.to_string(), first);
+        ledger.save();
+        first
+    }
+
     /// Mark a mention the author gate refused as done, so the policy it was
     /// sent under decides it: a respond-to change, which restarts the agent,
     /// must not answer a day of refused requests. Saved with the next turn, or
@@ -162,7 +185,12 @@ impl CatchUp {
 impl Ledger {
     fn save(&mut self) {
         self.unsaved = false;
-        let record = serde_json::json!({ "version": 1, "floor": self.floor, "done": self.done });
+        let record = serde_json::json!({
+            "version": 1,
+            "floor": self.floor,
+            "done": self.done,
+            "dm_floors": self.dm_floors,
+        });
         let written = self
             .path
             .parent()
@@ -329,6 +357,35 @@ mod tests {
             saved_ids(),
             ["e1", "r1", "r2", "r3"],
             "the next turn saves it too"
+        );
+    }
+
+    #[test]
+    fn owner_dm_floor_is_kept_from_the_first_exemption() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = uuid::Uuid::new_v4();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW + 5), NOW + 5);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW + 50), NOW + 5);
+        catch_up.record(&[("e1".into(), NOW + 10)], NOW + 20);
+        drop(catch_up);
+
+        let reopened = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 600);
+        assert_eq!(
+            reopened.owner_dm_floor(dm, NOW + 600),
+            NOW + 5,
+            "a restart must not move the floor up and drop what was sent while down"
+        );
+        assert_eq!(
+            reopened.owner_dm_floor(uuid::Uuid::new_v4(), NOW + 600),
+            NOW + 600,
+            "each DM has its own floor"
+        );
+        assert!(reopened.is_done("e1"));
+        assert_eq!(
+            CatchUp::default().owner_dm_floor(dm, NOW + 7),
+            NOW + 7,
+            "catch-up off: nothing saved, the floor is now"
         );
     }
 
