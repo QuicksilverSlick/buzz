@@ -169,6 +169,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: name.to_string(),
@@ -459,6 +460,7 @@ fn catalog_copy(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         id: id.to_string(),
         display_name: id.to_string(),
         description: None,
@@ -702,6 +704,7 @@ fn catalog_persona(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         id: id.to_string(),
         display_name: id.to_string(),
         description: None,

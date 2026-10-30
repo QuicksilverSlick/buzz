@@ -48,6 +48,8 @@ export type AgentPersona = {
   capabilities: AgentCapability[];
   /** Whether ACP context is shared by the channel or isolated per thread. */
   sessionPolicy?: AcpSessionPolicy;
+  /** Huddle voice. Null = no voice, which is the default. */
+  voiceProfile?: AgentVoiceProfile | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -74,6 +76,18 @@ export type AgentCapability =
   | "desktop-control"
   | "computer-control";
 
+/** Huddle voice for a definition. Mirrors the Rust `VoiceProfile`. */
+export type AgentVoiceProfile = {
+  /** Off by default; no voice joins a huddle while it is off. */
+  enabled: boolean;
+  /** GPT-Live voice name (e.g. "marin") or custom voice id. */
+  voice?: string;
+  persona?: string;
+  /** Names the voice answers to in a huddle. */
+  aliases?: string[];
+  voiceWithoutOwner: boolean;
+};
+
 export type PersonaBehaviorInput = {
   respondTo?: RespondToMode;
   respondToAllowlist?: string[];
@@ -81,6 +95,8 @@ export type PersonaBehaviorInput = {
   /** Absent and empty both mean no grants. */
   capabilities?: AgentCapability[];
   sessionPolicy?: AcpSessionPolicy;
+  /** Absent inside a present group clears the voice. */
+  voice?: AgentVoiceProfile;
 };
 
 export type CreatePersonaInput = {

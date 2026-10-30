@@ -31,6 +31,7 @@ fn base() -> SpawnConfigSnapshot {
         effort_level: Some("high".into()),
         session_policy: "channel".into(),
         capabilities: vec!["cross-session-note".into()],
+        voice_profile: Some(r#"{"enabled":true}"#.into()),
     }
 }
 
@@ -78,6 +79,7 @@ fn mutations() -> Vec<Mutation> {
         ("capabilities", |s| {
             s.capabilities = vec!["computer-control".into()]
         }),
+        ("voice_profile", |s| s.voice_profile = None),
     ]
 }
 

@@ -66,6 +66,7 @@ mod tests {
         ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             session_policy: Default::default(),
             description: None,
             pubkey: String::new(),
@@ -135,6 +136,7 @@ mod tests {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: None,
             id: id.to_string(),
             display_name: String::new(),

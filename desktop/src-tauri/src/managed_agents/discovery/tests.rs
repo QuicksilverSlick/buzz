@@ -166,34 +166,14 @@ fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
     assert_eq!(cmd.as_deref(), Some("codex-acp"));
     assert_eq!(path.as_deref(), Some("/opt/homebrew/bin/codex-acp"));
 }
+/// Built from JSON so optional definition fields need no listing here (the
+/// file is at its size ratchet).
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
-    crate::managed_agents::AgentDefinition {
-        capabilities: Vec::new(),
-        session_policy: Default::default(),
-        description: None,
-        id: id.to_string(),
-        display_name: id.to_string(),
-        avatar_url: None,
-        system_prompt: String::new(),
-        acp_command: None,
-        runtime: runtime.map(str::to_string),
-        model: None,
-        provider: None,
-        name_pool: Vec::new(),
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        team_catalog_source: None,
-        env_vars: std::collections::BTreeMap::new(),
-        respond_to: None,
-        respond_to_allowlist: Vec::new(),
-        parallelism: None,
-        created_at: "2026-06-09T00:00:00Z".to_string(),
-        updated_at: "2026-06-09T00:00:00Z".to_string(),
-    }
+    serde_json::from_value(serde_json::json!({
+        "id": id, "display_name": id, "system_prompt": "", "runtime": runtime,
+        "created_at": "2026-06-09T00:00:00Z", "updated_at": "2026-06-09T00:00:00Z",
+    }))
+    .expect("valid definition")
 }
 
 #[test]
@@ -214,6 +194,7 @@ fn record_with(
     crate::managed_agents::types::ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: String::new(),

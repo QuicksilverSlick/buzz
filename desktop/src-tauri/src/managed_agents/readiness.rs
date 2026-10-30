@@ -1465,11 +1465,7 @@ mod tests {
     #[test]
     fn cli_login_requirement_serializes_correctly() {
         let r = Requirement::CliLogin {
-            probe_args: vec![
-                "codex".to_string(),
-                "login".to_string(),
-                "status".to_string(),
-            ],
+            probe_args: vec!["codex".into(), "login".into(), "status".into()],
             setup_copy: "run `codex login`".to_string(),
             availability: crate::managed_agents::AcpAvailabilityStatus::Available,
         };
@@ -1491,6 +1487,7 @@ mod tests {
         let record = crate::managed_agents::types::ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             session_policy: Default::default(),
             description: None,
             pubkey: "test-pubkey".to_string(),
