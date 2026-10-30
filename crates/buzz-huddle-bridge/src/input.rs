@@ -117,6 +117,15 @@ pub enum Out {
     Pcm(Vec<u8>),
 }
 
+/// One admitted human's decoded level this tick, for barge-in. `isolated` marks the owner's
+/// desktop on headphones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Level {
+    pub index: u8,
+    pub isolated: bool,
+    pub dbov: i8,
+}
+
 /// One send-log entry: this span's audio filled session ms `from_ms..to_ms`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sent {
@@ -191,6 +200,7 @@ pub struct Input {
     output_until_ms: u64,
     secret: Vec<Range<u64>>,
     last_tick_ms: Option<u64>,
+    levels: Vec<Level>,
 }
 
 impl Input {
@@ -310,6 +320,17 @@ impl Input {
         self.output_until_ms = self.output_until_ms.max(unix_ms);
     }
 
+    /// The voice's output was cut at `now_ms` (a barge-in), so the half-duplex window ends there,
+    /// plus its tail.
+    pub fn output_stopped(&mut self, now_ms: u64) {
+        self.output_until_ms = self.output_until_ms.min(now_ms);
+    }
+
+    /// Each admitted human's level at the last tick.
+    pub fn levels(&self) -> impl Iterator<Item = Level> + '_ {
+        self.levels.iter().copied()
+    }
+
     /// Talos marked unix ms `from_ms..to_ms`, on its clock, secret; it arrived at `now_ms`. The
     /// window is widened by the skew margin on both sides and starts by `now_ms` at the latest.
     /// Its audio leaves every ring, nothing arriving inside it is recorded or forwarded, and what
@@ -422,7 +443,8 @@ impl Input {
             .filter(|(pk, _)| *pk == self.policy.owner)
             .count();
         let desktop_here = self.route.here && owner_peers == 1;
-        for slot in self.slots.values_mut() {
+        self.levels.clear();
+        for (&index, slot) in self.slots.iter_mut() {
             slot.last.clear();
             // Age bounds the ring, so sparse ticks can't keep audio past RING_MS.
             slot.ring.retain(|(t, _)| fresh(*t, now_ms));
@@ -433,9 +455,8 @@ impl Input {
             } else {
                 None
             };
-            let loud = pcm
-                .as_ref()
-                .is_some_and(|pcm| audio_level_dbov(pcm) >= t.speech_dbov);
+            let dbov = pcm.as_deref().map_or(-127, audio_level_dbov);
+            let loud = dbov >= t.speech_dbov;
             // ponytail: the route names the desktop only when the owner has one peer here.
             // Upgrade: have the desktop write its peer index into the route file.
             let desktop = desktop_here && slot.key.0 == self.policy.owner;
@@ -444,8 +465,13 @@ impl Input {
             } else {
                 t.remote_tail_ms
             };
-            slot.echo = !(desktop && self.route.isolated)
-                && now_ms < self.output_until_ms.saturating_add(tail);
+            let isolated = desktop && self.route.isolated;
+            self.levels.push(Level {
+                index,
+                isolated,
+                dbov,
+            });
+            slot.echo = !isolated && now_ms < self.output_until_ms.saturating_add(tail);
             if let Some(pcm) = pcm {
                 slot.last = slot.down.process(&pcm);
                 // A replay or preroll never carries secret audio or the voice's own echo.
@@ -1034,6 +1060,33 @@ mod tests {
             input.tick(late);
             assert!(input.slots[&1].ring.iter().all(|(t, _)| *t == late));
         }
+    }
+
+    #[test]
+    fn levels_mark_the_isolated_desktop_and_a_cut_ends_the_echo_window() {
+        let mut input = input();
+        input.set_awake(true);
+        let mut now = T0;
+        input.set_route(Route {
+            here: true,
+            isolated: true,
+        });
+        input.set_output_until(now + 5_000);
+        let mut ts = [talker(1, 0.3, None), talker(2, 0.3, None)];
+        let out = run(&mut input, &mut now, 1_000, &mut ts);
+        let mut levels: Vec<_> = input.levels().collect();
+        levels.sort_by_key(|l| l.index);
+        let marks: Vec<_> = levels.iter().map(|l| (l.index, l.isolated)).collect();
+        assert_eq!(marks, [(1, true), (2, false)]);
+        assert!(levels.iter().all(|l| l.dbov > -20));
+        // The owner holds the floor; the guest on speakers is in the echo for 5 s, unless a cut
+        // ends the window: then only its 600 ms tail is left, and its audio is forwarded.
+        assert!(input.who_said(0, u64::MAX).all(|s| s.pubkey == OWNER));
+        assert!(voiced(&out));
+        ts[0].2 = 0.0;
+        input.output_stopped(now);
+        run(&mut input, &mut now, 1_000, &mut ts);
+        assert!(input.who_said(0, u64::MAX).any(|s| s.pubkey == GUEST));
     }
 
     #[test]
