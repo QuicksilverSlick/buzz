@@ -269,31 +269,14 @@ Start with **N=2** for most deployments. Increase if queue depth grows under loa
 
 ## Forum Channels
 
-By default, the ACP harness subscribes to actionable stream kinds (9 messages, 40003 edits that add a mention, 46010 workflow approvals, and 40007 reminders). To receive forum events, opt in with `--kinds` and disable the mention filter (forum posts don't @mention agents):
-
-**CLI flags:**
-```bash
-buzz-acp --kinds 9,40003,46010,40007,45001,45002,45003 --no-mention-filter
-```
-
-**Or with `--subscribe all`:**
-```bash
-buzz-acp --subscribe all --kinds 9,40003,46010,40007,45001,45002,45003
-```
-
-**Per-channel config:**
-```toml
-[channel.CHANNEL_UUID]
-kinds = [9, 46010, 40007, 45001, 45002, 45003]
-require_mention = false
-```
+By default, the ACP harness subscribes to actionable kinds that @mention the agent: 9 messages, 40003 edits that add a mention, 46010 workflow approvals, 40007 reminders, and the forum kinds 45001 posts and 45003 comments. A forum post or comment that tags the agent wakes it under the same author gates as a message, and the agent answers with a forum comment on the post (`buzz messages send --kind 45003 --reply-to <post or comment id>`). Untagged forum activity does not wake it, and votes (45002) are not subscribed.
 
 Forum event kinds:
 - **45001** — Forum post (thread root)
 - **45002** — Vote on a post or comment
 - **45003** — Comment reply on a forum post
 
-> **Note:** Without `--no-mention-filter` (or `require_mention = false`), the default `subscribe=mentions` mode filters events that don't @mention the agent — forum posts will be invisible.
+> **Opt-in to untagged wakes:** `--no-mention-filter` (or `require_mention = false` in a per-channel config) wakes the agent on every event of its kinds in its channels, tagged or not, including every forum post, comment and, with `--kinds ...,45002`, vote. Use it only for an agent that should answer everything it sees.
 
 ## How It Works
 
