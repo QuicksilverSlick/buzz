@@ -16,15 +16,26 @@ pub fn audio_request(relay_url: &str, huddle: Uuid) -> Result<Request, String> {
         .map_err(|e| format!("audio request: {e}"))
 }
 
+/// The NIP-42 `relay` tag for the socket this request dials: its bare origin, which is what
+/// the relay expects (`scheme://<Host>`). Taking it from the request means a signed answer
+/// can never name a different host than the one that issued the challenge.
+fn relay_tag(request: &Request) -> Result<String, String> {
+    let uri = request.uri();
+    match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(authority)) => Ok(format!("{scheme}://{authority}")),
+        _ => Err("audio request has no origin".into()),
+    }
+}
+
 /// The kind 22242 answer to the audio challenge.
-pub fn auth_event(
+fn auth_event(
     keys: &Keys,
-    relay_url: &str,
+    relay: &str,
     challenge: &str,
     owner_tag: Option<&Tag>,
 ) -> Result<Event, String> {
     let mut tags = vec![
-        Tag::parse(["relay", relay_url]).map_err(|e| format!("relay tag: {e}"))?,
+        Tag::parse(["relay", relay]).map_err(|e| format!("relay tag: {e}"))?,
         Tag::parse(["challenge", challenge]).map_err(|e| format!("challenge tag: {e}"))?,
     ];
     tags.extend(owner_tag.cloned());
@@ -36,16 +47,19 @@ pub fn auth_event(
 
 /// Join the audio room. A refusal is logged with the version this side speaks, so an
 /// `upgrade_required` from a room pinned to another version shows in the logs.
+///
+/// The caller installs a rustls `CryptoProvider` first (buzz-acp does at startup); a `wss://`
+/// join panics without one.
 pub async fn join(
     request: Request,
     parent: Uuid,
-    relay_url: &str,
     keys: &Keys,
     owner_tag: Option<&Tag>,
 ) -> Result<Joined, String> {
+    let relay = relay_tag(&request)?;
     let parent = parent.to_string();
     connect(request, Some(&parent), None, |challenge| async move {
-        let event = auth_event(keys, relay_url, &challenge, owner_tag)?;
+        let event = auth_event(keys, &relay, &challenge, owner_tag)?;
         serde_json::to_value(&event).map_err(|e| format!("audio auth json: {e}"))
     })
     .await
@@ -88,5 +102,19 @@ mod tests {
             .headers_mut()
             .insert("Nostr-Federated-Identity", "token".parse().unwrap());
         assert!(audio_request("not a url", huddle).is_err());
+    }
+
+    /// The relay tag is the dialed origin, port included, whatever path the relay URL had.
+    #[test]
+    fn relay_tag_is_the_dialed_origin() {
+        let huddle = Uuid::nil();
+        for (relay_url, tag) in [
+            ("wss://relay.test/", "wss://relay.test"),
+            ("ws://127.0.0.1:3000", "ws://127.0.0.1:3000"),
+            ("wss://relay.test:8443/base", "wss://relay.test:8443"),
+        ] {
+            let request = audio_request(relay_url, huddle).unwrap();
+            assert_eq!(relay_tag(&request).unwrap(), tag, "{relay_url}");
+        }
     }
 }

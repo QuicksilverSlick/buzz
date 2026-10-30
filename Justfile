@@ -399,6 +399,8 @@ test-unit:
     ./scripts/test-ensure-local-relay-key.sh
     # Shared Huddle transport, codec, and loopback authentication regressions.
     cargo test -p buzz-audio-client
+    # Fork huddle voice bridge: frames-v1 contract fixtures and audio join.
+    cargo test -p buzz-huddle-bridge
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         # Mesh JWKS proxy-bypass regression: infra-free loopback I/O with
