@@ -1,7 +1,9 @@
 //! Answer routing: routes.json, the settle, and the notice in the card's
 //! thread. Child of tests.rs so the fake relay and Bench harness are in scope.
 
-use super::answers::{last_query, reply, tap, ITEM};
+use std::collections::BTreeMap;
+
+use super::answers::{last_query, posted, reply, tap, ITEM};
 use super::channels::thread_reply;
 use super::*;
 
@@ -544,4 +546,182 @@ async fn free_text_on_any_routed_card_reaches_the_route_target() {
     assert!(content(&n[0]).contains(&r2.id.to_hex()));
     assert!(settle_past(&mut b, 2).await.is_empty());
     assert_eq!(b.s.items[ITEM].routed_reply, Some(r2.id.to_hex()));
+    // r2 withdrawn: r1 is the newest again, and it was told already.
+    reply(&b, &[&r1, &aside]);
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    let r = b.s.items[ITEM].reply.as_ref().map(|r| r.event_id.clone());
+    assert_eq!(r, Some(r1.id.to_hex()));
+}
+
+/// The seeded bench with its writer routed, the target joined and the
+/// join's hold over, and the card's event id.
+async fn routed_bench() -> (Bench, Keys, String) {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let agent = route(&mut b);
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    let card = b.card(ITEM).event_id;
+    (b, agent, card)
+}
+
+/// `keys`' reply in `card`'s thread under `parent`, as the desktop builds it.
+fn under(keys: &Keys, card: &str, parent: &nostr::Event, text: &str, at: u64) -> nostr::Event {
+    let thread = crate::events::ThreadRef {
+        root_event_id: nostr::EventId::from_hex(card).unwrap(),
+        parent_event_id: parent.id,
+    };
+    let x = uuid::Uuid::parse_str(super::channels::X).unwrap();
+    let url = "http://127.0.0.1:1";
+    crate::events::build_message_with_client_tags(
+        x,
+        text,
+        Some(&thread),
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        url,
+        &[],
+    )
+    .unwrap()
+    .custom_created_at(nostr::Timestamp::from(at))
+    .sign_with_keys(keys)
+    .unwrap()
+}
+
+/// Tags pick who answers: a reply that tags anyone but the writer and the
+/// owner's keys is theirs, so the route target is not told of it.
+#[tokio::test]
+async fn a_reply_tagging_someone_else_is_not_told() {
+    let (mut b, _agent, card) = routed_bench().await;
+    let dana = Keys::generate().public_key().to_hex();
+    let ask = "@Dana can you take this one?";
+    let to_dana = thread_reply(&b.ctx.owner, &card, ask, b.now, &[dana.as_str()]);
+    reply(&b, &[&to_dana]);
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    // It is still the card's Other, so the card stays engaged.
+    let r = b.s.items[ITEM].reply.as_ref().map(|r| r.event_id.clone());
+    assert_eq!(r, Some(to_dana.id.to_hex()));
+    // Tagging the writer or the owner's own keys tags nobody else.
+    let (writer, phone) = (b.writer_hex(), "cd".repeat(32));
+    let mine = thread_reply(&b.ctx.owner, &card, "Noted", b.now, &[&writer, &phone]);
+    reply(&b, &[&to_dana, &mine]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&mine.id.to_hex()));
+}
+
+/// The whole thread of a card that is not scoped is its own: the owner's
+/// untagged reply under the agent's answer reaches the agent too.
+#[tokio::test]
+async fn a_nested_reply_on_an_unscoped_card_reaches_the_route_target() {
+    let (mut b, agent, card) = routed_bench().await;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Hold on", b.now, &[]);
+    reply(&b, &[&r1]);
+    assert_eq!(settle_past(&mut b, 2).await.len(), 1);
+    let answer = thread_reply(&agent, &card, "When should I ask again?", b.now, &[]);
+    let nested = under(&b.ctx.owner, &card, &answer, "after lunch", b.now + 1);
+    reply(&b, &[&r1, &answer, &nested]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&nested.id.to_hex()));
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(nested.id.to_hex()));
+}
+
+/// A reply older than the Bench's first read of it (made before the route,
+/// or before this build) is told at its own time, dated when not today.
+#[tokio::test]
+async fn an_old_reply_is_told_at_its_own_time() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    let at = b.now;
+    let old = thread_reply(&b.ctx.owner, &card, "Hold on", at, &[]);
+    reply(&b, &[&old]);
+    b.now += 3 * 86_400 + 3600;
+    route(&mut b);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].reply.as_ref().map(|r| r.at), Some(at));
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let local = chrono::DateTime::from_timestamp(at as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local);
+    let when = local.format("%Y-%m-%d %H:%M");
+    assert!(
+        content(&n[0]).contains(&format!("replied in this thread at {when} instead")),
+        "{}",
+        content(&n[0])
+    );
+}
+
+/// Once a reply is read on a card that is not scoped it stays read: one tick
+/// of a broken routes.json neither un-engages the card nor lets it expire.
+#[tokio::test]
+async fn a_bad_routes_tick_keeps_a_replied_card() {
+    let (mut b, _agent, card) = routed_bench().await;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Hold on", b.now, &[]);
+    reply(&b, &[&r1]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ITEM].reply.is_some());
+    // Past its deadline, and kept because it is engaged.
+    b.s.items.get_mut(ITEM).unwrap().deadline = Some("2025-01-01T00:00:00Z".to_string());
+    b.tick().await.unwrap();
+    std::fs::write(b.root.join("routes.json"), "{").unwrap();
+    b.tick().await.unwrap();
+    let i = &b.s.items[ITEM];
+    assert!(i.reply.is_some());
+    assert!(i.validity == Validity::Current);
+    assert_eq!(i.card.as_ref().map(|c| c.event_id.clone()), Some(card));
+}
+
+#[test]
+fn replies_are_read_while_the_route_target_can_be_told() {
+    use crate::bench::channels::reads_replies;
+    let mut s = BenchState {
+        channel_id: UUID.to_string(),
+        ..Default::default()
+    };
+    let mut item = check(&[]).unwrap();
+    let to = "ee".repeat(32);
+    let routes = BTreeMap::from([("orchestrator".to_string(), to.clone())]);
+    // Routed, but the target never joined the card's channel (its folder
+    // bound since): nobody to tell, so nothing is read.
+    assert!(!reads_replies(&s, &item, &routes));
+    s.members_added.push(to);
+    assert!(reads_replies(&s, &item, &routes));
+    // Once a reply is read it stays read, routes or not.
+    s.members_added.clear();
+    item.reply = Some(Reply {
+        event_id: "ab".repeat(32),
+        by: "cd".repeat(32),
+        by_name: None,
+        role: None,
+        at: 1,
+        hhmm: String::new(),
+    });
+    assert!(reads_replies(&s, &item, &BTreeMap::new()));
+}
+
+/// A reply on a card that is not scoped asked nothing of its own: asked
+/// again, that card is closed like one nobody answered, never left open.
+#[tokio::test]
+async fn a_reword_closes_a_routed_card_with_only_a_reply() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    route(&mut b);
+    let old_card = b.card(ITEM);
+    let why = thread_reply(&b.ctx.owner, &old_card.event_id, "Why?", b.now, &[]);
+    reply(&b, &[&why, &posted(&b, &old_card.event_id)]);
+    b.tick().await.unwrap();
+    assert!(b.s.items[ITEM].engaged());
+    let before = b.posts().len();
+    let reworded = drop_json(&[("options", json!(["Stay", "Move away"]))]);
+    b.drop_file("orchestrator", "relay-choice", &reworded);
+    b.settle(3).await;
+    assert_eq!(b.kinds()[before..], [40003, 9, 7, 7, 9, 5]);
+    let closed = &b.posts()[before].0;
+    assert_eq!(tag_value(closed, "e").unwrap(), old_card.event_id);
+    assert!(content(closed).contains("\n\nClosed: a tap or reply here is no longer read."));
+    assert_eq!(b.s.kept, [old_card.event_id]);
 }

@@ -84,15 +84,25 @@ pub(crate) fn root_until<'a>(
 
 /// Whether the kind 9 `e` replies to the card `card_id`: it names the card
 /// as its parent, or names only the card's thread root, after the card and
-/// by `root_until`. The Bench's own route notices never do: it signs those
-/// with the owner's keys for the owner's answers.
+/// by `root_until`. A card that is not scoped is top-level in #bench, so its
+/// whole thread is its own: a reply deeper in it (NIP-10 `root` the card,
+/// say under the agent's answer) is on it too. The Bench's own route notices
+/// never are: it signs those with the owner's keys for the owner's answers.
+// ponytail: a scoped card posted into such a thread (a project listing
+// #bench, replyTo that card) would share its replies; exclude replies whose
+// parent is another card if a roles.json ever does that.
 fn on_card(item: &Item, card_id: &str, e: &nostr::Event, root_until: Option<u64>) -> bool {
     let notice = e.tags.iter().any(
         |t| matches!(t.as_slice(), [k, m, ..] if k == "client" && m.starts_with("bench:route:")),
     );
+    let rooted = !item.scoped()
+        && e.tags.iter().any(
+            |t| matches!(t.as_slice(), [k, v, _, m, ..] if k == "e" && v == card_id && m == "root"),
+        );
     let (p, at) = (parent(e), e.created_at.as_secs());
     !notice
         && (p == Some(card_id)
+            || rooted
             || root_until.is_some_and(|until| {
                 p.is_some()
                     && p == item.reply_to.as_deref()
@@ -217,6 +227,28 @@ pub(crate) fn pick_reply<'e>(
                 && counts(item, e, owner_set, writer_hex, only_owner)
         })
         .max_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
+}
+
+/// Whether a newly picked reply `e` (its time `at`) is for the route target
+/// to be told of. Not one that tags anyone but the writer and the owner's
+/// keys: tags pick who answers, and a route target it tags hears it itself.
+/// Nor one no newer than the reply told last, back because that one was
+/// withdrawn.
+pub(crate) fn tell_reply(
+    item: &Item,
+    e: &nostr::Event,
+    at: u64,
+    owner_set: &[String],
+    writer_hex: &str,
+) -> bool {
+    let tagged = e.tags.iter().any(|t| {
+        matches!(t.as_slice(), [k, p, ..] if k == "p" && p != writer_hex && !owner_set.contains(p))
+    });
+    let older = item.reply.as_ref().is_some_and(|r| {
+        item.routed_reply.as_ref() == Some(&r.event_id)
+            && (at, e.id.to_hex()) <= (r.at, r.event_id.clone())
+    });
+    !tagged && !older
 }
 
 /// Valid answers on the live card from keys that may not answer it, for

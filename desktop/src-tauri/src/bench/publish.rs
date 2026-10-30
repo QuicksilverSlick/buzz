@@ -246,6 +246,18 @@ async fn edit(
     post_as_writer(ctx, s, builder, now).await
 }
 
+/// Local `HH:MM` of `at`, as `YYYY-MM-DD HH:MM` when that is not today.
+fn local_when(at: u64, now: u64) -> String {
+    let day = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|t| t.with_timezone(&chrono::Local).date_naive())
+    };
+    match day(at) {
+        Some(d) if day(now) != Some(d) => format!("{d} {}", local_hhmm(at)),
+        _ => local_hhmm(at),
+    }
+}
+
 fn df_answer(parts: [&str; 3]) -> Result<nostr::Tag, String> {
     let [n, by, id] = parts;
     nostr::Tag::parse(["df-answer", n, by, id]).map_err(|e| e.to_string())
@@ -579,7 +591,7 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let text = item::render_route_reply(&item, &local_hhmm(r.at)) + &link;
+        let text = item::render_route_reply(&item, &local_when(r.at, now)) + &link;
         let marker = format!("bench:route:{id}@r{}", &r.event_id[..16]);
         let extra = vec![df_answer(["other", &r.by, &r.event_id])?];
         let posted = post_message(
@@ -626,10 +638,10 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        // A reply or tap the item never read (free text on an unscoped card
-        // with no route)
-        // still makes the card a record: it stays, as `carry_card` keeps one,
-        // but closed, since nothing reads it any more.
+        // A reply or tap the item never read or no longer holds (free text on
+        // an unscoped card with no route, or one asked again) still makes the
+        // card a record: it stays, as `carry_card` keeps one, but closed,
+        // since nothing reads it any more.
         if touched(ctx, s, &ch, &card.event_id, now).await? {
             close(ctx, s, &ch, &card, now).await?;
         } else {

@@ -378,13 +378,14 @@ fn scan_inbox(
 
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
-/// new question after an answer, a reply or the owner's word leaves the old
-/// card on the relay as it is and gets a card of its own with nothing told
-/// yet, which comes back to whoever answered (`item::Previous`); anything
-/// else keeps the card for publish to refresh. Each keeps the owner's word
-/// told on the old item, or a notice of the owner's still owed there, to be
-/// ended or withdrawn (`item::Item::ends`), whether its card is there or not
-/// (crowded out, deleted by hand).
+/// new question after an answer, a scoped card's reply or the owner's word
+/// leaves the old card on the relay as it is and gets a card of its own with
+/// nothing told yet, which comes back to whoever answered (`item::Previous`);
+/// anything else (a reply on a card that is not scoped asked nothing of its
+/// own) keeps the card for publish to refresh or close. Each keeps the
+/// owner's word told on the old item, or a notice of the owner's still owed
+/// there, to be ended or withdrawn (`item::Item::ends`), whether its card is
+/// there or not (crowded out, deleted by hand).
 fn carry_card(
     old: Option<&item::Item>,
     mut new: item::Item,
@@ -403,7 +404,12 @@ fn carry_card(
         };
         new.request = o.request.clone().or(Some(Box::new(asked)));
         new.card = o.card.clone();
-    } else if asking && (o.engaged() || o.request.is_some() || o.owner_told()) {
+    } else if asking
+        && (o.answer.is_some()
+            || (o.scoped() && o.reply.is_some())
+            || o.request.is_some()
+            || o.owner_told())
+    {
         let asked = o.request.as_deref().unwrap_or(o);
         if let Some(c) = &o.card {
             kept.push(c.event_id.clone());
@@ -1011,7 +1017,7 @@ async fn poll_answers(
     // Thread replies count on scoped cards, and reach a routed writer's agent.
     let kinds = if live
         .iter()
-        .any(|i| i.scoped() || routes.contains_key(&i.writer))
+        .any(|i| i.scoped() || channels::reads_replies(s, i, routes))
     {
         serde_json::json!([7, 9])
     } else {
@@ -1084,6 +1090,7 @@ async fn poll_answers(
             continue;
         }
         let until = item::root_until(&s.items[&id], s.items.values(), &s.kept, &s.kept_at);
+        let routed = channels::reads_replies(s, &s.items[&id], routes);
         let item = s.items.get_mut(&id).expect("live id");
         let card = live_card(item).expect("live card").event_id.clone();
         // Their page was cut, so an answer or reply of theirs here may be
@@ -1107,10 +1114,9 @@ async fn poll_answers(
                 why: why.to_string(),
             });
         }
-        // The person's Other: kept while it is the newest, so its first-seen
-        // time holds; publish (a3) routes it unless it already pings the agent.
-        // An unscoped card has one only while its writer has a route.
-        let routed = routes.contains_key(&item.writer);
+        // The person's Other: kept while it is the newest; publish (a3)
+        // routes it unless it is marked told here. An unscoped card has one
+        // only while `channels::reads_replies`.
         let picked = (!unread)
             .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until, routed))
             .flatten();
@@ -1126,12 +1132,8 @@ async fn poll_answers(
             Some(e) => {
                 let by = e.pubkey.to_hex();
                 let (by_name, role) = named(item, &by, owner_set);
-                let pinged = routes.get(&item.writer).is_some_and(|to| {
-                    e.tags
-                        .iter()
-                        .any(|t| matches!(t.as_slice(), [k, p, ..] if k == "p" && p == to))
-                });
-                if pinged {
+                let at = e.created_at.as_secs().min(now);
+                if !item::tell_reply(item, e, at, owner_set, &writer_hex) {
                     item.routed_reply = Some(e.id.to_hex());
                 }
                 Some(item::Reply {
@@ -1139,8 +1141,8 @@ async fn poll_answers(
                     by,
                     by_name,
                     role,
-                    at: now,
-                    hhmm: hhmm.clone(),
+                    at,
+                    hhmm: local_hhmm(at),
                 })
             }
             None if unread => item

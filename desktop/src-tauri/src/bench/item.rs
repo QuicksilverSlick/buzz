@@ -211,6 +211,7 @@ pub(crate) struct Reply {
     /// None: the owner's own keys.
     pub by_name: Option<String>,
     pub role: Option<AnswerRole>,
+    /// The reply's own created_at, never past the Bench clock.
     pub at: u64,
     pub hhmm: String,
 }
@@ -1206,7 +1207,7 @@ pub(crate) fn thread_line(channel: &str, card_id: &str) -> String {
 
 pub(crate) use super::pick::{
     answer_option, eligible, owner_spoke, parent, pick_answer, pick_reply, reaction_target,
-    refused_taps, root_until,
+    refused_taps, root_until, tell_reply,
 };
 pub(crate) use super::route::{
     owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
