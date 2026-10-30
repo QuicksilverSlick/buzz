@@ -49,12 +49,22 @@ fn room(guest: bool) -> Room {
     }
 }
 
+fn nobody() -> Room {
+    let mut room = room(false);
+    room.humans.clear();
+    room
+}
+
 type Planned = Result<Vec<String>, String>;
 
-fn plan_as(tools: &VoiceTools, guest: bool, name: &str, args: Value) -> Planned {
+fn plan_in(tools: &VoiceTools, room: &Room, name: &str, args: Value) -> Planned {
     let call = json!({ "name": name, "args": args });
     let call: Call = serde_json::from_value(call).unwrap();
-    tools.plan(call, &room(guest)).map(|(_, args, _)| args)
+    tools.plan(call, room).map(|(_, args, _)| args)
+}
+
+fn plan_as(tools: &VoiceTools, guest: bool, name: &str, args: Value) -> Planned {
+    plan_in(tools, &room(guest), name, args)
 }
 
 /// Planned with the owner alone.
@@ -74,9 +84,8 @@ fn the_room_rule_is_every_present_humans_scope_intersected() {
     assert!(!one.readable(ch(3)));
     assert!(two.readable(ch(1)) && two.readable(ch(4)));
     assert!([2, 3, BENCH].iter().all(|&n| !two.readable(ch(n))));
-    let mut empty = room(false);
-    empty.humans.clear();
-    assert!(!empty.readable(ch(4)), "an empty room reads nothing");
+    assert!(!nobody().readable(ch(4)), "an empty room reads nothing");
+    assert!(nobody().guests() && two.guests() && !one.guests());
 }
 
 #[test]
@@ -101,15 +110,31 @@ fn scopes_come_only_from_relay_signed_events() {
         ev(39000, GUEST, 4, flags(&["public"])),
     ]);
     assert_eq!(open_channels(&meta, RELAY), [ch(1)].into());
+
+    // Only the newest copy counts, in either order; keys match in any case.
+    let old = ev(39002, RELAY, 1, p(GUEST));
+    let mut new = ev(39002, RELAY, 1, p(OWNER));
+    new["created_at"] = json!(2);
+    for members in [json!([old.clone(), new.clone()]), json!([new, old])] {
+        assert!(member_channels(&members, GUEST, RELAY).is_empty());
+        let (owner, relay) = (OWNER.to_uppercase(), RELAY.to_uppercase());
+        assert_eq!(member_channels(&members, &owner, &relay), [ch(1)].into());
+    }
 }
 
 #[test]
 fn code_reads_never_take_an_option_from_the_model() {
-    let args = json!({ "pattern": "--pre=sh", "glob": "*.rs" });
-    let rg = alone("search_code", args).unwrap();
-    assert_eq!(rg[0], "--no-config", "a config file can't add --pre either");
-    assert!(rg.ends_with(&words("--glob=*.rs -- --pre=sh .")));
-    assert!(rg[..rg.len() - 3].iter().all(|a| !a.starts_with("--pre")));
+    let args = json!({ "pattern": "--open-files-in-pager=sh", "glob": "*.rs" });
+    let grep = alone("search_code", args).unwrap();
+    assert_eq!(grep[..2], words("--no-pager grep"));
+    assert!(grep.ends_with(&words("-e --open-files-in-pager=sh -- *.rs")));
+    assert!(grep[..grep.len() - 3]
+        .iter()
+        .all(|a| !a.starts_with("--open")));
+    for glob in ["../x", "/etc/*", ":(top)*", "a\\b", ""] {
+        let args = json!({ "pattern": "x", "glob": glob });
+        assert!(alone("search_code", args).is_err(), "{glob}");
+    }
     for rev in ["-c", "--output=/tmp/x", "-p", "HEAD;rm", "a b", ""] {
         assert!(alone("git_log", json!({ "rev": rev })).is_err(), "{rev}");
         assert!(alone("git_show", json!({ "rev": rev })).is_err(), "{rev}");
@@ -148,6 +173,7 @@ fn gh_and_code_reads_name_their_repo_and_guests_keep_to_the_org() {
     assert!(plan_as(&other, false, "git_log", json!({})).is_ok());
     assert!(plan_as(&other, true, "git_log", json!({})).is_err());
     assert!(shared("search_code", json!({ "pattern": "fn main" })).is_ok());
+    assert!(plan_in(&unknown, &nobody(), "git_log", json!({})).is_err());
 }
 
 #[test]
@@ -183,6 +209,9 @@ fn writes_go_only_where_everyone_reads_never_the_huddle_or_bench() {
     assert!(post(1, &"x".repeat(POST_MAX + 1)).is_err());
     let sent = post(1, "hi --role owner").unwrap();
     assert_eq!(sent[3], "--content=hi --role owner");
+    for text in ["ask @Orchestrator", "nostr:npub1x", "NOSTR:npub1x"] {
+        assert!(post(1, text).is_err(), "a mention wakes an agent: {text}");
+    }
 
     assert!(alone("add_agent", json!({ "pubkey": GUEST })).is_err());
     let args = json!({ "pubkey": AGENT.to_uppercase() });
@@ -190,6 +219,11 @@ fn writes_go_only_where_everyone_reads_never_the_huddle_or_bench() {
     let huddle = ch(HUDDLE);
     let want = format!("channels add-member --role=bot --channel={huddle} --pubkey={AGENT}");
     assert_eq!(added, words(&want));
+    let mut upper = tools();
+    upper.agents = [AGENT.to_uppercase()].into();
+    assert!(plan_as(&upper, false, "add_agent", json!({ "pubkey": AGENT })).is_ok());
+    let args = json!({ "pubkey": AGENT });
+    assert!(plan_in(&tools(), &nobody(), "add_agent", args).is_err());
 }
 
 #[test]
@@ -222,7 +256,7 @@ async fn tools_outside_the_closed_list_are_refused() {
         ("git_log", json!({ "rev": "HEAD", "c": "core.pager=sh" })),
         ("post_message", reply),
     ] {
-        let result = tools().run(name, args, &room(false)).await;
+        let result = tools().run(name, args, &room(false), None).await;
         let text = result.text;
         assert!(
             !result.ok && text.contains("no such tool"),
@@ -259,11 +293,17 @@ fn filtered_reads_drop_what_the_room_cannot_see() {
         overflow,
         code,
     };
-    let cut = out(None, "", true).text(Keep::Events, &room);
+    let cut = out(None, "", true).text(Prog::Buzz, Keep::Events, &room);
     assert!(cut.is_err(), "a cut list is withheld, never half-checked");
-    let quiet = out(Some(1), "", false).text(Keep::All, &room);
+    let quiet = out(Some(1), "", false).text(Prog::Git, Keep::All, &room);
     assert_eq!(quiet.unwrap(), "(nothing found)");
-    let failed = out(Some(128), "fatal: bad revision", false).text(Keep::All, &room);
+    let silent = out(Some(1), "", false).text(Prog::Buzz, Keep::All, &room);
+    assert!(
+        silent.is_err(),
+        "only grep's quiet exit 1 means nothing found"
+    );
+    let failed = out(Some(128), "fatal: bad revision", false);
+    let failed = failed.text(Prog::Git, Keep::All, &room);
     assert!(failed.unwrap_err().contains("bad revision"));
 }
 
@@ -291,26 +331,66 @@ async fn git_runs_in_the_checkout_and_a_missing_program_is_a_failure() {
         assert!(out.status.success(), "{a}: {why}");
     };
     git("init -q");
+    let file = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+    file("a.rs", "TOKEN = 1\n");
+    file(".gitignore", "secret.txt\n");
+    file("secret.txt", "TOKEN = 2\n");
+    file(".env", "TOKEN = 3\n");
+    git("add a.rs .gitignore");
+    git("config remote.origin.url https://user:TOKEN@example.invalid/x");
     git(
         "-c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
-         commit -q --no-verify --allow-empty -m first<commit>",
+         commit -q --no-verify -m first<commit>",
     );
     let mut tools = tools();
     tools.checkout = dir.path().into();
     tools.buzz = dir.path().join("no-such-buzz");
     let room = room(false);
-    let log = tools.run("git_log", json!({}), &room).await;
+    let log = tools.run("git_log", json!({}), &room, None).await;
     assert!(
         log.ok && log.text.contains("first&lt;commit&gt;"),
         "{}",
         log.text
     );
-    let bad = tools.run("git_show", json!({ "rev": "nope" }), &room).await;
+    // Code search reads tracked files only: never ignored, untracked or .git.
+    for glob in [json!(null), json!("*"), json!(".env"), json!("**/config")] {
+        let args = json!({ "pattern": "TOKEN", "glob": glob });
+        let found = tools.run("search_code", args, &room, None).await;
+        let text = &found.text;
+        let leaked = ["secret.txt", ".env", "example.invalid"];
+        assert!(
+            found.ok && !leaked.iter().any(|l| text.contains(l)),
+            "{text}"
+        );
+        let tracked = text.contains("a.rs:1:TOKEN") || text.contains("(nothing found)");
+        assert!(tracked, "{text}");
+    }
+    let bad = tools
+        .run("git_show", json!({ "rev": "nope" }), &room, None)
+        .await;
     assert!(!bad.ok && bad.text.contains("failed"), "{}", bad.text);
-    let none = tools.run("list_channels", Value::Null, &room).await;
+    let none = tools.run("list_channels", Value::Null, &room, None).await;
     assert!(
         !none.ok && none.text.contains("did not start"),
         "{}",
         none.text
+    );
+}
+
+/// A reaction waits for 8c's go-ahead, then for its looked-up target: with a
+/// "buzz" that finds nothing, nothing is reacted to.
+#[tokio::test]
+async fn a_reaction_is_held_then_checked_against_its_target() {
+    let mut tools = tools();
+    tools.buzz = "git".into();
+    let args = || json!({ "event": AGENT, "emoji": "x" });
+    let held = tools.run("react", args(), &room(false), None).await;
+    assert!(!held.ok && held.text.contains("go-ahead"), "{}", held.text);
+    let cleared = Some(Cleared(()));
+    let looked = tools.run("react", args(), &room(false), cleared).await;
+    assert!(
+        !looked.ok && looked.text.contains("not found"),
+        "{}",
+        looked.text
     );
 }
