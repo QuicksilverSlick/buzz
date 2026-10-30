@@ -3,7 +3,6 @@ use super::*;
 const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GUEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RELAY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const AGENT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const HUDDLE: u128 = 50;
 const BENCH: u128 = 99;
 
@@ -15,19 +14,13 @@ fn words(s: &str) -> Vec<String> {
     argv(s, [])
 }
 
-fn tools_in(repo: Option<&str>) -> VoiceTools {
+fn tools() -> VoiceTools {
     VoiceTools {
         buzz: "buzz".into(),
         buzz_env: vec![],
         checkout: ".".into(),
-        checkout_repo: repo.map(String::from),
         bench: ch(BENCH),
-        agents: [AGENT.to_string()].into(),
     }
-}
-
-fn tools() -> VoiceTools {
-    tools_in(Some("QuicksilverSlick/buzz"))
 }
 
 /// The owner is in 1, 2 and #bench; the guest in 1 and 3; 4 is open.
@@ -38,14 +31,11 @@ fn room(guest: bool) -> Room {
     };
     let mut humans = vec![human(OWNER, &[1, 2, BENCH, HUDDLE])];
     humans.extend(guest.then(|| human(GUEST, &[1, 3, HUDDLE])));
-    let repos = vec!["quicksilverslick/buzz".into()];
-    let (huddle, owner, open) = (ch(HUDDLE), OWNER.into(), [ch(4)].into());
+    let (owner, open) = (OWNER.into(), [ch(4)].into());
     Room {
-        huddle,
         owner,
         humans,
         open,
-        repos,
     }
 }
 
@@ -123,60 +113,6 @@ fn scopes_come_only_from_relay_signed_events() {
 }
 
 #[test]
-fn code_reads_never_take_an_option_from_the_model() {
-    let args = json!({ "pattern": "--open-files-in-pager=sh", "glob": "*.rs" });
-    let grep = alone("search_code", args).unwrap();
-    assert_eq!(grep[..2], words("--no-pager grep"));
-    assert!(grep.ends_with(&words("-e --open-files-in-pager=sh -- *.rs")));
-    assert!(grep[..grep.len() - 3]
-        .iter()
-        .all(|a| !a.starts_with("--open")));
-    for glob in ["../x", "/etc/*", ":(top)*", "a\\b", ""] {
-        let args = json!({ "pattern": "x", "glob": glob });
-        assert!(alone("search_code", args).is_err(), "{glob}");
-    }
-    for rev in ["-c", "--output=/tmp/x", "-p", "HEAD;rm", "a b", ""] {
-        assert!(alone("git_log", json!({ "rev": rev })).is_err(), "{rev}");
-        assert!(alone("git_show", json!({ "rev": rev })).is_err(), "{rev}");
-    }
-    for path in ["../secret", "/etc/passwd", "a/../../b", "C:\\x", ":(top)x"] {
-        assert!(alone("git_log", json!({ "path": path })).is_err(), "{path}");
-    }
-    let args = json!({ "rev": "main..HEAD", "path": "src/lib.rs", "limit": 500 });
-    let log = alone("git_log", args).unwrap();
-    let flags = words("--no-pager --literal-pathspecs --no-ext-diff --no-textconv");
-    assert!(flags.iter().all(|f| log.contains(f)), "{log:?}");
-    let tail = words("--max-count=30 --end-of-options main..HEAD -- src/lib.rs");
-    assert!(log.ends_with(&tail), "{log:?}");
-    let show = alone("git_show", json!({ "rev": "HEAD~1" })).unwrap();
-    let tail = words("--no-textconv --stat --patch --end-of-options HEAD~1");
-    assert!(show.ends_with(&tail), "{show:?}");
-}
-
-#[test]
-fn gh_and_code_reads_name_their_repo_and_guests_keep_to_the_org() {
-    let view = alone("gh_pr_view", json!({ "number": 7 })).unwrap();
-    assert_eq!(view[..2], words("pr view"));
-    assert!(view.ends_with(&words("7 --repo=QuicksilverSlick/buzz")));
-    let upstream = json!({ "number": 7, "repo": "block/buzz" });
-    assert!(alone("gh_checks", upstream.clone()).is_ok());
-    assert!(shared("gh_checks", upstream).is_err());
-    for repo in ["-R/x", "a/b/c", "a", ".git/x", "a/b c", "a/-b"] {
-        let args = json!({ "number": 1, "repo": repo });
-        assert!(alone("gh_checks", args).is_err(), "{repo}");
-    }
-    let unknown = tools_in(None);
-    assert!(plan_as(&unknown, false, "gh_checks", json!({ "number": 7 })).is_err());
-    assert!(plan_as(&unknown, false, "git_log", json!({})).is_ok());
-    assert!(plan_as(&unknown, true, "git_log", json!({})).is_err());
-    let other = tools_in(Some("someone/else"));
-    assert!(plan_as(&other, false, "git_log", json!({})).is_ok());
-    assert!(plan_as(&other, true, "git_log", json!({})).is_err());
-    assert!(shared("search_code", json!({ "pattern": "fn main" })).is_ok());
-    assert!(plan_in(&unknown, &nobody(), "git_log", json!({})).is_err());
-}
-
-#[test]
 fn buzz_reads_are_allowlisted_and_room_bound() {
     let one = ch(1);
     let get = shared("get_messages", json!({ "channel": one, "limit": 999 }));
@@ -197,66 +133,15 @@ fn buzz_reads_are_allowlisted_and_room_bound() {
     assert_eq!(search[3..], ["--query=-x --limit 999".to_string()]);
 }
 
-#[test]
-fn writes_go_only_where_everyone_reads_never_the_huddle_or_bench() {
-    let post = |n: u128, text: &str| {
-        let args = json!({ "channel": ch(n), "text": text });
-        shared("post_message", args)
-    };
-    assert!(post(HUDDLE, "hi").is_err() && post(BENCH, "hi").is_err());
-    assert!(post(2, "hi").is_err(), "the guest can't read 2");
-    assert!(post(1, "-").is_err() && post(1, " ").is_err());
-    assert!(post(1, &"x".repeat(POST_MAX + 1)).is_err());
-    let sent = post(1, "hi --role owner").unwrap();
-    assert_eq!(sent[3], "--content=hi --role owner");
-    for text in ["ask @Orchestrator", "nostr:npub1x", "NOSTR:npub1x"] {
-        assert!(post(1, text).is_err(), "a mention wakes an agent: {text}");
-    }
-
-    assert!(alone("add_agent", json!({ "pubkey": GUEST })).is_err());
-    let args = json!({ "pubkey": AGENT.to_uppercase() });
-    let added = alone("add_agent", args).unwrap();
-    let huddle = ch(HUDDLE);
-    let want = format!("channels add-member --role=bot --channel={huddle} --pubkey={AGENT}");
-    assert_eq!(added, words(&want));
-    let mut upper = tools();
-    upper.agents = [AGENT.to_uppercase()].into();
-    assert!(plan_as(&upper, false, "add_agent", json!({ "pubkey": AGENT })).is_ok());
-    let args = json!({ "pubkey": AGENT });
-    assert!(plan_in(&tools(), &nobody(), "add_agent", args).is_err());
-}
-
-#[test]
-fn reactions_never_answer_cards_or_reach_unshared_channels() {
-    let tools = tools();
-    let check = |n: u128, client: &str, guest: bool| {
-        let tags = json!([["h", ch(n).to_string()], ["client", client]]);
-        let found = serde_json::to_vec(&json!([{ "tags": tags }])).unwrap();
-        tools.react_target(&found, &room(guest))
-    };
-    assert!(check(1, "buzz-desktop", true).is_ok());
-    assert!(check(BENCH, "", false).is_err() && check(HUDDLE, "", true).is_err());
-    assert!(check(2, "", true).is_err());
-    assert!(
-        check(1, "bench:card:x@1", true).is_err(),
-        "a reaction is a tap"
-    );
-    assert!(tools.react_target(b"[]", &room(true)).is_err());
-    let untagged = br#"[{"tags":[]}]"#;
-    assert!(tools.react_target(untagged, &room(true)).is_err());
-}
-
 #[tokio::test]
 async fn tools_outside_the_closed_list_are_refused() {
-    let reply = json!({ "channel": ch(1), "text": "hi", "reply_to": "e" });
     for (name, args) in [
         ("gh_api", json!({ "path": "/user" })),
         ("run_shell", json!({ "cmd": "ls" })),
-        ("search_code", json!({ "pattern": "x", "pre": "sh" })),
-        ("git_log", json!({ "rev": "HEAD", "c": "core.pager=sh" })),
-        ("post_message", reply),
+        ("get_messages", json!({ "channel": ch(1), "before": "e" })),
+        ("search_messages", json!({ "query": "x", "limit": 999 })),
     ] {
-        let result = tools().run(name, args, &room(false), None).await;
+        let result = tools().run(name, args, &room(false)).await;
         let text = result.text;
         assert!(
             !result.ok && text.contains("no such tool"),
@@ -293,17 +178,12 @@ fn filtered_reads_drop_what_the_room_cannot_see() {
         overflow,
         code,
     };
-    let cut = out(None, "", true).text(Prog::Buzz, Keep::Events, &room);
+    let cut = out(None, "", true).text(Keep::Events, &room);
     assert!(cut.is_err(), "a cut list is withheld, never half-checked");
-    let quiet = out(Some(1), "", false).text(Prog::Git, Keep::All, &room);
-    assert_eq!(quiet.unwrap(), "(nothing found)");
-    let silent = out(Some(1), "", false).text(Prog::Buzz, Keep::All, &room);
-    assert!(
-        silent.is_err(),
-        "only grep's quiet exit 1 means nothing found"
-    );
+    let silent = out(Some(1), "", false).text(Keep::All, &room);
+    assert!(silent.is_err(), "a quiet failure is still a failure");
     let failed = out(Some(128), "fatal: bad revision", false);
-    let failed = failed.text(Prog::Git, Keep::All, &room);
+    let failed = failed.text(Keep::All, &room);
     assert!(failed.unwrap_err().contains("bad revision"));
 }
 
@@ -328,86 +208,20 @@ async fn a_read_runs_its_program_and_keeps_only_what_the_room_reads() {
     let list = json!([{ "channel_id": ch(1) }, { "channel_id": ch(2) }]);
     let mut tools = tools();
     tools.buzz = crate::acp::write_stub_cli(dir.path(), "buzz", &list.to_string(), 0);
-    let read = tools
-        .run("list_channels", json!({}), &room(true), None)
-        .await;
+    let read = tools.run("list_channels", json!({}), &room(true)).await;
     let text = &read.text;
     assert!(read.ok && text.contains(&ch(1).to_string()), "{text}");
     assert!(!text.contains(&ch(2).to_string()), "the guest can't read 2");
 }
 
-/// A real child: git, in a scratch checkout. No network.
 #[tokio::test]
-async fn git_runs_in_the_checkout_and_a_missing_program_is_a_failure() {
-    let dir = tempfile::tempdir().unwrap();
-    let git = |a: &str| {
-        let mut cmd = std::process::Command::new("git");
-        let out = cmd.args(words(a)).current_dir(dir.path()).output().unwrap();
-        let why = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{a}: {why}");
-    };
-    git("init -q");
-    let file = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
-    file("a.rs", "TOKEN = 1\n");
-    file(".gitignore", "secret.txt\n");
-    file("secret.txt", "TOKEN = 2\n");
-    file(".env", "TOKEN = 3\n");
-    git("add a.rs .gitignore");
-    git("config remote.origin.url https://user:TOKEN@example.invalid/x");
-    git(
-        "-c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
-         commit -q --no-verify -m first<commit>",
-    );
+async fn a_missing_program_is_a_failure() {
     let mut tools = tools();
-    tools.checkout = dir.path().into();
-    tools.buzz = dir.path().join("no-such-buzz");
-    let room = room(false);
-    let log = tools.run("git_log", json!({}), &room, None).await;
-    assert!(
-        log.ok && log.text.contains("first&lt;commit&gt;"),
-        "{}",
-        log.text
-    );
-    // Code search reads tracked files only: never ignored, untracked or .git.
-    let globs = [(json!(null), "a.rs:1:TOKEN"), (json!("*"), "a.rs:1:TOKEN")];
-    let none = [
-        (json!(".env"), "(nothing found)"),
-        (json!("**/config"), "(nothing found)"),
-    ];
-    for (glob, want) in globs.into_iter().chain(none) {
-        let args = json!({ "pattern": "TOKEN", "glob": glob });
-        let found = tools.run("search_code", args, &room, None).await;
-        let text = &found.text;
-        let leaked = ["secret.txt", ".env", "example.invalid"];
-        let clean = !leaked.iter().any(|l| text.contains(l));
-        assert!(found.ok && clean && text.contains(want), "{text}");
-    }
-    let bad = tools
-        .run("git_show", json!({ "rev": "nope" }), &room, None)
-        .await;
-    assert!(!bad.ok && bad.text.contains("failed"), "{}", bad.text);
-    let none = tools.run("list_channels", Value::Null, &room, None).await;
+    tools.buzz = "no-such-buzz-program".into();
+    let none = tools.run("list_channels", Value::Null, &room(false)).await;
     assert!(
         !none.ok && none.text.contains("did not start"),
         "{}",
         none.text
-    );
-}
-
-/// A reaction waits for 8c's go-ahead, then for its looked-up target: with a
-/// "buzz" that finds nothing, nothing is reacted to.
-#[tokio::test]
-async fn a_reaction_is_held_then_checked_against_its_target() {
-    let mut tools = tools();
-    tools.buzz = "git".into();
-    let args = || json!({ "event": AGENT, "emoji": "x" });
-    let held = tools.run("react", args(), &room(false), None).await;
-    assert!(!held.ok && held.text.contains("go-ahead"), "{}", held.text);
-    let cleared = Some(Cleared(()));
-    let looked = tools.run("react", args(), &room(false), cleared).await;
-    assert!(
-        !looked.ok && looked.text.contains("not found"),
-        "{}",
-        looked.text
     );
 }
