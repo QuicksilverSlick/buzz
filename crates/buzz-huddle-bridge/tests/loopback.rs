@@ -595,7 +595,8 @@ async fn talking_over_the_voice_cuts_it_after_200_ms_on_headphones_or_320_ms_on_
 }
 
 /// A relay restart (1012) rejoins within the 10 s spread on the new snapshot, and an index that
-/// changed hands is held back 500 ms. One reused live (`left`, `joined`) is its new occupant's.
+/// changed hands is held back 500 ms. One reused live (`left`, `joined`) is held back as long,
+/// then is its new occupant's.
 #[tokio::test(start_paused = true)]
 async fn a_1012_rejoins_on_the_new_roster_and_holds_back_an_index_that_changed_hands() {
     let room = [(1, OWNER, 0.0), (2, GUEST, 0.0)];
@@ -618,8 +619,9 @@ async fn a_1012_rejoins_on_the_new_roster_and_holds_back_an_index_that_changed_h
         let joined = relay.seat(2, GUEST, Some(0.3));
         relay.control.borrow_mut().extend([left, joined]);
         let swapped = Instant::now();
-        sleep(ms(500)).await;
-        first(talos, false, GUEST, swapped).expect("index 2 is GUEST's now");
+        sleep(ms(1_000)).await;
+        let held = first(talos, false, GUEST, swapped).expect("index 2 is GUEST's now") - swapped;
+        assert!((ms(500)..ms(900)).contains(&held), "held back {held:?}");
         let left_then_joined = [roster(&[OWNER], &[ME]), roster(&[OWNER, GUEST], &[ME])];
         assert_eq!(rosters(talos, swapped), left_then_joined);
         // A second restart in a row (a 2 s backoff) sends a roster too, though nothing changed.
