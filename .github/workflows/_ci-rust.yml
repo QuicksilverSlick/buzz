@@ -156,6 +156,9 @@ jobs:
       - name: Test (ACP launch-prefix platform contract)
         # Execute the non-Unix refusal branch; a cross-compile cannot test it.
         run: cargo test -p buzz-acp --target $env:TARGET --lib acp::launch::platform_tests
+      - name: Test (buzz-huddle-bridge)
+        # Fork crate for huddle voices; CI runs tests only for crates it names.
+        run: cargo test -p buzz-huddle-bridge --target $env:TARGET
       - name: Test (buzz-agent auth coordinator)
         # The auth coordinator single-flights on an OS advisory lock, which is
         # LockFileEx on Windows; this integration suite drives real second
