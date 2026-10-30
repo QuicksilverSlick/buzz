@@ -51,7 +51,7 @@ cargo clippy -p buzz-relay-gateway --all-targets -- -D warnings
 ```
 
 The tests run offline against an in-process mock relay (HTTP routes and a
-NIP-42 socket) and a mock Worker. CI runs them through `just test-unit`.
+NIP-42 socket) and a mock Worker. CI runs them in the Unit Tests job (`.github/workflows/_ci-rust.yml`).
 
 The image builds from the repo root. Pushing it is a deployment step, not a
 build step:
