@@ -121,9 +121,10 @@ impl Backoff {
 }
 
 /// A uniform draw in [0, 1) from the OS RNG, through a v4 UUID as upstream PR 8653 does.
+/// The low half's top two bits are the fixed variant (0b10), so they are shifted out first.
 fn unit() -> f64 {
     let (_, low) = uuid::Uuid::new_v4().as_u64_pair();
-    (low >> 11) as f64 / (1u64 << 53) as f64
+    ((low << 2) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Join, run and rejoin until the voice leaves or the relay refuses for good; that end is
@@ -450,7 +451,10 @@ mod tests {
         let ended = End::Refused("huddle has ended".into());
         assert_eq!(b.next(&ended, s(0), 0.5), None);
         assert_eq!(b.next(&End::Left, s(0), 0.5), None);
-        assert!((0..100).map(|_| unit()).all(|u| (0.0..1.0).contains(&u)));
+        // The whole range: with the UUID's variant bits left in, every draw fell in [0.5, 0.75).
+        let draws: Vec<f64> = (0..1_000).map(|_| unit()).collect();
+        assert!(draws.iter().all(|u| (0.0..1.0).contains(u)));
+        assert!(draws.iter().any(|&u| u < 0.25) && draws.iter().any(|&u| u >= 0.75));
     }
 
     #[tokio::test(start_paused = true)]

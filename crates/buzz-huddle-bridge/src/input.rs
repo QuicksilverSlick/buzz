@@ -524,10 +524,10 @@ impl Input {
                     }
                 }
             }
-            // An onset in the echo goes out once the echo clears, if the talk goes on.
+            // An onset in the echo goes out on speech once the echo clears, not on its hangover.
             let onset = slot.hear(loud, now_ms, &t);
             slot.onset = (slot.onset || onset) && slot.talking;
-            if slot.onset && !slot.echo {
+            if slot.onset && !slot.echo && loud {
                 slot.onset = false;
                 out.push(Out::Frame(ToTalos::Onset {
                     pubkey: slot.key.0.clone(),
@@ -962,6 +962,12 @@ mod tests {
             pubkey: GUEST.into(),
         };
         assert_eq!(frames(&out), [&onset]);
+        // Talk that ends inside the echo (to +1.1 s) sends none, though its hangover outlasts it.
+        input = self::input();
+        input.set_output_until(now + 500);
+        let mut out = run(&mut input, &mut now, 850, &mut [talker(2, 0.3, None)]);
+        out.extend(run(&mut input, &mut now, 800, &mut []));
+        assert!(frames(&out).is_empty(), "{:?}", frames(&out));
     }
 
     #[test]

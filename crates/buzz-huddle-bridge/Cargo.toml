@@ -19,4 +19,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# The loopback relay decodes what the voice plays; buzz-audio-client already builds it.
+opus = "0.4"
 tokio = { workspace = true, features = ["test-util"] }
