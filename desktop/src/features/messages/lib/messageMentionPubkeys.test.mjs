@@ -6,6 +6,7 @@ import {
   DM_THREAD_MEMBERS_LOADING_ERROR,
 } from "./dmThreadAgentMentionError.ts";
 import {
+  dmRecipientPubkeys,
   inboxReplyRecipientPubkeys,
   messageMentionPubkeys,
 } from "./messageMentionPubkeys.ts";
@@ -150,6 +151,69 @@ test("an Inbox reply refuses when the DM or its participants are not loaded", ()
 test("an Inbox reply in a stream keeps explicit-mention semantics", () => {
   assert.deepEqual(
     inboxReply({
+      channel: channel({ channelType: "stream" }),
+      explicitMentions: ["person"],
+    }),
+    ["person"],
+  );
+});
+
+// The DM screen (useSendMessageMutation) uses the same rule as the Inbox.
+function dmSend(overrides = {}) {
+  return dmRecipientPubkeys({
+    channel: channel(),
+    senderPubkey: "owner",
+    explicitMentions: [],
+    members: pending,
+    managedAgents: pending,
+    relayAgents: pending,
+    knownAgentPubkeys: new Set(),
+    ...overrides,
+  });
+}
+
+test("a DM-screen send in a group DM with no @ tags only the person", () => {
+  assert.deepEqual(dmSend(groupDmRoster), ["person"]);
+});
+
+test("a typed @agent in a DM-screen group DM send is tagged", () => {
+  assert.deepEqual(
+    dmSend({ ...groupDmRoster, explicitMentions: ["AGENT-A"] }),
+    ["agent-a", "person"],
+  );
+});
+
+test("a member only profiles mark as an agent is not tagged untyped", () => {
+  assert.deepEqual(
+    dmSend({ ...groupDmRoster, knownAgentPubkeys: new Set(["person"]) }),
+    [],
+  );
+});
+
+test("a DM-screen send in a one-on-one agent DM still tags the agent", () => {
+  // No roster or directory is needed, so a 1:1 send never waits.
+  assert.deepEqual(dmSend(), ["agent"]);
+});
+
+test("a DM-screen group DM send refuses while members or directories load", () => {
+  for (const notReady of [
+    { members: pending },
+    { managedAgents: pending },
+    { relayAgents: pending },
+    { members: { data: [], error: new Error("relay down") } },
+  ]) {
+    assert.throws(() => dmSend({ ...groupDmRoster, ...notReady }), {
+      message: DM_THREAD_MEMBERS_LOADING_ERROR,
+    });
+  }
+});
+
+test("a DM-screen send keeps today's tags for mentions outside the DM and for streams", () => {
+  // The DM screen opens a new conversation for a new agent; a typed person
+  // outside the DM is still tagged, as before.
+  assert.deepEqual(dmSend({ explicitMentions: ["third"] }), ["third", "agent"]);
+  assert.deepEqual(
+    dmSend({
       channel: channel({ channelType: "stream" }),
       explicitMentions: ["person"],
     }),

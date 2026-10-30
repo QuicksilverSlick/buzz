@@ -37,7 +37,10 @@ import {
 
 export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
-import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import {
+  dmRecipientPubkeys,
+  messageMentionPubkeys,
+} from "@/features/messages/lib/messageMentionPubkeys";
 import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
 import {
   clearTimeoutState,
@@ -46,6 +49,11 @@ import {
 import { relayClient, setVisibleChannel } from "@/shared/api/relayClient";
 import { customEmojiQueryKey } from "@/features/custom-emoji/hooks";
 import { channelsQueryKey } from "@/features/channels/hooks";
+import { channelMembersQueryKey } from "@/features/channels/rosterFreshness";
+import {
+  managedAgentsQueryKey,
+  relayAgentsQueryKey,
+} from "@/features/agents/hooks";
 import { reactionEmojiUrl } from "@/shared/api/customEmoji";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import {
@@ -56,7 +64,12 @@ import {
   sendChannelMessage,
 } from "@/shared/api/tauri";
 import { getChannelWindowEvents } from "@/shared/api/channelWindow";
-import type { Channel, Identity, RelayEvent } from "@/shared/api/types";
+import type {
+  Channel,
+  ChannelMember,
+  Identity,
+  RelayEvent,
+} from "@/shared/api/types";
 // Same .mjs the renderer uses, so the cache-update projection can't drift
 // from the on-render overlay.
 import { noteChannelMembershipChange } from "@/shared/api/channelMembershipWrites";
@@ -473,9 +486,16 @@ export function useChannelSubscription(channel: Channel | null) {
   }, [channelId, channelType]);
 }
 
+/**
+ * `groupDmAgentPubkeys` opts in to the group-DM rule (dmRecipientPubkeys): a
+ * group DM tags its people and only the agents typed as @mentions. The DM's
+ * member list and agent directories are read from the query cache for the
+ * channel actually sent to.
+ */
 export function useSendMessageMutation(
   channel: Channel | null,
   identity: Identity | undefined,
+  groupDmAgentPubkeys?: ReadonlySet<string>,
 ) {
   const queryClient = useQueryClient();
 
@@ -544,11 +564,28 @@ export function useSendMessageMutation(
         mentionTags,
         linkPreviewTags,
       } = splitOutgoingTags(mediaTags);
-      const recipientPubkeys = messageMentionPubkeys(
-        effectiveChannel,
-        identity.pubkey,
-        mentionPubkeys,
-      );
+      const cached = <T>(queryKey: readonly unknown[]) =>
+        queryClient.getQueryState<T[]>(queryKey) ?? {
+          data: undefined,
+          error: null,
+        };
+      const recipientPubkeys = groupDmAgentPubkeys
+        ? dmRecipientPubkeys({
+            channel: effectiveChannel,
+            senderPubkey: identity.pubkey,
+            explicitMentions: mentionPubkeys ?? [],
+            members: cached<ChannelMember>(
+              channelMembersQueryKey(effectiveChannel.id),
+            ),
+            managedAgents: cached<{ pubkey: string }>(managedAgentsQueryKey),
+            relayAgents: cached<{ pubkey: string }>(relayAgentsQueryKey),
+            knownAgentPubkeys: groupDmAgentPubkeys,
+          })
+        : messageMentionPubkeys(
+            effectiveChannel,
+            identity.pubkey,
+            mentionPubkeys,
+          );
       if (sentFromThreadRootId && parentEventId) {
         throw new Error(
           "A thread message can only be sent as a top-level message.",

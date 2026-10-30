@@ -37,17 +37,28 @@ export function messageMentionPubkeys(
 
 type DirectoryQuery<T> = { data: readonly T[] | undefined; error: unknown };
 
+type DmRecipientInput = {
+  channel: Channel;
+  senderPubkey: string;
+  explicitMentions: readonly string[];
+  members: DirectoryQuery<{ pubkey: string; role: string; isAgent: boolean }>;
+  managedAgents: DirectoryQuery<{ pubkey: string }>;
+  relayAgents: DirectoryQuery<{ pubkey: string }>;
+  knownAgentPubkeys: ReadonlySet<string>;
+};
+
 /**
- * Recipients for an Inbox reply, which skips useSendMessage.
+ * Recipients for a send that tells a group DM's agents apart.
  *
- * A one-on-one DM tags the other participant, so a plain reply reaches an
- * agent. A group DM tags the other people but only the agents typed in the
- * composer, so one reply does not wake every agent in it. Agents are told
- * apart by the DM's own member list plus the agent directories; a group-DM
- * reply waits for all of them, and a participant missing from the member list
- * is never taken for a person. Throws rather than send untagged.
+ * Streams and one-on-one DMs get messageMentionPubkeys unchanged, so a plain
+ * message in a 1:1 DM still reaches its agent. A group DM tags the other
+ * people and the typed mentions but no untyped agent, so one message does not
+ * wake every agent in it. Agents are told apart by the DM's own member list
+ * plus the agent directories; a group-DM send waits for all of them, and a
+ * participant missing from the member list is never taken for a person.
+ * Throws rather than send untagged.
  */
-export function inboxReplyRecipientPubkeys({
+export function dmRecipientPubkeys({
   channel,
   senderPubkey,
   explicitMentions,
@@ -55,31 +66,18 @@ export function inboxReplyRecipientPubkeys({
   managedAgents,
   relayAgents,
   knownAgentPubkeys,
-}: {
-  channel: Channel | undefined;
-  senderPubkey: string;
-  explicitMentions: readonly string[];
-  members: DirectoryQuery<{ pubkey: string; role: string; isAgent: boolean }>;
-  managedAgents: DirectoryQuery<{ pubkey: string }>;
-  relayAgents: DirectoryQuery<{ pubkey: string }>;
-  knownAgentPubkeys: ReadonlySet<string>;
-}): string[] {
-  if (!channel) throw new Error("Open the linked channel to reply.");
-  if (channel.channelType !== "dm") {
-    return messageMentionPubkeys(channel, senderPubkey, explicitMentions);
+}: DmRecipientInput): string[] {
+  const recipients = messageMentionPubkeys(
+    channel,
+    senderPubkey,
+    explicitMentions,
+  );
+  if (
+    channel.channelType !== "dm" ||
+    messageMentionPubkeys(channel, senderPubkey).length <= 1
+  ) {
+    return recipients;
   }
-  const others = messageMentionPubkeys(channel, senderPubkey);
-  if (others.length === 0) throw new Error("Open the linked channel to reply.");
-  const sender = normalizePubkey(senderPubkey);
-  const mentioned = explicitMentions
-    .map(normalizePubkey)
-    .filter((pubkey) => pubkey.length > 0 && pubkey !== sender);
-  // The relay never shows this DM to a non-participant, and only the DM
-  // screen can open a new conversation that includes them.
-  if (mentioned.some((pubkey) => !others.includes(pubkey))) {
-    throw new Error(DM_NON_MEMBER_MENTION_ERROR);
-  }
-  if (others.length === 1) return others;
 
   if (
     !isAgentDirectoryReady(members) ||
@@ -101,7 +99,42 @@ export function inboxReplyRecipientPubkeys({
         (pubkey) => !agents.has(pubkey) && !knownAgentPubkeys.has(pubkey),
       ),
   );
-  return others.filter(
-    (pubkey) => mentioned.includes(pubkey) || people.has(pubkey),
+  const mentioned = new Set(explicitMentions.map(normalizePubkey));
+  return recipients.filter(
+    (pubkey) => mentioned.has(pubkey) || people.has(pubkey),
   );
+}
+
+/**
+ * Recipients for an Inbox reply, which skips useSendMessage: the
+ * dmRecipientPubkeys rule, refusing a DM that is not loaded or a mention of
+ * someone outside it.
+ */
+export function inboxReplyRecipientPubkeys({
+  channel,
+  ...input
+}: Omit<DmRecipientInput, "channel"> & {
+  channel: Channel | undefined;
+}): string[] {
+  if (!channel) throw new Error("Open the linked channel to reply.");
+  if (channel.channelType === "dm") {
+    const others = messageMentionPubkeys(channel, input.senderPubkey);
+    if (others.length === 0) {
+      throw new Error("Open the linked channel to reply.");
+    }
+    const sender = normalizePubkey(input.senderPubkey);
+    // The relay never shows this DM to a non-participant, and only the DM
+    // screen can open a new conversation that includes them.
+    if (
+      input.explicitMentions
+        .map(normalizePubkey)
+        .some(
+          (pubkey) =>
+            pubkey.length > 0 && pubkey !== sender && !others.includes(pubkey),
+        )
+    ) {
+      throw new Error(DM_NON_MEMBER_MENTION_ERROR);
+    }
+  }
+  return dmRecipientPubkeys({ channel, ...input });
 }

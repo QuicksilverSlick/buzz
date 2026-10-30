@@ -1044,3 +1044,48 @@ for (const partial of [false, true]) {
     }
   });
 }
+
+test("a group DM send tags its person and only the typed agent", async ({
+  page,
+}) => {
+  const bob = TEST_IDENTITIES.bob.pubkey;
+  const charlie = TEST_IDENTITIES.charlie.pubkey;
+  // DMs only offer owned agents, so charlie (also a relay-directory agent) is
+  // managed here; bob is a person. Both share e2eBridge's "Group DM (3)".
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: charlie, name: "charlie", status: "running" }],
+  });
+  await page.goto("/#/channels/d1ec7000-d000-4000-8000-000000000003");
+  const input = page.getByTestId("message-input");
+  const sent = (content: string) =>
+    page.evaluate(
+      (content) =>
+        (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
+          .filter((event) => event.content === content)
+          .map((event) => ({
+            kind: event.kind,
+            p: event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
+          })),
+      content,
+    );
+
+  // No @: the person is notified and the agent is not woken.
+  const plain = `group DM plain ${Date.now()}`;
+  await input.fill(plain);
+  await page.getByTestId("send-message").click();
+  await expect.poll(() => sent(plain)).toEqual([{ kind: 9, p: [bob] }]);
+
+  // A typed @charlie is tagged too.
+  await input.fill("@char");
+  await page
+    .getByTestId(`mention-suggestion-${charlie}`)
+    .getByRole("button", { name: "Mention charlie", exact: true })
+    .click();
+  await expect(input).toHaveText("@charlie ");
+  await page.keyboard.type("are you there?");
+  const mentioned = "@charlie are you there?";
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(async () => (await sent(mentioned)).map(({ p }) => p.sort()))
+    .toEqual([[bob, charlie].sort()]);
+});
