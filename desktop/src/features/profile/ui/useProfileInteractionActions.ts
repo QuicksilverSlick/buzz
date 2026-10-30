@@ -15,7 +15,7 @@ import {
   mergeTimelineCacheMessages,
 } from "@/features/messages/hooks";
 import { channelMessagesKey } from "@/features/messages/lib/messageQueryKeys";
-import { directMessageRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { buildWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { useProfileQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -206,13 +206,8 @@ export function useProfileInteractionActions({
           identity.pubkey,
         ) ?? (await openDm({ pubkeys: [targetPubkey] }));
       // A wave DM is one-on-one, so it tags the person waved at.
-      const recipientPubkeys = directMessageRecipientPubkeys(
-        dm,
-        identity.pubkey,
-        [],
-        () => false,
-      );
-      if (!recipientPubkeys) {
+      const recipientPubkeys = messageMentionPubkeys(dm, identity.pubkey);
+      if (recipientPubkeys.length === 0) {
         throw new Error("Couldn't send the wave.");
       }
       const senderName =

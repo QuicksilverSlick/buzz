@@ -13,6 +13,8 @@ const RELAY_HTTP_URL =
 
 // setup-desktop-test-data.sh: uuid5(NAMESPACE_DNS, "buzz.channel.dm.alice-tyler")
 const ALICE_TYLER_DM_CHANNEL_ID = "5a9c064e-0411-5242-ae6b-0363ba99b8e6";
+// uuid5(NAMESPACE_DNS, "buzz.channel.dm.bob-charlie-tyler")
+const BOB_CHARLIE_TYLER_DM_CHANNEL_ID = "c505a4ef-6256-5d85-ba62-e4ff3f6739eb";
 
 async function getLoggedNotifications(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
@@ -28,23 +30,27 @@ async function getLoggedNotifications(page: import("@playwright/test").Page) {
 }
 
 /**
- * Publishes a REAL signed DM message from alice through the relay ingest
- * path. Like every DM send in the product, it carries a recipient `p` tag
- * (see messageMentionPubkeys) — which is exactly what makes the event match
- * both the live DM subscription and the home-feed mention query.
+ * Publishes a REAL signed DM message (from alice by default) through the relay
+ * ingest path. Like every DM send in the product, it carries a recipient `p`
+ * tag (see messageMentionPubkeys) — which is exactly what makes the event
+ * match both the live DM subscription and the home-feed mention query.
  */
-async function publishAliceDm(content: string) {
+async function publishDm(
+  content: string,
+  sender: "alice" | "bob" = "alice",
+  channelId = ALICE_TYLER_DM_CHANNEL_ID,
+) {
   const event = finalizeEvent(
     {
       kind: 9,
       content,
       tags: [
-        ["h", ALICE_TYLER_DM_CHANNEL_ID],
+        ["h", channelId],
         ["p", TEST_IDENTITIES.tyler.pubkey],
       ],
       created_at: Math.floor(Date.now() / 1000),
     },
-    hexToBytes(TEST_IDENTITIES.alice.privateKey),
+    hexToBytes(TEST_IDENTITIES[sender].privateKey),
   );
 
   const response = await fetch(`${RELAY_HTTP_URL}/events`, {
@@ -92,7 +98,7 @@ test("an incoming DM produces exactly one desktop notification", async ({
   await page.waitForTimeout(1_000);
 
   const message = `dm dedupe probe ${Date.now()}`;
-  await publishAliceDm(message);
+  await publishDm(message);
 
   // Wait for the DM toast to arrive.
   await expect
@@ -125,7 +131,7 @@ test("an Inbox reply to a one-on-one DM with no @ tags the DM partner", async ({
 
   // The DM lands in tyler's Home Inbox as a mention (it p-tags tyler).
   const incoming = `inbox reply probe ${Date.now()}`;
-  await publishAliceDm(incoming);
+  await publishDm(incoming);
   await page
     .locator('[data-testid^="home-inbox-item-"]')
     .filter({ hasText: "alice" })
@@ -152,4 +158,45 @@ test("an Inbox reply to a one-on-one DM with no @ tags the DM partner", async ({
   };
   expect(event.kind).toBe(9);
   expect(event.tags).toContainEqual(["p", TEST_IDENTITIES.alice.pubkey]);
+});
+
+test("an Inbox reply to a group DM with no @ tags the person, not the agent", async ({
+  page,
+}) => {
+  await installRelayBridge(page, "tyler");
+  await page.goto("/");
+  await expect(page.getByTestId("dm-list")).toContainText("bob-charlie-tyler");
+
+  // The row may still preview an earlier probe; the detail loads the whole DM.
+  const incoming = `group inbox reply probe ${Date.now()}`;
+  await publishDm(incoming, "bob", BOB_CHARLIE_TYLER_DM_CHANNEL_ID);
+  await page
+    .locator('[data-testid^="home-inbox-item-"]')
+    .filter({ hasText: "group inbox reply probe" })
+    .first()
+    .click();
+  const detail = page.getByTestId("home-inbox-detail");
+  await expect(detail).toContainText(incoming);
+
+  const reply = `group inbox reply with no mention ${Date.now()}`;
+  const sent = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith("/events") &&
+      (request.postData() ?? "").includes(reply),
+  );
+  await detail.getByTestId("message-input").fill(reply);
+  await detail.getByRole("button", { name: /send/i }).click();
+
+  // charlie is a relay-directory agent in the e2e bridge, so this group DM
+  // holds a person (bob) and an agent. With no @, only the person is tagged:
+  // in a group DM, tags pick which agents answer.
+  const event = JSON.parse((await sent).postData() ?? "{}") as {
+    kind: number;
+    tags: string[][];
+  };
+  expect(event.kind).toBe(9);
+  expect(event.tags.filter((tag) => tag[0] === "p")).toEqual([
+    ["p", TEST_IDENTITIES.bob.pubkey],
+  ]);
 });

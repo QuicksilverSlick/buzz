@@ -2,8 +2,15 @@ import * as React from "react";
 import { RefreshCcw } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import {
+  useChannelMembersQuery,
+  useChannelsQuery,
+} from "@/features/channels/hooks";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
 import {
@@ -52,7 +59,7 @@ import {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTimelineMessages";
-import { directMessageRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import { inboxReplyRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
@@ -478,6 +485,14 @@ export function HomeView({
     }
     return null;
   }, [filteredItems, selectedConversationId, selectedEventId]);
+  // A group-DM reply tells its agents apart by these (inboxReplyRecipientPubkeys).
+  const replyMembersQuery = useChannelMembersQuery(
+    selectedItem?.item.channelType === "dm"
+      ? selectedItem.item.channelId
+      : null,
+  );
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const relayAgentsQuery = useRelayAgentsQuery();
   const {
     canOpenSelected,
     handleOpenDirect,
@@ -872,20 +887,17 @@ export function HomeView({
                 }
                 // Inbox replies skip useSendMessage, so add the DM recipient
                 // tags here; without them an agent in the DM never hears it.
-                const replyChannel = channels?.find(
-                  (channel) => channel.id === channelId,
-                );
-                const recipientPubkeys = replyChannel
-                  ? directMessageRecipientPubkeys(
-                      replyChannel,
-                      currentPubkey,
-                      mentionPubkeys,
-                      (pubkey) => inboxAgentPubkeys.has(pubkey),
-                    )
-                  : null;
-                if (!recipientPubkeys) {
-                  throw new Error("Open the linked channel to reply.");
-                }
+                const recipientPubkeys = inboxReplyRecipientPubkeys({
+                  channel: channels?.find(
+                    (channel) => channel.id === channelId,
+                  ),
+                  senderPubkey: currentPubkey,
+                  explicitMentions: mentionPubkeys,
+                  members: replyMembersQuery,
+                  managedAgents: managedAgentsQuery,
+                  relayAgents: relayAgentsQuery,
+                  knownAgentPubkeys: inboxAgentPubkeys,
+                });
 
                 const itemToReply = selectedItem;
                 setIsSendingReply(true);
