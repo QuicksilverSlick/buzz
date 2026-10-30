@@ -32,9 +32,10 @@ const UNTRUSTED: &str =
 
 /// Fixed flags. Every value the model supplies goes in as one `--flag=value`
 /// token, after `-e`, or after `--`, so it is never read as an option. Grep
-/// reads tracked files only: nothing gitignored, untracked or inside `.git`.
-const GIT_GREP: &str = "--no-pager grep --no-color --no-textconv -I --line-number \
-    --max-count=20 -E -e";
+/// reads tracked files only: nothing gitignored, untracked or inside `.git`,
+/// and outside a repo it fails rather than fall back to `--no-index`.
+const GIT_GREP: &str = "-c grep.fallbackToNoIndex=false --no-pager grep --no-color \
+    --no-textconv -I --line-number --max-count=20 -E -e";
 const GIT_LOG: &str = "--no-pager --literal-pathspecs log --no-show-signature --no-color \
     --no-ext-diff --no-textconv --date=short --format=%h%x09%ad%x09%an%x09%s";
 const GIT_SHOW: &str = "--no-pager show --no-show-signature --no-color --no-ext-diff \

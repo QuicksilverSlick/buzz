@@ -126,7 +126,8 @@ fn scopes_come_only_from_relay_signed_events() {
 fn code_reads_never_take_an_option_from_the_model() {
     let args = json!({ "pattern": "--open-files-in-pager=sh", "glob": "*.rs" });
     let grep = alone("search_code", args).unwrap();
-    assert_eq!(grep[..2], words("--no-pager grep"));
+    let head = words("-c grep.fallbackToNoIndex=false --no-pager grep");
+    assert_eq!(grep[..head.len()], head);
     assert!(grep.ends_with(&words("-e --open-files-in-pager=sh -- *.rs")));
     assert!(grep[..grep.len() - 3]
         .iter()
@@ -373,6 +374,7 @@ async fn git_runs_in_the_checkout_and_a_missing_program_is_a_failure() {
     let none = [
         (json!(".env"), "(nothing found)"),
         (json!("**/config"), "(nothing found)"),
+        (json!(".git/*"), "(nothing found)"),
     ];
     for (glob, want) in globs.into_iter().chain(none) {
         let args = json!({ "pattern": "TOKEN", "glob": glob });
@@ -410,4 +412,28 @@ async fn a_reaction_is_held_then_checked_against_its_target() {
         "{}",
         looked.text
     );
+
+    // A stand-in buzz returns the target: only a message everyone here can
+    // read gets a reaction, never a card, #bench or the huddle.
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (1, "buzz-desktop", ""),
+        (1, "bench:card:x@1", "through Talos"),
+        (2, "buzz-desktop", "not everyone"),
+        (BENCH, "buzz-desktop", "#bench"),
+        (HUDDLE, "buzz-desktop", "huddle"),
+    ];
+    for (i, (n, client, why)) in cases.into_iter().enumerate() {
+        let found = json!([{ "tags": [["h", ch(n).to_string()], ["client", client]] }]);
+        let name = format!("buzz{i}");
+        tools.buzz = crate::acp::write_stub_cli(dir.path(), &name, &found.to_string(), 0);
+        let cleared = Some(Cleared(()));
+        let reacted = tools.run("react", args(), &room(true), cleared).await;
+        let text = &reacted.text;
+        let refused = !why.is_empty();
+        assert!(
+            reacted.ok != refused && text.contains(why),
+            "{n} {client}: {text}"
+        );
+    }
 }
