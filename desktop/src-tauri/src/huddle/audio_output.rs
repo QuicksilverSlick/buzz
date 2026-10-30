@@ -148,6 +148,53 @@ pub(crate) fn output_route_is_isolated(preferred: Option<&str>) -> bool {
         .is_ok_and(|description| device_type_is_isolated(description.device_type()))
 }
 
+/// Keep the route file current while one huddle audio connection runs and a
+/// local agent has voice on; remove it otherwise and when the connection is
+/// cancelled. Rewritten every 5 s so `updated_at` doubles as a heartbeat: a
+/// reader treats a stale file as not isolated, which also covers a crash.
+pub(crate) fn spawn_output_route_writer(
+    app: Option<tauri::AppHandle>,
+    output_device: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use crate::managed_agents::voice_profile;
+    let Some((app, path)) =
+        app.and_then(|app| voice_profile::output_route_file(&app).map(|path| (app, path)))
+    else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if voice_profile::any_voice_enabled(&app) {
+                write_output_route(&path, output_device.clone()).await;
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+async fn write_output_route(path: &std::path::Path, output_device: Option<String>) {
+    let isolated =
+        tokio::task::spawn_blocking(move || output_route_is_isolated(output_device.as_deref()))
+            .await
+            .unwrap_or(false);
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let body = serde_json::json!({ "isolated": isolated, "updated_at": updated_at }).to_string();
+    if let Err(error) =
+        crate::managed_agents::storage::atomic_write_json_restricted(path, body.as_bytes())
+    {
+        eprintln!("buzz-desktop: huddle output route file: {error}");
+    }
+}
+
 #[cfg(test)]
 mod route_isolation_tests {
     use super::device_type_is_isolated;

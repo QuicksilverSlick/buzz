@@ -697,6 +697,7 @@ pub(crate) fn spawn_transcription_task(
         Err(_) => return,
     };
     let relay_base_url = crate::relay::relay_api_base_url_with_override(state);
+    let app = state.app_handle.lock().ok().and_then(|g| g.clone());
 
     tauri::async_runtime::spawn(async move {
         // recv().await yields (not blocks) until text arrives or sender is dropped.
@@ -717,6 +718,16 @@ pub(crate) fn spawn_transcription_task(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            // Slice 9: a voiced local agent hears the huddle live, so speech
+            // is not also posted as text (design 3.4).
+            if app.as_ref().is_some_and(|app| {
+                crate::managed_agents::voice_profile::huddle_has_voiced_local_agent(
+                    app,
+                    &agent_pubkeys,
+                )
+            }) {
+                continue;
+            }
 
             let p_tags: Vec<&str> = agent_pubkeys.iter().map(|s| s.as_str()).collect();
             let builder = match events::build_message(

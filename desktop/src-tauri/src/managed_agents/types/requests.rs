@@ -33,6 +33,9 @@ pub struct PersonaBehaviorRequest {
     /// Absent inside a present behavior group selects the channel default.
     #[serde(default)]
     pub session_policy: Option<AcpSessionPolicy>,
+    /// Huddle voice profile. Absent inside a present group clears it.
+    #[serde(default)]
+    pub voice: Option<crate::managed_agents::VoiceProfile>,
 }
 
 /// Validate a behavior group and apply it onto a persona record.
@@ -85,6 +88,8 @@ pub fn apply_persona_behavior(
             .map(|cap| cap.as_str().to_string())
             .collect();
     record.session_policy = behavior.session_policy.unwrap_or_default();
+    record.voice_profile =
+        crate::managed_agents::voice_profile::normalize_voice_profile(behavior.voice)?;
     Ok(())
 }
 
@@ -312,6 +317,7 @@ mod tests {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: None,
             id: "p-1".to_string(),
             display_name: "Test".to_string(),
@@ -362,6 +368,7 @@ mod tests {
                 respond_to_allowlist: Vec::new(),
                 parallelism: None,
                 session_policy: None,
+                voice: None,
             }),
         )
         .unwrap();
@@ -452,6 +459,7 @@ mod tests {
                 respond_to_allowlist: vec!["c".repeat(64)],
                 parallelism: Some(3),
                 session_policy: Some(AcpSessionPolicy::Thread),
+                voice: None,
             }),
         )
         .unwrap();

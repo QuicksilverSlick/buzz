@@ -35,6 +35,13 @@ export type RawPersona = {
   /** Owner-granted capabilities, wire shape. Absent on pre-feature records. */
   capabilities?: string[];
   session_policy?: "channel" | "thread";
+  voice_profile?: {
+    enabled?: boolean;
+    voice?: string;
+    persona?: string;
+    aliases?: string[];
+    voice_without_owner?: boolean;
+  } | null;
   created_at: string;
   updated_at: string;
   /** Non-null when the pack `.persona.md` write-back failed (non-fatal). */
@@ -71,6 +78,15 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     respondToAllowlist: persona.respond_to_allowlist ?? [],
     parallelism: persona.parallelism ?? null,
     sessionPolicy: persona.session_policy ?? "channel",
+    voiceProfile: persona.voice_profile
+      ? {
+          enabled: persona.voice_profile.enabled ?? false,
+          voice: persona.voice_profile.voice,
+          persona: persona.voice_profile.persona,
+          aliases: persona.voice_profile.aliases ?? [],
+          voiceWithoutOwner: persona.voice_profile.voice_without_owner ?? false,
+        }
+      : null,
     createdAt: persona.created_at,
     updatedAt: persona.updated_at,
   };

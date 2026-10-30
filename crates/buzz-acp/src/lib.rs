@@ -28,6 +28,7 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod usage;
+mod voice_profile;
 
 pub use usage::TurnUsage;
 
@@ -11765,6 +11766,8 @@ mod build_mcp_servers_tests {
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
+            voice_profile: None,
+            audio_route_file: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -12996,6 +12999,8 @@ mod error_outcome_emission_tests {
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
+            voice_profile: None,
+            audio_route_file: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

@@ -12,6 +12,7 @@ fn local_in_app() -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: UUID.to_string(),
         display_name: "Local".to_string(),
@@ -44,6 +45,7 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: d_tag.to_string(),
         display_name: display_name.to_string(),
@@ -186,6 +188,7 @@ fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: AGENT_PUBKEY.to_string(),

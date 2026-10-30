@@ -11,6 +11,7 @@ fn bare_agent_record(
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "agent".to_string(),
@@ -76,6 +77,7 @@ fn persona_record(id: &str, model: Option<&str>, provider: Option<&str>) -> Agen
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.to_string(),
         display_name: "Test Persona".to_string(),

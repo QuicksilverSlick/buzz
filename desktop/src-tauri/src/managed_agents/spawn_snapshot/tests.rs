@@ -44,6 +44,7 @@ fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "p".repeat(64),
@@ -109,6 +110,7 @@ fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.into(),
         display_name: id.into(),

@@ -485,6 +485,7 @@ fn member_copy(
         respond_to_allowlist: Vec::new(),
         parallelism: member.parallelism,
         session_policy: member.session_policy,
+        voice_profile: None,
         created_at: now.to_string(),
         updated_at: now.to_string(),
     })

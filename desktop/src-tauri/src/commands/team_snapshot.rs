@@ -144,6 +144,7 @@ fn definition_from_snapshot(
         respond_to_allowlist: behavior.respond_to_allowlist,
         parallelism: behavior.parallelism,
         session_policy: member.definition.session_policy,
+        voice_profile: None,
         created_at: now.to_string(),
         updated_at: now.to_string(),
     })
@@ -564,6 +565,7 @@ pub async fn confirm_team_snapshot_import(
         let record = ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,

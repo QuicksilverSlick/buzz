@@ -312,6 +312,7 @@ mod tests {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: None,
             id: "catalog-reviewer".to_string(),
             display_name: "Catalog Reviewer".to_string(),

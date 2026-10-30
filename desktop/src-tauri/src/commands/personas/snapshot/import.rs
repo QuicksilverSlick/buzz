@@ -588,6 +588,7 @@ pub async fn confirm_agent_snapshot_import(
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             parallelism: minted_parallelism,
             session_policy: snapshot.definition.session_policy,
+            voice_profile: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -602,6 +603,7 @@ pub async fn confirm_agent_snapshot_import(
         let record = ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
