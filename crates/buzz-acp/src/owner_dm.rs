@@ -7,9 +7,11 @@
 //! messages count, never an agent's, so two agents cannot wake each other.
 //!
 //! In mentions mode such a DM is subscribed without `#p` and the local rule
-//! takes its untagged owner messages as addressed. Each DM keeps a floor, the
-//! time it first got the exemption; older untagged messages are not answered,
-//! so turning this on never answers what was sent before it.
+//! takes its untagged owner messages as addressed. Each DM keeps a floor that
+//! older untagged messages must not predate: when the exemption started for
+//! this owner (the first of an unbroken run of startups with it on), or later
+//! for a DM that ran on `#p` first. So turning this on, or back on after a run
+//! without it, never answers what was sent while it was off.
 
 use std::collections::HashMap;
 
@@ -93,19 +95,26 @@ pub(crate) fn addresses_agent(event: &nostr::Event, agent: &str, owner: &str, fl
     event.created_at.as_secs() >= floor && is_owner_message(event, agent, owner)
 }
 
-/// Subscribe an owner DM without `#p`, keeping its kinds, and keep its floor:
-/// the one saved when it first got the exemption, or else `first`.
+/// Subscribe an owner DM without `#p`, keeping its kinds, and keep its floor
+/// ([`CatchUp::owner_dm_floor`]): at least the earlier of `since`
+/// ([`CatchUp::owner_dm_since`]) and `seen`, when this run found it. A DM
+/// found at startup or through a member-added notice holds nothing from
+/// before `since` unless it is that old, so a message sent in it while the
+/// harness was down, or stamped by a clock behind the relay's, is answered.
+/// A DM that ran on `#p` until now passes `now` for both: what it was sent
+/// untagged before then never arrived and stays unanswered.
 pub(crate) fn exempt(
     floors: &mut HashMap<Uuid, u64>,
     catch_up: &CatchUp,
     channel: Uuid,
     filter: &mut ChannelFilter,
-    first: u64,
+    since: u64,
+    seen: u64,
 ) {
     filter.require_mention = false;
     floors
         .entry(channel)
-        .or_insert_with(|| catch_up.owner_dm_floor(channel, first));
+        .or_insert_with(|| catch_up.owner_dm_floor(channel, since.min(seen)));
 }
 
 #[cfg(test)]
@@ -203,11 +212,56 @@ mod tests {
         let mut filter = crate::config::resolve_dynamic_channel_filter(&config, ch, &[]).unwrap();
         assert!(filter.require_mention);
         let mut floors = HashMap::new();
-        exempt(&mut floors, &CatchUp::default(), ch, &mut filter, AT);
+        exempt(&mut floors, &CatchUp::default(), ch, &mut filter, AT, AT);
         assert!(!filter.require_mention);
         assert_eq!(filter.kinds, Some(crate::config::default_mention_kinds()));
-        exempt(&mut floors, &CatchUp::default(), ch, &mut filter, AT + 60);
+        exempt(
+            &mut floors,
+            &CatchUp::default(),
+            ch,
+            &mut filter,
+            AT + 60,
+            AT + 60,
+        );
         assert_eq!(floors[&ch], AT, "the first floor is kept");
+    }
+
+    /// A DM this run finds, at startup or through a member-added notice,
+    /// floors at when the exemption started, not when it was found: the
+    /// owner's message sent in it while the harness was down, or stamped by
+    /// a clock behind the relay's, is answered. One that ran on `#p` first
+    /// floors at now.
+    #[test]
+    fn a_dm_found_later_floors_at_when_the_exemption_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mentions_config();
+        let agent = config.keys.public_key().to_hex();
+        let owner = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let open = |at| CatchUp::open(dir.path(), &agent, "wss://relay.test", 86_400, at);
+        assert_eq!(open(AT).owner_dm_since(Some(&owner_hex), AT), AT);
+
+        let startup = AT + 3_600;
+        let catch_up = open(startup);
+        let since = catch_up.owner_dm_since(Some(&owner_hex), startup);
+        let mut floors = HashMap::new();
+        let mut floor_of = |seen_since: u64, seen: u64| {
+            let ch = Uuid::new_v4();
+            let mut filter =
+                crate::config::resolve_dynamic_channel_filter(&config, ch, &[]).unwrap();
+            exempt(&mut floors, &catch_up, ch, &mut filter, seen_since, seen);
+            floors[&ch]
+        };
+        let addressed =
+            |at, floor| addresses_agent(&message(&owner, 9, at, &[]), &agent, &owner_hex, floor);
+        let opened_while_down = floor_of(since, startup);
+        assert!(addressed(AT + 600, opened_while_down), "sent while down");
+        let notice = startup + 100;
+        let opened_now = floor_of(since, notice);
+        assert!(addressed(notice - 3, opened_now), "clock behind the relay");
+        let now = startup + 200;
+        let ran_on_p = floor_of(now, now);
+        assert!(!addressed(now - 1, ran_on_p), "sent while it ran on #p");
     }
 
     #[test]

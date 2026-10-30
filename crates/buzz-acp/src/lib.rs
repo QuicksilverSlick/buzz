@@ -3256,8 +3256,12 @@ async fn run_harness(
         tracing::info!(since, "replaying mentions sent while the harness was down");
     }
     // One-on-one DMs with the owner, subscribed without `#p`, and the floor
-    // each one's untagged messages must not predate (see `owner_dm`).
+    // each one's untagged messages must not predate (see `owner_dm`). A
+    // startup without the exemption forgets the saved floors.
     let owner_dm_owner = owner_dm::exempt_owner(config, owner_cache.get());
+    let owner_dm_since = config
+        .catch_up
+        .owner_dm_since(owner_dm_owner.as_deref(), startup_watermark);
     let mut owner_dm_floors: HashMap<Uuid, u64> = HashMap::new();
     for (channel_id, filter) in &channel_filters {
         let mut filter = filter.clone();
@@ -3275,6 +3279,7 @@ async fn run_harness(
                 &config.catch_up,
                 *channel_id,
                 &mut filter,
+                owner_dm_since,
                 startup_watermark,
             );
             tracing::info!(channel_id = %channel_id, "one-on-one owner DM: no tag needed");
@@ -3870,12 +3875,13 @@ async fn run_harness(
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
                                     } else if let Some(mut filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
-                                        // A new DM's messages cannot predate
-                                        // its creation, so its floor is the
-                                        // membership notification's time.
+                                        // A new DM holds nothing from before
+                                        // the exemption, so it floors at its
+                                        // start, not at the relay-stamped
+                                        // notice a lagging client may precede.
                                         if let Some(owner) = owner_dm_owner.as_deref() {
                                             if owner_dm::channel_is_owner_dm(&ctx.channel_info, ch, &pubkey_hex, owner).await {
-                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, ts);
+                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, owner_dm_since, ts);
                                                 tracing::info!(channel_id = %ch, "one-on-one owner DM: no tag needed");
                                             }
                                         }
@@ -3961,8 +3967,9 @@ async fn run_harness(
                                     {
                                         if let Some(mut filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
                                             if owner_dm {
+                                                // It ran on `#p` until now.
                                                 let now = chrono::Utc::now().timestamp().max(0) as u64;
-                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, now);
+                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, now, now);
                                             } else {
                                                 owner_dm_floors.remove(&ch);
                                             }
