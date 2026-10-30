@@ -252,13 +252,12 @@ impl Input {
     }
 
     /// Apply a relay control message. `roster` is the full snapshot; `joined` adds its peers
-    /// (all of them locally, only the newcomer from another pod); `left` drops one.
-    pub fn on_control(&mut self, msg: &serde_json::Value) {
+    /// (all of them locally, only the newcomer from another pod); `left` drops one. `now_ms`
+    /// is the clock `on_audio` checks the quarantine against.
+    pub fn on_control(&mut self, msg: &serde_json::Value, now_ms: u64) {
         match msg["type"].as_str() {
             Some(kind @ ("joined" | "roster")) => match parse_peers(msg) {
-                Ok(peers) if kind == "roster" => {
-                    self.rejoin(&peers, self.last_tick_ms.unwrap_or(0))
-                }
+                Ok(peers) if kind == "roster" => self.rejoin(&peers, now_ms),
                 Ok(peers) => self.add_peers(&peers),
                 Err(e) => tracing::warn!(error = %e, "huddle bridge: bad roster"),
             },
@@ -839,7 +838,7 @@ mod tests {
         // A new occupant of slot 4 that the gate admits is heard. From another pod `joined`
         // lists only the newcomer, and everyone else stays.
         let peers = serde_json::json!([{"pubkey": GUEST, "peer_index": 4, "epoch": 1}]);
-        input.on_control(&serde_json::json!({"type": "joined", "peers": peers}));
+        input.on_control(&serde_json::json!({"type": "joined", "peers": peers}), now);
         let out = run(&mut input, &mut now, 400, &mut others);
         let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
         assert_eq!(frames(&out)[0], &onset(GUEST));
@@ -852,11 +851,11 @@ mod tests {
             humans: humans.iter().map(|pk| pk.to_string()).collect(),
             voices: voices.iter().map(|pk| pk.to_string()).collect(),
         };
-        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}));
+        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}), now);
         assert_eq!(input.roster_frame(), roster(&[OWNER, GUEST], &[AGENT]));
         // `roster` is the full snapshot.
         let peers = serde_json::json!([{"pubkey": OWNER, "peer_index": 1}]);
-        input.on_control(&serde_json::json!({"type": "roster", "peers": peers}));
+        input.on_control(&serde_json::json!({"type": "roster", "peers": peers}), now);
         assert_eq!(input.roster_frame(), roster(&[OWNER], &[]));
     }
 
@@ -1107,11 +1106,35 @@ mod tests {
         // The relay's resync after missed deltas is the same stale view.
         let swap = [(1, OWNER), (2, GUEST)]
             .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}));
-        input.on_control(&serde_json::json!({"type": "roster", "peers": swap}));
+        input.on_control(&serde_json::json!({"type": "roster", "peers": swap}), now);
         let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
         assert!(frames(&out).is_empty(), "quarantined");
         let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
         assert_eq!(frames(&out), [&onset(OWNER)]);
+    }
+
+    #[test]
+    fn a_roster_resync_before_any_tick_or_after_a_stall_holds_back_from_now() {
+        let swap = [(1, GUEST), (2, OWNER)]
+            .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}));
+        let msg = serde_json::json!({"type": "roster", "peers": swap});
+        let onset = ToTalos::Onset {
+            pubkey: GUEST.into(),
+        };
+        // The last tick was never, or a minute ago: neither is the clock the hold runs on.
+        for stall in [None, Some(60_000)] {
+            let mut input = input();
+            let mut now = T0;
+            if let Some(gap) = stall {
+                run(&mut input, &mut now, 100, &mut []);
+                now += gap;
+            }
+            input.on_control(&msg, now);
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert!(frames(&out).is_empty(), "quarantined ({stall:?})");
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert_eq!(frames(&out), [&onset]);
+        }
     }
 
     #[test]
