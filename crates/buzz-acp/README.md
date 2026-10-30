@@ -171,7 +171,7 @@ The gate applies to **all** inbound events — @mentions, DMs, thread replies, a
 
 Under the default `channel` policy, a session scope is the whole channel, so these commands retain their channel-wide behavior. Under the `thread` policy, post the command as a reply in the target thread so `!cancel` or `!rotate` affects only that thread. DMs remain one conversation scope. `!cancel` is a no-op when its scope is idle.
 
-Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, or `!shutdown` after trimming, and must mention this agent with a separate `p` tag. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
+Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, or `!shutdown` after trimming, and must mention this agent with a separate `p` tag, except in a one-on-one owner DM (see Forum Channels below), where an untagged command counts too. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
 
 ```bash
 buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
@@ -270,6 +270,8 @@ Start with **N=2** for most deployments. Increase if queue depth grows under loa
 ## Forum Channels
 
 By default, the ACP harness subscribes to actionable kinds that @mention the agent: 9 messages, 40003 edits that add a mention, 46010 workflow approvals, 40007 reminders, and the forum kinds 45001 posts and 45003 comments. A forum post or comment that tags the agent wakes it under the same author gates as a message, and the agent answers with a forum comment on the post (`buzz messages send --kind 45003 --reply-to <post or comment id>`). Untagged forum activity does not wake it, and votes (45002) are not subscribed.
+
+> **One-on-one owner DMs:** in a DM whose only members are the agent and its owner, the owner's own kind 9 messages need no tag: the agent answers them, and an untagged `!cancel`, `!rotate` or `!shutdown` there is a control command. This applies in the default mentions mode with the mention filter on, unless `--respond-to nobody`. Edits, reminders, approvals, forum posts and comments, and messages from anyone else, other agents included, still need the tag.
 
 Forum event kinds:
 - **45001** — Forum post (thread root)

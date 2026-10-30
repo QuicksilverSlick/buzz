@@ -474,6 +474,45 @@ mod tests {
         assert!(restarted.heard_when_sent(FORUM_COMMENT, NOW + 60));
     }
 
+    /// A ledger saved with owner-DM floors but no kinds, or with kinds but no
+    /// owner-DM floors, loads the missing part as a fresh one, and the next
+    /// save keeps all three.
+    #[test]
+    fn owner_dm_floors_and_kind_floors_load_and_save_together() {
+        const FORUM_COMMENT: u32 = buzz_core::kind::KIND_FORUM_COMMENT;
+        let dir = tempfile::tempdir().unwrap();
+        let dm = uuid::Uuid::new_v4();
+        let hour_ago = NOW - 3600;
+        let dm_only = serde_json::json!({
+            "version": 1, "floor": NOW - 2 * DAY, "done": {},
+            "dm_since": ["o", NOW - DAY], "dm_floors": { (dm.to_string()): NOW - DAY },
+        });
+        std::fs::write(file(dir.path(), RELAY), dm_only.to_string()).unwrap();
+        for at in [NOW, NOW + 60] {
+            let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, at);
+            catch_up.listen_for(&[9, FORUM_COMMENT], at);
+            assert_eq!(catch_up.owner_dm_since(Some("o"), at), NOW - DAY);
+            assert_eq!(catch_up.owner_dm_floor(dm, NOW - DAY), NOW - DAY);
+            assert!(catch_up.heard_when_sent(9, hour_ago));
+            assert!(!catch_up.heard_when_sent(FORUM_COMMENT, hour_ago));
+            assert!(
+                catch_up.heard_when_sent(FORUM_COMMENT, NOW + 30),
+                "the kind floor saved at NOW is kept"
+            );
+        }
+
+        let kinds_only = serde_json::json!({
+            "version": 1, "floor": NOW - 2 * DAY, "done": {},
+            "kinds": { "9": NOW - 2 * DAY, (FORUM_COMMENT.to_string()): NOW },
+        });
+        std::fs::write(file(dir.path(), RELAY), kinds_only.to_string()).unwrap();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 60);
+        assert_eq!(catch_up.owner_dm_since(Some("o"), NOW + 60), NOW + 60);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW + 60), NOW + 60);
+        assert!(catch_up.heard_when_sent(9, hour_ago));
+        assert!(!catch_up.heard_when_sent(FORUM_COMMENT, hour_ago));
+    }
+
     #[test]
     fn owner_dm_floor_is_kept_and_only_rises() {
         let dir = tempfile::tempdir().unwrap();
