@@ -12214,6 +12214,47 @@ mod edit_mention_admission_tests {
             "an edit that does not mention the agent must not wake it"
         );
     }
+
+    /// Default normal-mode admission for forum activity: the relay is asked
+    /// for tagged forum posts and comments, and the local rule wakes the agent
+    /// on a forum comment only when it tags the agent.
+    #[tokio::test]
+    async fn default_mentions_wake_on_tagged_forum_comments_only() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.subscribe_mode = SubscribeMode::Mentions;
+        let agent = config.keys.public_key().to_hex();
+        let rules = startup_subscription_rules(&config).expect("mentions rules");
+        let channel_id = Uuid::new_v4();
+        let post = "cd".repeat(32);
+        let comment = |p: Option<&str>| {
+            let mut tags = vec![nostr::Tag::parse(["e", &post, "", "reply"]).unwrap()];
+            tags.extend(p.map(|p| nostr::Tag::parse(["p", p]).unwrap()));
+            nostr::EventBuilder::new(nostr::Kind::Custom(45003), "comment")
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap()
+        };
+
+        let relay = config::resolve_channel_filters(&config, &[channel_id], &rules);
+        let relay = &relay[&channel_id];
+        assert!(relay.require_mention, "the relay filter keeps #p");
+        let kinds = relay.kinds.as_ref().expect("mentions mode lists kinds");
+        assert!(kinds.contains(&buzz_core::kind::KIND_FORUM_POST));
+        assert!(kinds.contains(&buzz_core::kind::KIND_FORUM_COMMENT));
+
+        assert!(
+            filter::match_event(&comment(Some(&agent)), channel_id, &rules, &agent)
+                .await
+                .is_some(),
+            "a forum comment that tags the agent must wake it"
+        );
+        assert!(
+            filter::match_event(&comment(None), channel_id, &rules, &agent)
+                .await
+                .is_none(),
+            "an untagged forum comment must not wake the agent"
+        );
+    }
 }
 
 #[cfg(test)]
