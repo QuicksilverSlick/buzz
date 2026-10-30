@@ -1959,18 +1959,38 @@ fn forum_target(event: &Event, thread_tags: &ThreadTags) -> Option<(&'static str
     }
 }
 
-/// Name the forum post and tell the agent to answer with a forum comment.
+/// Thread tags for a notice about `event`. A notice about a forum post goes
+/// under the post: the forum list shows only posts, so a top-level kind:9
+/// there is never seen, while the post's thread lists kind:9 replies.
+pub(crate) fn notice_thread_tags(event: &Event, tags: ThreadTags) -> ThreadTags {
+    if u32::from(event.kind.as_u16()) != buzz_core::kind::KIND_FORUM_POST
+        || tags.root_event_id.is_some()
+    {
+        return tags;
+    }
+    let post = event.id.to_hex();
+    ThreadTags {
+        root_event_id: Some(post.clone()),
+        parent_event_id: Some(post),
+        ..tags
+    }
+}
+
+/// Name the forum post and say where a reply goes: a forum comment.
 ///
 /// A forum reply is a kind:45003 comment threaded under the post. A plain
 /// `buzz messages send` publishes a kind:9 stream message instead, which is
-/// not a forum comment, so the instruction names the kind explicitly.
+/// not a forum comment, so the instruction names the kind explicitly. It says
+/// where a reply goes, never that one is owed: an agent's post leaves the
+/// stream anchor open for the same reason, so two agents do not ping-pong.
 fn append_forum_reply_instruction(s: &mut String, what: &str, post_id: &str, anchor: &str) {
     s.push_str(&format!(
         "\nForum: this is a {what} {post_id}.\
-         \nIMPORTANT: Reply with a forum comment: `buzz messages send --kind 45003 \
-         --reply-to {anchor}`. Without `--kind 45003` the reply is not a forum \
-         comment. Start a new forum post (`--kind 45001`, no `--reply-to`) only \
-         if the human explicitly asks for one."
+         \nIMPORTANT: If you reply in this turn, reply with a forum comment: \
+         `buzz messages send --kind 45003 --reply-to {anchor}`. A plain \
+         `buzz messages send` is not a forum comment. Start a new forum post \
+         (`--kind 45001`, no `--reply-to`) only if the human explicitly asks \
+         for one."
     ));
 }
 
@@ -6425,7 +6445,8 @@ mod tests {
     }
 
     /// An agent's top-level post leaves a stream reply's anchor open, but a
-    /// forum reply still has to be a comment on the post.
+    /// forum reply still has to be a comment on the post. The line says where
+    /// a reply goes, never that one is owed, so agents do not ping-pong.
     #[test]
     fn test_agent_forum_post_still_names_the_post_as_reply_target() {
         let keys = Keys::generate();
@@ -6433,10 +6454,12 @@ mod tests {
         let (prompt, post) = forum_prompt(45001, vec![], &keys, Some(&lookup));
         assert!(
             prompt.contains(&format!(
-                "`buzz messages send --kind 45003 --reply-to {post}`"
+                "If you reply in this turn, reply with a forum comment: \
+                 `buzz messages send --kind 45003 --reply-to {post}`"
             )),
             "{prompt}"
         );
+        assert!(!prompt.contains("Reply with a forum comment"), "{prompt}");
     }
 
     #[test]

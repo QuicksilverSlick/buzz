@@ -3641,7 +3641,12 @@ pub async fn run_prompt_task(
             let thread_tags = b
                 .events
                 .first()
-                .map(|be| crate::queue::parse_thread_tags(&be.event))
+                .map(|be| {
+                    crate::queue::notice_thread_tags(
+                        &be.event,
+                        crate::queue::parse_thread_tags(&be.event),
+                    )
+                })
                 .unwrap_or_default();
             let mentions = ctx
                 .agent_owner_pubkey
