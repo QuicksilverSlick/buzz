@@ -946,7 +946,8 @@ fn named(
 }
 
 /// Re-derive every answer from the kind-7 taps (and, on scoped cards, the
-/// kind-9 thread replies) on the live cards, from the owner's keys and the
+/// kind-9 thread replies) on the live cards, and each card's Other (scoped,
+/// or its writer routed), from the owner's keys and the
 /// cards' answerers only. The whole set comes back each tick, so a
 /// retraction is an event that stopped coming back and nothing is ever
 /// double-applied. The outbox file lands before state records the answer: a
@@ -1007,7 +1008,11 @@ async fn poll_answers(
     answerers.dedup();
     let chans: std::collections::BTreeSet<String> =
         live.iter().map(|i| channels::card_channel(s, i)).collect();
-    let kinds = if live.iter().any(|i| i.scoped()) {
+    // Thread replies count on scoped cards, and reach a routed writer's agent.
+    let kinds = if live
+        .iter()
+        .any(|i| i.scoped() || routes.contains_key(&i.writer))
+    {
         serde_json::json!([7, 9])
     } else {
         serde_json::json!([7])
@@ -1104,8 +1109,10 @@ async fn poll_answers(
         }
         // The person's Other: kept while it is the newest, so its first-seen
         // time holds; publish (a3) routes it unless it already pings the agent.
+        // An unscoped card has one only while its writer has a route.
+        let routed = routes.contains_key(&item.writer);
         let picked = (!unread)
-            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until))
+            .then(|| item::pick_reply(item, &events, owner_set, &writer_hex, until, routed))
             .flatten();
         item.reply = match picked {
             Some(e)

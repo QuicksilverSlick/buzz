@@ -201,8 +201,8 @@ pub(crate) enum AnswerSource {
     Reply,
 }
 
-/// The newest free-text reply on a scoped card from someone who may answer
-/// it: their "Other", routed to the writer like an answer.
+/// The newest free-text reply on a scoped or routed card from someone who
+/// may answer it: their "Other", routed to the writer like an answer.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Reply {

@@ -133,10 +133,10 @@ pub(crate) fn answer_option(
     }
 }
 
-/// A scoped card's Other: a kind 9 replying to it that names no option.
+/// A card's Other: a kind 9 replying to it that names no option. On a card
+/// that is not scoped every reply is one, since no reply names an option.
 fn free_text(item: &Item, card_id: &str, e: &nostr::Event, root_until: Option<u64>) -> bool {
-    item.scoped()
-        && e.kind.as_u16() == 9
+    e.kind.as_u16() == 9
         && on_card(item, card_id, e, root_until)
         && answer_option(item, card_id, e, root_until).is_none()
 }
@@ -194,15 +194,21 @@ pub(crate) fn pick_answer<'e>(
         .max_by_key(|(_, e)| (e.created_at.as_secs(), e.id.to_hex()))
 }
 
-/// The newest free-text reply on a scoped card that `counts`.
+/// The newest free-text reply that `counts`, on a scoped card or on one
+/// whose writer has a route target (`routed`) to tell it to.
 pub(crate) fn pick_reply<'e>(
     item: &Item,
     events: &'e [nostr::Event],
     owner_set: &[String],
     writer_hex: &str,
     root_until: Option<u64>,
+    routed: bool,
 ) -> Option<&'e nostr::Event> {
-    let card = &item.card.as_ref().filter(|_| item.scoped())?.event_id;
+    let card = &item
+        .card
+        .as_ref()
+        .filter(|_| item.scoped() || routed)?
+        .event_id;
     let only_owner = owner_spoke(item, card, events, owner_set, root_until);
     events
         .iter()

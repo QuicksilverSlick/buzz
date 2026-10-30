@@ -424,7 +424,7 @@ pub(super) async fn publish(
     }
 
     // (a3) Tell the writer's route target of a settled answer change, and of
-    // each new free-text reply on a scoped card, in the card's thread so the
+    // each new free-text reply on the card, in the card's thread so the
     // board stays newest. `routed` lands only once the relay took the notice,
     // so a failed post is retried next tick.
     for id in s.items.keys().cloned().collect::<Vec<_>>() {
@@ -626,7 +626,8 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        // A reply or tap the item never read (free text on an unscoped card)
+        // A reply or tap the item never read (free text on an unscoped card
+        // with no route)
         // still makes the card a record: it stays, as `carry_card` keeps one,
         // but closed, since nothing reads it any more.
         if touched(ctx, s, &ch, &card.event_id, now).await? {

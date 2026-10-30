@@ -107,7 +107,8 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
     }
 }
 
-/// The notice for a free-text reply on a scoped card (its Other). Like an
+/// The notice for a free-text reply on a card (its Other): any scoped card,
+/// and an unscoped one whose writer has a route. Like an
 /// answer notice it carries no reply text: the agent reads the reply itself
 /// in the thread, with the trust it gives that person.
 pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {

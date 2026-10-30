@@ -2,6 +2,7 @@
 //! thread. Child of tests.rs so the fake relay and Bench harness are in scope.
 
 use super::answers::{last_query, reply, tap, ITEM};
+use super::channels::thread_reply;
 use super::*;
 
 /// The owner's answer, as the owner's own message.
@@ -454,4 +455,93 @@ async fn a_join_or_a_launch_holds_notices_one_settle() {
     let n = notices(&b, before);
     assert_eq!(n.len(), 1);
     assert!(content(&n[0]).starts_with(&chose(&card, "Stay")));
+}
+
+/// Free text on a card that is not scoped reaches its writer's route target
+/// too, once per reply; a card whose writer has no route is not read for it.
+#[tokio::test]
+async fn free_text_on_any_routed_card_reaches_the_route_target() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    // The kinds of the last answer poll (the fake relay ignores kinds).
+    let polled = |b: &Bench| {
+        let q = b.relay.queries.lock().unwrap();
+        let poll = q.iter().rev().find(|q| q[0]["authors"].is_array());
+        poll.unwrap()[0]["kinds"].clone()
+    };
+    let r1 = thread_reply(
+        &b.ctx.owner,
+        &card,
+        "Hold on, ask me after lunch",
+        b.now,
+        &[],
+    );
+    reply(&b, &[&r1]);
+    // No route: taps only, and nothing is told.
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    assert_eq!(polled(&b), json!([7]));
+    assert!(b.s.items[ITEM].reply.is_none());
+
+    // Routed, beside another writer's card that has no route.
+    b.drop_file(
+        "claude-ai",
+        "other",
+        &drop_json(&[("title", json!("Other"))]),
+    );
+    b.settle(4).await;
+    let other = b.card("claude-ai/other").event_id;
+    let agent = route(&mut b).public_key().to_hex();
+    let aside = thread_reply(&b.ctx.owner, &other, "Not now", b.now, &[]);
+    reply(&b, &[&r1, &aside]);
+    b.tick().await.unwrap();
+    assert_eq!(polled(&b), json!([7, 9]));
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert_eq!(
+        (r.event_id.as_str(), r.by_name),
+        (r1.id.to_hex().as_str(), None)
+    );
+    assert!(b.s.items[ITEM].answer.is_none());
+    assert!(b.s.items["claude-ai/other"].reply.is_none());
+    // Held one settle after the join, then one notice, with no reply text.
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let ev = &n[0];
+    assert_eq!(
+        content(ev),
+        format!(
+            "Bench reply \u{b7} {ITEM}\nCard: Relay choice\nthe owner replied in this thread at {} \
+             instead of choosing an option. Read their reply (event {}) in this thread, answer \
+             them there, and when it is settled close the card by re-dropping {ITEM} as a \
+             decision or status with the outcome.\nOpen thread: buzz://message?channel={}&id={card}",
+            local_hhmm(r.at),
+            r1.id.to_hex(),
+            b.channel()
+        )
+    );
+    assert_eq!(ev["pubkey"], json!(b.writer_hex()));
+    assert_eq!(tag_value(ev, "h"), Some(b.channel()));
+    let tags = ev["tags"].as_array().unwrap();
+    assert!(tags.contains(&json!(["e", card, "", "reply"])));
+    assert!(tags.contains(&json!(["p", agent])));
+    assert!(tags.contains(&json!([
+        "df-answer",
+        "other",
+        b.owner_hex(),
+        r1.id.to_hex()
+    ])));
+    assert_eq!(
+        tag_value(ev, "client").unwrap(),
+        format!("bench:route:{ITEM}@r{}", &r1.id.to_hex()[..16])
+    );
+
+    // A second reply is a second notice, and each is told once.
+    let r2 = thread_reply(&b.ctx.owner, &card, "Actually, move it", b.now, &[]);
+    reply(&b, &[&r1, &aside, &r2]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).contains(&r2.id.to_hex()));
+    assert!(settle_past(&mut b, 2).await.is_empty());
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(r2.id.to_hex()));
 }
