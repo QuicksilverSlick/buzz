@@ -272,9 +272,7 @@ impl Room<'_> {
             let now = self.clock.unix0 + self.step * STEP_MS;
             let outs = self.input.tick(now);
             self.emit(outs).await;
-            if self.output.hear(self.input.levels(), now) {
-                self.input.output_stopped(now);
-            }
+            self.output.hear(self.input.levels(), now);
             if self.step.is_multiple_of(2) {
                 if let Some(frame) = self.output.tick(now) {
                     socket.send(Message::Binary(frame.into())).await?;

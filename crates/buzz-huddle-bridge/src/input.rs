@@ -338,15 +338,11 @@ impl Input {
         self.pending.clear();
     }
 
-    /// The voice's own output plays until `unix_ms` (set by the output path).
+    /// The voice's own output, sent and queued, plays until `unix_ms`. The output path sets it
+    /// every step, so a flush (a cut, a lost floor) ends the half-duplex window there, plus its
+    /// tail.
     pub fn set_output_until(&mut self, unix_ms: u64) {
-        self.output_until_ms = self.output_until_ms.max(unix_ms);
-    }
-
-    /// The voice's output was cut at `now_ms` (a barge-in), so the half-duplex window ends there,
-    /// plus its tail.
-    pub fn output_stopped(&mut self, now_ms: u64) {
-        self.output_until_ms = self.output_until_ms.min(now_ms);
+        self.output_until_ms = unix_ms;
     }
 
     /// Each admitted human's level at the last tick.
@@ -1129,7 +1125,7 @@ mod tests {
         assert!(input.who_said(0, u64::MAX).all(|s| s.pubkey == OWNER));
         assert!(voiced(&out));
         ts[0].2 = 0.0;
-        input.output_stopped(now);
+        input.set_output_until(now);
         run(&mut input, &mut now, 1_000, &mut ts);
         assert!(input.who_said(0, u64::MAX).any(|s| s.pubkey == GUEST));
     }
