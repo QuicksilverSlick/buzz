@@ -320,6 +320,22 @@ fn every_result_is_capped_and_framed_untrusted() {
     assert!(!frame("x", true, &"é".repeat(TEXT_MAX)).contains("[cut]"));
 }
 
+/// A stand-in buzz: its list comes back through `run()` kept to what everyone
+/// here may read.
+#[tokio::test]
+async fn a_read_runs_its_program_and_keeps_only_what_the_room_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = json!([{ "channel_id": ch(1) }, { "channel_id": ch(2) }]);
+    let mut tools = tools();
+    tools.buzz = crate::acp::write_stub_cli(dir.path(), "buzz", &list.to_string(), 0);
+    let read = tools
+        .run("list_channels", json!({}), &room(true), None)
+        .await;
+    let text = &read.text;
+    assert!(read.ok && text.contains(&ch(1).to_string()), "{text}");
+    assert!(!text.contains(&ch(2).to_string()), "the guest can't read 2");
+}
+
 /// A real child: git, in a scratch checkout. No network.
 #[tokio::test]
 async fn git_runs_in_the_checkout_and_a_missing_program_is_a_failure() {
