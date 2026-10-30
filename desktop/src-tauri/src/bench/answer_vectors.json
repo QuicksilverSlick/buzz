@@ -1,5 +1,5 @@
 {
-  "about": "Who may answer a Bench card and which answer stands. Read by the Rust bench tests (tests/scoped.rs) and the desktop TypeScript tests. Each alias is a fresh key; 'writer' is the Bench writer S, which supplies the seed taps. ownerSet is the owner plus members.txt. 'to' is the card's resolved answerers (scoped cards only). Kind 7 content is the 1-based keycap number or 'heart'; kind 9 content is a thread reply. 'target': 'other' aims the event at another card. Options in 'answer' are 1-based. No case relies on a tie in time.",
+  "about": "Who may answer a Bench card and which answer stands. Read by the Rust bench tests (tests/scoped.rs) and the desktop TypeScript tests. Each alias is a fresh key; 'writer' is the Bench writer S, which supplies the seed taps. ownerSet is the owner plus members.txt. 'to' is the card's resolved answerers (scoped cards only). 'routed': true says the card's writer has a route target, so an unscoped card's free text is its reply too (default false). Kind 7 content is the 1-based keycap number or 'heart'; kind 9 content is a thread reply. 'target': 'other' aims the event at another card. Options in 'answer' are 1-based. No case relies on a tie in time.",
   "ownerSet": ["owner", "phone"],
   "cases": [
     {
@@ -299,7 +299,7 @@
       "eligible": { "owner": true, "craig": true }
     },
     {
-      "name": "a reply on a legacy card is neither an answer nor a reply",
+      "name": "a reply on a legacy card with no route is neither an answer nor a reply",
       "scoped": false,
       "needs": "you",
       "options": ["Stay", "Move"],
@@ -312,6 +312,38 @@
       "reply": null,
       "refused": [],
       "eligible": { "owner": true, "phone": true }
+    },
+    {
+      "name": "on a routed legacy card free text is the reply, newest first",
+      "scoped": false,
+      "routed": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "owner", "kind": 9, "content": "1", "at": 10 },
+        { "who": "phone", "kind": 9, "content": "Hold on", "at": 20 },
+        { "who": "craig", "kind": 9, "content": "Ship it", "at": 30 }
+      ],
+      "answer": null,
+      "reply": { "who": "phone" },
+      "refused": [],
+      "eligible": { "owner": true, "phone": true, "craig": false }
+    },
+    {
+      "name": "on a routed legacy card the agent's own reply never counts",
+      "scoped": false,
+      "routed": true,
+      "needs": "you",
+      "options": ["Stay", "Move"],
+      "to": [],
+      "events": [
+        { "who": "agent", "kind": 9, "content": "Moved it", "at": 10 }
+      ],
+      "answer": null,
+      "reply": null,
+      "refused": [],
+      "eligible": { "owner": true, "agent": false }
     }
   ]
 }

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use super::channels::{card_channel, channel_ready, joined};
+use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
     forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
     same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
@@ -246,6 +246,18 @@ async fn edit(
     post_as_writer(ctx, s, builder, now).await
 }
 
+/// Local `HH:MM` of `at`, as `YYYY-MM-DD HH:MM` when that is not today.
+fn local_when(at: u64, now: u64) -> String {
+    let day = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|t| t.with_timezone(&chrono::Local).date_naive())
+    };
+    match day(at) {
+        Some(d) if day(now) != Some(d) => format!("{d} {}", local_hhmm(at)),
+        _ => local_hhmm(at),
+    }
+}
+
 fn df_answer(parts: [&str; 3]) -> Result<nostr::Tag, String> {
     let [n, by, id] = parts;
     nostr::Tag::parse(["df-answer", n, by, id]).map_err(|e| e.to_string())
@@ -424,7 +436,7 @@ pub(super) async fn publish(
     }
 
     // (a3) Tell the writer's route target of a settled answer change, and of
-    // each new free-text reply on a scoped card, in the card's thread so the
+    // each new free-text reply on the card, in the card's thread so the
     // board stays newest. `routed` lands only once the relay took the notice,
     // so a failed post is retried next tick.
     for id in s.items.keys().cloned().collect::<Vec<_>>() {
@@ -579,7 +591,7 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let text = item::render_route_reply(&item, &local_hhmm(r.at)) + &link;
+        let text = item::render_route_reply(&item, &local_when(r.at, now)) + &link;
         let marker = format!("bench:route:{id}@r{}", &r.event_id[..16]);
         let extra = vec![df_answer(["other", &r.by, &r.event_id])?];
         let posted = post_message(
@@ -626,9 +638,10 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        // A reply or tap the item never read (free text on an unscoped card)
-        // still makes the card a record: it stays, as `carry_card` keeps one,
-        // but closed, since nothing reads it any more.
+        // A reply or tap the item never read or no longer holds (free text on
+        // an unscoped card with no route, or one asked again) still makes the
+        // card a record: it stays, as `carry_card` keeps one, but closed,
+        // since nothing reads it any more.
         if touched(ctx, s, &ch, &card.event_id, now).await? {
             close(ctx, s, &ch, &card, now).await?;
         } else {
@@ -700,6 +713,8 @@ pub(super) async fn publish(
             Err(e) => return Err(e),
             Ok(Outcome::Accepted { event_id }) => {
                 let created_at = s.last_created_at;
+                // Posted while routed: no reply on it predates the route.
+                let seen = reads_replies(s, &item, routes);
                 let i = s.items.get_mut(id).expect("wanted id");
                 i.card = Some(Posted {
                     event_id,
@@ -707,6 +722,7 @@ pub(super) async fn publish(
                     hash,
                     seeded: 0,
                 });
+                i.routed_seen |= seen;
                 i.quiet_repost = false;
                 i.pinged.extend(pings);
                 s.board_dirty = true;

@@ -525,7 +525,8 @@ fn answer_vectors() {
             case["answer"],
             "{name}: answer"
         );
-        let reply = pick_reply(&item, &events, &owner_set, &writer_hex, None)
+        let routed = case["routed"] == json!(true);
+        let reply = pick_reply(&item, &events, &owner_set, &writer_hex, None, routed)
             .map(|e| json!({"who": alias(e)}));
         assert_eq!(reply.unwrap_or(Value::Null), case["reply"], "{name}: reply");
         let refused: Vec<&str> = refused_taps(&item, &events, &owner_set, &writer_hex, None)
@@ -615,8 +616,16 @@ fn each_thread_reply_counts_for_one_card() {
         assert_eq!((opt(&one, &e, u1), opt(&two, &e, u2)), want, "at {at}");
     }
     let other = say("Hold on", 55, &[(r, "root")]);
-    let replied =
-        |i: &Item, until| pick_reply(i, std::slice::from_ref(&other), &owner_set, "", until);
+    let replied = |i: &Item, until| {
+        pick_reply(
+            i,
+            std::slice::from_ref(&other),
+            &owner_set,
+            "",
+            until,
+            false,
+        )
+    };
     assert_eq!(replied(&two, u2).map(|e| e.id), Some(other.id));
     assert!(replied(&one, u1).is_none());
     // Deeper in r's thread a reply names its parent: another message is
