@@ -84,17 +84,45 @@ function errorText(error: unknown): string {
  * Other and Open thread open the card's thread, where a reply is the answer.
  * Project tabs (All, 28 Day Reset, Dreamforge, and Other when it has
  * cards) narrow the board first; search then narrows every section at once.
- * The sidebar badge still counts every project.
+ * The sidebar badge still counts every project. `focusCardId` (global
+ * search's ?card=) shows All, clears the search, and scrolls to and rings
+ * that card for a few seconds.
  */
-export function BenchScreen() {
+export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
   const { snapshot, error, isPending } = useBenchCards();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
   const { data: projects } = useProjectsQuery();
   const viewerAgents = useViewerAgentPubkeys();
-  const { goChannel } = useAppNavigation();
+  const { goBench, goChannel } = useAppNavigation();
   const [query, setQuery] = React.useState("");
   const matches = React.useMemo(() => benchSearch(query), [query]);
   const [savedTab, setSavedTab] = React.useState(readBenchTab);
+  const [focusedId, setFocusedId] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    if (!focusCardId) return;
+    // All for this visit only: the saved tab stays the owner's.
+    setSavedTab("all");
+    setQuery("");
+    setFocusedId(focusCardId);
+    // Drop ?card= so picking the same card again focuses it again.
+    void goBench({ replace: true });
+  }, [focusCardId, goBench]);
+  const hasSnapshot = snapshot !== null;
+  React.useEffect(() => {
+    if (!focusedId || !hasSnapshot) return;
+    const frame = window.requestAnimationFrame(() => {
+      const item = document
+        .querySelector(`[data-bench-item="${CSS.escape(focusedId)}"]`)
+        ?.closest("li");
+      item?.scrollIntoView({ block: "center" });
+      item?.focus({ preventScroll: true });
+    });
+    const timer = window.setTimeout(() => setFocusedId(null), 4_000);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [focusedId, hasSnapshot]);
   const counts = React.useMemo(
     () => (snapshot ? workbenchCounts(snapshot, viewerPubkey) : null),
     [snapshot, viewerPubkey],
@@ -233,6 +261,7 @@ export function BenchScreen() {
           <BenchSection
             cards={sections[section.key].filter(matches)}
             empty={query.trim() ? "No matching cards." : section.empty}
+            focusedId={focusedId}
             key={section.key}
             onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}
@@ -278,6 +307,7 @@ export function BenchScreen() {
 function BenchSection({
   cards,
   empty,
+  focusedId,
   onOther,
   ownerPubkey,
   showProject,
@@ -287,6 +317,8 @@ function BenchSection({
 }: {
   cards: BenchCardData[];
   empty: string;
+  /** Global search's pick, ringed until it fades. */
+  focusedId: string | null;
   onOther: (card: BenchCardData) => void;
   ownerPubkey: string | null;
   /** The All tab names each card's project; a project tab already does. */
@@ -314,7 +346,16 @@ function BenchSection({
           {cards.map((card) => (
             // A replaced card is a new row: nothing typed or saving on the
             // card the owner saw carries over to the one that replaced it.
-            <li key={card.cardEventId ?? card.id}>
+            <li
+              className={cn(
+                "outline-none",
+                card.id === focusedId &&
+                  "[&>[data-bench-item]]:ring-2 [&>[data-bench-item]]:ring-primary/60 [&>[data-bench-item]]:ring-offset-2 [&>[data-bench-item]]:ring-offset-background",
+              )}
+              data-bench-focused={card.id === focusedId || undefined}
+              key={card.cardEventId ?? card.id}
+              tabIndex={-1}
+            >
               <BenchCard
                 card={card}
                 onOther={() => onOther(card)}

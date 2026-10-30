@@ -567,6 +567,8 @@ type E2eConfig = {
     agentMetricArchiveDefaultEnabled?: boolean;
     // The `bench_cards` snapshot; absent means the Bench is not enabled.
     benchCards?: BenchCards;
+    // Extra `search_messages` hits, matched like the seeded ones.
+    searchHits?: RawSearchHit[];
     saveSubscriptions?: Array<{
       scope_type: string;
       scope_value: string;
@@ -10140,6 +10142,7 @@ async function handleSearchMessages(
         });
       }
     }
+    mockHits.push(...(config?.mock?.searchHits ?? []));
 
     const authorSet = args.authors?.length
       ? new Set(args.authors.map((author) => author.toLowerCase()))

@@ -1,8 +1,10 @@
 import { Search } from "lucide-react";
 import * as React from "react";
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
 import { parseSearchOperators } from "@/features/search/lib/parseSearchOperators";
+import { parsePrQuery } from "@/features/search/lib/prNumber";
 import { buildSearchResultPreview } from "@/features/search/lib/searchMatch";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
@@ -17,6 +19,7 @@ import {
   SearchDialogInputRow,
 } from "@/features/search/ui/SearchScopeControls";
 import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
+import { BenchResultRow } from "@/features/search/ui/LocalResultRow";
 import { useSearchMenuKeyboardNavigation } from "@/features/search/ui/useSearchMenuKeyboardNavigation";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -55,6 +58,7 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "direct-messages",
   "people",
   "agents",
+  "bench",
   "messages",
   "actions",
 ] as const;
@@ -200,6 +204,10 @@ function getSearchHitContextLabel(
 }
 
 function getResultSectionKey(result: SearchResult): SearchResultSectionKey {
+  if (result.kind === "bench") {
+    return "bench";
+  }
+
   if (result.kind === "channel") {
     return result.channel.channelType === "dm" ? "direct-messages" : "channels";
   }
@@ -225,6 +233,8 @@ function getSectionTitle(sectionKey: SearchResultSectionKey) {
       return "People";
     case "agents":
       return "Agents";
+    case "bench":
+      return "Bench cards";
     case "messages":
       return "Most relevant";
     case "actions":
@@ -256,7 +266,11 @@ function SearchHitContextLine({ label }: { label: SearchHitContextLabel }) {
   );
 }
 
-function groupSearchResults(results: SearchResult[]): SearchResultSection[] {
+/** A PR-number query leads with its Bench cards, so Enter opens the card. */
+function groupSearchResults(
+  results: SearchResult[],
+  benchFirst: boolean,
+): SearchResultSection[] {
   const resultsBySection = new Map<SearchResultSectionKey, SearchResult[]>();
 
   for (const result of results) {
@@ -266,7 +280,13 @@ function groupSearchResults(results: SearchResult[]): SearchResultSection[] {
     resultsBySection.set(sectionKey, sectionResults);
   }
 
-  return SEARCH_RESULT_SECTION_ORDER.flatMap((sectionKey) => {
+  const order = benchFirst
+    ? [
+        "bench" as const,
+        ...SEARCH_RESULT_SECTION_ORDER.filter((key) => key !== "bench"),
+      ]
+    : SEARCH_RESULT_SECTION_ORDER;
+  return order.flatMap((sectionKey) => {
     const sectionResults = resultsBySection.get(sectionKey);
 
     if (!sectionResults || sectionResults.length === 0) {
@@ -397,6 +417,7 @@ export function TopbarSearch({
   const [selectedMenuIndex, setSelectedMenuIndex] = React.useState(0);
   const triggerRef = React.useRef<HTMLButtonElement>(null);
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
+  const { goBench } = useAppNavigation();
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
   const {
@@ -421,6 +442,9 @@ export function TopbarSearch({
   // Bind highlights to the debounced result source so stale results can never
   // pair with newly typed text during the debounce window.
   const resultQuery = parseSearchOperators(debouncedQuery).text;
+  const prNumber = parsePrQuery(resultQuery)?.number ?? null;
+  // "#792" highlights and lands on 792 itself, a whole number.
+  const highlightQuery = prNumber ?? resultQuery;
   const resultsAreCurrent = debouncedQuery === trimmedQuery;
   const isIconVariant = variant === "icon";
   const currentChannel = currentChannelId
@@ -492,8 +516,8 @@ export function TopbarSearch({
   );
   const visibleSearchableResults = resultsAreCurrent ? searchableResults : [];
   const searchResultSections = React.useMemo(
-    () => groupSearchResults(visibleSearchableResults),
-    [visibleSearchableResults],
+    () => groupSearchResults(visibleSearchableResults, prNumber !== null),
+    [prNumber, visibleSearchableResults],
   );
   const groupedSearchResults = React.useMemo(
     () => searchResultSections.flatMap((section) => section.results),
@@ -543,6 +567,11 @@ export function TopbarSearch({
       setScopeChannelId(null);
       setQuery("");
 
+      if (result.kind === "bench") {
+        void goBench({ cardId: result.card.id });
+        return;
+      }
+
       if (result.kind === "channel") {
         onOpenChannel(result.channel.id);
         return;
@@ -571,9 +600,11 @@ export function TopbarSearch({
         return;
       }
 
-      onOpenResult(result.hit, resultQuery);
+      onOpenResult(result.hit, highlightQuery);
     },
     [
+      goBench,
+      highlightQuery,
       onBrowseChannels,
       onCreateAgent,
       onCreateChannel,
@@ -582,7 +613,6 @@ export function TopbarSearch({
       onOpenUser,
       openAfterExit,
       setQuery,
-      resultQuery,
     ],
   );
 
@@ -654,6 +684,28 @@ export function TopbarSearch({
 
   const renderSearchResultRow = (result: SearchResult, index: number) => {
     const menuIndex = index + (hasScopeAction ? 1 : 0);
+    if (result.kind === "bench") {
+      return (
+        <button
+          aria-selected={menuIndex === selectedMenuIndex}
+          className={cn(
+            "search-result-row flex w-full items-start gap-3 rounded-lg px-2.5 py-3 text-left transition-colors",
+            menuIndex === selectedMenuIndex
+              ? "bg-muted/45 text-foreground"
+              : "hover:bg-muted/35",
+          )}
+          data-search-result-index={menuIndex}
+          data-testid={resultTestId(result)}
+          key={resultKey(result)}
+          onClick={() => openResult(result)}
+          onMouseEnter={() => setSelectedMenuIndex(menuIndex)}
+          role="option"
+          type="button"
+        >
+          <BenchResultRow card={result.card} query={highlightQuery} />
+        </button>
+      );
+    }
     const channelDisplayName =
       result.kind === "channel"
         ? getChannelDisplayName(result.channel, channelLabels)
@@ -688,7 +740,7 @@ export function TopbarSearch({
           ? result.action.description
           : result.kind === "user"
             ? getUserSecondaryLabel(result.user)
-            : buildSearchResultPreview(result.hit.content, resultQuery);
+            : buildSearchResultPreview(result.hit.content, highlightQuery);
     const trailingLabel =
       result.kind === "channel"
         ? getChannelSuggestionMeta(result.channel)
@@ -769,7 +821,10 @@ export function TopbarSearch({
               ) : null}
               {preview ? (
                 <span className="col-start-1 mt-1.5 block min-w-0 truncate text-sm leading-5 text-muted-foreground">
-                  <HighlightedSearchText query={resultQuery} text={preview} />
+                  <HighlightedSearchText
+                    query={highlightQuery}
+                    text={preview}
+                  />
                 </span>
               ) : null}
             </span>

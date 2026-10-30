@@ -105,10 +105,11 @@ export function useAppNavigation() {
   );
 
   const goBench = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (behavior?: NavigationBehavior & { cardId?: string }) =>
       commitNavigation(
         {
           to: "/bench",
+          search: behavior?.cardId ? { card: behavior.cardId } : {},
         },
         behavior,
       ),

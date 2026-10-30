@@ -111,3 +111,12 @@ test("buildSearchResultPreview keeps the existing leading excerpt without a matc
     "abcdefg...",
   );
 });
+
+test("splitSearchMatches marks a number only as a whole lexeme", () => {
+  const marked = (text, query) =>
+    splitSearchMatches(text, query)
+      .filter((part) => part.isMatch)
+      .map((part) => part.text);
+  assert.deepEqual(marked("PR 792, 7928, 792d3edd", "#792"), ["792"]);
+  assert.deepEqual(marked("Project plans", "pro"), ["Pro"]);
+});

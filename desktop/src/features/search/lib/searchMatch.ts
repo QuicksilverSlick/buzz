@@ -34,7 +34,8 @@ function getSearchHighlightMatchers(query: string): SearchHighlightTerm[] {
   rawTokens.forEach((rawToken, tokenIndex) => {
     const isPrefix = tokenIndex === rawTokens.length - 1;
     for (const value of extractLexemes(rawToken)) {
-      matchers.push({ isPrefix, value });
+      // A number is a whole token, as on the relay: "792" never marks 7928.
+      matchers.push({ isPrefix: isPrefix && !/^\d+$/.test(value), value });
     }
   });
 

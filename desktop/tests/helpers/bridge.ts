@@ -494,6 +494,20 @@ type MockBridgeOptions = {
    */
   benchCards?: BenchCards;
   /**
+   * Extra `search_messages` hits in the relay's snake_case wire shape. The
+   * mock matches them by substring, as a prefix relay would.
+   */
+  searchHits?: Array<{
+    event_id: string;
+    content: string;
+    kind: number;
+    pubkey: string;
+    channel_id: string | null;
+    channel_name: string | null;
+    created_at: number;
+    score: number;
+  }>;
+  /**
    * Event IDs that `get_event` should report as definitively not found.
    * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs
    * can exercise the "Thread deleted" label / disabled-send path. A reply

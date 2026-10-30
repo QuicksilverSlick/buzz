@@ -1223,7 +1223,22 @@ test("search: a bare number also matches as a whole number in the text", () => {
   const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
   assert.deepEqual(ids("28"), ["w/reset"]);
   assert.deepEqual(ids("689"), ["w/merge"]);
-  assert.deepEqual(ids("#689"), [], "# and PR stay PR numbers only");
+  assert.deepEqual(ids("#28"), [], "# and PR stay PR numbers only");
+  // "pull request 689" names the PR, as the steward's cards write it.
+  assert.deepEqual(ids("#689"), ["w/merge"]);
+});
+
+test("search: a number is a whole token, never inside a hash or a longer one", () => {
+  const cards = [
+    card({ id: "w/hash", body: "commit 792d3edd and a792f" }),
+    card({ id: "w/prhash", title: "#792d3e" }),
+    card({ id: "w/named", body: "Ship pull request 792 of x/y" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("792"), ["w/named"]);
+  assert.deepEqual(ids("#792"), ["w/named"]);
+  assert.deepEqual(ids("pr-792"), ["w/named"]);
+  assert.deepEqual(ids("pull request 792"), ["w/named"]);
 });
 
 test("search: words, names and a receipt's request; empty matches all", () => {
