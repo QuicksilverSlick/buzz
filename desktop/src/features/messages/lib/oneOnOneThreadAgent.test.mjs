@@ -19,12 +19,11 @@ const agentA = "a".repeat(64);
 const agentB = "b".repeat(64);
 const isAgentPubkey = (pubkey) => pubkey === agentA || pubkey === agentB;
 
-function decide(participants, replyToPubkeys = [participants?.[0]?.pubkey]) {
+function decide(participants) {
   return selectOneOnOneThreadAgent({
     currentPubkey: me,
     isAgentPubkey,
     participants,
-    replyToPubkeys,
   });
 }
 
@@ -60,15 +59,17 @@ test("a thread with two agents is shared", () => {
   assert.equal(decide([{ pubkey: agentA }, { pubkey: agentB }]), "shared");
 });
 
-test("the agent must have written the root or the parent, and the thread be loaded", () => {
-  const ownRoot = [{ pubkey: me, tags: [["p", agentA]] }, { pubkey: agentA }];
-  assert.equal(decide(ownRoot, [me]), null);
-  assert.equal(decide(ownRoot, [me, agentA]), agentA);
+test("a thread you started counts once the agent has replied in it", () => {
+  // You post top-level @Agent; buzz-acp answers inside that thread.
+  const asked = { pubkey: me, tags: [["p", agentA]] };
+  assert.equal(decide([asked, { pubkey: agentA, tags: [["p", me]] }]), agentA);
+  // Tagged but silent is not a conversation yet; nor is a person or loading.
+  assert.equal(decide([asked]), null);
   assert.equal(decide([{ pubkey: person }]), null);
-  assert.equal(decide(null, [agentA]), null);
+  assert.equal(decide(null), null);
 });
 
-test("the chip is pre-addressed, and removing it sends with no tag", () => {
+test("the chip is pre-addressed, and a removed chip is not re-added", () => {
   const scope = scopeFor("one-on-one");
   syncOneOnOneThreadAgent(scope, agentA);
   assert.deepEqual(audience(scope), [agentA]);
@@ -90,8 +91,10 @@ test("a shared thread hands back only the agent this rule added", () => {
   assert.equal(syncOneOnOneThreadAgent(scope, "shared"), agentA);
   assert.equal(syncOneOnOneThreadAgent(scope, "shared"), null);
 
+  // Pinned by hand before the thread was one-on-one: the rule adds nothing.
   const pinned = scopeFor("explicit-pin");
   addPersistentAgentAudienceMember(pinned, agentA);
+  syncOneOnOneThreadAgent(pinned, agentA);
   assert.equal(syncOneOnOneThreadAgent(pinned, "shared"), null);
   assert.deepEqual(audience(pinned), [agentA]);
 });

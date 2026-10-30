@@ -342,16 +342,15 @@ function MessageComposerImpl({
   onLinkSelectionChangeRef.current = linkEditor.showFromCursor;
   onLinkShortcutRef.current = linkEditor.openFromShortcut;
   useComposerSpoilerParticles(richText.editor, composerScrollRef);
-  const removeAddressedAgentRef = React.useRef<(pubkey: string) => void>(
+  const revokeAddressedAgentRef = React.useRef<(pubkey: string) => void>(
     () => {},
   );
   const { audience: persistentAudience, keepMentionedAgentsPinned } =
     useThreadAgentAudience({
       currentPubkey: ownerPubkey,
       isAgentPubkey: mentions.isAgentPubkey,
-      onSharedThreadAgent: (pubkey) => removeAddressedAgentRef.current(pubkey),
+      onSharedThreadAgent: (pubkey) => revokeAddressedAgentRef.current(pubkey),
       participants: audienceContext?.participants ?? null,
-      replyToPubkeys: audienceContext?.replyToPubkeys ?? [],
       rootTags: audienceContext?.rootTags ?? [],
       scope: audienceScope,
     });
@@ -484,6 +483,7 @@ function MessageComposerImpl({
     lockedAgentPubkeys,
     removeAddressedAgent,
     restoreAddressedAgentMentions,
+    revokeAddressedAgent,
     selectMentionSuggestion,
     syncAddressedAgentsFromText,
     toggleAlwaysAddressAgent,
@@ -510,7 +510,7 @@ function MessageComposerImpl({
   });
   addressedMentionRestore.restoreAddressedAgentMentionsRef.current =
     restoreAddressedAgentMentions;
-  removeAddressedAgentRef.current = removeAddressedAgent;
+  revokeAddressedAgentRef.current = revokeAddressedAgent;
   React.useLayoutEffect(() => {
     if (!audienceScope || editTarget != null) return;
     restoreAddressedAgentMentions();

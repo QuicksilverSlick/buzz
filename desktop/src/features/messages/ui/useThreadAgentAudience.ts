@@ -16,16 +16,14 @@ export function useThreadAgentAudience({
   isAgentPubkey,
   onSharedThreadAgent,
   participants,
-  replyToPubkeys,
   rootTags,
   scope,
 }: {
   currentPubkey: string | null;
   isAgentPubkey: (pubkey: string) => boolean;
-  /** Drops the one-on-one chip (and its prefix) once the thread is shared. */
+  /** Drops the one-on-one chip once the thread is shared (no exclusion). */
   onSharedThreadAgent: (pubkey: string) => void;
   participants: readonly ThreadParticipantSource[] | null;
-  replyToPubkeys: readonly (string | null | undefined)[];
   rootTags: readonly string[][];
   scope: string | null;
 }) {
@@ -50,17 +48,15 @@ export function useThreadAgentAudience({
     currentPubkey,
     isAgentPubkey,
     participants,
-    replyToPubkeys,
   });
   const onSharedThreadAgentRef = React.useRef(onSharedThreadAgent);
   onSharedThreadAgentRef.current = onSharedThreadAgent;
-  // Audience changes re-run this so a store reset (switch off) re-adds the chip.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: audience changes re-run this to track removals, and so a store reset (switch off) re-adds a chip the user did not remove.
   React.useEffect(() => {
     if (!scope) return;
     const added = syncOneOnOneThreadAgent(scope, oneOnOneAgent);
     if (
       added &&
-      audience.pubkeys.includes(added) &&
       !(keepMentionedAgentsPinned && rootAgentPubkeys.includes(added))
     ) {
       onSharedThreadAgentRef.current(added);

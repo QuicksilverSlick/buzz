@@ -823,6 +823,7 @@ export function HomeView({
               isSinglePanelView={isSinglePanelDetailView}
               hasThreadContextLoadError={threadContext.hasLoadError}
               isThreadContextLoading={threadContext.isLoading}
+              isThreadContextTruncated={threadContext.isTruncated}
               isThreadRootDeleted={threadContext.isRootDeleted}
               item={selectedItem}
               latchedDefaultParentId={latchedDefaultParentId}

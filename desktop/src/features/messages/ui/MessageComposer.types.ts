@@ -30,8 +30,6 @@ export type MessageComposerProps = {
   audienceContext?: {
     /** Thread messages (and collapsed-reply authors); null while loading. */
     participants?: readonly ThreadParticipantSource[] | null;
-    /** Authors of the root and of the parent being replied to. */
-    replyToPubkeys?: readonly (string | null | undefined)[];
     rootTags?: readonly string[][];
     type: "thread";
   } | null;

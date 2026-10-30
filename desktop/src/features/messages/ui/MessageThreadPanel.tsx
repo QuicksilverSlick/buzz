@@ -847,7 +847,6 @@ export function MessageThreadPanel({
                 type: "thread",
                 rootTags: threadHead.tags,
                 participants: threadParticipants,
-                replyToPubkeys: [threadHead.pubkey, replyTargetMessage?.pubkey],
               }}
               channelId={channelId}
               channelName={channelName}

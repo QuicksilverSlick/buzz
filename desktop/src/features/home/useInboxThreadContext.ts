@@ -18,6 +18,8 @@ type InboxThreadContextResult = {
   events: RelayEvent[];
   hasLoadError: boolean;
   isLoading: boolean;
+  /** The descendant fetch hit its limit, so older replies may be missing. */
+  isTruncated: boolean;
   /** The relay says the thread root is gone: deleted, not a load error. */
   isRootDeleted: boolean;
   /** Edits/deletions referencing context messages, fetched by `#e`. */
@@ -60,6 +62,7 @@ export function useInboxThreadContext(
 ): InboxThreadContextResult {
   const [fetchedEvents, setFetchedEvents] = React.useState<RelayEvent[]>([]);
   const [hasLoadError, setHasLoadError] = React.useState(false);
+  const [isTruncated, setIsTruncated] = React.useState(false);
   const [deletedRootId, setDeletedRootId] = React.useState<string | null>(null);
   // Readiness belongs to the selection whose context actually settled. A
   // boolean set in the effect reports false for the first render of a new
@@ -88,6 +91,7 @@ export function useInboxThreadContext(
     if (fullChannel || !selectedEvent || !selectedThreadRootId) {
       setFetchedEvents([]);
       setHasLoadError(false);
+      setIsTruncated(false);
       setSettledEvent(null);
       return () => {
         isCancelled = true;
@@ -190,6 +194,7 @@ export function useInboxThreadContext(
         }
 
         setHasLoadError(ancestorResult.failed || descendantResult.failed);
+        setIsTruncated(descendantResult.events.length >= THREAD_CONTEXT_LIMIT);
         setDeletedRootId(ancestorResult.rootDeleted ? threadRootId : null);
         setFetchedEvents(
           dedupeEvents(
@@ -390,6 +395,7 @@ export function useInboxThreadContext(
     isLoading: fullChannel
       ? options.isChannelLoading === true
       : selectedEvent !== null && settledEvent !== selectedEvent,
+    isTruncated: !fullChannel && isTruncated,
     isRootDeleted:
       !fullChannel &&
       deletedRootId !== null &&

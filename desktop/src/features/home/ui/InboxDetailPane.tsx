@@ -110,6 +110,8 @@ type InboxDetailPaneProps = {
   isSinglePanelView?: boolean;
   hasThreadContextLoadError?: boolean;
   isThreadContextLoading?: boolean;
+  /** The fetched thread may be missing older replies (fetch limit hit). */
+  isThreadContextTruncated?: boolean;
   /** The relay reported the thread root as deleted. */
   isThreadRootDeleted?: boolean;
   item: InboxItem | null;
@@ -204,6 +206,7 @@ function InboxMessageDetailPane({
   isSinglePanelView = false,
   hasThreadContextLoadError = false,
   isThreadContextLoading = false,
+  isThreadContextTruncated = false,
   isThreadRootDeleted = false,
   item,
   messages = EMPTY_CONTEXT_MESSAGES,
@@ -563,7 +566,10 @@ function InboxMessageDetailPane({
   );
   const threadRootTags = isThreadContext ? (conversationRoot?.tags ?? []) : [];
   const threadParticipants =
-    isThreadContextLoading || hasThreadContextLoadError || !conversationRoot
+    isThreadContextLoading ||
+    hasThreadContextLoadError ||
+    isThreadContextTruncated ||
+    !conversationRoot
       ? null
       : displayMessages.map(({ authorPubkey, tags }) => ({
           pubkey: authorPubkey,
@@ -897,12 +903,6 @@ function InboxMessageDetailPane({
                       type: "thread",
                       rootTags: threadRootTags,
                       participants: threadParticipants,
-                      replyToPubkeys: [
-                        conversationRoot?.authorPubkey,
-                        displayMessages.find(
-                          (message) => message.id === composerParentEventId,
-                        )?.authorPubkey,
-                      ],
                     }
               }
               channelId={item.item.channelId}
