@@ -41,6 +41,7 @@ import {
 import { useLinkEditor } from "@/features/messages/lib/useLinkEditor";
 import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposerSpoilerParticles";
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
+import { stripImplicitAgentMentionPrefix } from "@/features/messages/lib/stripImplicitAgentMentions";
 import { cn } from "@/shared/lib/cn";
 import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
 import { ComposerShareLinkPrompt } from "./ComposerShareLinkPrompt";
@@ -327,7 +328,12 @@ function MessageComposerImpl({
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
-      if (text.trim().length > 0) {
+      if (
+        stripImplicitAgentMentionPrefix(
+          text,
+          implicitAgentMentionProvenance.getPrefix(),
+        ).trim().length > 0
+      ) {
         notifyTyping();
       }
     },
