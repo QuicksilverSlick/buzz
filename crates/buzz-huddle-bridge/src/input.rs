@@ -6,7 +6,8 @@
 //! own output plays (half-duplex).
 //!
 //! The caller owns the socket and the clock: it feeds relay frames and control messages in,
-//! calls [`Input::tick`] every 10 ms with unix ms, and sends what comes out to Talos.
+//! calls [`Input::tick`] every 10 ms, and sends what comes out to Talos. Every `now_ms` is unix
+//! ms on a monotonic clock (a start time plus `Instant` elapsed), so no window or age jumps.
 
 use crate::frames::{Role, ToTalos};
 use buzz_audio_client::connection::{parse_peers, Peer};
@@ -24,6 +25,8 @@ const IDLE_MS: u64 = 500;
 const CHUNK: usize = 480; // 20 ms at 24 kHz.
 const SENT_CAP: usize = 4_096;
 const TAPS: usize = 31;
+/// A tick gap past this is a stall: audio queued through it is dropped, never played late.
+const STALL_MS: u64 = 5 * TICK_MS;
 
 /// Who the voice may hear. The caller computes `admitted` with the agent's author gate and
 /// `agents` from the room's `bot` roles, trusted 30177 records, Talos, and this agent itself.
@@ -49,12 +52,16 @@ pub struct Tuning {
     pub onset_ms: u64,
     /// Silence before the forwarded human releases the floor.
     pub hangover_ms: u64,
-    /// Echo tail after the voice's output, for the owner's desktop.
+    /// Echo tail after the voice's output, for the owner's desktop. ponytail: both tails are
+    /// guesses until probe P measures them from `output_until`, the desktop's and the phone's.
     pub desktop_tail_ms: u64,
-    /// Echo tail for every other peer. ponytail: a guess until probe P measures the phone.
+    /// Echo tail for every other peer.
     pub remote_tail_ms: u64,
     /// Widening on both sides of each `secret` window, for clock skew with Talos.
     pub secret_skew_ms: u64,
+    /// A talker this long without a pause yields the floor to any fresh talker, so steady
+    /// noise can't hold it. ponytail: a per-peer noise floor is the upgrade, after probe P.
+    pub floor_cap_ms: u64,
 }
 
 impl Default for Tuning {
@@ -66,6 +73,7 @@ impl Default for Tuning {
             desktop_tail_ms: 300,
             remote_tail_ms: 600,
             secret_skew_ms: 1_000,
+            floor_cap_ms: 30_000,
         }
     }
 }
@@ -78,19 +86,22 @@ pub struct Route {
     pub isolated: bool,
 }
 
-/// Read the desktop's route file, `{isolated, huddle, updated_at}`, for `huddle`. A missing or
-/// unreadable file, or one naming another huddle, means not here and not isolated.
-pub fn read_route(path: &Path, huddle: &str) -> Route {
+/// Read the desktop's route file, `{isolated, huddle, updated_at}` in unix s, for `huddle` at
+/// `now_ms`. The desktop rewrites it every 5 s while in a huddle and deletes it on leaving. A
+/// missing or unreadable file, one for another huddle, or one 3 heartbeats stale means not here
+/// and not isolated. Re-read it every few seconds: going stale changes nothing on disk.
+pub fn read_route(path: &Path, huddle: &str, now_ms: u64) -> Route {
     #[derive(Deserialize)]
     struct File {
-        #[serde(default)]
         isolated: bool,
-        huddle: Option<String>,
+        huddle: String,
+        updated_at: u64,
     }
     let file: Option<File> = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    file.filter(|f| f.huddle.as_deref() == Some(huddle))
+    let fresh = |f: &File| f.updated_at.saturating_mul(1000).abs_diff(now_ms) <= 15_000;
+    file.filter(|f| f.huddle == huddle && fresh(f))
         .map_or_else(Route::default, |f| Route {
             here: true,
             isolated: f.isolated,
@@ -135,6 +146,8 @@ struct Slot {
     talking: bool,
     since_ms: u64,
     echo: bool,
+    /// An onset not yet sent because it fell in the echo.
+    onset: bool,
 }
 
 impl Slot {
@@ -177,6 +190,7 @@ pub struct Input {
     sent: VecDeque<Sent>,
     output_until_ms: u64,
     secret: Vec<Range<u64>>,
+    last_tick_ms: Option<u64>,
 }
 
 impl Input {
@@ -262,6 +276,7 @@ impl Input {
                     talking: false,
                     since_ms: 0,
                     echo: false,
+                    onset: false,
                 })
             }
         };
@@ -296,9 +311,10 @@ impl Input {
     }
 
     /// Talos marked unix ms `from_ms..to_ms`, on its clock, secret; it arrived at `now_ms`. The
-    /// window is widened by the skew margin on both sides and starts by `now_ms` at the latest,
-    /// so skew only widens it. Its audio leaves every ring, and nothing inside it is recorded
-    /// or forwarded.
+    /// window is widened by the skew margin on both sides and starts by `now_ms` at the latest.
+    /// Its audio leaves every ring, nothing arriving inside it is recorded or forwarded, and what
+    /// is still queued at its end is dropped. ponytail: judged by arrival, so a packet the network
+    /// holds past the window still plays; the RTP timestamp is the upgrade.
     pub fn add_secret(&mut self, from_ms: u64, to_ms: u64, now_ms: u64) {
         let skew = self.tuning.secret_skew_ms;
         let window =
@@ -308,20 +324,58 @@ impl Input {
         }
         // Up to 10 ms not yet sent: silence it, keeping the session clock.
         self.pending.fill(0);
-        self.secret.push(window);
+        if window.end > now_ms {
+            self.secret.push(window);
+        }
     }
 
-    /// One peer's ring audio in unix ms `from_ms..to_ms`, as PCM16 LE at 24 kHz. Audio older
-    /// than the ring at `now_ms` is never returned, even if no tick has evicted it yet.
-    pub fn replay(&self, index: u8, from_ms: u64, to_ms: u64, now_ms: u64) -> Vec<u8> {
-        let Some(slot) = self.slots.get(&index) else {
-            return Vec::new();
-        };
-        let ring = slot
-            .ring
-            .iter()
-            .filter(|(t, _)| (from_ms..to_ms).contains(t) && fresh(*t, now_ms));
-        ring.flat_map(|(_, pcm)| pcm.iter().flat_map(|s| s.to_le_bytes()))
+    /// Answer `replay_req` with one peer's ring audio in unix ms `from_ms..to_ms`: `replay`, the
+    /// PCM, `replay_end`, all sent before the next tick's output. It counts on the session clock
+    /// and in the send log like live audio. Nothing goes out while the voice is quiet.
+    pub fn replay(&mut self, index: u8, from_ms: u64, to_ms: u64, now_ms: u64) -> Vec<Out> {
+        let mut out = Vec::new();
+        if !self.awake {
+            return out;
+        }
+        // Live audio already counted goes first, padded to a whole chunk.
+        let pad = (CHUNK - self.pending.len() % CHUNK) % CHUNK;
+        self.pending.resize(self.pending.len() + pad, 0);
+        self.session_ms += pad as u64 * 1000 / 24_000;
+        self.send(&mut out);
+        self.next_span += 1;
+        let span = self.next_span;
+        out.push(Out::Frame(ToTalos::Replay {
+            span,
+            from_ms,
+            to_ms,
+        }));
+        let mut pcm = self.ring_pcm(index, from_ms, to_ms, now_ms);
+        pcm.resize(pcm.len().next_multiple_of(CHUNK), 0);
+        let from = self.session_ms;
+        self.session_ms += pcm.len() as u64 * 1000 / 24_000;
+        if let Some(slot) = self.slots.get(&index).filter(|_| !pcm.is_empty()) {
+            let pubkey = slot.key.0.clone();
+            self.log_sent(Sent {
+                span,
+                role: self.role(&pubkey),
+                pubkey,
+                echo: false,
+                from_ms: from,
+                to_ms: self.session_ms,
+            });
+        }
+        self.pending = pcm;
+        self.send(&mut out);
+        out.push(Out::Frame(ToTalos::ReplayEnd { span }));
+        out
+    }
+
+    /// One peer's ring audio in unix ms `from_ms..to_ms`. Audio older than the ring at `now_ms`
+    /// is never returned, even if no tick has evicted it yet.
+    fn ring_pcm(&self, index: u8, from_ms: u64, to_ms: u64, now_ms: u64) -> Vec<i16> {
+        let ring = self.slots.get(&index).into_iter().flat_map(|s| &s.ring);
+        ring.filter(|(t, _)| (from_ms..to_ms).contains(t) && fresh(*t, now_ms))
+            .flat_map(|(_, pcm)| pcm.iter().copied())
             .collect()
     }
 
@@ -350,8 +404,18 @@ impl Input {
     pub fn tick(&mut self, now_ms: u64) -> Vec<Out> {
         let mut out = Vec::new();
         let t = self.tuning.clone();
+        let windows = self.secret.len();
         self.secret.retain(|w| w.end > now_ms);
-        let secret = self.secret.iter().any(|w| w.contains(&now_ms));
+        // Windows start by their receipt, so one not yet over holds through a clock step back.
+        let secret = !self.secret.is_empty();
+        // What a stall, a clock step or a window's end left queued must not play late.
+        let stalled = self
+            .last_tick_ms
+            .is_some_and(|last| now_ms < last || now_ms - last > STALL_MS);
+        self.last_tick_ms = Some(now_ms);
+        if stalled || self.secret.len() < windows {
+            self.flush();
+        }
         let owner_peers = self
             .roster
             .values()
@@ -392,7 +456,11 @@ impl Input {
                     }
                 }
             }
-            if slot.hear(loud, now_ms, &t) && !slot.echo {
+            // An onset in the echo goes out once the echo clears, if the talk goes on.
+            let onset = slot.hear(loud, now_ms, &t);
+            slot.onset = (slot.onset || onset) && slot.talking;
+            if slot.onset && !slot.echo {
+                slot.onset = false;
                 out.push(Out::Frame(ToTalos::Onset {
                     pubkey: slot.key.0.clone(),
                 }));
@@ -401,11 +469,17 @@ impl Input {
         if !self.awake {
             return out;
         }
-        if self
-            .floor
-            .as_ref()
-            .is_some_and(|f| !self.slots.get(&f.index).is_some_and(|s| s.talking))
-        {
+        // A talker in its echo, or one that hasn't paused for `floor_cap_ms`, yields the floor
+        // to any other talker.
+        let demoted = |s: &Slot| s.echo || now_ms.saturating_sub(s.since_ms) >= t.floor_cap_ms;
+        let rival = |held: u8| {
+            let mut others = self.slots.iter().filter(|(i, _)| **i != held);
+            others.any(|(_, s)| s.talking && !demoted(s))
+        };
+        if self.floor.as_ref().is_some_and(|f| {
+            let slot = self.slots.get(&f.index);
+            !slot.is_some_and(|s| s.talking) || (slot.is_some_and(demoted) && rival(f.index))
+        }) {
             self.floor = None;
         }
         let mut preroll = false;
@@ -414,7 +488,7 @@ impl Input {
                 .slots
                 .iter()
                 .filter(|(_, s)| s.talking)
-                .min_by_key(|(i, s)| (s.since_ms, **i));
+                .min_by_key(|(i, s)| (demoted(s), s.since_ms, **i));
             if let Some((&index, slot)) = next {
                 self.next_span += 1;
                 let floor = Floor {
@@ -463,15 +537,27 @@ impl Input {
             });
         }
         self.pending.extend(audio);
-        while self.pending.len() >= CHUNK {
-            out.push(Out::Pcm(
-                self.pending
-                    .drain(..CHUNK)
-                    .flat_map(|s| s.to_le_bytes())
-                    .collect(),
-            ));
-        }
+        self.send(&mut out);
         out
+    }
+
+    /// Send pending audio in whole chunks.
+    fn send(&mut self, out: &mut Vec<Out>) {
+        while self.pending.len() >= CHUNK {
+            let chunk = self.pending.drain(..CHUNK).flat_map(|s| s.to_le_bytes());
+            out.push(Out::Pcm(chunk.collect()));
+        }
+    }
+
+    /// Drop every slot's queued packets and filter state; one that can't restart goes.
+    fn flush(&mut self) {
+        self.slots.retain(|&index, slot| {
+            slot.down = Halfband::new();
+            PeerJitterBuffer::new(index)
+                .map(|j| slot.jitter = j)
+                .is_ok()
+        });
+        self.prune();
     }
 
     fn role(&self, pubkey: &str) -> Role {
@@ -515,7 +601,8 @@ fn fresh(t: u64, now_ms: u64) -> bool {
     t <= now_ms && now_ms - t < RING_MS
 }
 
-/// 48 to 24 kHz: a 31-tap Hamming-windowed half-band low-pass, then every second sample.
+/// 48 to 24 kHz: a 31-tap Hamming-windowed half-band low-pass, then every second sample. It
+/// passes speech flat and takes about 30 dB off 14 kHz and 50 dB off 16 kHz and up.
 struct Halfband {
     taps: [f32; TAPS],
     hist: Vec<f32>,
@@ -599,26 +686,35 @@ mod tests {
         Talker(index, AudioEncoder::new().unwrap(), amp, level)
     }
 
+    impl Talker {
+        fn frame(&mut self) -> Vec<u8> {
+            let Talker(index, enc, amp, level) = self;
+            let pcm: Vec<f32> = (0..960)
+                .map(|i| *amp * (TAU * 1000.0 * i as f32 / 48_000.0).sin())
+                .collect();
+            let mut frame = vec![*index];
+            frame.extend(enc.encode(&pcm).unwrap());
+            if let Some(level) = level {
+                frame[7] = *level as u8;
+            }
+            frame
+        }
+    }
+
     fn run(input: &mut Input, now: &mut u64, ms: u64, talkers: &mut [Talker]) -> Vec<Out> {
         let mut out = Vec::new();
         for _ in 0..ms / TICK_MS {
-            for Talker(index, enc, amp, level) in
-                talkers.iter_mut().filter(|_| now.is_multiple_of(20))
-            {
-                let pcm: Vec<f32> = (0..960)
-                    .map(|i| *amp * (TAU * 1000.0 * i as f32 / 48_000.0).sin())
-                    .collect();
-                let mut frame = vec![*index];
-                frame.extend(enc.encode(&pcm).unwrap());
-                if let Some(level) = level {
-                    frame[7] = *level as u8;
-                }
-                input.on_audio(&frame, *now);
+            for talker in talkers.iter_mut().filter(|_| now.is_multiple_of(20)) {
+                input.on_audio(&talker.frame(), *now);
             }
             out.extend(input.tick(*now));
             *now += TICK_MS;
         }
         out
+    }
+
+    fn ring(input: &Input, from: u64, to: u64, now: u64) -> usize {
+        input.ring_pcm(1, from, to, now).len() / (CHUNK / 2)
     }
 
     fn frames(out: &[Out]) -> Vec<&ToTalos> {
@@ -783,9 +879,103 @@ mod tests {
             let after = run(&mut input, &mut now, 1_200, &mut owner);
             assert!(voiced(&after) && input.who_said(0, u64::MAX).all(|s| s.echo == echo));
             // Echo lasts to start + 1.6 s (1 s of output, 600 ms tail) and never enters the ring.
-            let ring = if echo { 20 } else { 180 };
-            assert_eq!(input.replay(1, start, now, now).len(), ring * CHUNK);
+            let kept = if echo { 20 } else { 180 };
+            assert_eq!(ring(&input, start, now, now), kept);
         }
+        // Quiet, an onset in the echo goes out once the echo clears.
+        let mut input = input();
+        input.set_output_until(now + 100);
+        let out = run(&mut input, &mut now, 1_000, &mut [talker(2, 0.3, None)]);
+        let onset = ToTalos::Onset {
+            pubkey: GUEST.into(),
+        };
+        assert_eq!(frames(&out), [&onset]);
+    }
+
+    #[test]
+    fn echo_and_steady_noise_yield_the_floor() {
+        for echo in [true, false] {
+            let mut input = input();
+            input.set_awake(true);
+            let mut now = T0;
+            if echo {
+                // The owner on headphones, the guest on speakers while the voice talks.
+                input.set_route(Route {
+                    here: true,
+                    isolated: true,
+                });
+                input.set_output_until(now + 3_000);
+            } else {
+                input.tuning.floor_cap_ms = 1_000;
+            }
+            // The guest takes the floor, then the owner talks.
+            let mut ts = [talker(2, 0.3, None), talker(1, 0.0, None)];
+            run(&mut input, &mut now, 1_500, &mut ts);
+            ts[1].2 = 0.3;
+            run(&mut input, &mut now, 500, &mut ts);
+            let owner = input.who_said(0, u64::MAX).any(|s| s.pubkey == OWNER);
+            assert!(owner, "echo: {echo}");
+        }
+    }
+
+    #[test]
+    fn audio_queued_through_a_stall_never_plays_late() {
+        // The secret window, or the output and its tail, end while no tick runs.
+        for secret in [true, false] {
+            let mut input = input();
+            input.set_awake(true);
+            let mut now = T0;
+            if secret {
+                input.add_secret(now, now + 100, now);
+            } else {
+                input.set_output_until(now + 500);
+            }
+            input.tick(now);
+            let mut owner = talker(1, 0.3, None);
+            for _ in 0..55 {
+                input.on_audio(&owner.frame(), now);
+                now += 20;
+            }
+            owner.2 = 0.0;
+            let out = run(&mut input, &mut now, 300, &mut [owner]);
+            let pcm = input.ring_pcm(1, T0, now, now);
+            assert!(
+                !voiced(&out) && pcm.iter().all(|s| s.abs() < 1000),
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replay_counts_on_the_session_clock_and_names_its_peer() {
+        let mut input = input();
+        input.set_awake(true);
+        let mut now = T0;
+        let mut ts = [talker(1, 0.3, None), talker(2, 0.3, None)];
+        let mut out = run(&mut input, &mut now, 500, &mut ts);
+        let replay = input.replay(2, now - 300, now, now);
+        let at = input.session_ms;
+        assert!(matches!(
+            frames(&replay)[..],
+            [
+                ToTalos::Replay { span: 2, .. },
+                ToTalos::ReplayEnd { span: 2 }
+            ]
+        ));
+        out.extend(replay);
+        out.extend(run(&mut input, &mut now, 200, &mut ts));
+        // Every sample sent counts once, so Talos's ms map back to the right peer.
+        let chunks = out.iter().filter(|o| matches!(o, Out::Pcm(_))).count();
+        let sent = chunks * CHUNK + input.pending.len();
+        assert_eq!(sent, input.session_ms as usize * 24);
+        let who = |from, to| {
+            let log = input.who_said(from, to);
+            log.map(|s| s.pubkey.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(who(at - 300, at), [GUEST]);
+        assert_eq!(who(at, at + 200), [OWNER]);
+        input.set_awake(false);
+        assert!(input.replay(2, now - 300, now, now).is_empty(), "quiet");
     }
 
     #[test]
@@ -799,11 +989,11 @@ mod tests {
                 .all(|o| matches!(o, Out::Frame(ToTalos::Onset { .. }))),
             "quiet: onset only"
         );
-        assert_eq!(input.replay(1, T0, now, now).len(), 300 * CHUNK);
+        assert_eq!(ring(&input, T0, now, now), 300);
         // 1 s of skew on each side: T0 + 0.5 s to T0 + 2.6 s goes.
         input.add_secret(T0 + 1_500, T0 + 1_600, now);
-        assert_eq!(input.replay(1, T0, now, now).len(), 90 * CHUNK);
-        assert!(input.replay(1, T0 + 500, T0 + 2_600, now).is_empty());
+        assert_eq!(ring(&input, T0, now, now), 90);
+        assert_eq!(ring(&input, T0 + 500, T0 + 2_600, now), 0);
         // A window still ahead on this clock starts dropping on receipt: start to start + 3.1 s.
         // Forwarding when it lands, with 10 ms of voiced audio still pending.
         input.set_awake(true);
@@ -811,11 +1001,20 @@ mod tests {
         let start = now;
         input.add_secret(start + 2_000, start + 2_100, start);
         let out = run(&mut input, &mut now, 3_100, &mut owner);
-        assert!(!voiced(&out) && input.replay(1, start, now, now).is_empty());
+        assert!(!voiced(&out) && ring(&input, start, now, now) == 0);
+        // Its end drops what is still queued.
+        run(&mut input, &mut now, 10, &mut owner);
+        assert!(input.slots[&1].jitter.is_empty());
         assert!(
             voiced(&run(&mut input, &mut now, 200, &mut owner)),
             "after the window"
         );
+        // A window not yet over holds when the clock steps back.
+        input.add_secret(now, now + 100, now);
+        now -= 5_000;
+        let start = now;
+        let out = run(&mut input, &mut now, 500, &mut owner);
+        assert!(!voiced(&out) && ring(&input, start, now, now) == 0);
     }
 
     #[test]
@@ -824,14 +1023,17 @@ mod tests {
         let mut now = T0;
         run(&mut input, &mut now, 500, &mut [talker(1, 0.3, None)]);
         // No tick since, and a replay still ages entries out: T0 + 0.26 s to T0 + 0.49 s is left.
-        assert_eq!(
-            input.replay(1, 0, u64::MAX, T0 + RING_MS + 250).len(),
-            24 * CHUNK
-        );
-        assert!(input.replay(1, 0, u64::MAX, T0 + RING_MS + 490).is_empty());
-        // One late tick evicts by age, where a count bound would have kept all 50 entries.
-        input.tick(T0 + 20_000);
-        assert!(input.slots[&1].ring.iter().all(|(t, _)| *t == T0 + 20_000));
+        assert_eq!(ring(&input, 0, u64::MAX, T0 + RING_MS + 250), 24);
+        assert_eq!(ring(&input, 0, u64::MAX, T0 + RING_MS + 490), 0);
+        // One late tick evicts by age, where a count bound would have kept all 50 entries; one
+        // after the clock steps back drops entries stamped ahead of it.
+        for late in [T0 + 20_000, T0 - 5_000] {
+            let mut input = self::input();
+            let mut now = T0;
+            run(&mut input, &mut now, 500, &mut [talker(1, 0.3, None)]);
+            input.tick(late);
+            assert!(input.slots[&1].ring.iter().all(|(t, _)| *t == late));
+        }
     }
 
     #[test]
@@ -855,34 +1057,33 @@ mod tests {
             out[100..].iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / (0.5 * 32_767.0)
         };
         assert!((gain(1_000.0) - 1.0).abs() < 0.05);
-        assert!(gain(20_000.0) < 0.01);
+        assert!(gain(14_000.0) < 0.04 && gain(16_000.0) < 0.004 && gain(20_000.0) < 0.01);
     }
 
     #[test]
-    fn route_file_counts_only_for_this_huddle() {
+    fn route_file_counts_only_for_this_huddle_while_fresh() {
         let path =
             std::env::temp_dir().join(format!("huddle-bridge-route-{}.json", std::process::id()));
-        let read = |text: &str| {
+        let read = |text: String| {
             std::fs::write(&path, text).unwrap();
-            read_route(&path, H)
+            read_route(&path, H, T0)
+        };
+        let file = |huddle: &str, age_s: u64| {
+            let at = T0 / 1000 - age_s;
+            format!(r#"{{"isolated":true,"huddle":"{huddle}","updated_at":{at}}}"#)
         };
         let on = Route {
             here: true,
             isolated: true,
         };
-        assert_eq!(
-            read(&format!(
-                r#"{{"isolated":true,"huddle":"{H}","updated_at":1}}"#
-            )),
-            on
-        );
-        assert_eq!(
-            read(r#"{"isolated":true,"huddle":"other","updated_at":1}"#),
-            Route::default()
-        );
-        assert_eq!(read(r#"{"isolated":true}"#), Route::default());
-        assert_eq!(read("not json"), Route::default());
+        assert_eq!(read(file(H, 5)), on);
+        assert_eq!(read(file("other", 5)), Route::default());
+        // A desktop that crashed, or left without deleting it: three heartbeats missed.
+        assert_eq!(read(file(H, 20)), Route::default());
+        let unnamed = format!(r#"{{"isolated":true,"updated_at":{}}}"#, T0 / 1000);
+        assert_eq!(read(unnamed), Route::default());
+        assert_eq!(read("not json".into()), Route::default());
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(read_route(&path, H), Route::default());
+        assert_eq!(read_route(&path, H, T0), Route::default());
     }
 }
