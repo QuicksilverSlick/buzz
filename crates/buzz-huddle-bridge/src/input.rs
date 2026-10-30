@@ -1,7 +1,8 @@
 //! Room audio toward one voice. Each peer is decoded on its own; agents and peers the agent's
 //! author gate doesn't admit are dropped before decode; speech comes from decoded PCM energy
-//! (never the client-written `level_dbov`); and one human at a time is forwarded, resampled to
-//! 24 kHz, with a send log.
+//! (never the client-written `level_dbov`); one human at a time is forwarded, resampled to
+//! 24 kHz, with a send log; each peer keeps an ~8 s ring that drops secret windows; and on a
+//! non-isolated route the voice doesn't hear a peer while its own output plays (half-duplex).
 //!
 //! The caller owns the socket and the clock: it feeds relay frames and control messages in,
 //! calls [`Input::tick`] every 10 ms with unix ms, and sends what comes out to Talos.
@@ -10,10 +11,13 @@ use crate::frames::{Frame, Role};
 use buzz_audio_client::connection::{parse_peers, Peer};
 use buzz_audio_client::jitter::PeerJitterBuffer;
 use buzz_audio_client::wire::{audio_level_dbov, parse_relay_frame};
+use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 const TICK_MS: u64 = 10;
+const RING_MS: u64 = 8_000;
 const IDLE_MS: u64 = 500;
 const CHUNK: usize = 480; // 20 ms at 24 kHz.
 const SENT_CAP: usize = 4_096;
@@ -39,10 +43,14 @@ impl Policy {
 pub struct Tuning {
     /// Decoded-PCM RMS level (dBov) at or above which a 10 ms frame is speech.
     pub speech_dbov: i8,
-    /// Sustained speech before `onset`.
+    /// Sustained speech before `onset`; this much audio is also sent ahead of the span.
     pub onset_ms: u64,
     /// Silence before the forwarded human releases the floor.
     pub hangover_ms: u64,
+    /// Echo tail after the voice's output, for the owner's desktop.
+    pub desktop_tail_ms: u64,
+    /// Echo tail for every other peer. ponytail: a guess until probe P measures the phone.
+    pub remote_tail_ms: u64,
 }
 
 impl Default for Tuning {
@@ -51,8 +59,37 @@ impl Default for Tuning {
             speech_dbov: -45,
             onset_ms: 100,
             hangover_ms: 300,
+            desktop_tail_ms: 300,
+            remote_tail_ms: 600,
         }
     }
+}
+
+/// The desktop's output route as it applies to one huddle: `here` when the desktop's audio is
+/// in it, `isolated` when that output is headphones.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Route {
+    pub here: bool,
+    pub isolated: bool,
+}
+
+/// Read the desktop's route file, `{isolated, huddle, updated_at}`, for `huddle`. A missing or
+/// unreadable file, or one naming another huddle, means not here and not isolated.
+pub fn read_route(path: &Path, huddle: &str) -> Route {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        isolated: bool,
+        huddle: Option<String>,
+    }
+    let file: Option<File> = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    file.filter(|f| f.huddle.as_deref() == Some(huddle))
+        .map_or_else(Route::default, |f| Route {
+            here: true,
+            isolated: f.isolated,
+        })
 }
 
 /// What the caller sends on to Talos.
@@ -70,6 +107,7 @@ pub struct Sent {
     pub span: u64,
     pub pubkey: String,
     pub role: Role,
+    pub echo: bool,
     pub from_ms: u64,
     pub to_ms: u64,
 }
@@ -77,18 +115,21 @@ pub struct Sent {
 struct Floor {
     index: u8,
     span: u64,
+    echo: bool,
 }
 
 struct Slot {
     key: (String, u8),
     jitter: PeerJitterBuffer,
     down: Halfband,
+    ring: VecDeque<(u64, Vec<i16>)>,
     last: Vec<i16>,
     last_packet_ms: u64,
     loud_ms: u64,
     quiet_ms: u64,
     talking: bool,
     since_ms: u64,
+    echo: bool,
 }
 
 impl Slot {
@@ -120,6 +161,7 @@ impl Slot {
 pub struct Input {
     policy: Policy,
     tuning: Tuning,
+    route: Route,
     roster: HashMap<u8, (String, u8)>,
     slots: HashMap<u8, Slot>,
     floor: Option<Floor>,
@@ -128,6 +170,8 @@ pub struct Input {
     session_ms: u64,
     pending: Vec<i16>,
     sent: VecDeque<Sent>,
+    output_until_ms: u64,
+    secret: Vec<(u64, u64)>,
 }
 
 impl Input {
@@ -142,6 +186,10 @@ impl Input {
     pub fn set_policy(&mut self, policy: Policy) {
         self.policy = policy;
         self.prune();
+    }
+
+    pub fn set_route(&mut self, route: Route) {
+        self.route = route;
     }
 
     /// Replace the peer map from a relay snapshot (the initial `Joined::peers`).
@@ -195,12 +243,14 @@ impl Input {
                     key: key.clone(),
                     jitter,
                     down: Halfband::new(),
+                    ring: VecDeque::new(),
                     last: Vec::new(),
                     last_packet_ms: now_ms,
                     loud_ms: 0,
                     quiet_ms: 0,
                     talking: false,
                     since_ms: 0,
+                    echo: false,
                 })
             }
         };
@@ -223,6 +273,33 @@ impl Input {
         self.awake = awake;
         self.floor = None;
         self.pending.clear();
+    }
+
+    /// The voice's own output plays until `unix_ms` (set by the output path).
+    pub fn set_output_until(&mut self, unix_ms: u64) {
+        self.output_until_ms = self.output_until_ms.max(unix_ms);
+    }
+
+    /// The room marked unix ms `from_ms..to_ms` secret: drop it from every ring, record and
+    /// forward nothing inside it.
+    pub fn add_secret(&mut self, from_ms: u64, to_ms: u64) {
+        for slot in self.slots.values_mut() {
+            slot.ring.retain(|(t, _)| *t < from_ms || *t >= to_ms);
+        }
+        self.secret.push((from_ms, to_ms));
+    }
+
+    /// One peer's ring audio in unix ms `from_ms..to_ms`, as PCM16 LE at 24 kHz.
+    pub fn replay(&self, index: u8, from_ms: u64, to_ms: u64) -> Vec<u8> {
+        let Some(slot) = self.slots.get(&index) else {
+            return Vec::new();
+        };
+        let ring = slot
+            .ring
+            .iter()
+            .filter(|(t, _)| (from_ms..to_ms).contains(t));
+        ring.flat_map(|(_, pcm)| pcm.iter().flat_map(|s| s.to_le_bytes()))
+            .collect()
     }
 
     /// Send-log entries overlapping session ms `start_ms..end_ms`, for mapping a transcript
@@ -250,6 +327,18 @@ impl Input {
     pub fn tick(&mut self, now_ms: u64) -> Vec<Out> {
         let mut out = Vec::new();
         let t = self.tuning.clone();
+        let secret = self
+            .secret
+            .iter()
+            .any(|&(from, to)| (from..to).contains(&now_ms));
+        self.secret
+            .retain(|&(_, to)| to.saturating_add(RING_MS) > now_ms);
+        let owner_peers = self
+            .roster
+            .values()
+            .filter(|(pk, _)| *pk == self.policy.owner)
+            .count();
+        let desktop_here = self.route.here && owner_peers == 1;
         for slot in self.slots.values_mut() {
             slot.last.clear();
             let active =
@@ -264,8 +353,24 @@ impl Input {
                 .is_some_and(|pcm| audio_level_dbov(pcm) >= t.speech_dbov);
             if let Some(pcm) = pcm {
                 slot.last = slot.down.process(&pcm);
+                if !secret {
+                    slot.ring.push_back((now_ms, slot.last.clone()));
+                    while slot.ring.len() as u64 > RING_MS / TICK_MS {
+                        slot.ring.pop_front();
+                    }
+                }
             }
-            if slot.hear(loud, now_ms, &t) {
+            // ponytail: the route names the desktop only when the owner has one peer here.
+            // Upgrade: have the desktop write its peer index into the route file.
+            let desktop = desktop_here && slot.key.0 == self.policy.owner;
+            let tail = if desktop {
+                t.desktop_tail_ms
+            } else {
+                t.remote_tail_ms
+            };
+            slot.echo = !(desktop && self.route.isolated)
+                && now_ms < self.output_until_ms.saturating_add(tail);
+            if slot.hear(loud, now_ms, &t) && !slot.echo {
                 out.push(Out::Frame(Frame::Onset {
                     pubkey: slot.key.0.clone(),
                 }));
@@ -281,6 +386,7 @@ impl Input {
         {
             self.floor = None;
         }
+        let mut preroll = false;
         if self.floor.is_none() {
             let next = self
                 .slots
@@ -292,31 +398,48 @@ impl Input {
                 let floor = Floor {
                     index,
                     span: self.next_span,
+                    echo: slot.echo,
                 };
                 out.push(Out::Frame(Frame::Speaker {
                     span: floor.span,
                     pubkey: slot.key.0.clone(),
                     role: self.role(&slot.key.0),
-                    echo: false,
+                    echo: floor.echo,
                     t_ms: self.session_ms,
                 }));
                 self.floor = Some(floor);
+                preroll = true;
             }
         }
-        // ponytail: the onset's first `onset_ms` isn't forwarded; the ring slice sends it.
-        let held = self.floor.as_ref().map(|f| (f.span, &self.slots[&f.index]));
-        let audio = match held {
-            Some((_, slot)) if !slot.last.is_empty() => slot.last.clone(),
-            _ => vec![0; CHUNK / 2],
+        let held = self.floor.as_ref().map(|f| (f, &self.slots[&f.index]));
+        let audio: Vec<i16> = match held {
+            Some((_, slot)) if !slot.echo && !secret && preroll => {
+                let n = (t.onset_ms / TICK_MS) as usize;
+                slot.ring
+                    .iter()
+                    .rev()
+                    .take(n)
+                    .rev()
+                    .flat_map(|(_, pcm)| pcm.iter().copied())
+                    .collect()
+            }
+            Some((_, slot)) if !slot.echo && !secret => slot.last.clone(),
+            _ => Vec::new(),
+        };
+        let audio = if audio.is_empty() {
+            vec![0; CHUNK / 2]
+        } else {
+            audio
         };
         let from = self.session_ms;
         self.session_ms += audio.len() as u64 * 1000 / 24_000;
-        if let Some((span, slot)) = held {
-            let pubkey = slot.key.0.clone();
+        if let Some((floor, slot)) = held.filter(|(_, s)| !s.echo && !secret) {
+            let (span, echo, pubkey) = (floor.span, floor.echo, slot.key.0.clone());
             self.log_sent(Sent {
                 span,
                 role: self.role(&pubkey),
                 pubkey,
+                echo,
                 from_ms: from,
                 to_ms: self.session_ms,
             });
@@ -420,6 +543,7 @@ mod tests {
     use buzz_audio_client::encoder::AudioEncoder;
     use std::f32::consts::TAU;
 
+    const H: &str = "5b6f8c2e-1d3a-4c8e-9f21-7a0b3c4d5e6f";
     const OWNER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
     const GUEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const AGENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -597,6 +721,68 @@ mod tests {
     }
 
     #[test]
+    fn half_duplex_unless_the_desktop_here_is_isolated() {
+        let mut now = T0;
+        for (here, echo) in [(false, true), (true, false)] {
+            let mut input = input();
+            input.set_awake(true);
+            input.set_route(Route {
+                here,
+                isolated: true,
+            });
+            input.set_output_until(now + 1_000);
+            let mut owner = [talker(1, 0.3, None)];
+            let during = run(&mut input, &mut now, 600, &mut owner);
+            let onset = frames(&during)
+                .iter()
+                .any(|f| matches!(f, Frame::Onset { .. }));
+            assert_eq!(onset, !echo, "here: {here}");
+            assert!(frames(&during)
+                .iter()
+                .any(|f| matches!(f, Frame::Speaker { echo: e, .. } if *e == echo)));
+            assert_eq!(voiced(&during), !echo, "here: {here}");
+            let after = run(&mut input, &mut now, 1_200, &mut owner);
+            assert!(voiced(&after) && input.who_said(0, u64::MAX).all(|s| s.echo == echo));
+        }
+    }
+
+    #[test]
+    fn ring_replays_and_drops_secret_windows() {
+        let mut input = input();
+        let mut now = T0;
+        let mut owner = [talker(1, 0.3, None)];
+        let out = run(&mut input, &mut now, 500, &mut owner);
+        assert!(
+            out.iter()
+                .all(|o| matches!(o, Out::Frame(Frame::Onset { .. }))),
+            "quiet: onset only"
+        );
+        assert_eq!(input.replay(1, T0, now).len(), 50 * CHUNK);
+        input.add_secret(T0 + 100, T0 + 300);
+        assert_eq!(input.replay(1, T0, now).len(), 30 * CHUNK);
+        assert!(input.replay(1, T0 + 100, T0 + 300).is_empty());
+        input.set_awake(true);
+        let start = now;
+        input.add_secret(start, start + 400);
+        let out = run(&mut input, &mut now, 400, &mut owner);
+        assert!(!voiced(&out) && input.replay(1, start, now).is_empty());
+        assert!(
+            voiced(&run(&mut input, &mut now, 200, &mut owner)),
+            "after the window"
+        );
+    }
+
+    #[test]
+    fn the_floor_starts_with_the_onset_audio() {
+        let mut input = input();
+        input.set_awake(true);
+        let mut now = T0;
+        run(&mut input, &mut now, 300, &mut [talker(1, 0.3, None)]);
+        // 30 ticks of 10 ms, plus the onset's 100 ms sent at once in place of one tick.
+        assert_eq!(input.who_said(0, u64::MAX).last().unwrap().to_ms, 390);
+    }
+
+    #[test]
     fn halfband_keeps_speech_and_stops_aliases() {
         let gain = |hz: f32| {
             let tone: Vec<f32> = (0..4_800)
@@ -608,5 +794,33 @@ mod tests {
         };
         assert!((gain(1_000.0) - 1.0).abs() < 0.05);
         assert!(gain(20_000.0) < 0.01);
+    }
+
+    #[test]
+    fn route_file_counts_only_for_this_huddle() {
+        let path =
+            std::env::temp_dir().join(format!("huddle-bridge-route-{}.json", std::process::id()));
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            read_route(&path, H)
+        };
+        let on = Route {
+            here: true,
+            isolated: true,
+        };
+        assert_eq!(
+            read(&format!(
+                r#"{{"isolated":true,"huddle":"{H}","updated_at":1}}"#
+            )),
+            on
+        );
+        assert_eq!(
+            read(r#"{"isolated":true,"huddle":"other","updated_at":1}"#),
+            Route::default()
+        );
+        assert_eq!(read(r#"{"isolated":true}"#), Route::default());
+        assert_eq!(read("not json"), Route::default());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_route(&path, H), Route::default());
     }
 }
