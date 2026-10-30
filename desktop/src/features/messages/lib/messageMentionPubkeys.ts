@@ -35,6 +35,14 @@ export function messageMentionPubkeys(
   );
 }
 
+/** A DM with more than one other participant, where agents are told apart. */
+export function isGroupDm(channel: Channel, senderPubkey: string): boolean {
+  return (
+    channel.channelType === "dm" &&
+    messageMentionPubkeys(channel, senderPubkey).length > 1
+  );
+}
+
 type DirectoryQuery<T> = { data: readonly T[] | undefined; error: unknown };
 
 type DmRecipientInput = {
@@ -72,12 +80,7 @@ export function dmRecipientPubkeys({
     senderPubkey,
     explicitMentions,
   );
-  if (
-    channel.channelType !== "dm" ||
-    messageMentionPubkeys(channel, senderPubkey).length <= 1
-  ) {
-    return recipients;
-  }
+  if (!isGroupDm(channel, senderPubkey)) return recipients;
 
   if (
     !isAgentDirectoryReady(members) ||

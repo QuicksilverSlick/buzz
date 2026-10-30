@@ -39,8 +39,10 @@ export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import {
   dmRecipientPubkeys,
+  isGroupDm,
   messageMentionPubkeys,
 } from "@/features/messages/lib/messageMentionPubkeys";
+import { isAgentDirectoryReady } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
 import {
   clearTimeoutState,
@@ -60,6 +62,9 @@ import {
   addReaction,
   deleteMessage,
   editMessage,
+  getChannelMembers,
+  listManagedAgents,
+  listRelayAgents,
   removeReaction,
   sendChannelMessage,
 } from "@/shared/api/tauri";
@@ -489,8 +494,8 @@ export function useChannelSubscription(channel: Channel | null) {
 /**
  * `groupDmAgentPubkeys` opts in to the group-DM rule (dmRecipientPubkeys): a
  * group DM tags its people and only the agents typed as @mentions. The DM's
- * member list and agent directories are read from the query cache for the
- * channel actually sent to.
+ * member list and agent directories come from the query cache, or are fetched
+ * when missing or failed, for the channel actually sent to.
  */
 export function useSendMessageMutation(
   channel: Channel | null,
@@ -564,28 +569,44 @@ export function useSendMessageMutation(
         mentionTags,
         linkPreviewTags,
       } = splitOutgoingTags(mediaTags);
-      const cached = <T>(queryKey: readonly unknown[]) =>
-        queryClient.getQueryState<T[]>(queryKey) ?? {
-          data: undefined,
-          error: null,
-        };
-      const recipientPubkeys = groupDmAgentPubkeys
-        ? dmRecipientPubkeys({
-            channel: effectiveChannel,
-            senderPubkey: identity.pubkey,
-            explicitMentions: mentionPubkeys ?? [],
-            members: cached<ChannelMember>(
-              channelMembersQueryKey(effectiveChannel.id),
-            ),
-            managedAgents: cached<{ pubkey: string }>(managedAgentsQueryKey),
-            relayAgents: cached<{ pubkey: string }>(relayAgentsQueryKey),
-            knownAgentPubkeys: groupDmAgentPubkeys,
-          })
-        : messageMentionPubkeys(
-            effectiveChannel,
-            identity.pubkey,
-            mentionPubkeys,
-          );
+      // A group-DM send reads a cold or failed member list or agent directory
+      // itself (joining any read in flight), and refuses only if that fails.
+      const source = async <T>(
+        queryKey: readonly unknown[],
+        queryFn: () => Promise<T[]>,
+      ): Promise<{ data: T[] | undefined; error: unknown }> => {
+        const state = queryClient.getQueryState<T[]>(queryKey);
+        if (state && isAgentDirectoryReady(state)) return state;
+        return queryClient.fetchQuery({ queryKey, queryFn }).then(
+          (data) => ({ data, error: null }),
+          (error: unknown) => ({ data: undefined, error }),
+        );
+      };
+      const recipientPubkeys =
+        groupDmAgentPubkeys && isGroupDm(effectiveChannel, identity.pubkey)
+          ? await Promise.all([
+              source<ChannelMember>(
+                channelMembersQueryKey(effectiveChannel.id),
+                () => getChannelMembers(effectiveChannel.id),
+              ),
+              source(managedAgentsQueryKey, listManagedAgents),
+              source(relayAgentsQueryKey, listRelayAgents),
+            ]).then(([members, managedAgents, relayAgents]) =>
+              dmRecipientPubkeys({
+                channel: effectiveChannel,
+                senderPubkey: identity.pubkey,
+                explicitMentions: mentionPubkeys ?? [],
+                members,
+                managedAgents,
+                relayAgents,
+                knownAgentPubkeys: groupDmAgentPubkeys,
+              }),
+            )
+          : messageMentionPubkeys(
+              effectiveChannel,
+              identity.pubkey,
+              mentionPubkeys,
+            );
       if (sentFromThreadRootId && parentEventId) {
         throw new Error(
           "A thread message can only be sent as a top-level message.",

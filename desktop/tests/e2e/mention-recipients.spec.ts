@@ -2,7 +2,12 @@ import { expect, test, type Page } from "@playwright/test";
 import { GENERAL_WELCOME_EVENT_ID } from "@/testing/e2eSeedIds";
 import { truncateNpub } from "../../src/shared/lib/pubkey";
 import { waitForAnimations } from "../helpers/animations";
-import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import {
+  installMockBridge,
+  pendingChannelMembersReads,
+  releaseChannelMembersReads,
+  TEST_IDENTITIES,
+} from "../helpers/bridge";
 
 const FIRST = TEST_IDENTITIES.alice.pubkey;
 const SECOND = TEST_IDENTITIES.bob.pubkey;
@@ -1045,29 +1050,37 @@ for (const partial of [false, true]) {
   });
 }
 
+// e2eBridge's "Group DM (3)": bob is a person, charlie an agent. DMs only offer
+// owned agents, so charlie (also a relay-directory agent) is managed here.
+const GROUP_DM = "d1ec7000-d000-4000-8000-000000000003";
+const bob = TEST_IDENTITIES.bob.pubkey;
+const charlie = TEST_IDENTITIES.charlie.pubkey;
+const charlieAgent = {
+  pubkey: charlie,
+  name: "charlie",
+  status: "running",
+} as const;
+
+function sentKinds(page: Page, content: string) {
+  return page.evaluate(
+    (content) =>
+      (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
+        .filter((event) => event.content === content)
+        .map((event) => ({
+          kind: event.kind,
+          p: event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
+        })),
+    content,
+  );
+}
+
 test("a group DM send tags its person and only the typed agent", async ({
   page,
 }) => {
-  const bob = TEST_IDENTITIES.bob.pubkey;
-  const charlie = TEST_IDENTITIES.charlie.pubkey;
-  // DMs only offer owned agents, so charlie (also a relay-directory agent) is
-  // managed here; bob is a person. Both share e2eBridge's "Group DM (3)".
-  await installMockBridge(page, {
-    managedAgents: [{ pubkey: charlie, name: "charlie", status: "running" }],
-  });
-  await page.goto("/#/channels/d1ec7000-d000-4000-8000-000000000003");
+  await installMockBridge(page, { managedAgents: [charlieAgent] });
+  await page.goto(`/#/channels/${GROUP_DM}`);
   const input = page.getByTestId("message-input");
-  const sent = (content: string) =>
-    page.evaluate(
-      (content) =>
-        (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
-          .filter((event) => event.content === content)
-          .map((event) => ({
-            kind: event.kind,
-            p: event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
-          })),
-      content,
-    );
+  const sent = (content: string) => sentKinds(page, content);
 
   // No @: the person is notified and the agent is not woken.
   const plain = `group DM plain ${Date.now()}`;
@@ -1088,4 +1101,88 @@ test("a group DM send tags its person and only the typed agent", async ({
   await expect
     .poll(async () => (await sent(mentioned)).map(({ p }) => p.sort()))
     .toEqual([[bob, charlie].sort()]);
+});
+
+test("a Drafts-panel send into a group DM waits for its member list", async ({
+  page,
+}) => {
+  const content = `group DM draft ${Date.now()}`;
+  await page.addInitScript(
+    ({ channel, content }) => {
+      const timestamp = new Date().toISOString();
+      window.localStorage.setItem(
+        `buzz-drafts.v1:${"deadbeef".repeat(8)}`,
+        JSON.stringify({
+          [channel]: {
+            channelId: channel,
+            content,
+            createdAt: timestamp,
+            pendingImeta: [],
+            selectionEnd: content.length,
+            selectionStart: content.length,
+            spoileredAttachmentUrls: [],
+            status: "active",
+            updatedAt: timestamp,
+          },
+        }),
+      );
+    },
+    { channel: GROUP_DM, content },
+  );
+  // Stands in for relay latency: the DM's member list is not cached yet.
+  await installMockBridge(page, {
+    managedAgents: [charlieAgent],
+    deferChannelMembersReads: true,
+  });
+  await page.goto("/");
+  await page.getByTestId("inbox-filter-trigger").click();
+  await page.getByRole("menuitemradio", { name: "Drafts" }).click();
+  await page.keyboard.press("Escape");
+  const draftRow = page.getByTestId(`home-draft-item-${GROUP_DM}`);
+  await draftRow.hover();
+  await draftRow
+    .getByRole("button", { name: "Send message", exact: true })
+    .click();
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "Send", exact: true })
+    .click();
+
+  // The send is under way (optimistic row) while the member list is held.
+  await expect(
+    page.getByTestId("message-row").filter({ hasText: content }),
+  ).toBeVisible();
+  await expect.poll(() => pendingChannelMembersReads(page)).toBeGreaterThan(0);
+  await releaseChannelMembersReads(page);
+  await expect
+    .poll(() => sentKinds(page, content))
+    .toEqual([{ kind: 9, p: [bob] }]);
+});
+
+test("a group DM send rereads an agent directory whose last read failed", async ({
+  page,
+}) => {
+  // Both the first read and its retry fail; the directory then recovers.
+  await installMockBridge(page, {
+    managedAgents: [charlieAgent],
+    relayAgentListErrors: ["relay down", "relay down"],
+  });
+  await page.goto(`/#/channels/${GROUP_DM}`);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "list_relay_agents",
+          ).length ?? 0,
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+
+  const content = `group DM after directory error ${Date.now()}`;
+  await page.getByTestId("message-input").fill(content);
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => sentKinds(page, content))
+    .toEqual([{ kind: 9, p: [bob] }]);
 });
