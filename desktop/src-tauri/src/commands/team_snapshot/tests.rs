@@ -59,6 +59,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: Some("A careful reviewer.".to_string()),
             id: "alice".to_string(),
             display_name: "Alice".to_string(),
@@ -86,6 +87,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: None,
             id: "bob".to_string(),
             display_name: "Bob".to_string(),
@@ -167,6 +169,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let definitions = vec![AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "alice".to_string(),
         display_name: "Alice".to_string(),
@@ -212,6 +215,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let instance = ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "a".repeat(64),

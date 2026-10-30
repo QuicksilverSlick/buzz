@@ -167,6 +167,7 @@ test("agent-requested access edits keep the owner's capability grants", () => {
       parallelism: 2,
       capabilities: ["desktop-control", "cross-session-note"],
       sessionPolicy: "channel",
+      voice: { enabled: true, voice: "marin", voiceWithoutOwner: false },
     },
   });
 
@@ -181,11 +182,19 @@ test("agent-requested access edits keep the owner's capability grants", () => {
   // grants, or the backend stores an empty list and silently revokes them.
   const seed = draftFromBehavior(updated.behavior);
   const edited = { ...seed, parallelism: "3" };
+  // The huddle voice rides along the same way, or the edit switches it off.
   assert.deepEqual(behaviorForSubmit(edited, seed, true), {
     respondTo: "anyone",
     respondToAllowlist: undefined,
     parallelism: 3,
     capabilities: ["cross-session-note", "desktop-control"],
     sessionPolicy: "channel",
+    voice: {
+      enabled: true,
+      voice: "marin",
+      persona: undefined,
+      aliases: undefined,
+      voiceWithoutOwner: false,
+    },
   });
 });

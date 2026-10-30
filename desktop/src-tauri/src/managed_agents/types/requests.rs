@@ -33,6 +33,9 @@ pub struct PersonaBehaviorRequest {
     /// Absent inside a present behavior group selects the channel default.
     #[serde(default)]
     pub session_policy: Option<AcpSessionPolicy>,
+    /// Huddle voice profile. Absent inside a present group clears it.
+    #[serde(default)]
+    pub voice: Option<crate::managed_agents::VoiceProfile>,
 }
 
 /// Validate a behavior group and apply it onto a persona record.
@@ -85,6 +88,8 @@ pub fn apply_persona_behavior(
             .map(|cap| cap.as_str().to_string())
             .collect();
     record.session_policy = behavior.session_policy.unwrap_or_default();
+    record.voice_profile =
+        crate::managed_agents::voice_profile::normalize_voice_profile(behavior.voice)?;
     Ok(())
 }
 
@@ -305,6 +310,10 @@ mod tests {
         record.respond_to = Some("allowlist".to_string());
         record.respond_to_allowlist = vec!["a".repeat(64)];
         record.parallelism = Some(4);
+        record.voice_profile = Some(crate::managed_agents::VoiceProfile {
+            enabled: true,
+            ..Default::default()
+        });
         record
     }
 
@@ -312,6 +321,7 @@ mod tests {
         AgentDefinition {
             capabilities: Vec::new(),
             session_policy: Default::default(),
+            voice_profile: None,
             description: None,
             id: "p-1".to_string(),
             display_name: "Test".to_string(),
@@ -348,6 +358,7 @@ mod tests {
         assert_eq!(record.respond_to.as_deref(), Some("allowlist"));
         assert_eq!(record.respond_to_allowlist, vec!["a".repeat(64)]);
         assert_eq!(record.parallelism, Some(4));
+        assert!(record.voice_profile.is_some_and(|voice| voice.enabled));
     }
 
     #[test]
@@ -362,6 +373,7 @@ mod tests {
                 respond_to_allowlist: Vec::new(),
                 parallelism: None,
                 session_policy: None,
+                voice: None,
             }),
         )
         .unwrap();
@@ -369,6 +381,8 @@ mod tests {
         assert!(record.respond_to_allowlist.is_empty());
         assert_eq!(record.parallelism, None);
         assert_eq!(record.session_policy, AcpSessionPolicy::Channel);
+        // A group without a voice switches it off and clears it.
+        assert_eq!(record.voice_profile, None);
     }
 
     #[test]
@@ -452,6 +466,7 @@ mod tests {
                 respond_to_allowlist: vec!["c".repeat(64)],
                 parallelism: Some(3),
                 session_policy: Some(AcpSessionPolicy::Thread),
+                voice: None,
             }),
         )
         .unwrap();

@@ -370,6 +370,7 @@ mod tests {
         ManagedAgentRecord {
             capabilities: Vec::new(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             session_policy: Default::default(),
             description: None,
             pubkey,

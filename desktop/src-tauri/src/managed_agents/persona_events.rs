@@ -274,6 +274,7 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
         respond_to_allowlist: content.respond_to_allowlist,
         parallelism: content.parallelism,
         session_policy: content.session_policy,
+        voice_profile: None,
         created_at: created_at.clone(),
         updated_at: created_at,
     })

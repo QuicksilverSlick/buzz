@@ -144,6 +144,12 @@ pub(crate) async fn connect_audio_relay(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // Slice 9: voiced agents read this desktop's output route from a file.
+    super::audio_output::spawn_output_route_writer(
+        app_handle.clone(),
+        output_device_name.clone(),
+        cancel.clone(),
+    );
 
     tokio::spawn(async move {
         if let Err(e) = audio_relay_pipeline(AudioRelayPipelineArgs {

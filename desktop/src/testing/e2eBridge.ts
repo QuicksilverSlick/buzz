@@ -1075,6 +1075,7 @@ type RawPersona = {
   respond_to_allowlist?: string[];
   parallelism?: number | null;
   session_policy?: "channel" | "thread";
+  voice_profile?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 };
@@ -8978,6 +8979,7 @@ type PersonaBehaviorInput = {
   respondToAllowlist?: string[];
   parallelism?: number;
   sessionPolicy?: "channel" | "thread";
+  voice?: { voiceWithoutOwner: boolean } & Record<string, unknown>;
 };
 
 /** Mirrors `apply_persona_behavior`: replace all four as a unit. */
@@ -8995,6 +8997,10 @@ function applyMockPersonaBehavior(
       : [];
   persona.parallelism = behavior.parallelism ?? null;
   persona.session_policy = behavior.sessionPolicy ?? "channel";
+  const { voiceWithoutOwner, ...voice } = behavior.voice ?? {};
+  persona.voice_profile = behavior.voice
+    ? { ...voice, voice_without_owner: voiceWithoutOwner }
+    : null;
 }
 
 async function handleCreatePersona(args: {

@@ -24,6 +24,7 @@ fn persona(id: &str, prompt: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         id: id.to_string(),
         display_name: id.to_string(),
         description: None,

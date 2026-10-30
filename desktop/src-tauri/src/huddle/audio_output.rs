@@ -148,9 +148,61 @@ pub(crate) fn output_route_is_isolated(preferred: Option<&str>) -> bool {
         .is_ok_and(|description| device_type_is_isolated(description.device_type()))
 }
 
+/// Keep the route file current while one huddle audio connection runs and a
+/// local agent has voice on; remove it otherwise and when the connection is
+/// cancelled. Rewritten every 5 s so `updated_at` doubles as a heartbeat: a
+/// reader treats a stale file as not isolated, which also covers a crash.
+pub(crate) fn spawn_output_route_writer(
+    app: Option<tauri::AppHandle>,
+    output_device: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use crate::managed_agents::voice_profile;
+    let Some((app, path)) =
+        app.and_then(|app| voice_profile::output_route_file(&app).map(|path| (app, path)))
+    else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // The store read and the device query both block, so off the runtime.
+            let (app, path, device) = (app.clone(), path.clone(), output_device.clone());
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let isolated = voice_profile::any_voice_enabled(&app)
+                    .then(|| output_route_is_isolated(device.as_deref()));
+                sync_output_route_file(&path, isolated);
+            })
+            .await;
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+/// Write `{isolated, updated_at}` (unix seconds), or remove the file when no
+/// voice needs it (`None`).
+fn sync_output_route_file(path: &std::path::Path, isolated: Option<bool>) {
+    let Some(isolated) = isolated else {
+        let _ = std::fs::remove_file(path);
+        return;
+    };
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let body = serde_json::json!({ "isolated": isolated, "updated_at": updated_at }).to_string();
+    if let Err(error) =
+        crate::managed_agents::storage::atomic_write_json_restricted(path, body.as_bytes())
+    {
+        eprintln!("buzz-desktop: huddle output route file: {error}");
+    }
+}
+
 #[cfg(test)]
 mod route_isolation_tests {
-    use super::device_type_is_isolated;
+    use super::{device_type_is_isolated, sync_output_route_file};
     use rodio::cpal::DeviceType;
 
     #[test]
@@ -162,5 +214,18 @@ mod route_isolation_tests {
         assert!(!device_type_is_isolated(DeviceType::Speaker));
         assert!(!device_type_is_isolated(DeviceType::Virtual));
         assert!(!device_type_is_isolated(DeviceType::Unknown));
+    }
+
+    #[test]
+    fn output_route_file_is_written_then_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huddle-output-route.json");
+        sync_output_route_file(&path, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["isolated"], true);
+        assert!(body["updated_at"].as_u64().is_some_and(|secs| secs > 0));
+        sync_output_route_file(&path, None);
+        assert!(!path.exists());
     }
 }

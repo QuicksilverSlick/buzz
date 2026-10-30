@@ -619,6 +619,16 @@ pub struct CliArgs {
     /// 7 days. Only #p (mentions) subscriptions in `--dedup queue` mode replay.
     #[arg(long, env = "BUZZ_ACP_CATCH_UP_WINDOW", default_value_t = 86_400)]
     pub catch_up_window: u64,
+
+    /// Huddle voice profile JSON. The desktop sets it only while the agent
+    /// definition's voice switch is on (huddle voices, slice 9).
+    #[arg(long, env = "BUZZ_ACP_VOICE_PROFILE", value_parser = crate::voice_profile::parse_voice_profile)]
+    pub voice_profile: Option<crate::voice_profile::VoiceProfile>,
+
+    /// File where the desktop keeps `{isolated, updated_at}` for its huddle
+    /// output route. Set alongside `--voice-profile`.
+    #[arg(long, env = "BUZZ_ACP_AUDIO_ROUTE_FILE")]
+    pub audio_route_file: Option<PathBuf>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -717,6 +727,11 @@ pub struct Config {
     /// triggering message. Clamped where consumed — see
     /// `startup_watermark_with_floor`.
     pub replay_floor_unix: Option<u64>,
+    /// Huddle voice profile, present only while switched on. Read-only until
+    /// the voice module (slice 8a).
+    pub voice_profile: Option<crate::voice_profile::VoiceProfile>,
+    /// The desktop's huddle output route file (see `--audio-route-file`).
+    pub audio_route_file: Option<PathBuf>,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1448,6 +1463,8 @@ impl Config {
             lazy_pool: args.lazy_pool,
             idle_pool_sleep_secs: args.idle_pool_sleep,
             replay_floor_unix: args.replay_floor,
+            voice_profile: args.voice_profile.filter(|profile| profile.enabled),
+            audio_route_file: args.audio_route_file,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1487,8 +1504,12 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        let voice_detail = match (&self.voice_profile, &self.audio_route_file) {
+            (None, _) => String::new(),
+            (Some(_), route) => format!(" voice=on route_file={route:?}"),
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} capabilities=[{}] {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} capabilities=[{}] {}{}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1515,6 +1536,7 @@ impl Config {
             self.capabilities.iter().cloned().collect::<Vec<_>>().join(","),
             respond_to_detail,
             allowed_respond_to_detail,
+            voice_detail,
         )
     }
 }
@@ -1852,6 +1874,8 @@ mod tests {
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
+            voice_profile: None,
+            audio_route_file: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -3075,6 +3099,33 @@ channels = "ALL"
         ]);
         assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
         assert_eq!(args.session_policy.to_string(), "thread");
+    }
+
+    #[test]
+    fn voice_profile_reaches_config_only_while_switched_on() {
+        let parse = |json: &str| {
+            let route = ["--audio-route-file", "r.json"];
+            let flags = [
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--voice-profile",
+                json,
+            ];
+            let args = CliArgs::try_parse_from(flags.iter().chain(&route))?;
+            Ok::<_, clap::Error>(Config::from_args(args).expect("from_args"))
+        };
+        let on = parse(r#"{"enabled":true,"voice":"marin","later":1}"#).unwrap();
+        assert_eq!(
+            on.voice_profile.and_then(|p| p.voice).as_deref(),
+            Some("marin")
+        );
+        assert_eq!(on.audio_route_file, Some(PathBuf::from("r.json")));
+        assert!(parse(r#"{"enabled":false}"#)
+            .unwrap()
+            .voice_profile
+            .is_none());
+        assert!(parse("{").is_err());
     }
 
     // ── Multiple-event-handling validation + default ──────────────────────────
