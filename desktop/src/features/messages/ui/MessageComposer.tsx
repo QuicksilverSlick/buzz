@@ -41,6 +41,7 @@ import {
 import { useLinkEditor } from "@/features/messages/lib/useLinkEditor";
 import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposerSpoilerParticles";
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
+import { stripImplicitAgentMentionPrefix } from "@/features/messages/lib/stripImplicitAgentMentions";
 import { cn } from "@/shared/lib/cn";
 import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
 import { ComposerShareLinkPrompt } from "./ComposerShareLinkPrompt";
@@ -327,7 +328,12 @@ function MessageComposerImpl({
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
-      if (text.trim().length > 0) {
+      if (
+        stripImplicitAgentMentionPrefix(
+          text,
+          implicitAgentMentionProvenance.getPrefix(),
+        ).trim().length > 0
+      ) {
         notifyTyping();
       }
     },
@@ -342,9 +348,15 @@ function MessageComposerImpl({
   onLinkSelectionChangeRef.current = linkEditor.showFromCursor;
   onLinkShortcutRef.current = linkEditor.openFromShortcut;
   useComposerSpoilerParticles(richText.editor, composerScrollRef);
+  const revokeAddressedAgentRef = React.useRef<(pubkey: string) => void>(
+    () => {},
+  );
   const { audience: persistentAudience, keepMentionedAgentsPinned } =
     useThreadAgentAudience({
+      currentPubkey: ownerPubkey,
       isAgentPubkey: mentions.isAgentPubkey,
+      onSharedThreadAgent: (pubkey) => revokeAddressedAgentRef.current(pubkey),
+      participants: audienceContext?.participants ?? null,
       rootTags: audienceContext?.rootTags ?? [],
       scope: audienceScope,
     });
@@ -477,6 +489,7 @@ function MessageComposerImpl({
     lockedAgentPubkeys,
     removeAddressedAgent,
     restoreAddressedAgentMentions,
+    revokeAddressedAgent,
     selectMentionSuggestion,
     syncAddressedAgentsFromText,
     toggleAlwaysAddressAgent,
@@ -503,6 +516,7 @@ function MessageComposerImpl({
   });
   addressedMentionRestore.restoreAddressedAgentMentionsRef.current =
     restoreAddressedAgentMentions;
+  revokeAddressedAgentRef.current = revokeAddressedAgent;
   React.useLayoutEffect(() => {
     if (!audienceScope || editTarget != null) return;
     restoreAddressedAgentMentions();
