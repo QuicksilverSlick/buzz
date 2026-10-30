@@ -1,6 +1,7 @@
 //! Loopback: the bridge's public API against a fake relay audio endpoint and a fake LiveSession
 //! that says back what it hears. The join runs over a real local socket; the rest runs in memory
-//! on a paused clock, so pacing, windows and backoff are exact. No network, no OpenAI. NetEQ
+//! on a paused clock, so pacing and windows are exact and the restart spread is a bounded random
+//! draw. No network, no OpenAI. NetEQ
 //! times arrivals on the wall clock, so there its decode delay varies (up to 200 ms) run to run;
 //! a timing that includes it is checked against what the bridge itself heard, or as a bound.
 //!
@@ -16,7 +17,7 @@ use buzz_huddle_bridge::join::{audio_request, join};
 use buzz_huddle_bridge::link::{run, Cmd, End};
 use buzz_huddle_bridge::output::{Barge, Output};
 use futures_util::{SinkExt, StreamExt};
-use nostr::{Event, Keys, Kind, Tag};
+use nostr::{Event, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -85,7 +86,7 @@ impl Mic {
 
 /// The fake relay audio endpoint for one huddle. Each 20 ms it sends queued control messages,
 /// then every mic's frame with its peer index. What the voice plays is timed and decoded, and
-/// with `bleed` (speakers, no headset) it comes back on the owner's mic.
+/// with `bleed` (speakers, no headset) it comes back on the owner's mic, delayed.
 #[derive(Default)]
 struct Relay {
     peers: RefCell<Vec<(u8, String)>>,
@@ -96,7 +97,8 @@ struct Relay {
     control: RefCell<VecDeque<Value>>,
     /// Close the socket with this code at the next tick.
     kick: Cell<Option<u16>>,
-    bleed: Cell<bool>,
+    /// On speakers, how long after the relay sends the voice's audio it is back in the owner's mic.
+    bleed: Cell<Option<Duration>>,
     dials: RefCell<Vec<Instant>>,
     played: RefCell<Vec<Instant>>,
     closes: RefCell<Vec<Option<u16>>>,
@@ -129,11 +131,11 @@ impl Relay {
         json!({"type": "joined", "pubkey": pubkey, "peer_index": index, "epoch": 0, "peers": all})
     }
 
-    /// `pubkey` joins at the lowest index free, or its own.
+    /// `pubkey` joins at the lowest index free (the relay's are 0-254), or its own.
     fn admit(&self, pubkey: &str) -> Value {
         let peers = self.peers.borrow();
         let free = |i: &u8| peers.iter().all(|(j, pk)| j != i || pk == pubkey);
-        let index = (1..=u8::MAX).find(free).unwrap();
+        let index = (0..u8::MAX).find(free).unwrap();
         drop(peers);
         self.seat(index, pubkey, None)
     }
@@ -154,25 +156,26 @@ impl Relay {
         let auth: Value = serde_json::from_str(&auth).unwrap();
         let event: Event = serde_json::from_value(auth["event"].clone()).unwrap();
         let tags = auth["event"]["tags"].as_array().unwrap();
+        let now = Timestamp::now().as_secs();
         let signed = event.verify().is_ok()
+            && event.created_at.as_secs().abs_diff(now) <= 60
             && event.kind == Kind::Authentication
             && tags.contains(&json!(["challenge", "c-1"]))
             && tags.contains(&json!(["relay", origin]));
         let requested = auth["protocol_version"].as_u64().unwrap_or(1);
         let pinned = self.pinned.get().unwrap_or(requested);
-        let (code, message) = if !signed {
-            ("auth_failed", "auth failed".into())
+        let error = if !signed {
+            json!({"type": "error", "message": "auth failed"})
         } else if pinned != requested {
             let words = "this huddle is using audio protocol";
             let message = format!("{words} v{pinned}; your client requested v{requested}");
-            ("upgrade_required", message)
+            json!({"type": "error", "code": "upgrade_required", "message": message})
         } else {
             self.pinned.set(Some(pinned));
             *self.auth.borrow_mut() = auth;
             let joined = self.admit(&event.pubkey.to_hex());
             return ws.send(text(joined)).await.is_ok();
         };
-        let error = json!({"type": "error", "code": code, "message": message});
         let _ = ws.send(text(error)).await;
         let _ = ws.close(None).await;
         false
@@ -187,12 +190,16 @@ impl Relay {
             tokio::select! {
                 msg = ws.next() => match msg {
                     Some(Ok(Message::Binary(frame))) => {
+                        // The relay drops a frame with no Opus payload, or over 4 KiB.
+                        assert!((9..=4096).contains(&frame.len()), "{} bytes", frame.len());
                         self.played.borrow_mut().push(Instant::now());
                         let (_, opus) = FrameHeader::parse(&frame).expect("a v2 frame");
                         let mut pcm = vec![0.0; 960];
                         let n = decoder.decode_float(opus, &mut pcm, false).unwrap();
                         pcm.truncate(n);
-                        echo.push_back(pcm);
+                        if let Some(delay) = self.bleed.get() {
+                            echo.push_back((Instant::now() + delay, pcm));
+                        }
                     }
                     Some(Ok(Message::Close(frame))) => {
                         self.closes.borrow_mut().push(frame.map(|f| f.code.into()));
@@ -206,7 +213,8 @@ impl Relay {
                         // Nothing more goes out on this socket.
                         let _ = ws.close(Some(close)).await;
                     }
-                    let pickup = echo.pop_front().filter(|_| self.bleed.get()).unwrap_or_default();
+                    let due = echo.front().is_some_and(|(at, _)| *at <= Instant::now());
+                    let pickup = if due { echo.pop_front().unwrap().1 } else { Vec::new() };
                     let owner = self.peers.borrow().iter().find(|(_, pk)| pk == OWNER).map(|p| p.0);
                     let control = self.control.borrow_mut().drain(..).collect::<Vec<_>>();
                     let mut out: Vec<Message> =
@@ -397,6 +405,20 @@ fn rosters(talos: &Talos, after: Instant) -> Vec<ToTalos> {
         .collect()
 }
 
+/// The owner's desktop in the huddle, on speakers.
+const DESKTOP: Route = Route {
+    here: true,
+    isolated: false,
+};
+
+/// How long the voice's audio takes from the relay back into the owner's mic on `route`: never on
+/// headphones, 40 ms from the desktop, 200 ms from the owner's phone. A tail covers this plus the
+/// bridge's own NetEQ delay, here at its 200 ms cap, so echo leaks from 65 ms on the desktop (its
+/// 300 ms tail) and 380 ms on the phone (600 ms). Probe P measures the real path.
+fn bleed(route: Route) -> Option<Duration> {
+    (!route.isolated).then(|| ms(if route.here { 40 } else { 200 }))
+}
+
 /// Over a real local socket the agent answers the challenge as itself, for the dialed origin, with
 /// its owner tag, the parent channel and buzz-audio-client's protocol version, and leaves with a
 /// 1000. A room whose first peer pinned another version refuses it, and the bridge doesn't retry.
@@ -459,77 +481,86 @@ async fn the_agent_signs_its_way_in_and_a_room_pinned_to_another_version_refuses
 }
 
 /// The voice hears only the owner, though another voice and a stranger talk throughout, at
-/// 24 kHz; says it back at 48 kHz paced 20 ms apart; on speakers neither cuts itself on its echo
-/// nor hears it; replays the owner's ring without that echo; and leaves with a 1000.
+/// 24 kHz; says it back at 48 kHz paced 20 ms apart; on the desktop's or the phone's speakers
+/// neither cuts itself on its echo nor hears it; replays the owner's ring without that echo, and
+/// nothing of another voice's or a stranger's; and leaves with a 1000.
 #[tokio::test(start_paused = true)]
 async fn the_voice_hears_the_owner_and_says_it_back_paced_without_hearing_its_own_echo() {
-    let room = [(1, OWNER, 0.0), (3, AGENT, 0.5), (4, STRANGER, 0.5)];
-    let (relay, talos) = (&Relay::with(&room), &Talos::default());
-    relay.bleed.set(true);
-    talos.repeat.set(1);
-    loopback(relay, talos, |cmd| async move {
-        let start = Instant::now();
-        sleep(ms(200)).await;
-        relay.talk(1, 0.1);
-        sleep(ms(600)).await;
-        relay.talk(1, 0.0);
-        sleep(ms(2_500)).await;
-        let said = frames_since(talos, start);
-        assert_eq!(said[0], roster(&[OWNER, STRANGER], &[AGENT, ME]));
-        let owner = |pk: &String| pk == OWNER;
-        assert!(
-            matches!(&said[1..], [
-                ToTalos::Onset { pubkey: a },
-                ToTalos::Speaker { pubkey: b, role: Role::Owner, echo: false, .. },
-                ToTalos::Speaker { pubkey: c, echo: true, .. },
-            ] if owner(a) && owner(b) && owner(c)),
-            "only the owner, and the echo span flagged: {said:?}"
-        );
-        let turn = {
-            let (log, played) = (talos.log.borrow(), relay.played.borrow());
-            let (turn, late): (Vec<_>, Vec<_>) =
-                speech(&log).into_iter().partition(|(t, _)| *t < played[0]);
-            assert_eq!(late.len(), 0, "half-duplex: the echo is never heard");
-            assert!(turn.len() >= 30, "{}", turn.len());
-            let mid = crossings(&samples(turn[turn.len() / 2].1));
-            assert!((38..=42).contains(&mid), "{mid} crossings at 24 kHz");
-            assert_eq!(played.len(), turn.len(), "never cut by its own echo");
-            assert!(played.windows(2).all(|w| w[1] - w[0] == ms(20)), "paced");
-            turn.len()
-        };
-        let all = Cmd::Replay {
-            index: 1,
-            from_ms: 0,
-            to_ms: u64::MAX,
-        };
-        let asked = Instant::now();
-        cmd.send(all).await.unwrap();
-        sleep(ms(50)).await;
-        let frames = frames_since(talos, asked);
-        let replay = matches!(
-            &frames[..],
-            [ToTalos::Replay { .. }, ToTalos::ReplayEnd { .. }]
-        );
-        assert!(replay, "{frames:?}");
-        let log = talos.log.borrow();
-        let replayed = speech(&log).iter().filter(|(t, _)| *t >= asked).count();
-        assert!(replayed.abs_diff(turn) <= 2, "{replayed} of {turn}");
-    })
-    .await;
-    assert_eq!(relay.closes.borrow().last(), Some(&Some(1000)));
+    for route in [DESKTOP, Route::default()] {
+        let room = [(1, OWNER, 0.0), (3, AGENT, 0.5), (4, STRANGER, 0.5)];
+        let (relay, talos) = (&Relay::with(&room), &Talos::default());
+        relay.bleed.set(bleed(route));
+        talos.repeat.set(1);
+        loopback(relay, talos, |cmd| async move {
+            cmd.send(Cmd::Route(route)).await.unwrap();
+            let start = Instant::now();
+            sleep(ms(200)).await;
+            relay.talk(1, 0.1);
+            sleep(ms(600)).await;
+            relay.talk(1, 0.0);
+            sleep(ms(2_500)).await;
+            let said = frames_since(talos, start);
+            assert_eq!(said[0], roster(&[OWNER, STRANGER], &[AGENT, ME]));
+            let owner = |pk: &String| pk == OWNER;
+            assert!(
+                matches!(&said[1..], [
+                    ToTalos::Onset { pubkey: a },
+                    ToTalos::Speaker { pubkey: b, role: Role::Owner, echo: false, .. },
+                    ToTalos::Speaker { pubkey: c, echo: true, .. },
+                ] if owner(a) && owner(b) && owner(c)),
+                "{route:?}: only the owner, and the echo span flagged: {said:?}"
+            );
+            let turn = {
+                let (log, played) = (talos.log.borrow(), relay.played.borrow());
+                let (turn, late): (Vec<_>, Vec<_>) =
+                    speech(&log).into_iter().partition(|(t, _)| *t < played[0]);
+                assert!(late.is_empty(), "{route:?}: the echo is never heard");
+                assert!(turn.len() >= 30, "{}", turn.len());
+                let mid = crossings(&samples(turn[turn.len() / 2].1));
+                assert!((38..=42).contains(&mid), "{mid} crossings at 24 kHz");
+                assert_eq!(played.len(), turn.len(), "{route:?}: cut by its echo");
+                assert!(played.windows(2).all(|w| w[1] - w[0] == ms(20)), "paced");
+                turn.len()
+            };
+            for (index, want) in [(1, turn), (3, 0), (4, 0)] {
+                let asked = Instant::now();
+                let all = Cmd::Replay {
+                    index,
+                    from_ms: 0,
+                    to_ms: u64::MAX,
+                };
+                cmd.send(all).await.unwrap();
+                sleep(ms(50)).await;
+                let frames = frames_since(talos, asked);
+                let replay = matches!(
+                    &frames[..],
+                    [ToTalos::Replay { .. }, ToTalos::ReplayEnd { .. }]
+                );
+                assert!(replay, "{frames:?}");
+                let log = talos.log.borrow();
+                let replayed = speech(&log).iter().filter(|(t, _)| *t >= asked).count();
+                // The owner's turn to a chunk or two; the agent's and the stranger's rings are empty.
+                let close = replayed.abs_diff(want) <= want.min(2);
+                assert!(close, "{route:?}: {replayed} of {want} from {index}");
+            }
+        })
+        .await;
+        assert_eq!(relay.closes.borrow().last(), Some(&Some(1000)));
+    }
 }
 
 /// The owner talking over the voice cuts it: after 200 ms of energy on the isolated desktop, or
-/// 320 ms over the echo on speakers. The rest of that response never plays, and the owner is heard.
+/// 320 ms over the echo on speakers. The rest of that response never plays, and the owner is heard:
+/// at once on headphones, else once the echo tail after the cut (desktop 300 ms, phone 600) passes.
 #[tokio::test(start_paused = true)]
 async fn talking_over_the_voice_cuts_it_after_200_ms_on_headphones_or_320_ms_on_speakers() {
     let headphones = Route {
         here: true,
         isolated: true,
     };
-    for (route, need) in [(headphones, 200), (Route::default(), 320)] {
+    for (route, need) in [(headphones, 200), (DESKTOP, 320), (Route::default(), 320)] {
         let (relay, talos) = (&Relay::with(&[(1, OWNER, 0.0)]), &Talos::default());
-        relay.bleed.set(!route.isolated);
+        relay.bleed.set(bleed(route));
         talos.repeat.set(4);
         loopback(relay, talos, |cmd| async move {
             cmd.send(Cmd::Route(route)).await.unwrap();
@@ -553,9 +584,9 @@ async fn talking_over_the_voice_cuts_it_after_200_ms_on_headphones_or_320_ms_on_
                 let after = cut - onset;
                 assert!((ms(80)..ms(130)).contains(&after), "cut {after:?} after");
             } else {
-                // Heard once the echo tail after the cut has passed.
-                let after = onset - cut;
-                assert!((ms(600)..ms(640)).contains(&after), "heard {after:?} after");
+                let (after, tail) = (onset - cut, ms(if route.here { 300 } else { 600 }));
+                let heard = (tail..tail + ms(40)).contains(&after);
+                assert!(heard, "{route:?}: heard {after:?} after the cut");
                 assert!(lag < ms(need + 300), "cut {lag:?} after the barge");
             }
         })
@@ -591,7 +622,13 @@ async fn a_1012_rejoins_on_the_new_roster_and_holds_back_an_index_that_changed_h
         first(talos, false, GUEST, swapped).expect("index 2 is GUEST's now");
         let left_then_joined = [roster(&[OWNER], &[ME]), roster(&[OWNER, GUEST], &[ME])];
         assert_eq!(rosters(talos, swapped), left_then_joined);
+        // A second restart in a row (a 2 s backoff) sends a roster too, though nothing changed.
+        relay.kick.set(Some(1012));
+        until(|| relay.dials.borrow().len() >= 3).await;
+        sleep(ms(100)).await;
+        let again = rosters(talos, relay.dials.borrow()[2]);
+        assert_eq!(again, [roster(&[OWNER, GUEST], &[ME])]);
     })
     .await;
-    assert_eq!(relay.dials.borrow().len(), 2);
+    assert_eq!(relay.dials.borrow().len(), 3);
 }
