@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# Buzz relay gateway: a keyless forwarder between one Worker link and one Buzz relay.
+# The build context is the repo root (cargo needs the workspace manifests and Cargo.lock):
+#   docker build -f Dockerfile.relay-gateway --platform linux/amd64 -t buzz-relay-gateway:dev .
+# Base images pinned by digest (first build, 27 Oct 2026).
+FROM --platform=linux/amd64 rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
+# build-base for ring and aws-lc-sys (C); cmake in case aws-lc-sys picks its cmake builder.
+RUN apk add --no-cache build-base cmake
+WORKDIR /build
+COPY . .
+# The image already has 1.95.0; this skips the components rust-toolchain.toml would install.
+ENV RUSTUP_TOOLCHAIN=1.95.0
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -p buzz-relay-gateway --bin buzz-relay-gateway \
+ && install -D -m 0755 target/release/buzz-relay-gateway /out/buzz-relay-gateway \
+ && strip /out/buzz-relay-gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+LABEL org.opencontainers.image.title="Buzz relay gateway" \
+      org.opencontainers.image.description="Keyless forwarder from a Worker link to one Buzz relay" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=builder /out/buzz-relay-gateway /usr/local/bin/buzz-relay-gateway
+ENV BUZZ_RELAY_GATEWAY_BIND_ADDR=0.0.0.0:8080 RUST_LOG=info
+EXPOSE 8080
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/buzz-relay-gateway"]
