@@ -1,8 +1,7 @@
 /**
  * Global search over what the app already holds for its other screens:
- * Inbox rows, Projects (projects, repositories and the Buzz Git pull
- * requests the Projects screen cached) and the agent library. Pure: each hit
- * names where it opens; the dialog navigates.
+ * Inbox rows and the agent library. Pure: each hit names where it opens;
+ * the dialog navigates.
  */
 
 import { getLibraryPersonas } from "@/features/agents/lib/catalog";
@@ -15,30 +14,21 @@ import {
   filterInboxItems,
   matchesInboxAllView,
 } from "@/features/home/lib/inboxViewHelpers";
-import {
-  type ProjectColor,
-  projectColorOf,
-} from "@/features/projects/lib/projectColors";
+import type { ProjectColor } from "@/features/projects/lib/projectColors";
 import { matchesProjectsSearch } from "@/features/projects/lib/projectsSearch";
-import type { Project } from "@/features/projects/projectModels";
-import type { ProjectsWorkItemsResult } from "@/features/projects/projectWorkItems";
 import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
 import type { AgentPersona } from "@/shared/api/personaTypes";
 
-export type SurfaceKey = "inbox" | "projects" | "agent-library";
-
-type ProjectIds = { repositoryId?: string; pullRequestId?: string };
+export type SurfaceKey = "inbox" | "agent-library";
 
 export type SurfaceTarget =
   | { to: "inbox"; item: string }
-  | ({ to: "project"; projectId: string } & ProjectIds)
   | { to: "persona"; personaId: string };
 
 export type SurfaceHit = {
   surface: SurfaceKey;
   id: string;
-  /** Inbox type, "project", "repository", "pull-request" or "persona": the
-   * row's icon and label. */
+  /** Inbox type or "persona": the row's icon and label. */
   kind: string;
   title: string;
   meta: string | null;
@@ -84,7 +74,6 @@ function take<T>(
 
 // Rows truncate it.
 const firstLine = (text: string) => text.trim().split("\n")[0] ?? "";
-const joined = (...parts: Values) => parts.filter(Boolean).join(" · ") || null;
 
 /**
  * Only rows the Inbox's All view lists, so each one opens a row; a Bench
@@ -123,62 +112,6 @@ export function inboxHits(
       ],
     };
   });
-}
-
-/**
- * Projects, their repositories, then cached Buzz Git pull requests, so a
- * branch name finds its PR. A repository-only project is its repository.
- */
-export function projectHits(
-  projects: readonly Project[],
-  workItems: ReadonlyArray<ProjectsWorkItemsResult<Project>>,
-  query: string,
-  limit = 4,
-): SurfaceHit[] {
-  const hit = (
-    project: Project,
-    kind: string,
-    found: Pick<Candidate, "id" | "title" | "meta" | "text"> & {
-      chips?: string[];
-    },
-    ids: ProjectIds = {},
-  ): Candidate => ({
-    chips: [],
-    ...found,
-    surface: "projects",
-    id: `${kind}:${found.id}`,
-    kind,
-    color: projectColorOf(project),
-    target: { to: "project", projectId: project.id, ...ids },
-  });
-  const candidates: Candidate[] = [];
-  for (const project of projects) {
-    const { description, dtag, id, legacy, name } = project;
-    if (!legacy) {
-      const text = [name, description, dtag];
-      const meta = description || null;
-      candidates.push(hit(project, "project", { id, title: name, meta, text }));
-    }
-    for (const repo of project.repositories) {
-      const text = [repo.name, repo.description, repo.dtag, repo.webUrl];
-      const meta = joined(legacy ? null : name, repo.description);
-      const found = { id: repo.id, title: repo.name, meta, text };
-      candidates.push(
-        hit(project, "repository", found, { repositoryId: repo.id }),
-      );
-    }
-  }
-  const pullRequests = workItems.flatMap((items) => items.pullRequests.items);
-  for (const { project, repository, pullRequest: pr } of pullRequests) {
-    const { branchName, labels, status, targetBranch, title } = pr;
-    const branches = [branchName, targetBranch].filter(Boolean).join(" → ");
-    const meta = joined(repository.name, branches);
-    const text = [title, branchName, targetBranch, status, ...labels];
-    const found = { id: pr.id, title, meta, text, chips: [status] };
-    const ids = { repositoryId: repository.id, pullRequestId: pr.id };
-    candidates.push(hit(project, "pull-request", found, ids));
-  }
-  return take(candidates, query, limit, (candidate) => candidate);
 }
 
 /**

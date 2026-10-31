@@ -46,46 +46,6 @@ test("Inbox hits are the All view's rows, found by sender, #792 as a token", () 
   );
 });
 
-test("Projects find repositories, and cached pull requests by branch", () => {
-  const repo = { id: "r1", name: "buzz", webUrl: "https://github.com/x/buzz" };
-  const project = {
-    id: "p1",
-    dtag: "df",
-    description: "The factory",
-    repositories: [repo],
-  };
-  const legacy = {
-    id: "p2",
-    dtag: "relay",
-    legacy: true,
-    repositories: [{ id: "r2", name: "relay" }],
-  };
-  const pullRequest = {
-    id: "pr1",
-    title: "Updater",
-    status: "Open",
-    labels: [],
-    branchName: "fix/updater-check-while-running",
-    targetBranch: "main",
-  };
-  const work = [
-    { pullRequests: { items: [{ project, repository: repo, pullRequest }] } },
-  ];
-  const [pr] = s.projectHits([project], work, "updater-check");
-  assert.equal(pr.meta, "buzz · fix/updater-check-while-running → main");
-  assert.deepEqual(pr.target, {
-    to: "project",
-    projectId: "p1",
-    repositoryId: "r1",
-    pullRequestId: "pr1",
-  });
-  const find = (projects, query) => ids(s.projectHits(projects, work, query));
-  assert.deepEqual(find([project], "github.com/x"), ["repository:r1"]);
-  assert.deepEqual(find([project], "factory"), ["project:p1"]);
-  // A repository-only project shows once, as its repository.
-  assert.deepEqual(find([legacy], "relay"), ["repository:r2"]);
-});
-
 test("Personas: the active library, by name and description, never prompt or env", () => {
   const persona = {
     id: "p1",

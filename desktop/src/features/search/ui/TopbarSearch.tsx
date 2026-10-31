@@ -64,7 +64,6 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "bench",
   "agent-library",
   "inbox",
-  "projects",
   "messages",
   "actions",
 ] as const;
@@ -247,8 +246,6 @@ function getSectionTitle(sectionKey: SearchResultSectionKey) {
       return "Agent library";
     case "inbox":
       return "Inbox";
-    case "projects":
-      return "Projects";
     case "bench":
       return "Bench cards";
     case "messages":
@@ -435,7 +432,7 @@ export function TopbarSearch({
   // An opened Bench card keeps the focus the Bench gives it.
   const cardOpenedRef = React.useRef(false);
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
-  const { goAgents, goBench, goHome, goProject } = useAppNavigation();
+  const { goAgents, goBench, goHome } = useAppNavigation();
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
   const {
@@ -602,10 +599,7 @@ export function TopbarSearch({
       if (result.kind === "surface") {
         const { target } = result.hit;
         if (target.to === "inbox") void goHome({ item: target.item });
-        else if (target.to === "project") {
-          const { projectId, to: _, ...ids } = target;
-          void goProject(projectId, ids);
-        } else void goAgents({ profilePersona: target.personaId });
+        else void goAgents({ profilePersona: target.personaId });
         return;
       }
 
@@ -643,7 +637,6 @@ export function TopbarSearch({
       goAgents,
       goBench,
       goHome,
-      goProject,
       highlightQuery,
       onBrowseChannels,
       onCreateAgent,

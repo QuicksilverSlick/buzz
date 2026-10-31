@@ -18,7 +18,6 @@ import {
 import type { InboxItemType } from "@/features/home/lib/inboxClass";
 import { INBOX_TYPE_META } from "@/features/home/ui/InboxItemPreview";
 import { useProjectsQuery } from "@/features/projects/hooks";
-import { PROJECT_EVENT_VISUALS } from "@/features/projects/ui/ProjectEventTypeIcon";
 import type { SurfaceHit } from "@/features/search/lib/surfaceSearch";
 import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -92,22 +91,12 @@ type Visual = {
 /** Each screen's own icon, colour and word for what a hit is. */
 function surfaceVisual({ kind, surface }: SurfaceHit): Visual {
   if (surface === "inbox") return INBOX_TYPE_META[kind as InboxItemType];
-  if (surface === "projects") {
-    const pr = kind === "pull-request";
-    const { icon, iconClassName } =
-      PROJECT_EVENT_VISUALS[pr ? kind : "repository"];
-    const label = pr
-      ? "Pull request"
-      : kind === "project"
-        ? "Project"
-        : "Repository";
-    return { icon, label, text: iconClassName };
-  }
   return { icon: Bot, label: "Agent library", tile: "rounded-squircle" };
 }
 
 /**
- * An Inbox row, project or agent-library persona in global search, in its screen's icon and colours, with its project dot.
+ * An Inbox row or agent-library persona in global search, in its screen's
+ * icon and colours, with its project dot.
  */
 export function SurfaceResultRow({
   hit,

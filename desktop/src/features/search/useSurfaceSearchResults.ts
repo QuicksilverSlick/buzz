@@ -16,12 +16,9 @@ import {
 } from "@/features/home/lib/inboxClass";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { useProjectsQuery } from "@/features/projects/hooks";
-import type { Project } from "@/features/projects/projectModels";
-import type { ProjectsWorkItemsResult } from "@/features/projects/projectWorkItems";
 import {
   inboxHits,
   personaHits,
-  projectHits,
   type SurfaceHit,
 } from "@/features/search/lib/surfaceSearch";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -31,7 +28,6 @@ import type {
   ManagedAgent,
   UsersBatchResponse,
 } from "@/shared/api/types";
-import { useFeatureEnabled } from "@/shared/features";
 
 /**
  * Global search hits from the other screens' warm caches. Reads only: it
@@ -48,7 +44,6 @@ export function useSurfaceSearchResults({
   query: string;
 }): SurfaceHit[] {
   const queryClient = useQueryClient();
-  const projectsOn = useFeatureEnabled("projects");
   const viewer = useIdentityQuery().data?.pubkey;
   const relaySelf = useRelaySelfQuery().data;
   const viewerAgents = useViewerAgentPubkeys();
@@ -91,13 +86,6 @@ export function useSurfaceSearchResults({
         owned,
         query,
       ),
-      ...(projectsOn
-        ? projectHits(
-            projects ?? [],
-            cached<ProjectsWorkItemsResult<Project>>("projects", "work-items"),
-            query,
-          )
-        : []),
     ];
   }, [
     benchSnapshot,
@@ -105,7 +93,6 @@ export function useSurfaceSearchResults({
     enabled,
     personas,
     projects,
-    projectsOn,
     query,
     queryClient,
     relaySelf,
