@@ -18,9 +18,19 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
     "3\u{FE0F}\u{20E3}",
     "4\u{FE0F}\u{20E3}",
 ];
-/// An answered card holds a live slot 24 h so late pills still land, then it
-/// is a receipt only; also the attention clock on the board.
+/// The board's attention clock: an answer no agent acted on in 24 h is
+/// marked late.
 pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
+/// How long an answered card still holds one of the `MAX_CARDS` slots. The
+/// slot only holds back new posts: the card stays on the relay and its taps
+/// are read for as long as it is Pending (`poll_answers`), slot or not. The
+/// trade-off: past it, newer cards can push an answered card out of the
+/// phone's view, and the board's "Answered" link is how the owner reaches it
+/// to change the answer. 15 min covers a second thought; the 24 h it held
+/// before helped crowd Talos #7-#9 off the relay (31 Oct 2026). The
+/// fork's phone sends a tap only while online (addReaction awaits the
+/// relay); Block's app is unmeasured.
+pub(crate) const ANSWER_SLOT_SECS: u64 = 900;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
 const TITLE_MAX: usize = 120;
@@ -308,6 +318,10 @@ pub(crate) struct Item {
     /// next one posts without the p tag. A new Drop starts false.
     #[serde(default)]
     pub quiet_repost: bool,
+    /// Its card left the relay (retired for a refresh, deleted by hand) and
+    /// has not posted again: it keeps its `MAX_CARDS` place till it does.
+    #[serde(default)]
+    pub repost: bool,
     #[serde(default)]
     pub routed: Option<Routed>,
     /// Bench clock of the last answer change: a new reaction or a clear.
@@ -636,6 +650,7 @@ pub(crate) fn validate(
         answer: None,
         recorded: None,
         quiet_repost: false,
+        repost: false,
         routed: None,
         changed_at: 0,
         stamp: None,
@@ -857,6 +872,36 @@ pub(crate) fn severity_rank(s: Option<Severity>) -> u8 {
         Some(Severity::Good) => 3,
         None => 4,
     }
+}
+
+/// Where an open card stands in line: severity, the writer's order, then its
+/// id with every digit run read as a number, so a stack of `hold-talos-7`
+/// .. `hold-talos-17` runs bottom first, never `-10` before `-7`.
+pub(crate) fn rank(i: &Item) -> (u8, i64, String, String) {
+    // ponytail: digit runs zero-padded to 20; a longer run (none in ids
+    // today) still orders, just as text. The trailing space (never in an
+    // id) only flushes the last run.
+    let mut natural = String::new();
+    let mut digits = String::new();
+    for c in i.id.chars().chain([' ']) {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        if !digits.is_empty() {
+            natural.push_str(&format!("{digits:0>20}"));
+            digits.clear();
+        }
+        natural.push(c);
+    }
+    (severity_rank(i.severity), i.order, natural, i.id.clone())
+}
+
+/// A card that may post past `MAX_CARDS`, up to `OVER_CAP` more: critical,
+/// or asked again after the owner answered, so it never waits days behind
+/// older cards.
+pub(crate) fn preempts(i: &Item) -> bool {
+    severity_rank(i.severity) == 0 || i.back_to_you()
 }
 
 fn marker(item: &Item) -> &'static str {
@@ -1222,7 +1267,14 @@ pub(crate) use super::route::{
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).
-pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64) -> String {
+/// `queued`: open cards waiting for a `MAX_CARDS` slot (`BenchState::queued`).
+pub(crate) fn render_board(
+    items: &[&Item],
+    queued: &[String],
+    channel: &str,
+    hhmm: &str,
+    now: u64,
+) -> String {
     let current = |kind: ItemKind| -> Vec<&Item> {
         items
             .iter()
@@ -1238,8 +1290,8 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     let (mut waiting, mut pending): (Vec<&Item>, Vec<&Item>) = open
         .into_iter()
         .partition(|i| i.stamp.as_ref().is_some_and(|s| !s.answerers.is_empty()));
-    pending.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
-    waiting.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
+    pending.sort_by_key(|i| rank(i));
+    waiting.sort_by_key(|i| rank(i));
     answered.sort_by_key(|i| (i.answer.as_ref().map(|a| a.answered_at), i.id.clone()));
     let mut decisions = current(ItemKind::Decision);
     decisions.sort_by_key(by_area);
@@ -1270,8 +1322,11 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
             .as_ref()
             .map(|c| format!("buzz://message?channel={ch}&id={}", c.event_id))
     };
-    let target =
-        |i: &Item| link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
+    let target = |i: &Item| match link(i) {
+        Some(l) => format!("\u{2192} {l}"),
+        None if queued.contains(&i.id) => "(queued for a slot)".to_string(),
+        None => "(no card yet)".to_string(),
+    };
     // A closed item's card: its question, answer and outcome.
     let receipt = |i: &Item| {
         link(i)
