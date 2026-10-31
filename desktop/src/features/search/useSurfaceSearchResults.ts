@@ -16,18 +16,26 @@ import {
 } from "@/features/home/lib/inboxClass";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { useProjectsQuery } from "@/features/projects/hooks";
+import type { Project } from "@/features/projects/projectModels";
+import type { ProjectsWorkItemsResult } from "@/features/projects/projectWorkItems";
 import {
   inboxHits,
+  noteHits,
   personaHits,
+  projectHits,
   type SurfaceHit,
+  workflowHits,
 } from "@/features/search/lib/surfaceSearch";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import type { UserNotesResponse } from "@/shared/api/socialTypes";
 import type {
   Channel,
   HomeFeedResponse,
   ManagedAgent,
   UsersBatchResponse,
+  Workflow,
 } from "@/shared/api/types";
+import { useFeatureEnabled } from "@/shared/features";
 
 /**
  * Global search hits from the other screens' warm caches. Reads only: it
@@ -44,6 +52,9 @@ export function useSurfaceSearchResults({
   query: string;
 }): SurfaceHit[] {
   const queryClient = useQueryClient();
+  const projectsOn = useFeatureEnabled("projects");
+  const workflowsOn = useFeatureEnabled("workflows");
+  const pulseOn = useFeatureEnabled("pulse");
   const viewer = useIdentityQuery().data?.pubkey;
   const relaySelf = useRelaySelfQuery().data;
   const viewerAgents = useViewerAgentPubkeys();
@@ -78,6 +89,9 @@ export function useSurfaceSearchResults({
       viewer,
     );
     const chips = inboxProjects(projects ?? [], viewer, viewerAgents);
+    const notes = ["global-notes", "pulse-timeline", "my-notes", "liked-notes"]
+      .flatMap((key) => cached<UserNotesResponse>(key))
+      .flatMap((response) => response.notes);
     return [
       ...personaHits(personas ?? [], query),
       ...inboxHits(
@@ -86,6 +100,22 @@ export function useSurfaceSearchResults({
         owned,
         query,
       ),
+      ...(projectsOn
+        ? projectHits(
+            projects ?? [],
+            cached<ProjectsWorkItemsResult<Project>>("projects", "work-items"),
+            query,
+          )
+        : []),
+      ...(workflowsOn
+        ? workflowHits(
+            cached<Array<{ workflow: Workflow; channelName: string }>>(
+              "workflows-all",
+            ).flat(),
+            query,
+          )
+        : []),
+      ...(pulseOn ? noteHits(notes, query) : []),
     ];
   }, [
     benchSnapshot,
@@ -93,10 +123,13 @@ export function useSurfaceSearchResults({
     enabled,
     personas,
     projects,
+    projectsOn,
+    pulseOn,
     query,
     queryClient,
     relaySelf,
     viewer,
     viewerAgents,
+    workflowsOn,
   ]);
 }
