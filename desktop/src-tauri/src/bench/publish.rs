@@ -10,10 +10,13 @@ use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
     forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
     same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
-    MAX_CARDS, OVER_CAP, RECOVER_LIMIT,
+    MAX_CARDS, RECOVER_LIMIT,
 };
 use crate::events;
 
+/// How far past MAX_CARDS a card that preempts (`item::preempts`) or that
+/// the owner tapped on the desktop (`bump`) may post.
+pub(super) const OVER_CAP: usize = 10;
 /// Longer than the desktop waits for a bumped card to post.
 pub(super) const BUMP_SECS: u64 = 120;
 

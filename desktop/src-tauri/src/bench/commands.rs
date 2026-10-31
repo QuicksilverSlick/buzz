@@ -389,7 +389,7 @@ pub(crate) fn bump(root: &Path, item_id: &str, now: u64) -> Result<(), String> {
     if super::publish::placed(item) {
         return Ok(());
     }
-    let limit = super::MAX_CARDS + super::OVER_CAP;
+    let limit = super::MAX_CARDS + super::publish::OVER_CAP;
     if super::publish::in_use(&s, now) >= limit {
         return Err(format!(
             "all {limit} card slots are in use, the Bench's limit; answer or close a card first"
