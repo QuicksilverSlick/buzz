@@ -4,6 +4,8 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { findBenchCards } from "@/features/bench/lib/benchFind";
+import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import {
   useUserSearchQuery,
@@ -157,6 +159,7 @@ export function useSearchResults({
 
   const ftsQuery = parsedQuery.text;
   const prQuery = React.useMemo(() => parsePrQuery(ftsQuery), [ftsQuery]);
+  const benchSnapshot = useBenchSnapshot();
 
   const needsAuthorResolution = Boolean(parsedQuery.from);
   const entitySearchEnabled = searchBackedQueriesEnabled && !scopeChannelId;
@@ -259,11 +262,33 @@ export function useSearchResults({
     minimumQueryLength: prQuery ? 1 : minimumQueryLength,
   });
 
+  // Cards are local: unscoped or in #bench, never under from:/after:/before:.
+  const scope =
+    channelResolution.status === "resolved" ? channelResolution.value : null;
+  const benchQuery =
+    enabled &&
+    !hasUnresolvedOperator &&
+    ftsQuery.length >= minimumQueryLength &&
+    !parsedQuery.from &&
+    parsedQuery.since === null &&
+    parsedQuery.until === null &&
+    (scope === null || scope === benchSnapshot?.channelId)
+      ? ftsQuery
+      : "";
+  const benchResults = React.useMemo(
+    () => findBenchCards(benchSnapshot, benchQuery),
+    [benchQuery, benchSnapshot],
+  );
+
   const messageResults = React.useMemo(() => {
     if (hasUnresolvedOperator) {
       return [];
     }
-    const hits = dedupeSearchHits(searchQuery.data?.hits ?? []);
+    // A card's own post would repeat the card result.
+    const cardPosts = new Set(benchResults.map((card) => card.cardEventId));
+    const hits = dedupeSearchHits(searchQuery.data?.hits ?? []).filter(
+      (hit) => !cardPosts.has(hit.eventId),
+    );
     if (!prQuery) {
       return hits;
     }
@@ -276,7 +301,7 @@ export function useSearchResults({
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score)
       .map(({ hit }) => hit);
-  }, [hasUnresolvedOperator, prQuery, searchQuery.data?.hits]);
+  }, [benchResults, hasUnresolvedOperator, prQuery, searchQuery.data?.hits]);
   const channelResults = React.useMemo(() => {
     if (scopeChannelId || ftsQuery.length < MIN_SEARCH_QUERY_LENGTH) {
       return [];
@@ -449,6 +474,7 @@ export function useSearchResults({
 
   const results = React.useMemo<SearchResult[]>(
     () => [
+      ...benchResults.map((card) => ({ kind: "bench" as const, card })),
       ...channelResults.map((channel) => ({
         kind: "channel" as const,
         channel,
@@ -462,7 +488,7 @@ export function useSearchResults({
         hit,
       })),
     ],
-    [channelResults, messageResults, userResults],
+    [benchResults, channelResults, messageResults, userResults],
   );
 
   const resultProfilesQuery = useUsersBatchQuery(
