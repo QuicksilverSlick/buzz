@@ -28,6 +28,7 @@ import {
   parseSearchOperators,
   type OperatorResolveResult,
 } from "@/features/search/lib/parseSearchOperators";
+import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -155,6 +156,7 @@ export function useSearchResults({
   );
 
   const ftsQuery = parsedQuery.text;
+  const prQuery = React.useMemo(() => parsePrQuery(ftsQuery), [ftsQuery]);
 
   const needsAuthorResolution = Boolean(parsedQuery.from);
   const entitySearchEnabled = searchBackedQueriesEnabled && !scopeChannelId;
@@ -235,7 +237,8 @@ export function useSearchResults({
     fromUserSearchQuery.isLoading &&
     authorResolution.status === "unresolved";
 
-  const searchQuery = useSearchMessagesQuery(ftsQuery, {
+  // "pr792" and "buzz#792" search the relay for the number itself.
+  const searchQuery = useSearchMessagesQuery(prQuery?.number ?? ftsQuery, {
     enabled:
       enabled &&
       !hasUnresolvedOperator &&
@@ -253,15 +256,27 @@ export function useSearchResults({
     since: parsedQuery.since,
     until: parsedQuery.until,
     unresolvedOperator: hasUnresolvedOperator,
-    minimumQueryLength,
+    minimumQueryLength: prQuery ? 1 : minimumQueryLength,
   });
 
   const messageResults = React.useMemo(() => {
     if (hasUnresolvedOperator) {
       return [];
     }
-    return dedupeSearchHits(searchQuery.data?.hits ?? []);
-  }, [hasUnresolvedOperator, searchQuery.data?.hits]);
+    const hits = dedupeSearchHits(searchQuery.data?.hits ?? []);
+    if (!prQuery) {
+      return hits;
+    }
+    // PR-form mentions first, then the bare number; never 7928 or 792d3edd.
+    return hits
+      .map((hit) => ({
+        hit,
+        score: prMentionScore(hit.content, prQuery.number),
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(({ hit }) => hit);
+  }, [hasUnresolvedOperator, prQuery, searchQuery.data?.hits]);
   const channelResults = React.useMemo(() => {
     if (scopeChannelId || ftsQuery.length < MIN_SEARCH_QUERY_LENGTH) {
       return [];

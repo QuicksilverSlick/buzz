@@ -3,6 +3,7 @@ import * as React from "react";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
 import { parseSearchOperators } from "@/features/search/lib/parseSearchOperators";
+import { parsePrQuery } from "@/features/search/lib/prNumber";
 import { buildSearchResultPreview } from "@/features/search/lib/searchMatch";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
@@ -421,6 +422,9 @@ export function TopbarSearch({
   // Bind highlights to the debounced result source so stale results can never
   // pair with newly typed text during the debounce window.
   const resultQuery = parseSearchOperators(debouncedQuery).text;
+  const prNumber = parsePrQuery(resultQuery)?.number ?? null;
+  // "#792" highlights and lands on 792 itself, a whole number.
+  const highlightQuery = prNumber ?? resultQuery;
   const resultsAreCurrent = debouncedQuery === trimmedQuery;
   const isIconVariant = variant === "icon";
   const currentChannel = currentChannelId
@@ -571,9 +575,10 @@ export function TopbarSearch({
         return;
       }
 
-      onOpenResult(result.hit, resultQuery);
+      onOpenResult(result.hit, highlightQuery);
     },
     [
+      highlightQuery,
       onBrowseChannels,
       onCreateAgent,
       onCreateChannel,
@@ -582,7 +587,6 @@ export function TopbarSearch({
       onOpenUser,
       openAfterExit,
       setQuery,
-      resultQuery,
     ],
   );
 
@@ -688,7 +692,7 @@ export function TopbarSearch({
           ? result.action.description
           : result.kind === "user"
             ? getUserSecondaryLabel(result.user)
-            : buildSearchResultPreview(result.hit.content, resultQuery);
+            : buildSearchResultPreview(result.hit.content, highlightQuery);
     const trailingLabel =
       result.kind === "channel"
         ? getChannelSuggestionMeta(result.channel)
@@ -769,7 +773,10 @@ export function TopbarSearch({
               ) : null}
               {preview ? (
                 <span className="col-start-1 mt-1.5 block min-w-0 truncate text-sm leading-5 text-muted-foreground">
-                  <HighlightedSearchText query={resultQuery} text={preview} />
+                  <HighlightedSearchText
+                    query={highlightQuery}
+                    text={preview}
+                  />
                 </span>
               ) : null}
             </span>
