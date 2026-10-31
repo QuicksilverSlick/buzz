@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import type { BenchCard } from "@/features/bench/lib/benchCards";
+import type { SurfaceHit } from "@/features/search/lib/surfaceSearch";
 import { HashSearch } from "@/shared/ui/icons";
 import {
   resolveUserLabel,
@@ -34,9 +35,14 @@ export type SearchResult =
   | { kind: "channel"; channel: Channel }
   | { kind: "user"; user: UserSearchResult }
   | { kind: "message"; hit: SearchHit }
-  | { kind: "bench"; card: BenchCard };
+  | { kind: "bench"; card: BenchCard }
+  | { kind: "surface"; hit: SurfaceHit };
 
 export function resultKey(result: SearchResult) {
+  if (result.kind === "surface") {
+    return `${result.hit.surface}-${result.hit.id}`;
+  }
+
   if (result.kind === "bench") {
     return `bench-${result.card.id}`;
   }
@@ -57,6 +63,10 @@ export function resultKey(result: SearchResult) {
 }
 
 export function resultTestId(result: SearchResult) {
+  if (result.kind === "surface") {
+    return `search-result-${result.hit.surface}-${result.hit.id}`;
+  }
+
   if (result.kind === "bench") {
     return `search-result-bench-${result.card.id}`;
   }
@@ -80,7 +90,8 @@ export function resultIcon(
   result: SearchResult,
   channelLookup: ReadonlyMap<string, Channel>,
 ) {
-  if (result.kind === "bench") {
+  // A surface row draws its own icon.
+  if (result.kind === "bench" || result.kind === "surface") {
     return ListChecks;
   }
 

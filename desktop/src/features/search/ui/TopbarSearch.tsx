@@ -19,7 +19,10 @@ import {
   SearchDialogInputRow,
 } from "@/features/search/ui/SearchScopeControls";
 import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
-import { BenchResultRow } from "@/features/search/ui/LocalResultRow";
+import {
+  BenchResultRow,
+  SurfaceResultRow,
+} from "@/features/search/ui/LocalResultRow";
 import { useSearchMenuKeyboardNavigation } from "@/features/search/ui/useSearchMenuKeyboardNavigation";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -59,6 +62,8 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "people",
   "agents",
   "bench",
+  "agent-library",
+  "inbox",
   "messages",
   "actions",
 ] as const;
@@ -204,6 +209,10 @@ function getSearchHitContextLabel(
 }
 
 function getResultSectionKey(result: SearchResult): SearchResultSectionKey {
+  if (result.kind === "surface") {
+    return result.hit.surface;
+  }
+
   if (result.kind === "bench") {
     return "bench";
   }
@@ -233,6 +242,10 @@ function getSectionTitle(sectionKey: SearchResultSectionKey) {
       return "People";
     case "agents":
       return "Agents";
+    case "agent-library":
+      return "Agent library";
+    case "inbox":
+      return "Inbox";
     case "bench":
       return "Bench cards";
     case "messages":
@@ -419,7 +432,7 @@ export function TopbarSearch({
   // An opened Bench card keeps the focus the Bench gives it.
   const cardOpenedRef = React.useRef(false);
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
-  const { goBench } = useAppNavigation();
+  const { goAgents, goBench, goHome } = useAppNavigation();
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
   const {
@@ -583,6 +596,13 @@ export function TopbarSearch({
         return;
       }
 
+      if (result.kind === "surface") {
+        const { target } = result.hit;
+        if (target.to === "inbox") void goHome({ item: target.item });
+        else void goAgents({ profilePersona: target.personaId });
+        return;
+      }
+
       if (result.kind === "channel") {
         onOpenChannel(result.channel.id);
         return;
@@ -614,7 +634,9 @@ export function TopbarSearch({
       onOpenResult(result.hit, highlightQuery);
     },
     [
+      goAgents,
       goBench,
+      goHome,
       highlightQuery,
       onBrowseChannels,
       onCreateAgent,
@@ -695,7 +717,7 @@ export function TopbarSearch({
 
   const renderSearchResultRow = (result: SearchResult, index: number) => {
     const menuIndex = index + (hasScopeAction ? 1 : 0);
-    if (result.kind === "bench") {
+    if (result.kind === "bench" || result.kind === "surface") {
       return (
         <button
           aria-selected={menuIndex === selectedMenuIndex}
@@ -713,7 +735,11 @@ export function TopbarSearch({
           role="option"
           type="button"
         >
-          <BenchResultRow card={result.card} query={highlightQuery} />
+          {result.kind === "bench" ? (
+            <BenchResultRow card={result.card} query={highlightQuery} />
+          ) : (
+            <SurfaceResultRow hit={result.hit} query={highlightQuery} />
+          )}
         </button>
       );
     }

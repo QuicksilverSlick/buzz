@@ -224,3 +224,54 @@ test("global search finds a Bench card by PR number and opens it", async ({
   await expect(focused).toContainText("PR #719 merged and live");
   await expect(focused).toBeFocused();
 });
+
+test("global search finds Inbox rows and agent-library personas", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "release-captain",
+        displayName: "Release Captain",
+        description: "Cuts desktop releases",
+        systemPrompt: "Never searched.",
+      },
+    ],
+  });
+  await page.goto("/");
+  // Search reads the Inbox the app already loaded.
+  const row = page.getByTestId("home-inbox-item-mock-feed-mention");
+  await expect(row).toBeVisible();
+  const dialog = page.getByTestId("search-results");
+  const input = page.getByTestId("search-dialog-input");
+  const section = (key: string) =>
+    dialog.locator(`[data-search-section="${key}"]`).getByRole("option");
+
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("release");
+  await expect(section("agent-library")).toContainText("Cuts desktop releases");
+  await expect(section("inbox")).toContainText(
+    "Please review the release checklist.Mention",
+  );
+  await waitForAnimations(page);
+  await dialog.screenshot({
+    path: "test-results/bench-search/05-agent-library-and-inbox.png",
+  });
+  await section("inbox").click();
+  await expect(row).toHaveAttribute("aria-current", "true");
+
+  // Channel activity the Inbox hides stays a message result.
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("shipped");
+  await expect(section("messages").first()).toContainText(
+    "Engineering shipped the desktop build.",
+  );
+  await expect(section("inbox")).toHaveCount(0);
+
+  await input.fill("release captain");
+  await section("agent-library").click();
+  await expect(page).toHaveURL(/#\/agents\?.*profilePersona=release-captain/);
+  await expect(page.getByTestId("user-profile-panel")).toContainText(
+    "Release Captain",
+  );
+});

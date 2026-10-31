@@ -85,6 +85,7 @@ type MockHuddleSeed = {
 type MockPersonaSeed = {
   id?: string;
   displayName: string;
+  description?: string | null;
   avatarUrl?: string | null;
   systemPrompt: string;
   updatedAt?: string;

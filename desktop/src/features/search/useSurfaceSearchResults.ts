@@ -1,0 +1,102 @@
+import { useQueryClient } from "@tanstack/react-query";
+import * as React from "react";
+
+import {
+  managedAgentsQueryKey,
+  usePersonasQuery,
+} from "@/features/agents/hooks";
+import { mergeOwnedAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
+import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { useBenchSnapshot } from "@/features/bench/useBenchCards";
+import { withoutOwnWorkflowPosts } from "@/features/home/hooks";
+import { buildInboxItems } from "@/features/home/lib/inbox";
+import {
+  classifyInboxItem,
+  inboxProjects,
+} from "@/features/home/lib/inboxClass";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
+import { useProjectsQuery } from "@/features/projects/hooks";
+import {
+  inboxHits,
+  personaHits,
+  type SurfaceHit,
+} from "@/features/search/lib/surfaceSearch";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import type {
+  Channel,
+  HomeFeedResponse,
+  ManagedAgent,
+  UsersBatchResponse,
+} from "@/shared/api/types";
+
+/**
+ * Global search hits from the other screens' warm caches. Reads only: it
+ * never starts a relay fetch (the agent library is a local read), so a
+ * screen not visited this session adds nothing.
+ */
+export function useSurfaceSearchResults({
+  channels,
+  enabled,
+  query,
+}: {
+  channels: Channel[];
+  enabled: boolean;
+  query: string;
+}): SurfaceHit[] {
+  const queryClient = useQueryClient();
+  const viewer = useIdentityQuery().data?.pubkey;
+  const relaySelf = useRelaySelfQuery().data;
+  const viewerAgents = useViewerAgentPubkeys();
+  const benchSnapshot = useBenchSnapshot();
+  const projects = useProjectsQuery(false).data;
+  const personas = usePersonasQuery({ enabled }).data;
+
+  return React.useMemo(() => {
+    if (!enabled) return [];
+    // Read, not subscribe: an observer would push its options onto the
+    // screens' own queries.
+    const cached = <T>(...queryKey: string[]) =>
+      queryClient
+        .getQueriesData<T>({ queryKey })
+        .flatMap(([, data]) => (data ? [data] : []));
+    const [feed] = cached<HomeFeedResponse>("home-feed");
+    // The Inbox's own profiles: sender names, and which agents are yours.
+    const profiles: UsersBatchResponse["profiles"] = Object.assign(
+      {},
+      ...cached<UsersBatchResponse>("users-batch").map((r) => r.profiles),
+    );
+    const items = buildInboxItems({
+      channels,
+      currentPubkey: viewer,
+      feed: feed && withoutOwnWorkflowPosts(feed, viewer, relaySelf),
+      profiles,
+      relaySelfPubkey: relaySelf,
+    });
+    const owned = mergeOwnedAgentPubkeys(
+      queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey),
+      profiles,
+      viewer,
+    );
+    const chips = inboxProjects(projects ?? [], viewer, viewerAgents);
+    return [
+      ...personaHits(personas ?? [], query),
+      ...inboxHits(
+        items,
+        (item) => classifyInboxItem(item, benchSnapshot, chips),
+        owned,
+        query,
+      ),
+    ];
+  }, [
+    benchSnapshot,
+    channels,
+    enabled,
+    personas,
+    projects,
+    query,
+    queryClient,
+    relaySelf,
+    viewer,
+    viewerAgents,
+  ]);
+}
