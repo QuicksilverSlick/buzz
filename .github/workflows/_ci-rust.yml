@@ -66,6 +66,12 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Unit tests
         run: just test-unit
+      # Relay gateway (Bishop's keyless relay forwarder): infra-free tests
+      # against a loopback mock relay and Worker. Kept out of the Justfile so
+      # gateway PRs do not select the desktop suite. nextest gives each test
+      # its own process, which tests/logs.rs needs for its global subscriber.
+      - name: Unit tests (buzz-relay-gateway)
+        run: cargo nextest run -p buzz-relay-gateway
 
   server-cross-compile:
     name: Server Cross-Compile
