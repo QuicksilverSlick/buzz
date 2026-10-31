@@ -10,7 +10,12 @@
  */
 
 import type { TimelineReaction } from "@/features/messages/types";
-import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
+import {
+  REPO_SHORT,
+  type RepoShort,
+  parsePrQuery,
+  prMentionScore,
+} from "@/features/search/lib/prNumber";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSeverity = "critical" | "attention" | "info" | "good";
@@ -945,9 +950,6 @@ export function searchText(card: BenchCard): string {
   return searchParts(card)
     .flatMap((c) => [
       c.id,
-      c.kind,
-      benchSeverityChip(c.severity)?.label,
-      c.request || c.id.endsWith("-train") ? "receipt" : null,
       c.title,
       c.body,
       c.area,
@@ -977,22 +979,47 @@ function searchDates(card: BenchCard): Date[] {
     .map((at) => new Date(at * 1_000));
 }
 
+const AREA_SHORT: Record<string, RepoShort> = {
+  buzz: "buzz",
+  "28-day-reset": "reset",
+  "dreamforge-talos": "talos",
+};
+
+/** The repo a card is about, from the steward's id, a pull link or its area. */
+export function benchCardRepo(card: BenchCard): RepoShort | null {
+  const own = /^steward\/(?:hold-)?(buzz|reset|talos)-/.exec(card.id)?.[1];
+  if (own) return own as RepoShort;
+  for (const { url } of card.links) {
+    const repo = /github\.com\/[^/]+\/([^/]+)\/pull\//.exec(url)?.[1];
+    if (repo && Object.hasOwn(REPO_SHORT, repo.toLowerCase())) {
+      return REPO_SHORT[repo.toLowerCase()];
+    }
+  }
+  return Object.hasOwn(AREA_SHORT, card.area) ? AREA_SHORT[card.area] : null;
+}
+
 /**
  * The Bench search as a card predicate; a receipt matches on its request
  * too. "#689", "PR 689", "pr-689" and "pull/689" match only that PR number
- * (#689, PR 689, pull request 689, .../pull/689); a bare "689" matches it as
- * a whole number anywhere, so "28" finds "28 Day Reset" and never "6890",
- * "3,689" or "689d3e"; "2026-10-14" and "Oct 14" also match the local day a
- * card was updated or answered; otherwise every word must be in the card's
- * text, kind, severity, project, writer or names. Empty matches everything.
+ * (#689, PR 689, pull request 689, .../pull/689), and "buzz#689" only on a
+ * card that is not about another repo; a bare "689" matches it as a whole
+ * number anywhere, so "28" finds "28 Day Reset" and never "6890", "3,689" or
+ * "689d3e"; "2026-10-14" and "Oct 14" also match the local day a card was
+ * updated or answered; otherwise every word must be in the card's text,
+ * project, writer or names. Empty matches everything.
  */
 export function benchSearch(query: string): (card: BenchCard) => boolean {
   const q = query.trim().toLowerCase();
   if (!q) return () => true;
   const pr = parsePrQuery(q);
   if (pr) {
-    return (card) =>
-      prMentionScore(searchText(card), pr.number) >= (pr.explicit ? 2 : 1);
+    return (card) => {
+      const repo = pr.repo && benchCardRepo(card);
+      return (
+        (!repo || repo === pr.repo) &&
+        prMentionScore(searchText(card), pr.number) >= (pr.explicit ? 2 : 1)
+      );
+    };
   }
   const day = searchDay(q);
   const words = q.split(/\s+/);

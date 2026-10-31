@@ -22,12 +22,13 @@ export type PrQuery = {
 
 /**
  * "#792", "PR 792", "pr792", "pr-792", "PR #792", "pull/792", "792",
- * "buzz#792", "reset pr 792" and "talos 12"; null for anything else.
+ * "buzz#792", "talos/12" and "reset pr 792"; null for anything else. A repo
+ * and a number with only a space between ("reset 14") stay words.
  */
 export function parsePrQuery(query: string): PrQuery | null {
   const q = query.trim().toLowerCase().replace(/\s+/g, " ");
   const m =
-    /^(?:(buzz|reset|talos|metabolic-reset|dreamforge-talos)(?:\s+|\s*[#:/]\s*))?(?:(pr|pull)\s*[-#/]?\s*|(#))?(\d{1,7})$/.exec(
+    /^(?:(buzz|reset|talos|metabolic-reset|dreamforge-talos)(?:\s*[#:/]\s*|\s+(?=pr|pull)))?(?:(pr|pull)\s*[-#/]?\s*|(#))?(\d{1,7})$/.exec(
       q,
     );
   return m

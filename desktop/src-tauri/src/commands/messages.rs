@@ -164,12 +164,10 @@ pub async fn get_feed(
     })
 }
 
-/// A number is a whole token: "#792" must find 792, never 7928 or 792d3edd.
-fn ends_with_number(q: &str) -> bool {
-    q.split_whitespace().last().is_some_and(|t| {
-        let mut d = t.chars().filter(|c| c.is_alphanumeric()).peekable();
-        d.peek().is_some() && d.all(|c| c.is_ascii_digit())
-    })
+/// A query that is only a number ("792", "#792") must find 792, never 7928.
+fn is_number(q: &str) -> bool {
+    let digits = q.trim().trim_start_matches('#');
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn build_search_messages_filter(
@@ -188,10 +186,10 @@ fn build_search_messages_filter(
     filter.insert("search".to_string(), serde_json::json!(q.trim()));
     // The desktop topbar is a typeahead surface. This bridge-only extension is
     // consumed before nostr::Filter parsing on the relay, so general WS/NIP-50
-    // search remains word/lexeme-based. A query ending in a number ("#792",
-    // "PR 792", "0.5.792") leaves it out: the relay's full-text default then
-    // matches the number as an exact lexeme, not as a prefix of 7928.
-    if !ends_with_number(q) {
+    // search remains word/lexeme-based. A query that is only a number leaves
+    // it out: the relay's full-text default then matches the number as an
+    // exact lexeme, not as a prefix of 7928, and digits carry no operators.
+    if !is_number(q) {
         filter.insert("search_mode".to_string(), serde_json::json!("prefix"));
     }
     filter.insert("limit".to_string(), serde_json::json!(cap));

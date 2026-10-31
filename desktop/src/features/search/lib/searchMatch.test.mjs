@@ -112,11 +112,13 @@ test("buildSearchResultPreview keeps the existing leading excerpt without a matc
   );
 });
 
-test("splitSearchMatches marks a number only as a whole lexeme", () => {
+test("splitSearchMatches marks a number query only as a whole lexeme", () => {
   const marked = (text, query) =>
     splitSearchMatches(text, query)
       .filter((part) => part.isMatch)
       .map((part) => part.text);
   assert.deepEqual(marked("PR 792, 7928, 792d3edd", "#792"), ["792"]);
   assert.deepEqual(marked("Project plans", "pro"), ["Pro"]);
+  // Words before it keep the relay's prefix rule: "12" marks "120" there.
+  assert.deepEqual(marked("release 120", "release 12"), ["release", "12"]);
 });

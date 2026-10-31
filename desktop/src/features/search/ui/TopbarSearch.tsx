@@ -416,6 +416,8 @@ export function TopbarSearch({
   );
   const [selectedMenuIndex, setSelectedMenuIndex] = React.useState(0);
   const triggerRef = React.useRef<HTMLButtonElement>(null);
+  // An opened Bench card keeps the focus the Bench gives it.
+  const cardOpenedRef = React.useRef(false);
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
   const { goBench } = useAppNavigation();
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
@@ -523,6 +525,14 @@ export function TopbarSearch({
     () => searchResultSections.flatMap((section) => section.results),
     [searchResultSections],
   );
+  // A PR query that finds its card selects it, past "Search in #channel".
+  const leadCardQuery =
+    prNumber !== null && searchResultSections[0]?.key === "bench"
+      ? debouncedQuery
+      : null;
+  React.useEffect(() => {
+    if (leadCardQuery !== null) setSelectedMenuIndex(hasScopeAction ? 1 : 0);
+  }, [hasScopeAction, leadCardQuery]);
   const activeResults = isShowingSuggestions
     ? scopeChannel
       ? []
@@ -568,6 +578,7 @@ export function TopbarSearch({
       setQuery("");
 
       if (result.kind === "bench") {
+        cardOpenedRef.current = true;
         void goBench({ cardId: result.card.id });
         return;
       }
@@ -1027,6 +1038,10 @@ export function TopbarSearch({
           }}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
+            if (cardOpenedRef.current) {
+              cardOpenedRef.current = false;
+              return;
+            }
             triggerRef.current?.focus();
           }}
           showCloseButton={false}

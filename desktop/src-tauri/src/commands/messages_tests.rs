@@ -105,10 +105,11 @@ fn search_messages_filter_matches_a_number_exactly() {
             .get("search_mode")
             .cloned()
     };
-    for q in ["792", "#792", "PR 792", "release 0.5.792"] {
+    for q in ["792", " 792 ", "#792"] {
         assert!(mode(q).is_none(), "{q} must match 792 exactly");
     }
-    for q in ["pro", "792d", "pr792"] {
+    // "-12" would be NOT 12 in the relay's full-text syntax.
+    for q in ["pro", "792d", "pr792", "-12", "lost -5", "release 12"] {
         assert_eq!(mode(q), Some(serde_json::json!("prefix")), "{q}");
     }
 }

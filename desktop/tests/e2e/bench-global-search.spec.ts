@@ -77,6 +77,15 @@ const benchCards = {
       options: [],
       state: "done",
     }),
+    // Enough cards above it that the status card opens below the fold.
+    ...Array.from({ length: 30 }, (_, i) =>
+      hold(
+        `steward/hold-buzz-${100 + i}-${"0".repeat(12)}`,
+        `${100 + i}`,
+        "buzz",
+        {},
+      ),
+    ),
   ],
 };
 
@@ -104,6 +113,10 @@ test("global search finds a Bench card by PR number and opens it", async ({
       hit(CARD_POST, "reset PR 792 waits for you"),
     ],
   });
+  // A saved Dreamforge tab hides the 28 Day Reset cards until a card opens.
+  await page.addInitScript(() =>
+    localStorage.setItem("buzz.bench.workbench.v1", "dreamforge"),
+  );
   await page.goto("/");
   await expect(page.getByTestId("sidebar-bench-count")).toBeVisible();
 
@@ -132,13 +145,37 @@ test("global search finds a Bench card by PR number and opens it", async ({
     path: "test-results/bench-search/01-pr-792-dialog.png",
   });
 
-  await first.click();
+  await page.keyboard.press("Escape");
+
+  // From a channel the card is selected past "Search in #general", so Enter
+  // opens it; scoping to #general hides it.
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  const input = page.getByTestId("search-dialog-input");
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("#792");
+  const card = page.getByTestId(`search-result-bench-${HOLD_792}`);
+  await expect(card).toHaveAttribute("aria-selected", "true");
+  await input.press("ArrowUp");
+  await input.press("Enter");
+  await expect(dialog).toContainText("No messages for #792 in #general");
+  await expect(card).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("#792");
+  await expect(card).toHaveAttribute("aria-selected", "true");
+  await input.press("Enter");
   await expect(page).toHaveURL(/#\/bench/);
   const focused = page.locator("[data-bench-focused]");
   await expect(focused).toContainText("reset PR 792 waits for you");
+  await expect(focused).toBeFocused();
   await expect(
     focused.getByRole("button", { name: /^1\. Ship it/ }),
   ).toBeVisible();
+  expect(
+    await page.evaluate(() => localStorage.getItem("buzz.bench.workbench.v1")),
+  ).toBe("dreamforge");
   await waitForAnimations(page);
   await page.getByTestId("bench-screen").screenshot({
     path: "test-results/bench-search/02-bench-card-focused.png",
@@ -154,4 +191,8 @@ test("global search finds a Bench card by PR number and opens it", async ({
   await dialog.screenshot({
     path: "test-results/bench-search/03-pr-719-dialog.png",
   });
+  await dialog.getByRole("option").first().click();
+  await expect(focused).toContainText("PR #719 merged and live");
+  await expect(focused).toBeInViewport();
+  await expect(focused).toBeFocused();
 });

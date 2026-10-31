@@ -7,34 +7,13 @@
 import {
   type BenchCard,
   type BenchSnapshot,
-  benchSearch,
+  benchCardRepo,
   searchText,
 } from "@/features/bench/lib/benchCards";
-import {
-  REPO_SHORT,
-  type RepoShort,
-  parsePrQuery,
-  prMentionScore,
-} from "@/features/search/lib/prNumber";
+import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
 
 const HOLD = /^steward\/hold-(buzz|reset|talos)-(\d{1,7})-[0-9a-f]{12}/;
-const AREA_SHORT: Record<string, RepoShort> = {
-  buzz: "buzz",
-  "28-day-reset": "reset",
-  "dreamforge-talos": "talos",
-};
-
-export function benchCardRepo(card: BenchCard): RepoShort | null {
-  const own = /^steward\/(?:hold-)?(buzz|reset|talos)-/.exec(card.id)?.[1];
-  if (own) return own as RepoShort;
-  for (const { url } of card.links) {
-    const repo = /github\.com\/[^/]+\/([^/]+)\/pull\//.exec(url)?.[1];
-    if (repo && Object.hasOwn(REPO_SHORT, repo.toLowerCase())) {
-      return REPO_SHORT[repo.toLowerCase()];
-    }
-  }
-  return Object.hasOwn(AREA_SHORT, card.area) ? AREA_SHORT[card.area] : null;
-}
+const WORD = /[^\p{L}\p{N}]+/u;
 
 /** The PRs a card is about: its id, PR links, launch item, receipt lines. */
 export function benchCardPrs(card: BenchCard): string[] {
@@ -55,15 +34,38 @@ export function benchCardTier(card: BenchCard): "red" | null {
   return HOLD.test(card.id) && card.kind === "pending" ? "red" : null;
 }
 
+/** As the Bench's Needs you shows it to the owner: no one else asked first. */
+export const benchNeedsYou = (card: BenchCard) =>
+  card.kind === "pending" && !card.answer && card.answerers.length === 0;
+
 /** Needs you, then other pending, then decisions and status. */
 const rank = (card: BenchCard) =>
-  card.kind !== "pending" ? 2 : card.answer ? 1 : 0;
+  benchNeedsYou(card) ? 0 : card.kind === "pending" ? 1 : 2;
+
+/**
+ * What names a card, split into words: its id, title, project, pull links
+ * and "receipt" for one. Word queries look only here, so "it" or "send"
+ * never match every card's options or body.
+ */
+function nameWords(card: BenchCard): string[] {
+  const receipt = card.request || card.id.endsWith("-train") ? "receipt" : "";
+  return [
+    card.id,
+    card.title,
+    card.area,
+    receipt,
+    ...card.links.map((l) => l.url),
+  ]
+    .join(" ")
+    .toLowerCase()
+    .split(WORD);
+}
 
 /**
  * Current cards for a global search, best first. A PR query ranks cards about
  * that PR (and repo) first, then cards naming it, then (a bare number only)
- * cards with it as a whole number; other queries use the Bench search, title
- * matches first. Ties: needs you, newest, id.
+ * cards with it as a whole number; for other queries each word must start a
+ * word of the card's names, title matches first. Ties: needs you, newest, id.
  */
 export function findBenchCards(
   snapshot: BenchSnapshot | null,
@@ -72,11 +74,13 @@ export function findBenchCards(
 ): BenchCard[] {
   if (!snapshot || !query.trim()) return [];
   const pr = parsePrQuery(query);
-  const matches = benchSearch(query);
   const q = query.trim().toLowerCase();
+  const words = q.split(WORD).filter(Boolean);
+  if (!pr && !words.length) return [];
   const score = (card: BenchCard): number => {
     if (!pr) {
-      if (!matches(card)) return 0;
+      const names = nameWords(card);
+      if (!words.every((w) => names.some((n) => n.startsWith(w)))) return 0;
       return card.title.toLowerCase().includes(q) ? 2 : 1;
     }
     const repo = benchCardRepo(card);

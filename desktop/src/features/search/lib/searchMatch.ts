@@ -30,12 +30,14 @@ function extractLexemes(value: string): string[] {
 function getSearchHighlightMatchers(query: string): SearchHighlightTerm[] {
   const rawTokens = query.trim().split(/\s+/).filter(Boolean);
   const matchers: SearchHighlightTerm[] = [];
+  // A query that is only a number matches it exactly, as on the relay:
+  // "792" never marks 7928.
+  const isNumber = /^#?\d+$/.test(query.trim());
 
   rawTokens.forEach((rawToken, tokenIndex) => {
-    const isPrefix = tokenIndex === rawTokens.length - 1;
+    const isPrefix = !isNumber && tokenIndex === rawTokens.length - 1;
     for (const value of extractLexemes(rawToken)) {
-      // A number is a whole token, as on the relay: "792" never marks 7928.
-      matchers.push({ isPrefix: isPrefix && !/^\d+$/.test(value), value });
+      matchers.push({ isPrefix, value });
     }
   });
 

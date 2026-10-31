@@ -21,13 +21,13 @@ test("parsePrQuery: every PR form, with its repo; nothing else", () => {
   assert.equal(parsePrQuery("buzz#792")?.repo, "buzz");
   assert.equal(parsePrQuery("reset pr 792")?.repo, "reset");
   assert.equal(parsePrQuery("Metabolic-reset#792")?.repo, "reset");
-  assert.deepEqual(parsePrQuery("talos 12"), {
+  assert.deepEqual(parsePrQuery("talos/12"), {
     number: "12",
     repo: "talos",
     explicit: true,
   });
   const none =
-    "792d3edd | 7928x | pr | # | buzz | buzz2 | 0.5.792 | 2026-10-14 | dec 14 | 12345678 | release 12";
+    "792d3edd | 7928x | pr | # | buzz | buzz2 | 0.5.792 | 2026-10-14 | dec 14 | 12345678 | release 12 | reset 14 | buzz 2 | talos 12";
   for (const q of list(none)) assert.equal(parsePrQuery(q), null, q);
 });
 

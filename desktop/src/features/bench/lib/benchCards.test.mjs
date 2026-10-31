@@ -1241,6 +1241,26 @@ test("search: a number is a whole token, never inside a hash or a longer one", (
   assert.deepEqual(ids("pull request 792"), ["w/named"]);
 });
 
+test("search: a repo narrows a PR number; a repo word and a number are words", () => {
+  const cards = [
+    card({ id: "w/day", title: "28 Day Reset: day 14 check-in failed" }),
+    card({
+      id: "steward/hold-buzz-14-0a1b2c3d4e5f",
+      title: "buzz PR 14 waits",
+    }),
+    card({
+      id: "steward/hold-talos-2-0a1b2c3d4e5f",
+      title: "talos PR 2 waits",
+    }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("reset 14"), ["w/day"]);
+  assert.deepEqual(ids("reset 28"), ["w/day"]);
+  assert.deepEqual(ids("buzz#2"), []);
+  assert.deepEqual(ids("talos#2"), ["steward/hold-talos-2-0a1b2c3d4e5f"]);
+  assert.deepEqual(ids("reset pr 14"), []);
+});
+
 test("search: words, names and a receipt's request; empty matches all", () => {
   const craig = { pk: CRAIG, name: "Craig", role: "decider", agent: false };
   const cards = [

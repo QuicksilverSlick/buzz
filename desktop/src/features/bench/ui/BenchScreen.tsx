@@ -97,32 +97,34 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
   const [query, setQuery] = React.useState("");
   const matches = React.useMemo(() => benchSearch(query), [query]);
   const [savedTab, setSavedTab] = React.useState(readBenchTab);
-  const [focusedId, setFocusedId] = React.useState<string | null>(null);
+  // A new object per pick, so the same card picked again scrolls again.
+  const [focused, setFocused] = React.useState<{ id: string } | null>(null);
+  const focusedId = focused?.id ?? null;
   React.useEffect(() => {
     if (!focusCardId) return;
     // All for this visit only: the saved tab stays the owner's.
     setSavedTab("all");
     setQuery("");
-    setFocusedId(focusCardId);
+    setFocused({ id: focusCardId });
     // Drop ?card= so picking the same card again focuses it again.
     void goBench({ replace: true });
   }, [focusCardId, goBench]);
   const hasSnapshot = snapshot !== null;
   React.useEffect(() => {
-    if (!focusedId || !hasSnapshot) return;
+    if (!focused || !hasSnapshot) return;
     const frame = window.requestAnimationFrame(() => {
       const item = document
-        .querySelector(`[data-bench-item="${CSS.escape(focusedId)}"]`)
+        .querySelector(`[data-bench-item="${CSS.escape(focused.id)}"]`)
         ?.closest("li");
       item?.scrollIntoView({ block: "center" });
       item?.focus({ preventScroll: true });
     });
-    const timer = window.setTimeout(() => setFocusedId(null), 4_000);
+    const timer = window.setTimeout(() => setFocused(null), 4_000);
     return () => {
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timer);
     };
-  }, [focusedId, hasSnapshot]);
+  }, [focused, hasSnapshot]);
   const counts = React.useMemo(
     () => (snapshot ? workbenchCounts(snapshot, viewerPubkey) : null),
     [snapshot, viewerPubkey],

@@ -5,7 +5,7 @@ import {
   benchSeverityChip,
   benchStateLabel,
 } from "@/features/bench/lib/benchCards";
-import { benchCardTier } from "@/features/bench/lib/benchFind";
+import { benchCardTier, benchNeedsYou } from "@/features/bench/lib/benchFind";
 import {
   WORKBENCHES,
   cardWorkbench,
@@ -34,7 +34,7 @@ export function BenchResultRow({
   const viewer = useIdentityQuery().data?.pubkey;
   const projects = useProjectsQuery(false).data ?? [];
   const viewerAgents = useViewerAgentPubkeys();
-  const needsYou = card.kind === "pending" && !card.answer;
+  const needsYou = benchNeedsYou(card);
   const meta = INBOX_TYPE_META[needsYou ? "needs-you" : "bench"];
   const severity = benchSeverityChip(card.severity);
   const state = card.kind === "status" ? benchStateLabel(card.state) : null;
