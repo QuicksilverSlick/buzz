@@ -14,6 +14,7 @@ mod factory;
 mod filter;
 mod isolated_execution;
 mod observer;
+mod owner_dm;
 mod pending_permissions;
 mod pool;
 mod pool_lifecycle;
@@ -29,6 +30,9 @@ mod scope;
 mod setup_mode;
 mod usage;
 mod voice_profile;
+// Huddle voices' typed tools; the voice module (slice 8a) is its first caller.
+#[cfg_attr(not(test), allow(dead_code))]
+mod voice_tools;
 
 pub use usage::TurnUsage;
 
@@ -831,17 +835,20 @@ struct NormalListenerIngress {
 }
 
 impl AuthorizedNormalListenerEvent {
+    /// `owner_dm_addressed`: see [`filter::match_event_addressed`].
     async fn match_subscription(
         self,
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
+        owner_dm_addressed: bool,
     ) -> Option<NormalListenerIngress> {
         let (buzz_event, effective_author) = self.0.into_parts();
-        let matched = filter::match_event(
+        let matched = filter::match_event_addressed(
             &buzz_event.event,
             buzz_event.channel_id,
             rules,
             agent_pubkey_hex,
+            owner_dm_addressed,
         )
         .await?;
         Some(NormalListenerIngress {
@@ -3261,11 +3268,44 @@ async fn run_harness(
     if let Some(since) = catch_up_since.filter(|since| *since < startup_watermark) {
         tracing::info!(since, "replaying mentions sent while the harness was down");
     }
+    // One-on-one DMs with the owner, subscribed without `#p`, and the floor
+    // each one's untagged messages must not predate (see `owner_dm`). A
+    // startup without the exemption forgets the saved floors.
+    let owner_dm_owner = owner_dm::exempt_owner(config, owner_cache.get());
+    let owner_dm_since = config
+        .catch_up
+        .owner_dm_since(owner_dm_owner.as_deref(), startup_watermark);
+    let mut owner_dm_floors: HashMap<Uuid, u64> = HashMap::new();
     for (channel_id, filter) in &channel_filters {
-        let replay_since =
-            catch_up_replay_since(catch_up_since, startup_watermark, filter.require_mention);
+        let mut filter = filter.clone();
+        let owner_dm = channel_info_map.get(channel_id).is_some_and(|info| {
+            owner_dm::is_owner_dm(
+                &info.channel_type,
+                &info.participants,
+                &pubkey_hex,
+                owner_dm_owner.as_deref(),
+            )
+        });
+        if owner_dm {
+            owner_dm::exempt(
+                &mut owner_dm_floors,
+                &config.catch_up,
+                *channel_id,
+                &mut filter,
+                owner_dm_since,
+                startup_watermark,
+            );
+            tracing::info!(channel_id = %channel_id, "one-on-one owner DM: no tag needed");
+        }
+        // An owner DM keeps the mention catch-up: the floor, not the
+        // subscription, holds back untagged messages from before it.
+        let replay_since = catch_up_replay_since(
+            catch_up_since,
+            startup_watermark,
+            filter.require_mention || owner_dm,
+        );
         if let Err(e) = relay
-            .subscribe_channel_from(*channel_id, filter.clone(), replay_since)
+            .subscribe_channel_from(*channel_id, filter, replay_since)
             .await
         {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
@@ -3847,7 +3887,17 @@ async fn run_harness(
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
+                                    } else if let Some(mut filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
+                                        // A new DM holds nothing from before
+                                        // the exemption, so it floors at its
+                                        // start, not at the relay-stamped
+                                        // notice a lagging client may precede.
+                                        if let Some(owner) = owner_dm_owner.as_deref() {
+                                            if owner_dm::channel_is_owner_dm(&ctx.channel_info, ch, &pubkey_hex, owner).await {
+                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, owner_dm_since, ts);
+                                                tracing::info!(channel_id = %ch, "one-on-one owner DM: no tag needed");
+                                            }
+                                        }
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
@@ -3859,6 +3909,7 @@ async fn run_harness(
                                     }
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
+                                    owner_dm_floors.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
@@ -3911,10 +3962,48 @@ async fn run_harness(
                                 continue;
                             }
 
+                            // The owner talking in their one-on-one DM is
+                            // addressed without a tag. The DM's roster is
+                            // re-read from the resolver's kind:39000, which
+                            // each prompt turn refreshes, and the subscription
+                            // follows it: a DM that stops being one goes back
+                            // to `#p`.
+                            let ch = buzz_event.channel_id;
+                            let owner_dm_addressed = match owner_dm_owner.as_deref() {
+                                Some(owner)
+                                    if owner_dm_floors.contains_key(&ch)
+                                        || owner_dm::is_owner_message(&buzz_event.event, &pubkey_hex, owner) =>
+                                {
+                                    let owner_dm = owner_dm::channel_is_owner_dm(&ctx.channel_info, ch, &pubkey_hex, owner).await;
+                                    if owner_dm != owner_dm_floors.contains_key(&ch)
+                                        && subscribed_channel_ids.contains(&ch)
+                                    {
+                                        if let Some(mut filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
+                                            if owner_dm {
+                                                // It ran on `#p` until now.
+                                                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                                                owner_dm::exempt(&mut owner_dm_floors, &config.catch_up, ch, &mut filter, now, now);
+                                            } else {
+                                                owner_dm_floors.remove(&ch);
+                                            }
+                                            tracing::info!(channel_id = %ch, owner_dm, "owner DM status changed — resubscribing");
+                                            if let Err(e) = relay.subscribe_channel_from(ch, filter, None).await {
+                                                tracing::warn!("failed to resubscribe to channel {ch}: {e}");
+                                            }
+                                        }
+                                    }
+                                    owner_dm_floors.get(&ch).is_some_and(|floor| {
+                                        owner_dm::addresses_agent(&buzz_event.event, &pubkey_hex, owner, *floor)
+                                    })
+                                }
+                                _ => false,
+                            };
+
                             let inbound_backlog = match catch_up_intake(
                                 &buzz_event.event,
                                 kind_u32,
                                 &pubkey_hex,
+                                owner_dm_addressed,
                                 &config.catch_up,
                                 ctx.replayed_before,
                                 chrono::Utc::now().timestamp().max(0) as u64,
@@ -3930,12 +4019,14 @@ async fn run_harness(
                                 }
                             };
 
-                            // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
+                            // Check: kind:9, content "!shutdown", from owner, addressed
+                            // to THIS agent (a mention, or the owner's own DM).
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
                                 kind_u32,
                                 "!shutdown",
                                 &pubkey_hex,
+                                owner_dm_addressed,
                             );
                             if is_shutdown {
                                 let owner = owner_cache.get();
@@ -3967,6 +4058,7 @@ async fn run_harness(
                                 kind_u32,
                                 "!cancel",
                                 &pubkey_hex,
+                                owner_dm_addressed,
                             );
                             if is_cancel {
                                 let from_owner = owner_cache.get().is_some_and(|owner| {
@@ -4027,6 +4119,7 @@ async fn run_harness(
                                 kind_u32,
                                 "!rotate",
                                 &pubkey_hex,
+                                owner_dm_addressed,
                             );
                             if is_rotate {
                                 let from_owner = owner_cache.get().is_some_and(|owner| {
@@ -4098,7 +4191,8 @@ async fn run_harness(
                                 &buzz_event.event,
                                 queue::parse_thread_tags(&buzz_event.event),
                             );
-                            let inbound_mention = event_mentions_agent(&buzz_event.event, &pubkey_hex)
+                            let inbound_mention = (owner_dm_addressed
+                                || event_mentions_agent(&buzz_event.event, &pubkey_hex))
                                 .then(|| (buzz_event.event.id.to_hex(), buzz_event.event.created_at.as_secs()));
                             let authorized = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
@@ -4158,7 +4252,7 @@ async fn run_harness(
                             };
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex)
+                                    .match_subscription(&rules, &pubkey_hex, owner_dm_addressed)
                                     .await
                             else {
                                 tracing::debug!(
@@ -4815,7 +4909,13 @@ async fn run_harness(
     let mut finishing: HashMap<usize, Vec<(String, u64)>> = pool
         .task_map()
         .values()
-        .map(|meta| (meta.agent_index, turn_mentions(meta, &pubkey_hex)))
+        .map(|meta| {
+            let every_event = owner_dm::exemption_on(config);
+            (
+                meta.agent_index,
+                turn_mentions(meta, &pubkey_hex, every_event),
+            )
+        })
         .collect();
     let mut record_if_answered = |pr: &PromptResult| {
         if let (true, Some(finished)) = (
@@ -4932,15 +5032,19 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     })
 }
 
+/// `owner_dm_addressed`: the event is the owner talking in their one-on-one
+/// DM ([`owner_dm::addresses_agent`]), which counts as mentioning the agent,
+/// so an untagged `!cancel` there is a command and never reaches the model.
 fn is_owner_control_command(
     event: &nostr::Event,
     kind_u32: u32,
     command: &str,
     agent_pubkey_hex: &str,
+    owner_dm_addressed: bool,
 ) -> bool {
     kind_u32 == KIND_STREAM_MESSAGE
         && event.content.trim() == command
-        && event_mentions_agent(event, agent_pubkey_hex)
+        && (owner_dm_addressed || event_mentions_agent(event, agent_pubkey_hex))
 }
 
 /// Whether a turn that returned during the shutdown drain answered its
@@ -4980,10 +5084,12 @@ enum Intake {
 /// - talk in the owner's huddle older than [`HUDDLE_BACKLOG_MAX_AGE_SECS`] is
 ///   dropped, as the desktop p-tags every agent on every utterance and the
 ///   call has likely ended. `in_owner_huddle` is only awaited for that.
+#[allow(clippy::too_many_arguments)]
 async fn catch_up_intake(
     event: &nostr::Event,
     kind_u32: u32,
     agent_pubkey_hex: &str,
+    owner_dm_addressed: bool,
     catch_up: &catch_up::CatchUp,
     replayed_before: Option<u64>,
     now: u64,
@@ -4998,10 +5104,15 @@ async fn catch_up_intake(
     if !catch_up.heard_when_sent(kind_u32, event.created_at.as_secs()) {
         return Intake::Skip("sent before the harness listened for its kind");
     }
-    if ["!shutdown", "!cancel", "!rotate"]
-        .iter()
-        .any(|command| is_owner_control_command(event, kind_u32, command, agent_pubkey_hex))
-    {
+    if ["!shutdown", "!cancel", "!rotate"].iter().any(|command| {
+        is_owner_control_command(
+            event,
+            kind_u32,
+            command,
+            agent_pubkey_hex,
+            owner_dm_addressed,
+        )
+    }) {
         return Intake::Skip("a control command sent while the harness was down");
     }
     let sent = event.created_at.as_secs();
@@ -5938,7 +6049,14 @@ fn shed_parked_notice() -> String {
 /// steered into it. Only a steer's id is kept, so it is stamped with the
 /// batch's newest send time (it was sent later) rather than the local clock,
 /// which the ledger's pruning must not depend on.
-fn turn_mentions(meta: &pool::TaskMeta, agent_pubkey_hex: &str) -> Vec<(String, u64)> {
+/// `every_event`: in mentions mode with the owner-DM exemption on, every
+/// event a turn runs on was addressed to the agent, untagged ones included
+/// (its owner in their one-on-one DM), and a restart replays those too.
+fn turn_mentions(
+    meta: &pool::TaskMeta,
+    agent_pubkey_hex: &str,
+    every_event: bool,
+) -> Vec<(String, u64)> {
     let events = || {
         meta.recoverable_batch
             .iter()
@@ -5949,7 +6067,7 @@ fn turn_mentions(meta: &pool::TaskMeta, agent_pubkey_hex: &str) -> Vec<(String, 
         .max()
         .unwrap_or_else(|| chrono::Utc::now().timestamp().max(0) as u64);
     events()
-        .filter(|be| event_mentions_agent(&be.event, agent_pubkey_hex))
+        .filter(|be| every_event || event_mentions_agent(&be.event, agent_pubkey_hex))
         .map(|be| (be.event.id.to_hex(), be.event.created_at.as_secs()))
         .chain(
             meta.successful_steer_deliveries
@@ -6133,7 +6251,10 @@ fn handle_prompt_result(
         .map(|meta| meta.successful_steer_deliveries.clone())
         .unwrap_or_default();
     let mut finished = meta
-        .map(|meta| turn_mentions(meta, &config.keys.public_key().to_hex()))
+        .map(|meta| {
+            let every_event = owner_dm::exemption_on(config);
+            turn_mentions(meta, &config.keys.public_key().to_hex(), every_event)
+        })
         .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
@@ -7687,18 +7808,26 @@ mod owner_control_command_tests {
             &event,
             KIND_STREAM_MESSAGE,
             "!rotate",
-            &agent
+            &agent,
+            false
         ));
 
         let wrong_kind = make_event(1, "!rotate", Some(&agent));
-        assert!(!is_owner_control_command(&wrong_kind, 1, "!rotate", &agent));
+        assert!(!is_owner_control_command(
+            &wrong_kind,
+            1,
+            "!rotate",
+            &agent,
+            false
+        ));
 
         let wrong_content = make_event(KIND_STREAM_MESSAGE, "!cancel", Some(&agent));
         assert!(!is_owner_control_command(
             &wrong_content,
             KIND_STREAM_MESSAGE,
             "!rotate",
-            &agent
+            &agent,
+            false
         ));
 
         let no_mention = make_event(KIND_STREAM_MESSAGE, "!rotate", None);
@@ -7706,8 +7835,61 @@ mod owner_control_command_tests {
             &no_mention,
             KIND_STREAM_MESSAGE,
             "!rotate",
-            &agent
+            &agent,
+            false
         ));
+    }
+
+    /// The rule picked for untagged control commands in a one-on-one owner
+    /// DM: they are addressed, so they run as commands (consumed, never a
+    /// prompt), and one replayed after a restart is dropped unexecuted like a
+    /// tagged one.
+    #[tokio::test]
+    async fn untagged_owner_dm_control_commands_run_as_commands() {
+        let agent = "ab".repeat(32);
+        let owner = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let cancel = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "!cancel")
+            .sign_with_keys(&owner)
+            .unwrap();
+        let sent = cancel.created_at.as_secs();
+        let addressed = owner_dm::addresses_agent(&cancel, &agent, &owner_hex, sent);
+        assert!(addressed);
+        assert!(is_owner_control_command(
+            &cancel,
+            KIND_STREAM_MESSAGE,
+            "!cancel",
+            &agent,
+            addressed
+        ));
+        // Outside an owner DM the same line addresses nobody: no command, and
+        // the mention rule drops it.
+        assert!(!is_owner_control_command(
+            &cancel,
+            KIND_STREAM_MESSAGE,
+            "!cancel",
+            &agent,
+            false
+        ));
+
+        let catch_up = crate::catch_up::CatchUp::default();
+        let intake = |replayed_before| {
+            catch_up_intake(
+                &cancel,
+                KIND_STREAM_MESSAGE,
+                &agent,
+                addressed,
+                &catch_up,
+                replayed_before,
+                sent + 600,
+                std::future::ready(false),
+            )
+        };
+        assert_eq!(intake(None).await, Intake::Live);
+        assert_eq!(
+            intake(Some(sent + 600)).await,
+            Intake::Skip("a control command sent while the harness was down")
+        );
     }
 
     #[test]
@@ -7789,6 +7971,7 @@ mod owner_control_command_tests {
                 event,
                 KIND_STREAM_MESSAGE,
                 &agent,
+                false,
                 &catch_up,
                 replayed_before,
                 now,
@@ -7820,6 +8003,7 @@ mod owner_control_command_tests {
                 event,
                 kind,
                 &agent,
+                false,
                 &catch_up,
                 Some(upgraded),
                 upgraded,
@@ -8748,6 +8932,7 @@ mod author_gate_tests {
                     name: "workflow".into(),
                     channel_type: channel_type.into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             rest_client.clone(),
@@ -9064,6 +9249,7 @@ mod author_gate_tests {
                     name: "workflow".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             rest_client.clone(),
@@ -9173,6 +9359,7 @@ mod author_gate_tests {
                     name: "workflow".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             rest_client.clone(),
@@ -9238,6 +9425,7 @@ mod author_gate_tests {
                     name: "workflow".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             rest_client.clone(),
@@ -9298,6 +9486,7 @@ mod author_gate_tests {
                         name: "workflow".into(),
                         channel_type: "stream".into(),
                         description: None,
+                        participants: Vec::new(),
                     },
                 )]),
                 rest_client.clone(),
@@ -9375,6 +9564,7 @@ mod author_gate_tests {
                     name: "test".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             rest_client.clone(),
@@ -9759,6 +9949,7 @@ mod author_gate_tests {
                         name: "project".into(),
                         channel_type: "stream".into(),
                         description: None,
+                        participants: Vec::new(),
                     },
                 )]),
                 rest.clone(),
@@ -10385,6 +10576,7 @@ mod author_gate_tests {
                     name: "dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             ),
             (
@@ -10393,6 +10585,7 @@ mod author_gate_tests {
                     name: "stream".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             ),
         ]);
@@ -10410,6 +10603,7 @@ mod author_gate_tests {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
                 description: None,
+                participants: Vec::new(),
             },
         )]);
         assert!(
@@ -12671,6 +12865,7 @@ mod edit_native_steer_tests {
                     name: "test-channel".into(),
                     channel_type: channel_type.into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             ctx.rest_client.clone(),
@@ -13461,8 +13656,16 @@ mod error_outcome_emission_tests {
     /// and steers the chat line into it, so the mention rides as the merged
     /// turn's interrupted request.
     async fn ledger_after(outcome: PromptOutcome, returned: bool, merged: bool) -> (bool, bool) {
+        ledger_after_in(test_config(), outcome, returned, merged).await
+    }
+
+    async fn ledger_after_in(
+        base: Config,
+        outcome: PromptOutcome,
+        returned: bool,
+        merged: bool,
+    ) -> (bool, bool) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let base = test_config();
         let agent_hex = base.keys.public_key().to_hex();
         let catch_up = crate::catch_up::CatchUp::open(
             dir.path(),
@@ -13559,6 +13762,25 @@ mod error_outcome_emission_tests {
             .await,
             (true, false),
             "an answered mention is done; a line that never mentioned the agent is not tracked"
+        );
+    }
+
+    /// In mentions mode an untagged line in a turn was the owner talking in
+    /// their one-on-one DM, and a restart replays those: it is done too, or
+    /// the restart answers it twice.
+    #[tokio::test]
+    async fn ok_turn_records_untagged_owner_dm_lines_in_mentions_mode() {
+        let mut config = test_config();
+        config.subscribe_mode = config::SubscribeMode::Mentions;
+        assert_eq!(
+            ledger_after_in(
+                config,
+                PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+                false,
+                false
+            )
+            .await,
+            (true, true)
         );
     }
 

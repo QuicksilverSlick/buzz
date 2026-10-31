@@ -796,6 +796,7 @@ impl ChannelInfoResolver {
                         channel_type: info.channel_type,
                         description: info.description,
                         project: None,
+                        participants: info.participants,
                     },
                 ))
             })
@@ -3977,6 +3978,7 @@ async fn fetch_channel_info_once(channel_id: Uuid, rest: &RestClient) -> Option<
                 channel_type,
                 description,
                 project: None,
+                participants: crate::relay::participants_from_tags(tags),
             })
         }
         Ok(Err(e)) => {
@@ -7537,6 +7539,7 @@ pub(crate) mod tests {
                         name: "test-channel".into(),
                         channel_type: "stream".into(),
                         description: None,
+                        participants: Vec::new(),
                     },
                 )]),
                 ctx.rest_client.clone(),
@@ -7938,6 +7941,7 @@ done"#
                         name: "test-thread".into(),
                         channel_type: "stream".into(),
                         description: None,
+                        participants: Vec::new(),
                     },
                 )]),
                 RestClient {
@@ -8152,6 +8156,7 @@ done"#
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             RestClient {
@@ -8320,6 +8325,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             RestClient {
@@ -11588,6 +11594,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     name: "ordinary-looking".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             crate::relay::RestClient {
@@ -11727,6 +11734,7 @@ done"#
                     name: "ordinary-looking".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             RestClient {
@@ -11834,6 +11842,7 @@ done"#
                     name: "project-home".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    participants: Vec::new(),
                 },
             )]),
             crate::relay::RestClient {

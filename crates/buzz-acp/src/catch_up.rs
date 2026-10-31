@@ -48,6 +48,12 @@ struct Ledger {
     floor: u64,
     /// Finished event id (hex) and its `created_at`.
     done: HashMap<String, u64>,
+    /// The owner whose one-on-one DMs are exempt from `#p`, and when that
+    /// started (see [`CatchUp::owner_dm_since`]).
+    dm_since: Option<(String, u64)>,
+    /// Owner DM (channel UUID) and when it first got the exemption from `#p`
+    /// (see [`CatchUp::owner_dm_floor`]).
+    dm_floors: HashMap<String, u64>,
     /// Each kind listened for, and the first boot that listened for it.
     kinds: HashMap<u32, u64>,
     /// Ids added since the last save, with a save already scheduled.
@@ -87,6 +93,8 @@ impl CatchUp {
                             .collect()
                     })
                     .unwrap_or_default(),
+                dm_since: serde_json::from_value(saved["dm_since"].clone()).unwrap_or_default(),
+                dm_floors: serde_json::from_value(saved["dm_floors"].clone()).unwrap_or_default(),
                 kinds: match saved["kinds"].as_object() {
                     Some(kinds) => kinds
                         .iter()
@@ -112,6 +120,8 @@ impl CatchUp {
                     window,
                     floor: now,
                     done: HashMap::new(),
+                    dm_since: None,
+                    dm_floors: HashMap::new(),
                     kinds: HashMap::new(),
                     unsaved: false,
                 };
@@ -185,6 +195,52 @@ impl CatchUp {
         ledger.save();
     }
 
+    /// When the one-on-one DMs of `owner` became exempt from `#p`: the first
+    /// startup of the current unbroken run of startups exempting them, or
+    /// else `now`, saved. A startup with no exemption (`None`: respond-to
+    /// nobody, another subscribe mode, no resolved owner) or for another owner
+    /// forgets it and every DM floor. Untagged messages sent under that run's
+    /// policy never reached the harness and were never marked done, so the
+    /// next exempting startup starts over and does not answer them.
+    pub(crate) fn owner_dm_since(&self, owner: Option<&str>, now: u64) -> u64 {
+        let Some(ledger) = self.0.as_ref() else {
+            return now;
+        };
+        let mut ledger = lock(ledger);
+        if let (Some((saved, since)), Some(owner)) = (&ledger.dm_since, owner) {
+            if saved.eq_ignore_ascii_case(owner) {
+                return *since;
+            }
+        }
+        let fresh = owner.map(|owner| (owner.to_ascii_lowercase(), now));
+        if ledger.dm_since != fresh || !ledger.dm_floors.is_empty() {
+            ledger.dm_since = fresh;
+            ledger.dm_floors.clear();
+            ledger.save();
+        }
+        now
+    }
+
+    /// The time untagged messages in the owner DM `channel` must not predate:
+    /// the later of the saved one and `first`, saved. It only rises: a
+    /// restart keeps it, so what the owner sent while the harness was down is
+    /// replayed but nothing from before the exemption is, and a DM that ran
+    /// on `#p` raises it to then. With catch-up off nothing is replayed, and
+    /// it is `first`.
+    pub(crate) fn owner_dm_floor(&self, channel: uuid::Uuid, first: u64) -> u64 {
+        let Some(ledger) = self.0.as_ref() else {
+            return first;
+        };
+        let mut ledger = lock(ledger);
+        let saved = ledger.dm_floors.get(&channel.to_string()).copied();
+        let floor = saved.map_or(first, |saved| saved.max(first));
+        if saved != Some(floor) {
+            ledger.dm_floors.insert(channel.to_string(), floor);
+            ledger.save();
+        }
+        floor
+    }
+
     /// Mark a mention the author gate refused as done, so the policy it was
     /// sent under decides it: a respond-to change, which restarts the agent,
     /// must not answer a day of refused requests. Saved with the next turn, or
@@ -219,6 +275,8 @@ impl Ledger {
             "version": 1,
             "floor": self.floor,
             "done": self.done,
+            "dm_since": self.dm_since,
+            "dm_floors": self.dm_floors,
             "kinds": self.kinds,
         });
         let written = self
@@ -414,6 +472,124 @@ mod tests {
             "the next restart remembers when the kind was first heard"
         );
         assert!(restarted.heard_when_sent(FORUM_COMMENT, NOW + 60));
+    }
+
+    /// A ledger saved with owner-DM floors but no kinds, or with kinds but no
+    /// owner-DM floors, loads the missing part as a fresh one, and the next
+    /// save keeps all three.
+    #[test]
+    fn owner_dm_floors_and_kind_floors_load_and_save_together() {
+        const FORUM_COMMENT: u32 = buzz_core::kind::KIND_FORUM_COMMENT;
+        let dir = tempfile::tempdir().unwrap();
+        let dm = uuid::Uuid::new_v4();
+        let hour_ago = NOW - 3600;
+        let dm_only = serde_json::json!({
+            "version": 1, "floor": NOW - 2 * DAY, "done": {},
+            "dm_since": ["o", NOW - DAY], "dm_floors": { (dm.to_string()): NOW - DAY },
+        });
+        std::fs::write(file(dir.path(), RELAY), dm_only.to_string()).unwrap();
+        for at in [NOW, NOW + 60] {
+            let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, at);
+            catch_up.listen_for(&[9, FORUM_COMMENT], at);
+            assert_eq!(catch_up.owner_dm_since(Some("o"), at), NOW - DAY);
+            assert_eq!(catch_up.owner_dm_floor(dm, NOW - DAY), NOW - DAY);
+            assert!(catch_up.heard_when_sent(9, hour_ago));
+            assert!(!catch_up.heard_when_sent(FORUM_COMMENT, hour_ago));
+            assert!(
+                catch_up.heard_when_sent(FORUM_COMMENT, NOW + 30),
+                "the kind floor saved at NOW is kept"
+            );
+        }
+
+        let kinds_only = serde_json::json!({
+            "version": 1, "floor": NOW - 2 * DAY, "done": {},
+            "kinds": { "9": NOW - 2 * DAY, (FORUM_COMMENT.to_string()): NOW },
+        });
+        std::fs::write(file(dir.path(), RELAY), kinds_only.to_string()).unwrap();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 60);
+        assert_eq!(catch_up.owner_dm_since(Some("o"), NOW + 60), NOW + 60);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW + 60), NOW + 60);
+        assert!(catch_up.heard_when_sent(9, hour_ago));
+        assert!(!catch_up.heard_when_sent(FORUM_COMMENT, hour_ago));
+    }
+
+    #[test]
+    fn owner_dm_floor_is_kept_and_only_rises() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = uuid::Uuid::new_v4();
+        let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW + 5), NOW + 5);
+        assert_eq!(catch_up.owner_dm_floor(dm, NOW), NOW + 5, "never lowered");
+        catch_up.record(&[("e1".into(), NOW + 10)], NOW + 20);
+        drop(catch_up);
+
+        let reopened = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 600);
+        assert_eq!(
+            reopened.owner_dm_floor(dm, NOW),
+            NOW + 5,
+            "kept across a restart"
+        );
+        assert_eq!(
+            reopened.owner_dm_floor(dm, NOW + 600),
+            NOW + 600,
+            "a DM that ran on #p until now raises it"
+        );
+        drop(reopened);
+        let reopened = CatchUp::open(dir.path(), PK, RELAY, DAY, NOW + 700);
+        assert_eq!(
+            reopened.owner_dm_floor(dm, NOW),
+            NOW + 600,
+            "the raise is saved"
+        );
+        assert_eq!(
+            reopened.owner_dm_floor(uuid::Uuid::new_v4(), NOW + 600),
+            NOW + 600,
+            "each DM has its own floor"
+        );
+        assert!(reopened.is_done("e1"));
+        assert_eq!(
+            CatchUp::default().owner_dm_floor(dm, NOW + 7),
+            NOW + 7,
+            "catch-up off: nothing saved, the floor is now"
+        );
+    }
+
+    /// A run with the exemption off, or for another owner, never answers
+    /// what was sent during it once the exemption is back: its untagged
+    /// messages were never delivered, so nothing marked them done.
+    #[test]
+    fn owner_dm_since_starts_over_after_a_run_without_the_exemption() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = uuid::Uuid::new_v4();
+        // A run exempts its owner DM, or with the exemption off none.
+        let run = |at: u64, owner: Option<&str>| {
+            let catch_up = CatchUp::open(dir.path(), PK, RELAY, DAY, at);
+            let since = catch_up.owner_dm_since(owner, at);
+            (since, owner.map(|_| catch_up.owner_dm_floor(dm, since)))
+        };
+        assert_eq!(run(NOW, Some("O")), (NOW, Some(NOW)));
+        assert_eq!(
+            run(NOW + 100, Some("o")),
+            (NOW, Some(NOW)),
+            "kept across restarts"
+        );
+        run(NOW + 200, None);
+        let saved = std::fs::read_to_string(file(dir.path(), RELAY)).unwrap();
+        assert!(!saved.contains(&dm.to_string()), "the muted run forgets it");
+        assert_eq!(
+            run(NOW + 300, Some("o")),
+            (NOW + 300, Some(NOW + 300)),
+            "after a muted run nothing it was sent is answered"
+        );
+        assert_eq!(
+            run(NOW + 400, Some("p")),
+            (NOW + 400, Some(NOW + 400)),
+            "another owner starts over"
+        );
+        assert_eq!(
+            CatchUp::default().owner_dm_since(Some("o"), NOW + 7),
+            NOW + 7
+        );
     }
 
     #[test]
