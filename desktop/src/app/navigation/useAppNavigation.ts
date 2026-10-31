@@ -72,10 +72,11 @@ export function useAppNavigation() {
   );
 
   const goHome = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (behavior?: NavigationBehavior & { item?: string }) =>
       commitNavigation(
         {
           to: "/",
+          ...(behavior?.item ? { search: { item: behavior.item } } : {}),
         },
         behavior,
       ),
@@ -83,10 +84,13 @@ export function useAppNavigation() {
   );
 
   const goAgents = React.useCallback(
-    (behavior?: NavigationBehavior) =>
+    (behavior?: NavigationBehavior & { profilePersona?: string }) =>
       commitNavigation(
         {
           to: "/agents",
+          ...(behavior?.profilePersona
+            ? { search: { profilePersona: behavior.profilePersona } }
+            : {}),
         },
         behavior,
       ),

@@ -32,6 +32,7 @@ import {
 } from "@/features/search/lib/parseSearchOperators";
 import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
+import { useSurfaceSearchResults } from "@/features/search/useSurfaceSearchResults";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -279,15 +280,33 @@ export function useSearchResults({
     () => findBenchCards(benchSnapshot, benchQuery),
     [benchQuery, benchSnapshot],
   );
+  // Inbox, Projects, Workflows, Pulse and the agent library: unscoped only.
+  const surfaceHits = useSurfaceSearchResults({
+    channels,
+    enabled:
+      enabled &&
+      !scopeChannelId &&
+      !parsedQuery.in &&
+      !parsedQuery.from &&
+      parsedQuery.since === null &&
+      parsedQuery.until === null &&
+      ftsQuery.length >= MIN_SEARCH_QUERY_LENGTH,
+    query: ftsQuery,
+  });
 
   const messageResults = React.useMemo(() => {
     if (hasUnresolvedOperator) {
       return [];
     }
-    // A card's own post would repeat the card result.
-    const cardPosts = new Set(benchResults.map((card) => card.cardEventId));
+    // A card's own post, or an Inbox row's, would repeat that result.
+    const shown = new Set<string | null>([
+      ...benchResults.map((card) => card.cardEventId),
+      ...surfaceHits.flatMap((hit) =>
+        hit.surface === "inbox" ? [hit.id] : [],
+      ),
+    ]);
     const hits = dedupeSearchHits(searchQuery.data?.hits ?? []).filter(
-      (hit) => !cardPosts.has(hit.eventId),
+      (hit) => !shown.has(hit.eventId),
     );
     if (!prQuery) {
       return hits;
@@ -301,7 +320,13 @@ export function useSearchResults({
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score)
       .map(({ hit }) => hit);
-  }, [benchResults, hasUnresolvedOperator, prQuery, searchQuery.data?.hits]);
+  }, [
+    benchResults,
+    hasUnresolvedOperator,
+    prQuery,
+    searchQuery.data?.hits,
+    surfaceHits,
+  ]);
   const channelResults = React.useMemo(() => {
     if (scopeChannelId || ftsQuery.length < MIN_SEARCH_QUERY_LENGTH) {
       return [];
@@ -483,12 +508,13 @@ export function useSearchResults({
         kind: "user" as const,
         user,
       })),
+      ...surfaceHits.map((hit) => ({ kind: "surface" as const, hit })),
       ...messageResults.map((hit) => ({
         kind: "message" as const,
         hit,
       })),
     ],
-    [benchResults, channelResults, messageResults, userResults],
+    [benchResults, channelResults, messageResults, surfaceHits, userResults],
   );
 
   const resultProfilesQuery = useUsersBatchQuery(

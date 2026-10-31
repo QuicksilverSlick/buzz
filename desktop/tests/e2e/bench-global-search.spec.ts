@@ -224,3 +224,61 @@ test("global search finds a Bench card by PR number and opens it", async ({
   await expect(focused).toContainText("PR #719 merged and live");
   await expect(focused).toBeFocused();
 });
+
+test("global search finds Inbox rows, projects and agent-library personas", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "buzz-feature-overrides-v1",
+      JSON.stringify({ projects: true }),
+    ),
+  );
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "release-captain",
+        displayName: "Release Captain",
+        description: "Cuts desktop releases",
+        systemPrompt: "Never searched.",
+      },
+    ],
+  });
+  await page.goto("/");
+  // Search reads the Inbox the app already loaded.
+  const row = page.getByTestId("home-inbox-item-mock-feed-mention");
+  await expect(row).toBeVisible();
+  const dialog = page.getByTestId("search-results");
+  const input = page.getByTestId("search-dialog-input");
+  const section = (key: string) =>
+    dialog.locator(`[data-search-section="${key}"]`).getByRole("option");
+
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("release");
+  await expect(section("agent-library")).toContainText("Cuts desktop releases");
+  await expect(section("inbox")).toContainText(
+    "Please review the release checklist.Mention",
+  );
+  await waitForAnimations(page);
+  await dialog.screenshot({
+    path: "test-results/bench-search/05-agent-library-and-inbox.png",
+  });
+  await section("inbox").click();
+  await expect(row).toHaveAttribute("aria-current", "true");
+
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("release captain");
+  await section("agent-library").click();
+  await expect(page).toHaveURL(/#\/agents\?.*profilePersona=release-captain/);
+
+  // Projects the app already loaded; search never fetches them.
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("relay-tools");
+  await expect(section("projects").first()).toContainText("relay-tools");
+  await waitForAnimations(page);
+  await dialog.screenshot({
+    path: "test-results/bench-search/04-projects-dialog.png",
+  });
+  await section("projects").first().click();
+  await expect(page).toHaveURL(/#\/projects\/[^/?]+/);
+});
