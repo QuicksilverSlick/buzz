@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 import type { BenchCard } from "../../src/features/bench/lib/benchCards";
 import { waitForAnimations } from "../helpers/animations";
@@ -100,9 +100,9 @@ const hit = (event_id: string, content: string) => ({
   score: 9,
 });
 
-test("global search finds a Bench card by PR number and opens it", async ({
-  page,
-}) => {
+const TAB_KEY = "buzz.bench.workbench.v1";
+
+async function open(page: Page, path: string) {
   // The mock matches by substring, as a prefix relay would: "792" also
   // returns the 7928 decoy, so this checks the client's own guard.
   await installMockBridge(page, {
@@ -114,11 +114,43 @@ test("global search finds a Bench card by PR number and opens it", async ({
     ],
   });
   // A saved Dreamforge tab hides the 28 Day Reset cards until a card opens.
-  await page.addInitScript(() =>
-    localStorage.setItem("buzz.bench.workbench.v1", "dreamforge"),
+  await page.addInitScript(
+    (key) => localStorage.setItem(key, "dreamforge"),
+    TAB_KEY,
   );
-  await page.goto("/");
+  await page.goto(path);
   await expect(page.getByTestId("sidebar-bench-count")).toBeVisible();
+}
+
+test("#792 lists messages with 792 as a whole number, never 7928", async ({
+  page,
+}) => {
+  await open(page, "/");
+  await page.keyboard.press("ControlOrMeta+k");
+  await page.getByTestId("search-dialog-input").fill("#792");
+  const merged = page.getByTestId(`search-result-${MERGED}`);
+  await expect(merged.locator("mark")).toHaveText("792");
+  await expect(page.getByTestId(`search-result-${DECOY}`)).toHaveCount(0);
+});
+
+test("?card= shows All, then scrolls to and focuses that card", async ({
+  page,
+}) => {
+  await open(page, "/#/bench?card=orchestrator%2Fpr-719");
+  const focused = page.locator("[data-bench-focused]");
+  await expect(focused).toContainText("PR #719 merged and live");
+  await expect(focused).toBeInViewport();
+  await expect(focused).toBeFocused();
+  await expect(page).not.toHaveURL(/card=/);
+  expect(await page.evaluate((key) => localStorage.getItem(key), TAB_KEY)).toBe(
+    "dreamforge",
+  );
+});
+
+test("global search finds a Bench card by PR number and opens it", async ({
+  page,
+}) => {
+  await open(page, "/");
 
   await page.keyboard.press("ControlOrMeta+k");
   await page.getByTestId("search-dialog-input").fill("#792");
@@ -173,9 +205,6 @@ test("global search finds a Bench card by PR number and opens it", async ({
   await expect(
     focused.getByRole("button", { name: /^1\. Ship it/ }),
   ).toBeVisible();
-  expect(
-    await page.evaluate(() => localStorage.getItem("buzz.bench.workbench.v1")),
-  ).toBe("dreamforge");
   await waitForAnimations(page);
   await page.getByTestId("bench-screen").screenshot({
     path: "test-results/bench-search/02-bench-card-focused.png",
@@ -193,6 +222,5 @@ test("global search finds a Bench card by PR number and opens it", async ({
   });
   await dialog.getByRole("option").first().click();
   await expect(focused).toContainText("PR #719 merged and live");
-  await expect(focused).toBeInViewport();
   await expect(focused).toBeFocused();
 });
