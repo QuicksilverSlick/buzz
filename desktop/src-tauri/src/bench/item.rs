@@ -21,13 +21,15 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
 /// The board's attention clock: an answer no agent acted on in 24 h is
 /// marked late.
 pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
-/// How long an answered card still holds one of the `MAX_CARDS` slots. Its
-/// taps are read for as long as it is Pending (`poll_answers`), slot or
-/// not; the slot only keeps newer cards from crowding it while the owner may
-/// still change the answer from a phone that was offline. The relay refuses
-/// an event signed more than 900 s from its own clock (buzz-relay
-/// MAX_TIMESTAMP_DRIFT_SECS), so a queued tap lands within 15 min or never:
-/// holding the slot longer keeps no tap alive.
+/// How long an answered card still holds one of the `MAX_CARDS` slots. The
+/// slot only holds back new posts: the card stays on the relay and its taps
+/// are read for as long as it is Pending (`poll_answers`), slot or not. The
+/// trade-off: past it, newer cards can push an answered card out of the
+/// phone's view, and the board's "Answered" link is how the owner reaches it
+/// to change the answer. 15 min covers a second thought; the 24 h it held
+/// before helped crowd Talos #7-#9 off the relay (31 Oct 2026). The
+/// fork's phone sends a tap only while online (addReaction awaits the
+/// relay); Block's app is unmeasured.
 pub(crate) const ANSWER_SLOT_SECS: u64 = 900;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
@@ -316,6 +318,10 @@ pub(crate) struct Item {
     /// next one posts without the p tag. A new Drop starts false.
     #[serde(default)]
     pub quiet_repost: bool,
+    /// Its card left the relay (retired for a refresh, deleted by hand) and
+    /// has not posted again: it keeps its `MAX_CARDS` place till it does.
+    #[serde(default)]
+    pub repost: bool,
     #[serde(default)]
     pub routed: Option<Routed>,
     /// Bench clock of the last answer change: a new reaction or a clear.
@@ -644,6 +650,7 @@ pub(crate) fn validate(
         answer: None,
         recorded: None,
         quiet_repost: false,
+        repost: false,
         routed: None,
         changed_at: 0,
         stamp: None,
@@ -888,6 +895,13 @@ pub(crate) fn rank(i: &Item) -> (u8, i64, String, String) {
         natural.push(c);
     }
     (severity_rank(i.severity), i.order, natural, i.id.clone())
+}
+
+/// A card that may post past `MAX_CARDS`, up to `OVER_CAP` more: critical,
+/// or asked again after the owner answered, so it never waits days behind
+/// older cards.
+pub(crate) fn preempts(i: &Item) -> bool {
+    severity_rank(i.severity) == 0 || i.back_to_you()
 }
 
 fn marker(item: &Item) -> &'static str {
@@ -1253,7 +1267,14 @@ pub(crate) use super::route::{
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).
-pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64) -> String {
+/// `queued`: open cards waiting for a `MAX_CARDS` slot (`BenchState::queued`).
+pub(crate) fn render_board(
+    items: &[&Item],
+    queued: &[String],
+    channel: &str,
+    hhmm: &str,
+    now: u64,
+) -> String {
     let current = |kind: ItemKind| -> Vec<&Item> {
         items
             .iter()
@@ -1301,8 +1322,11 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
             .as_ref()
             .map(|c| format!("buzz://message?channel={ch}&id={}", c.event_id))
     };
-    let target =
-        |i: &Item| link(i).map_or("(no card yet)".to_string(), |l| format!("\u{2192} {l}"));
+    let target = |i: &Item| match link(i) {
+        Some(l) => format!("\u{2192} {l}"),
+        None if queued.contains(&i.id) => "(queued for a slot)".to_string(),
+        None => "(no card yet)".to_string(),
+    };
     // A closed item's card: its question, answer and outcome.
     let receipt = |i: &Item| {
         link(i)
