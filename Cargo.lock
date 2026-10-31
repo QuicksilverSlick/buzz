@@ -934,6 +934,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "buzz-core",
+ "buzz-huddle-bridge",
  "buzz-persona",
  "buzz-sdk",
  "chrono",
@@ -1263,6 +1264,19 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "buzz-huddle-bridge"
+version = "0.1.0"
+dependencies = [
+ "buzz-audio-client",
+ "nostr 0.44.7",
+ "serde",
+ "serde_json",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
