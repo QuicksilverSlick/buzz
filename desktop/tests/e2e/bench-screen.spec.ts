@@ -151,19 +151,23 @@ test("a card waiting for a slot says why, and a tap posts it next", async ({
   const queued = benchSnapshot(null);
   if (!queued.enabled) throw new Error("the Bench is on");
   queued.maxCards = 30;
-  queued.items[0] = { ...queued.items[0], cardEventId: null, queued: true };
+  queued.items[0] = {
+    ...queued.items[0],
+    cardEventId: null,
+    waitsFor: "slot",
+  };
   await installMockBridge(page, { benchCards: queued });
   await page.goto("/");
   await page.getByTestId("open-bench-view").click();
 
   await expect(page.getByTestId("bench-queued")).toHaveText(
-    "1 card waits off the relay: the Bench keeps 30 cards live at once, and each posts when a slot frees. Tap one below to post it now.",
+    "1 card waits off the relay: the Bench posts a new card only while fewer than 30 slots are in use, and each posts when a slot frees. Tap one below to post it now.",
   );
   const card = page
     .getByTestId("bench-section-needsYou")
     .getByTestId("bench-card");
   await expect(card).toContainText(
-    "Queued: the Bench keeps 30 cards live on the relay; this one posts when a slot frees.",
+    "Queued: the Bench posts a new card only while fewer than 30 slots are in use; this one posts when a slot frees.",
   );
   const ship = card.getByRole("button", { name: /^1\. Ship it/ });
   await expect(ship).toBeEnabled();
@@ -197,7 +201,13 @@ test("a card waiting for a slot says why, and a tap posts it next", async ({
     .getByTestId("bench-section-needsYou")
     .getByTestId("bench-card");
   await expect(live).not.toContainText("Queued:");
-  await live.getByRole("button", { name: /^1\. Ship it/ }).click();
+  // The new row says the first tap answered nothing, and holds its focus.
+  await expect(live).toContainText(
+    "Posted at your request. Your earlier tap didn't answer it; tap your answer now.",
+  );
+  const again = live.getByRole("button", { name: /^1\. Ship it/ });
+  await expect(again).toBeFocused();
+  await again.click();
   await expect
     .poll(() => sent("bench_answer"))
     .toEqual([{ itemId: ITEM_ID, option: 0, cardEventId: "e".repeat(64) }]);

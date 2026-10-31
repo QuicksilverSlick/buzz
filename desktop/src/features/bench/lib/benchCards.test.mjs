@@ -232,22 +232,28 @@ test("mode: read-only for another viewer, no owner, stale or superseded", () => 
 });
 
 test("mode: a card off the relay says why, and a tap on it posts it next", () => {
-  const queued = benchCardMode(
-    card({ cardEventId: null, queued: true }),
-    OWNER,
-    OWNER,
-    30,
-  );
-  assert.deepEqual(queued, {
+  const off = (waitsFor) => card({ cardEventId: null, waitsFor });
+  const queued =
+    "Queued: the Bench posts a new card only while fewer than 30 slots are in use; this one posts when a slot frees.";
+  assert.deepEqual(benchCardMode(off("slot"), OWNER, OWNER, 30), {
     interactive: false,
-    readOnlyReason:
-      "Queued: the Bench keeps 30 cards live on the relay; this one posts when a slot frees. Tap an option to post it now.",
+    readOnlyReason: `${queued} Tap an option to post it now.`,
     bumpable: true,
   });
-  assert.deepEqual(benchCardMode(card({ cardEventId: null }), OWNER, OWNER), {
+  // Only the owner's tap posts it; anyone else is told why it waits.
+  assert.deepEqual(benchCardMode(off("slot"), OWNER, "c".repeat(64), 30), {
+    interactive: false,
+    readOnlyReason: queued,
+  });
+  assert.equal(benchCardMode(off("slot"), null, OWNER, 30).bumpable, undefined);
+  // A channel not ready says so before any tap; about to post, nothing to do.
+  assert.deepEqual(benchCardMode(off("channel"), OWNER, OWNER), {
+    interactive: false,
+    readOnlyReason: "Waiting: this card's channel isn't ready for cards yet.",
+  });
+  assert.deepEqual(benchCardMode(off(null), OWNER, OWNER), {
     interactive: false,
     readOnlyReason: "Waiting for the Bench to post this card.",
-    bumpable: true,
   });
   // An answered card whose card was retired: nothing to post or answer.
   const retired = card({
@@ -261,13 +267,18 @@ test("queued line: the header counts every card waiting for a slot", () => {
   assert.equal(benchQueuedLine({ items: [card()], maxCards: 30 }), null);
   assert.equal(
     benchQueuedLine({
-      items: [card({ queued: true }), card(), card({ queued: true })],
+      items: [
+        card({ waitsFor: "slot" }),
+        card({ waitsFor: "channel" }),
+        card({ waitsFor: "slot" }),
+      ],
       maxCards: 30,
     }),
-    "2 cards wait off the relay: the Bench keeps 30 cards live at once, and each posts when a slot frees. Tap one below to post it now.",
+    "2 cards wait off the relay: the Bench posts a new card only while fewer than 30 slots are in use, and each posts when a slot frees. Tap one below to post it now.",
   );
   assert.match(
-    benchQueuedLine({ items: [card({ queued: true })], maxCards: 30 }) ?? "",
+    benchQueuedLine({ items: [card({ waitsFor: "slot" })], maxCards: 30 }) ??
+      "",
     /^1 card waits off the relay/,
   );
 });

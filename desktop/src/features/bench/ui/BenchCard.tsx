@@ -8,6 +8,8 @@ import {
   type BenchCard as BenchCardData,
   type BenchOptionView,
   type SafeBenchLink,
+  BENCH_BUMP_HINT_MS,
+  BENCH_BUMP_POSTED,
   BENCH_BUMP_POSTING,
   BENCH_BUMP_TIMEOUT_MESSAGE,
   BENCH_BUMP_TIMEOUT_MS,
@@ -51,6 +53,13 @@ import { Spinner } from "@/shared/ui/spinner";
 function formatBenchTime(unixSeconds: number): string {
   return formatItemTimestamp(unixSeconds, { withTime: true });
 }
+
+/**
+ * Taps on cards off the relay, by item id: when, and the option. The row
+ * remounts once the card posts (a new key), so the live row reads this to
+ * say the tap answered nothing, and focuses that option.
+ */
+const bumpedTaps = new Map<string, { at: number; option: number }>();
 
 /**
  * A Bench decision card, in #bench or its project channel. Every string here
@@ -154,10 +163,20 @@ function BenchQuestionCard({
   // says so until the card is live (a new row) or the wait runs out.
   const [bump, setBump] = React.useState<{
     attempt: number;
+    option: number;
     error: string | null;
   } | null>(null);
   const bumpAttempt = bump?.attempt ?? 0;
-  const posting = bump !== null && bump.error === null;
+  const tapped = bump !== null && bump.error === null ? bump.option : null;
+  const posting = tapped !== null;
+  // The live row of a card tapped while queued: the option tapped then.
+  const [posted, setPosted] = React.useState(() => {
+    const tap = bumpedTaps.get(card.id);
+    return card.cardEventId && tap && Date.now() - tap.at < BENCH_BUMP_HINT_MS
+      ? tap.option
+      : null;
+  });
+  const reasonId = React.useId();
   React.useEffect(() => {
     if (!posting) return;
     const timer = window.setTimeout(
@@ -180,17 +199,21 @@ function BenchQuestionCard({
     if (!cardEventId) {
       if (!bumpable || posting) return;
       const attempt = bumpAttempt + 1;
-      setBump({ attempt, error: null });
+      setBump({ attempt, option, error: null });
+      bumpedTaps.set(card.id, { at: Date.now(), option });
       postNext(card.id).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
+        bumpedTaps.delete(card.id);
         setBump((b) =>
           b?.attempt === attempt
-            ? { attempt, error: `Couldn't post it: ${message}` }
+            ? { attempt, option, error: `Couldn't post it: ${message}` }
             : b,
         );
       });
       return;
     }
+    bumpedTaps.delete(card.id);
+    setPosted(null);
     const action = {
       type: "click",
       option,
@@ -212,9 +235,15 @@ function BenchQuestionCard({
     );
   };
 
-  const clickable = interactive || (bumpable === true && !posting);
-  const options =
-    card.kind === "pending" ? benchOptionViews(card, state, clickable) : [];
+  const clickable = interactive || bumpable === true;
+  // While posting, the tapped option stays enabled and busy, as a save's does.
+  const options = (
+    card.kind === "pending" ? benchOptionViews(card, state, clickable) : []
+  ).map((o) =>
+    posting
+      ? { ...o, pending: o.index === tapped, disabled: o.index !== tapped }
+      : o,
+  );
   const recordedLine = benchRecordedLine(card, formatBenchTime);
   const overrides = interactive && card.recorded !== null && !byOwner;
   const other =
@@ -235,7 +264,7 @@ function BenchQuestionCard({
       ) : null}
       {options.length > 0 ? (
         <fieldset
-          aria-busy={saving}
+          aria-busy={saving || posting}
           aria-label="Answer"
           className={cn(
             "flex flex-wrap gap-1.5",
@@ -244,6 +273,8 @@ function BenchQuestionCard({
         >
           {options.map((option) => (
             <BenchOptionButton
+              autoFocus={option.index === posted}
+              describedBy={bumpable ? reasonId : undefined}
               key={option.index}
               onSelect={handleOption}
               option={option}
@@ -284,10 +315,19 @@ function BenchQuestionCard({
             {bump.error}
           </p>
         ) : null}
+        {posted !== null && card.recorded === null && !saving ? (
+          <p className="mt-1.5 font-medium text-foreground">
+            {BENCH_BUMP_POSTED}
+          </p>
+        ) : null}
         {posting ? (
-          <p className="mt-1.5 text-muted-foreground">{BENCH_BUMP_POSTING}</p>
+          <p className="mt-1.5 text-muted-foreground" id={reasonId}>
+            {BENCH_BUMP_POSTING}
+          </p>
         ) : readOnlyReason ? (
-          <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
+          <p className="mt-1.5 text-muted-foreground" id={reasonId}>
+            {readOnlyReason}
+          </p>
         ) : null}
       </div>
       <BenchCardFooter card={card} onOpenThread={onOther} />
@@ -574,9 +614,14 @@ function BenchCardText({ card }: { card: BenchCardData }) {
 }
 
 function BenchOptionButton({
+  autoFocus,
+  describedBy,
   onSelect,
   option,
 }: {
+  autoFocus?: boolean;
+  /** The reason a tap posts the card rather than answering it. */
+  describedBy?: string;
   onSelect: (index: number) => void;
   option: BenchOptionView;
 }) {
@@ -587,6 +632,8 @@ function BenchOptionButton({
   return (
     <Button
       aria-busy={option.pending || undefined}
+      aria-describedby={describedBy}
+      autoFocus={autoFocus}
       aria-label={
         undoable
           ? `${label}${recommended} (recorded, click to undo)`
