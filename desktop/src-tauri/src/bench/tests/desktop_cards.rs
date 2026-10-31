@@ -280,6 +280,7 @@ async fn bench_cards_snapshot() {
             "items",
             "lastError",
             "lastTick",
+            "maxCards",
             "ownerPubkey",
             "writerPubkey"
         ]
@@ -289,6 +290,7 @@ async fn bench_cards_snapshot() {
     assert_eq!(snap["ownerPubkey"], json!(b.owner_hex()));
     assert_eq!(snap["lastError"], json!("relay unreachable"));
     assert_eq!(snap["lastTick"], json!(NOW));
+    assert_eq!(snap["maxCards"], json!(MAX_CARDS));
     let item = &snap["items"][0];
     assert_eq!(
         keys(item),
@@ -313,6 +315,7 @@ async fn bench_cards_snapshot() {
             "plain",
             "previousAnswer",
             "project",
+            "queued",
             "recommend",
             "recommender",
             "recorded",
@@ -358,6 +361,7 @@ async fn bench_cards_snapshot() {
         ("action", Value::Null),
         ("backToYou", json!(false)),
         ("previousAnswer", Value::Null),
+        ("queued", json!(false)),
     ] {
         assert_eq!(item[k], v, "{k}");
     }

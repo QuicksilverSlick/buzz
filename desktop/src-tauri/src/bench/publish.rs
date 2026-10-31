@@ -12,6 +12,27 @@ use super::{
 };
 use crate::events;
 
+/// `{"<item id>": <unix secs>}`, written by `commands::bench_bump` only: the
+/// owner tapped a card that waits for a slot, so it posts next, even over
+/// `MAX_CARDS`, for `BUMP_SECS`. Read every tick, never written here. It
+/// only orders posts: no answer is ever read from it.
+pub(super) const BUMP_FILE: &str = "bump.json";
+/// Longer than the desktop waits for a bumped card to post.
+pub(super) const BUMP_SECS: u64 = 120;
+
+/// The items `BUMP_FILE` asks to post next, still within `BUMP_SECS`. A
+/// missing or unreadable file bumps nothing.
+fn read_bumps(root: &std::path::Path, now: u64) -> Vec<String> {
+    std::fs::read_to_string(root.join(BUMP_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<BTreeMap<String, u64>>(&t).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, at)| now < at.saturating_add(BUMP_SECS))
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// Twice the relay's +-900 s created_at window: past it the relay refuses an
 /// event's time before it would answer duplicate, so only a lookup can tell
 /// (and sooner, by the relay's clock: `resend_owner`).
@@ -336,11 +357,25 @@ pub(super) async fn publish(
     owner_set: &[String],
     failed: &mut Vec<String>,
 ) -> Result<(), String> {
-    // (a) The live cards: pending + current + unanswered by severity, in a
-    // channel ready for them; an answered card counts against MAX_CARDS (the
-    // phone's pill window) for ANSWER_KEEP_SECS so late pills land, then
-    // stays on the relay as a receipt. Receipts do not count.
-    let mut ranked: Vec<(u8, i64, String)> = s
+    // (a) The live cards: pending + current + unanswered, in a channel ready
+    // for them, in `item::rank` order. MAX_CARDS gates new posts only: a
+    // card already posted keeps its place, so (b) never takes down a card
+    // someone may be tapping. An answered card holds a slot for
+    // ANSWER_SLOT_SECS; receipts hold none. A card the owner bumped from the
+    // desktop posts first, even over the cap; the rest wait in `s.queued`,
+    // which the board and the desktop Bench show.
+    //
+    // Sized for the factory's open questions today (31 Oct 2026: 23
+    // unanswered at once, about 10 answered a day). A new card costs 1 post
+    // plus a seed per option, at MAX_POSTS_PER_TICK, so 30 two-option cards
+    // take ~23 ticks (~45 s). At ten times that (300 open) the queue holds
+    // the rest in order and the alarm says so; nothing else changes. Not
+    // raised: what the phone shows is unmeasured. The fork's mobile/ pages a
+    // channel 50 top-level events at a time, reactions included, and pages
+    // back with them, but the phone may run Block's build: measure it there
+    // before raising MAX_CARDS.
+    let bumped = read_bumps(&ctx.root, now);
+    let mut ranked: Vec<&item::Item> = s
         .items
         .values()
         .filter(|i| {
@@ -349,9 +384,8 @@ pub(super) async fn publish(
                 && i.answer.is_none()
                 && channel_ready(s, i)
         })
-        .map(|i| (item::severity_rank(i.severity), i.order, i.id.clone()))
         .collect();
-    ranked.sort();
+    ranked.sort_by_key(|i| (!bumped.contains(&i.id), item::rank(i)));
     let kept = s
         .items
         .values()
@@ -360,14 +394,23 @@ pub(super) async fn publish(
                 && i.card.is_some()
                 && i.answer
                     .as_ref()
-                    .is_some_and(|a| now.saturating_sub(a.answered_at) <= item::ANSWER_KEEP_SECS)
+                    .is_some_and(|a| now.saturating_sub(a.answered_at) <= item::ANSWER_SLOT_SECS)
         })
         .count();
-    let wanted: Vec<String> = ranked
-        .into_iter()
-        .take(MAX_CARDS.saturating_sub(kept))
-        .map(|r| r.2)
-        .collect();
+    let (on, off): (Vec<&item::Item>, Vec<&item::Item>) =
+        ranked.into_iter().partition(|i| i.card.is_some());
+    let mut slots = MAX_CARDS.saturating_sub(kept + on.len());
+    let (mut wanted, mut queued) = (Vec::new(), Vec::new());
+    for i in off {
+        if slots > 0 || bumped.contains(&i.id) {
+            slots = slots.saturating_sub(1);
+            wanted.push(i.id.clone());
+        } else {
+            queued.push(i.id.clone());
+        }
+    }
+    wanted.extend(on.into_iter().map(|i| i.id.clone()));
+    s.queued = queued;
 
     // (a2) Record / un-record on the live card, first so a tap is acknowledged
     // within one tick. Diff-driven from what the card text shows (`recorded`,
@@ -617,10 +660,11 @@ pub(super) async fn publish(
     }
 
     // (b) Delete cards that are stale (another Drop, card format or stamp) or
-    // no longer wanted, unless someone answered or replied on them or they
-    // are a receipt: those stay on the relay for good, and so, closed, does
-    // one with anything else on it but its seeds. A card in a channel
-    // that is not ready, or `held`, waits: its taps are read once it is again.
+    // no longer asked (superseded, expired, no longer pending), never for
+    // MAX_CARDS, unless someone answered or replied on them or they are a
+    // receipt: those stay on the relay for good, and so, closed, does one
+    // with anything else on it but its seeds. A card in a channel that is
+    // not ready, or `held`, waits: its taps are read once it is again.
     let stale: Vec<(String, String, Posted)> = s
         .items
         .values()
@@ -767,6 +811,21 @@ pub(super) async fn publish(
         .iter()
         .filter_map(|(ch, c)| Some(format!("- {ch}: {}", c.refused.as_ref()?)));
     item::section(&mut text, "Cards refused", refused);
+    // Every limit has an alarm: the cap says what it holds back, and why.
+    let n = s.queued.len();
+    let show = match n {
+        1 => "1 open card shows".to_string(),
+        n => format!("{n} open cards show"),
+    };
+    let why = format!(
+        "{show} (no card yet): the Bench keeps {MAX_CARDS} live at once, and each posts as \
+         a slot frees. On the desktop Bench, tap one to post it now."
+    );
+    item::section(
+        &mut text,
+        &format!("Queued for a slot ({n})"),
+        (n > 0).then_some(why).into_iter(),
+    );
     let hash = item::board_hash(&text);
     let aged = s
         .board

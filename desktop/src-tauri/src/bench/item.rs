@@ -18,9 +18,17 @@ pub(crate) const OPTION_EMOJI: [&str; 4] = [
     "3\u{FE0F}\u{20E3}",
     "4\u{FE0F}\u{20E3}",
 ];
-/// An answered card holds a live slot 24 h so late pills still land, then it
-/// is a receipt only; also the attention clock on the board.
+/// The board's attention clock: an answer no agent acted on in 24 h is
+/// marked late.
 pub(crate) const ANSWER_KEEP_SECS: u64 = 86_400;
+/// How long an answered card still holds one of the `MAX_CARDS` slots. Its
+/// taps are read for as long as it is Pending (`poll_answers`), slot or
+/// not; the slot only keeps newer cards from crowding it while the owner may
+/// still change the answer from a phone that was offline. The relay refuses
+/// an event signed more than 900 s from its own clock (buzz-relay
+/// MAX_TIMESTAMP_DRIFT_SECS), so a queued tap lands within 15 min or never:
+/// holding the slot longer keeps no tap alive.
+pub(crate) const ANSWER_SLOT_SECS: u64 = 900;
 pub(crate) const ALLOWED_HTTPS_HOSTS: &[&str] = &["github.com", "claude.ai"];
 
 const TITLE_MAX: usize = 120;
@@ -859,6 +867,29 @@ pub(crate) fn severity_rank(s: Option<Severity>) -> u8 {
     }
 }
 
+/// Where an open card stands in line: severity, the writer's order, then its
+/// id with every digit run read as a number, so a stack of `hold-talos-7`
+/// .. `hold-talos-17` runs bottom first, never `-10` before `-7`.
+pub(crate) fn rank(i: &Item) -> (u8, i64, String, String) {
+    // ponytail: digit runs zero-padded to 20; a longer run (none in ids
+    // today) still orders, just as text. The trailing space (never in an
+    // id) only flushes the last run.
+    let mut natural = String::new();
+    let mut digits = String::new();
+    for c in i.id.chars().chain([' ']) {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        if !digits.is_empty() {
+            natural.push_str(&format!("{digits:0>20}"));
+            digits.clear();
+        }
+        natural.push(c);
+    }
+    (severity_rank(i.severity), i.order, natural, i.id.clone())
+}
+
 fn marker(item: &Item) -> &'static str {
     match (item.kind, item.severity) {
         (ItemKind::Decision, _) => "\u{1F9ED}",
@@ -1238,8 +1269,8 @@ pub(crate) fn render_board(items: &[&Item], channel: &str, hhmm: &str, now: u64)
     let (mut waiting, mut pending): (Vec<&Item>, Vec<&Item>) = open
         .into_iter()
         .partition(|i| i.stamp.as_ref().is_some_and(|s| !s.answerers.is_empty()));
-    pending.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
-    waiting.sort_by_key(|i| (severity_rank(i.severity), i.order, i.id.clone()));
+    pending.sort_by_key(|i| rank(i));
+    waiting.sort_by_key(|i| rank(i));
     answered.sort_by_key(|i| (i.answer.as_ref().map(|a| a.answered_at), i.id.clone()));
     let mut decisions = current(ItemKind::Decision);
     decisions.sort_by_key(by_area);

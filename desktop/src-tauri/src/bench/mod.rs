@@ -41,6 +41,8 @@ const ABOUT: &str = "Dreamforge owner dashboard";
 const POLL: Duration = Duration::from_secs(2);
 const TAG_TTL_SECS: u64 = 3600;
 const BOARD_MAX_AGE_SECS: u64 = 86_400;
+/// Open cards on the relay at once; what it is sized for: publish (a). It
+/// gates new posts only, and past it cards queue (`BenchState::queued`).
 const MAX_CARDS: usize = 30;
 /// The relay's HTTP budget is 300/min; a 429 gates the whole desktop.
 const MAX_POSTS_PER_TICK: usize = 4;
@@ -153,6 +155,8 @@ pub(crate) struct BenchState {
     board_dirty: bool,
     needs_rebuild: bool,
     items: BTreeMap<String, item::Item>,
+    /// Open cards waiting off the relay for a `MAX_CARDS` slot, next first.
+    queued: Vec<String>,
     orphan_cards: BTreeMap<String, Posted>,
     strays: Vec<String>,
     /// routes.json entries refused this tick, as `<writer>: <reason>`.

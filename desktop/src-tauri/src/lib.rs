@@ -878,6 +878,7 @@ pub fn run() {
             archive::sync::stop_archive_sync,
             bench::commands::bench_cards,
             bench::commands::bench_answer,
+            bench::commands::bench_bump,
             is_auto_update_supported,
             set_window_vibrancy,
             #[cfg(target_os = "macos")]

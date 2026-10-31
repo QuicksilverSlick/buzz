@@ -1,8 +1,10 @@
 //! Desktop cards: `bench_cards`, a read-only view of state.json for the
-//! Dreamforge Bench screen, and `bench_answer`, which answers a card with the
+//! Dreamforge Bench screen, `bench_answer`, which answers a card with the
 //! owner's own keycap reaction so the running tick records it like a phone
-//! tap. Neither writes state.json; neither returns or logs key material.
+//! tap, and `bench_bump`, which asks the tick to post a queued card next.
+//! None writes state.json; none returns or logs key material.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -29,6 +31,8 @@ struct Snapshot {
     owner_pubkey: Option<String>,
     last_error: Option<String>,
     last_tick: String,
+    /// `MAX_CARDS`: how many open cards the relay holds at once.
+    max_cards: usize,
     items: Vec<Card>,
 }
 
@@ -54,6 +58,8 @@ struct Card {
     /// The live card only: one showing the item's current Drop. A receipt's
     /// is the card it keeps.
     card_event_id: Option<String>,
+    /// Open, and waiting off the relay for a `MAX_CARDS` slot.
+    queued: bool,
     answer: Option<CardAnswer>,
     recorded: Option<usize>,
     /// None: #bench. A receipt's is its request's.
@@ -131,6 +137,7 @@ fn card(i: &item::Item, owner_set: &[String]) -> Card {
         validity: i.validity,
         updated_at: i.updated_at.clone(),
         card_event_id: posted.map(|c| c.event_id.clone()),
+        queued: false,
         answer: i.answer.as_ref().map(|a| CardAnswer {
             option: a.option,
             answered_at: a.answered_at,
@@ -179,7 +186,14 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
         [] => vec![s.owner_pubkey.clone()],
         keys => keys.to_vec(),
     };
-    let items = s.items.values().map(|i| card(i, &owner_set)).collect();
+    let items = s
+        .items
+        .values()
+        .map(|i| Card {
+            queued: s.queued.contains(&i.id),
+            ..card(i, &owner_set)
+        })
+        .collect();
     BenchCards {
         enabled: true,
         snapshot: Some(Snapshot {
@@ -188,6 +202,7 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
             owner_pubkey: Some(s.owner_pubkey).filter(|o| !o.is_empty()),
             last_error: s.last_error,
             last_tick: s.last_tick,
+            max_cards: super::MAX_CARDS,
             items,
         }),
     }
@@ -338,4 +353,45 @@ pub(crate) async fn bench_answer(
     };
     let now = nostr::Timestamp::now().as_secs();
     answer_card(&ctx, &s, &item_id, &card_event_id, option, now).await
+}
+
+/// Ask the running tick to post `item_id` next, even over `MAX_CARDS`
+/// (`publish::BUMP_FILE`). Only an open card with no live card is bumped;
+/// one already live is left as it is. It never answers the card: the owner
+/// taps again once it is live. Errors say why the card cannot post, so a
+/// tap on it never waits on nothing.
+pub(crate) fn bump(root: &Path, item_id: &str, now: u64) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err("the Bench is not enabled".to_string());
+    }
+    let (s, _) = load_state(root);
+    let item = s
+        .items
+        .get(item_id)
+        .ok_or_else(|| format!("no Bench item {item_id:?}"))?;
+    if item.kind != ItemKind::Pending || item.validity != Validity::Current || item.answer.is_some()
+    {
+        return Err(format!("{item_id} is no longer an open card"));
+    }
+    if !super::channels::channel_ready(&s, item) {
+        return Err("this card's channel isn't ready for cards yet".to_string());
+    }
+    if live_card(item).is_some() {
+        return Ok(());
+    }
+    let path = root.join(super::publish::BUMP_FILE);
+    let mut bumps: BTreeMap<String, u64> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    bumps.retain(|_, at| now < at.saturating_add(super::publish::BUMP_SECS));
+    bumps.insert(item_id.to_string(), now);
+    let body = serde_json::to_string(&bumps).map_err(|e| e.to_string())?;
+    crate::managed_agents::atomic_write_json_restricted(&path, body.as_bytes())
+}
+
+/// `bump` on the Bench's own folder.
+#[tauri::command]
+pub(crate) async fn bench_bump(item_id: String) -> Result<(), String> {
+    bump(&root_dir()?, &item_id, nostr::Timestamp::now().as_secs())
 }

@@ -621,35 +621,6 @@ async fn truncated_answers_are_reported() {
     assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
 }
 
-#[tokio::test]
-async fn kept_answered_cards_count_against_max_cards() {
-    let mut b = seeded_bench(Gate::Open, &[]).await;
-    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
-    reply(&b, &[&owner_tap]);
-    b.tick().await.unwrap();
-    for i in 0..MAX_CARDS {
-        b.drop_file("orchestrator", &format!("c{i:02}"), &drop_json(&[]));
-    }
-    b.settle(26).await;
-    // The kept answered card holds one of the MAX_CARDS slots, so the last
-    // pending item (by id) waits for one.
-    let live = b.s.items.values().filter(|i| i.card.is_some()).count();
-    assert_eq!(live, MAX_CARDS);
-    assert!(b.s.items[ITEM].card.is_some());
-    assert!(b.s.items["orchestrator/c28"].card.is_some());
-    assert!(b.s.items["orchestrator/c29"].card.is_none());
-    // A day on it is a receipt only: it stays, and gives its slot back.
-    let card = b.card(ITEM).event_id;
-    let before = b.posts().len();
-    b.now += ANSWER_KEEP_SECS;
-    b.settle(4).await;
-    assert_eq!(b.card(ITEM).event_id, card);
-    assert!(b.s.items["orchestrator/c29"].card.is_some());
-    assert!(!b.posts()[before..]
-        .iter()
-        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
-}
-
 // ── Saying how to answer ────────────────────────────────────────────────
 
 const LEGEND: &str =

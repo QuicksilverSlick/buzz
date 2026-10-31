@@ -1451,6 +1451,7 @@ fn exported_board_drops_all_validate() {
 }
 
 mod answers;
+mod capacity;
 mod card_layout;
 mod channels;
 mod desktop_cards;
