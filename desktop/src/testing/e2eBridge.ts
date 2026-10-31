@@ -164,6 +164,7 @@ type MockRelayAgentSeed = {
 type MockPersonaSeed = {
   id?: string;
   displayName: string;
+  description?: string | null;
   avatarUrl?: string | null;
   systemPrompt: string;
   updatedAt?: string;
@@ -567,6 +568,8 @@ type E2eConfig = {
     agentMetricArchiveDefaultEnabled?: boolean;
     // The `bench_cards` snapshot; absent means the Bench is not enabled.
     benchCards?: BenchCards;
+    // Extra `search_messages` hits, matched like the seeded ones.
+    searchHits?: RawSearchHit[];
     saveSubscriptions?: Array<{
       scope_type: string;
       scope_value: string;
@@ -2735,6 +2738,7 @@ function resetMockPersonas(config?: E2eConfig) {
       id: persona.id ?? crypto.randomUUID(),
       display_name: persona.displayName,
       avatar_url: persona.avatarUrl ?? null,
+      description: persona.description ?? null,
       system_prompt: persona.systemPrompt,
       runtime: persona.runtime ?? null,
       model: persona.model ?? null,
@@ -10140,6 +10144,7 @@ async function handleSearchMessages(
         });
       }
     }
+    mockHits.push(...(config?.mock?.searchHits ?? []));
 
     const authorSet = args.authors?.length
       ? new Set(args.authors.map((author) => author.toLowerCase()))

@@ -1223,7 +1223,42 @@ test("search: a bare number also matches as a whole number in the text", () => {
   const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
   assert.deepEqual(ids("28"), ["w/reset"]);
   assert.deepEqual(ids("689"), ["w/merge"]);
-  assert.deepEqual(ids("#689"), [], "# and PR stay PR numbers only");
+  assert.deepEqual(ids("#28"), [], "# and PR stay PR numbers only");
+  // "pull request 689" names the PR, as the steward's cards write it.
+  assert.deepEqual(ids("#689"), ["w/merge"]);
+});
+
+test("search: a number is a whole token, never inside a hash or a longer one", () => {
+  const cards = [
+    card({ id: "w/hash", body: "commit 792d3edd and a792f" }),
+    card({ id: "w/prhash", title: "#792d3e" }),
+    card({ id: "w/named", body: "Ship pull request 792 of x/y" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("792"), ["w/named"]);
+  assert.deepEqual(ids("#792"), ["w/named"]);
+  assert.deepEqual(ids("pr-792"), ["w/named"]);
+  assert.deepEqual(ids("pull request 792"), ["w/named"]);
+});
+
+test("search: a repo narrows a PR number; a repo word and a number are words", () => {
+  const cards = [
+    card({ id: "w/day", title: "28 Day Reset: day 14 check-in failed" }),
+    card({
+      id: "steward/hold-buzz-14-0a1b2c3d4e5f",
+      title: "buzz PR 14 waits",
+    }),
+    card({
+      id: "steward/hold-talos-2-0a1b2c3d4e5f",
+      title: "talos PR 2 waits",
+    }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("reset 14"), ["w/day"]);
+  assert.deepEqual(ids("reset 28"), ["w/day"]);
+  assert.deepEqual(ids("buzz#2"), []);
+  assert.deepEqual(ids("talos#2"), ["steward/hold-talos-2-0a1b2c3d4e5f"]);
+  assert.deepEqual(ids("reset pr 14"), []);
 });
 
 test("search: words, names and a receipt's request; empty matches all", () => {

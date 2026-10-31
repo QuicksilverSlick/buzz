@@ -4,6 +4,8 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { findBenchCards } from "@/features/bench/lib/benchFind";
+import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import {
   useUserSearchQuery,
@@ -28,7 +30,9 @@ import {
   parseSearchOperators,
   type OperatorResolveResult,
 } from "@/features/search/lib/parseSearchOperators";
+import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
+import { useSurfaceSearchResults } from "@/features/search/useSurfaceSearchResults";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -155,6 +159,8 @@ export function useSearchResults({
   );
 
   const ftsQuery = parsedQuery.text;
+  const prQuery = React.useMemo(() => parsePrQuery(ftsQuery), [ftsQuery]);
+  const benchSnapshot = useBenchSnapshot();
 
   const needsAuthorResolution = Boolean(parsedQuery.from);
   const entitySearchEnabled = searchBackedQueriesEnabled && !scopeChannelId;
@@ -235,7 +241,8 @@ export function useSearchResults({
     fromUserSearchQuery.isLoading &&
     authorResolution.status === "unresolved";
 
-  const searchQuery = useSearchMessagesQuery(ftsQuery, {
+  // "pr792" and "buzz#792" search the relay for the number itself.
+  const searchQuery = useSearchMessagesQuery(prQuery?.number ?? ftsQuery, {
     enabled:
       enabled &&
       !hasUnresolvedOperator &&
@@ -253,15 +260,67 @@ export function useSearchResults({
     since: parsedQuery.since,
     until: parsedQuery.until,
     unresolvedOperator: hasUnresolvedOperator,
-    minimumQueryLength,
+    minimumQueryLength: prQuery ? 1 : minimumQueryLength,
+  });
+
+  // Cards are local: unscoped or in #bench, never under from:/after:/before:.
+  const scope =
+    channelResolution.status === "resolved" ? channelResolution.value : null;
+  const benchQuery =
+    enabled &&
+    !hasUnresolvedOperator &&
+    ftsQuery.length >= minimumQueryLength &&
+    !parsedQuery.from &&
+    parsedQuery.since === null &&
+    parsedQuery.until === null &&
+    (scope === null || scope === benchSnapshot?.channelId)
+      ? ftsQuery
+      : "";
+  const benchResults = React.useMemo(
+    () => findBenchCards(benchSnapshot, benchQuery),
+    [benchQuery, benchSnapshot],
+  );
+  // Inbox, Projects, Workflows, Pulse and the agent library: the cards'
+  // rules, but unscoped only.
+  const surfaceHits = useSurfaceSearchResults({
+    channels,
+    enabled: Boolean(benchQuery) && scope === null,
+    query: ftsQuery,
   });
 
   const messageResults = React.useMemo(() => {
     if (hasUnresolvedOperator) {
       return [];
     }
-    return dedupeSearchHits(searchQuery.data?.hits ?? []);
-  }, [hasUnresolvedOperator, searchQuery.data?.hits]);
+    // A card's own post, or an Inbox row's, would repeat that result.
+    const shown = new Set<string | null>([
+      ...benchResults.map((card) => card.cardEventId),
+      ...surfaceHits.flatMap((hit) =>
+        hit.surface === "inbox" ? [hit.id] : [],
+      ),
+    ]);
+    const hits = dedupeSearchHits(searchQuery.data?.hits ?? []).filter(
+      (hit) => !shown.has(hit.eventId),
+    );
+    if (!prQuery) {
+      return hits;
+    }
+    // PR-form mentions first, then the bare number; never 7928 or 792d3edd.
+    return hits
+      .map((hit) => ({
+        hit,
+        score: prMentionScore(hit.content, prQuery.number),
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(({ hit }) => hit);
+  }, [
+    benchResults,
+    hasUnresolvedOperator,
+    prQuery,
+    searchQuery.data?.hits,
+    surfaceHits,
+  ]);
   const channelResults = React.useMemo(() => {
     if (scopeChannelId || ftsQuery.length < MIN_SEARCH_QUERY_LENGTH) {
       return [];
@@ -434,6 +493,7 @@ export function useSearchResults({
 
   const results = React.useMemo<SearchResult[]>(
     () => [
+      ...benchResults.map((card) => ({ kind: "bench" as const, card })),
       ...channelResults.map((channel) => ({
         kind: "channel" as const,
         channel,
@@ -442,12 +502,13 @@ export function useSearchResults({
         kind: "user" as const,
         user,
       })),
+      ...surfaceHits.map((hit) => ({ kind: "surface" as const, hit })),
       ...messageResults.map((hit) => ({
         kind: "message" as const,
         hit,
       })),
     ],
-    [channelResults, messageResults, userResults],
+    [benchResults, channelResults, messageResults, surfaceHits, userResults],
   );
 
   const resultProfilesQuery = useUsersBatchQuery(
