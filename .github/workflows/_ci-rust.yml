@@ -66,6 +66,12 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Unit tests
         run: just test-unit
+      # Relay gateway (Bishop's keyless relay forwarder): infra-free tests
+      # against a loopback mock relay and Worker. Kept out of the Justfile so
+      # gateway PRs do not select the desktop suite. nextest gives each test
+      # its own process, which tests/logs.rs needs for its global subscriber.
+      - name: Unit tests (buzz-relay-gateway)
+        run: cargo nextest run -p buzz-relay-gateway
 
   server-cross-compile:
     name: Server Cross-Compile
@@ -156,6 +162,9 @@ jobs:
       - name: Test (ACP launch-prefix platform contract)
         # Execute the non-Unix refusal branch; a cross-compile cannot test it.
         run: cargo test -p buzz-acp --target $env:TARGET --lib acp::launch::platform_tests
+      - name: Test (buzz-huddle-bridge)
+        # Fork crate for huddle voices; CI runs tests only for crates it names.
+        run: cargo test -p buzz-huddle-bridge --target $env:TARGET
       - name: Test (buzz-agent auth coordinator)
         # The auth coordinator single-flights on an OS advisory lock, which is
         # LockFileEx on Windows; this integration suite drives real second
