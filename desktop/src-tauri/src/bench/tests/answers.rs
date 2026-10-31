@@ -158,7 +158,7 @@ fn render_board_answered_section() {
     .unwrap();
     let mut first = check(&[("id", json!("zz")), ("title", json!("Earlier tap"))]).unwrap();
     assert_eq!(
-        render_board(&[&open, &done, &first], UUID, "14:05", 0),
+        render_board(&[&open, &done, &first], &[], UUID, "14:05", 0),
         format!(
             "Bench · as of 14:05 · needs you: 3\n\
              {LEGEND}\n\
@@ -180,7 +180,7 @@ fn render_board_answered_section() {
         seeded: 1,
     });
     let all = [&open, &done, &first];
-    let board = render_board(&all, UUID, "14:05", 100);
+    let board = render_board(&all, &[], UUID, "14:05", 100);
     assert_eq!(
         board,
         format!(
@@ -200,9 +200,15 @@ fn render_board_answered_section() {
     // the latest one is, and it changes the hash.
     assert_eq!(
         board_hash(&board),
-        board_hash(&render_board(&all, UUID, "23:59", 50 + ANSWER_KEEP_SECS))
+        board_hash(&render_board(
+            &all,
+            &[],
+            UUID,
+            "23:59",
+            50 + ANSWER_KEEP_SECS
+        ))
     );
-    let late = render_board(&all, UUID, "14:05", 100 + ANSWER_KEEP_SECS + 1);
+    let late = render_board(&all, &[], UUID, "14:05", 100 + ANSWER_KEEP_SECS + 1);
     assert!(
         late.ends_with("→ 2. Move x (https: evil.example) 🟠 24h"),
         "{late:?}"
@@ -648,7 +654,7 @@ async fn legend_is_board_line_2_and_lands_by_edit() {
 fn needs_you_lines_are_bullets_not_numbers() {
     let a = check(&[("id", json!("a"))]).unwrap();
     let c = check(&[("id", json!("c")), ("severity", json!("info"))]).unwrap();
-    let board = render_board(&[&a, &c], UUID, "14:05", 0);
+    let board = render_board(&[&a, &c], &[], UUID, "14:05", 0);
     let needs: Vec<&str> = board
         .lines()
         .skip_while(|l| *l != "Needs you")

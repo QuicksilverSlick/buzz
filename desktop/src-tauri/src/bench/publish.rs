@@ -3,34 +3,71 @@
 //! lands in state first, so the next tick resumes where this one stopped.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
     forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
     same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
-    MAX_CARDS, RECOVER_LIMIT,
+    MAX_CARDS, OVER_CAP, RECOVER_LIMIT,
 };
 use crate::events;
 
-/// `{"<item id>": <unix secs>}`, written by `commands::bench_bump` only: the
-/// owner tapped a card that waits for a slot, so it posts next, even over
-/// `MAX_CARDS`, for `BUMP_SECS`. Read every tick, never written here. It
-/// only orders posts: no answer is ever read from it.
-pub(super) const BUMP_FILE: &str = "bump.json";
 /// Longer than the desktop waits for a bumped card to post.
 pub(super) const BUMP_SECS: u64 = 120;
 
-/// The items `BUMP_FILE` asks to post next, still within `BUMP_SECS`. A
-/// missing or unreadable file bumps nothing.
-fn read_bumps(root: &std::path::Path, now: u64) -> Vec<String> {
-    std::fs::read_to_string(root.join(BUMP_FILE))
-        .ok()
-        .and_then(|t| serde_json::from_str::<BTreeMap<String, u64>>(&t).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, at)| now < at.saturating_add(BUMP_SECS))
-        .map(|(id, _)| id)
+/// The owner's desktop taps on cards waiting for a slot, `(root, item id)`
+/// -> when (`commands::bench_bump`): each posts next, past MAX_CARDS up to
+/// OVER_CAP, for BUMP_SECS. In memory, in the desktop process that runs the
+/// tick, so no file an agent can write orders a post. It never answers.
+static BUMPS: Mutex<BTreeMap<(PathBuf, String), u64>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn bump(root: &Path, id: &str, now: u64) {
+    let mut bumps = BUMPS.lock().unwrap_or_else(PoisonError::into_inner);
+    bumps.retain(|_, at| now < at.saturating_add(BUMP_SECS));
+    bumps.insert((root.to_path_buf(), id.to_string()), now);
+}
+
+fn bumped(root: &Path, now: u64) -> Vec<String> {
+    let bumps = BUMPS.lock().unwrap_or_else(PoisonError::into_inner);
+    bumps
+        .iter()
+        .filter(|((r, _), at)| r == root && now < at.saturating_add(BUMP_SECS))
+        .map(|((_, id), _)| id.clone())
         .collect()
+}
+
+/// The open cards: pending, current, unanswered, in a channel ready for them.
+fn open(s: &BenchState) -> impl Iterator<Item = &item::Item> {
+    s.items.values().filter(|i| {
+        i.kind == item::ItemKind::Pending
+            && i.validity == item::Validity::Current
+            && i.answer.is_none()
+            && channel_ready(s, i)
+    })
+}
+
+/// An open card with a place: posted, or coming back (`Item::repost`).
+pub(super) fn placed(i: &item::Item) -> bool {
+    i.card.is_some() || i.repost
+}
+
+/// Slots in use: each placed open card, and an answered card for
+/// ANSWER_SLOT_SECS. Receipts hold none.
+pub(super) fn in_use(s: &BenchState, now: u64) -> usize {
+    let kept = s
+        .items
+        .values()
+        .filter(|i| {
+            i.kind == item::ItemKind::Pending
+                && i.card.is_some()
+                && i.answer
+                    .as_ref()
+                    .is_some_and(|a| now.saturating_sub(a.answered_at) <= item::ANSWER_SLOT_SECS)
+        })
+        .count();
+    kept + open(s).filter(|i| placed(i)).count()
 }
 
 /// Twice the relay's +-900 s created_at window: past it the relay refuses an
@@ -357,59 +394,47 @@ pub(super) async fn publish(
     owner_set: &[String],
     failed: &mut Vec<String>,
 ) -> Result<(), String> {
-    // (a) The live cards: pending + current + unanswered, in a channel ready
-    // for them, in `item::rank` order. MAX_CARDS gates new posts only: a
-    // card already posted keeps its place, so (b) never takes down a card
-    // someone may be tapping. An answered card holds a slot for
-    // ANSWER_SLOT_SECS; receipts hold none. A card the owner bumped from the
-    // desktop posts first, even over the cap; the rest wait in `s.queued`,
-    // which the board and the desktop Bench show.
+    // (a) The live cards: the open ones (`open`), in `item::rank` order.
+    // MAX_CARDS gates new posts only: an open card with a place (`placed`:
+    // posted, or retired for a refresh and coming back) keeps it, so (b)
+    // never takes down a card someone may be tapping, and (c) reposts it
+    // before any newcomer. A newcomer posts while fewer than MAX_CARDS slots
+    // are in use (`in_use`); one that preempts (`item::preempts`) or that the
+    // owner tapped on the desktop (`bump`), while fewer than MAX_CARDS +
+    // OVER_CAP. The rest wait in `s.queued`, which the board and the desktop
+    // Bench show.
     //
     // Sized for the factory's open questions today (31 Oct 2026: 23
     // unanswered at once, about 10 answered a day). A new card costs 1 post
     // plus a seed per option, at MAX_POSTS_PER_TICK, so 30 two-option cards
     // take ~23 ticks (~45 s). At ten times that (300 open) the queue holds
-    // the rest in order and the alarm says so; nothing else changes. Not
-    // raised: what the phone shows is unmeasured. The fork's mobile/ pages a
-    // channel 50 top-level events at a time, reactions included, and pages
-    // back with them, but the phone may run Block's build: measure it there
-    // before raising MAX_CARDS.
-    let bumped = read_bumps(&ctx.root, now);
-    let mut ranked: Vec<&item::Item> = s
-        .items
-        .values()
-        .filter(|i| {
-            i.kind == item::ItemKind::Pending
-                && i.validity == item::Validity::Current
-                && i.answer.is_none()
-                && channel_ready(s, i)
-        })
-        .collect();
+    // the rest in rank order behind the alarm, and critical cards and
+    // re-asks still go out until OVER_CAP is used up. Not raised: what the
+    // phone shows is unmeasured. The fork's mobile/ pages a channel 50
+    // top-level events at a time, reactions included, and pages back with
+    // them, but the phone may run Block's build: measure it there before
+    // raising MAX_CARDS.
+    let bumped = bumped(&ctx.root, now);
+    let mut used = in_use(s, now);
+    let mut ranked: Vec<&item::Item> = open(s).collect();
     ranked.sort_by_key(|i| (!bumped.contains(&i.id), item::rank(i)));
-    let kept = s
-        .items
-        .values()
-        .filter(|i| {
-            i.kind == item::ItemKind::Pending
-                && i.card.is_some()
-                && i.answer
-                    .as_ref()
-                    .is_some_and(|a| now.saturating_sub(a.answered_at) <= item::ANSWER_SLOT_SECS)
-        })
-        .count();
     let (on, off): (Vec<&item::Item>, Vec<&item::Item>) =
-        ranked.into_iter().partition(|i| i.card.is_some());
-    let mut slots = MAX_CARDS.saturating_sub(kept + on.len());
-    let (mut wanted, mut queued) = (Vec::new(), Vec::new());
+        ranked.into_iter().partition(|i| placed(i));
+    let mut wanted: Vec<String> = on.into_iter().map(|i| i.id.clone()).collect();
+    let mut queued = Vec::new();
     for i in off {
-        if slots > 0 || bumped.contains(&i.id) {
-            slots = slots.saturating_sub(1);
+        let cap = if bumped.contains(&i.id) || item::preempts(i) {
+            MAX_CARDS + OVER_CAP
+        } else {
+            MAX_CARDS
+        };
+        if used < cap {
+            used += 1;
             wanted.push(i.id.clone());
         } else {
             queued.push(i.id.clone());
         }
     }
-    wanted.extend(on.into_iter().map(|i| i.id.clone()));
     s.queued = queued;
 
     // (a2) Record / un-record on the live card, first so a tap is acknowledged
@@ -768,6 +793,7 @@ pub(super) async fn publish(
                 });
                 i.routed_seen |= seen;
                 i.quiet_repost = false;
+                i.repost = false;
                 i.pinged.extend(pings);
                 s.board_dirty = true;
             }
@@ -805,7 +831,7 @@ pub(super) async fn publish(
     // (e) The board: reposted after any card change or daily, edited in place
     // for a text-only change so it keeps its id and stays newest.
     let all: Vec<&item::Item> = s.items.values().collect();
-    let mut text = item::render_board(&all, &s.channel_id, hhmm, now);
+    let mut text = item::render_board(&all, &s.queued, &s.channel_id, hhmm, now);
     let refused = s
         .channels
         .iter()
@@ -813,18 +839,17 @@ pub(super) async fn publish(
     item::section(&mut text, "Cards refused", refused);
     // Every limit has an alarm: the cap says what it holds back, and why.
     let n = s.queued.len();
-    let show = match n {
-        1 => "1 open card shows".to_string(),
-        n => format!("{n} open cards show"),
-    };
     let why = format!(
-        "{show} (no card yet): the Bench keeps {MAX_CARDS} live at once, and each posts as \
-         a slot frees. On the desktop Bench, tap one to post it now."
+        "The Bench posts a new card only while fewer than {MAX_CARDS} slots are in use; a \
+         critical card, one asked again or one tapped on the desktop Bench may take it to {}. \
+         Cards marked (queued for a slot) post in order as slots free; tap one on the desktop \
+         Bench to post it now.",
+        MAX_CARDS + OVER_CAP
     );
     item::section(
         &mut text,
-        &format!("Queued for a slot ({n})"),
-        (n > 0).then_some(why).into_iter(),
+        &format!("Card slots: {used} of {MAX_CARDS} in use, {n} queued"),
+        (n > 0 || used > MAX_CARDS).then_some(why).into_iter(),
     );
     let hash = item::board_hash(&text);
     let aged = s

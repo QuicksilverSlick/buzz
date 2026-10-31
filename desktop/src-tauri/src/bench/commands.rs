@@ -4,7 +4,6 @@
 //! tap, and `bench_bump`, which asks the tick to post a queued card next.
 //! None writes state.json; none returns or logs key material.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -31,7 +30,7 @@ struct Snapshot {
     owner_pubkey: Option<String>,
     last_error: Option<String>,
     last_tick: String,
-    /// `MAX_CARDS`: how many open cards the relay holds at once.
+    /// `MAX_CARDS`: new cards post only while fewer slots are in use.
     max_cards: usize,
     items: Vec<Card>,
 }
@@ -58,8 +57,10 @@ struct Card {
     /// The live card only: one showing the item's current Drop. A receipt's
     /// is the card it keeps.
     card_event_id: Option<String>,
-    /// Open, and waiting off the relay for a `MAX_CARDS` slot.
-    queued: bool,
+    /// Why an open card has no card on the relay yet: "slot" (queued for a
+    /// `MAX_CARDS` slot) or "channel" (its channel is not ready for cards);
+    /// None when it is posted or about to be.
+    waits_for: Option<&'static str>,
     answer: Option<CardAnswer>,
     recorded: Option<usize>,
     /// None: #bench. A receipt's is its request's.
@@ -137,7 +138,7 @@ fn card(i: &item::Item, owner_set: &[String]) -> Card {
         validity: i.validity,
         updated_at: i.updated_at.clone(),
         card_event_id: posted.map(|c| c.event_id.clone()),
-        queued: false,
+        waits_for: None,
         answer: i.answer.as_ref().map(|a| CardAnswer {
             option: a.option,
             answered_at: a.answered_at,
@@ -190,7 +191,16 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
         .items
         .values()
         .map(|i| Card {
-            queued: s.queued.contains(&i.id),
+            waits_for: if s.queued.contains(&i.id) {
+                Some("slot")
+            } else if i.kind == ItemKind::Pending
+                && i.card.is_none()
+                && !super::channels::channel_ready(&s, i)
+            {
+                Some("channel")
+            } else {
+                None
+            },
             ..card(i, &owner_set)
         })
         .collect();
@@ -355,11 +365,11 @@ pub(crate) async fn bench_answer(
     answer_card(&ctx, &s, &item_id, &card_event_id, option, now).await
 }
 
-/// Ask the running tick to post `item_id` next, even over `MAX_CARDS`
-/// (`publish::BUMP_FILE`). Only an open card with no live card is bumped;
-/// one already live is left as it is. It never answers the card: the owner
-/// taps again once it is live. Errors say why the card cannot post, so a
-/// tap on it never waits on nothing.
+/// Ask the running tick to post `item_id` next, past `MAX_CARDS` up to
+/// `OVER_CAP` (`publish::bump`). Only an open card with no place is bumped;
+/// one posted or coming back is left as it is. It never answers the card:
+/// the owner taps again once it is live. Errors say why the card cannot
+/// post, so a tap on it never waits on nothing.
 pub(crate) fn bump(root: &Path, item_id: &str, now: u64) -> Result<(), String> {
     if !root.is_dir() {
         return Err("the Bench is not enabled".to_string());
@@ -376,18 +386,17 @@ pub(crate) fn bump(root: &Path, item_id: &str, now: u64) -> Result<(), String> {
     if !super::channels::channel_ready(&s, item) {
         return Err("this card's channel isn't ready for cards yet".to_string());
     }
-    if live_card(item).is_some() {
+    if super::publish::placed(item) {
         return Ok(());
     }
-    let path = root.join(super::publish::BUMP_FILE);
-    let mut bumps: BTreeMap<String, u64> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    bumps.retain(|_, at| now < at.saturating_add(super::publish::BUMP_SECS));
-    bumps.insert(item_id.to_string(), now);
-    let body = serde_json::to_string(&bumps).map_err(|e| e.to_string())?;
-    crate::managed_agents::atomic_write_json_restricted(&path, body.as_bytes())
+    let limit = super::MAX_CARDS + super::OVER_CAP;
+    if super::publish::in_use(&s, now) >= limit {
+        return Err(format!(
+            "all {limit} card slots are in use, the Bench's limit; answer or close a card first"
+        ));
+    }
+    super::publish::bump(root, item_id, now);
+    Ok(())
 }
 
 /// `bump` on the Bench's own folder.

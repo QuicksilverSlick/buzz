@@ -44,6 +44,9 @@ const BOARD_MAX_AGE_SECS: u64 = 86_400;
 /// Open cards on the relay at once; what it is sized for: publish (a). It
 /// gates new posts only, and past it cards queue (`BenchState::queued`).
 const MAX_CARDS: usize = 30;
+/// How far past MAX_CARDS a card that preempts (`item::preempts`) or that
+/// the owner tapped on the desktop (`commands::bench_bump`) may post.
+const OVER_CAP: usize = 10;
 /// The relay's HTTP budget is 300/min; a 429 gates the whole desktop.
 const MAX_POSTS_PER_TICK: usize = 4;
 /// The relay clamps created_at at +-900 s.
@@ -431,6 +434,7 @@ fn carry_card(
         new.previous = answered.or_else(|| o.previous.clone());
     } else {
         new.card = o.card.clone();
+        new.repost = o.repost;
         new.previous = o.previous.clone().filter(|_| asking);
     }
     if o.owner_told() {
@@ -928,11 +932,13 @@ fn live_card(i: &item::Item) -> Option<&Posted> {
 }
 
 /// Forget a card that is gone from the relay. The owner was already pinged
-/// for a card of the same Drop, so its replacement goes out quietly.
+/// for a card of the same Drop, so its replacement goes out quietly; it
+/// keeps the card's `MAX_CARDS` place till it posts (`Item::repost`).
 fn forget_card(s: &mut BenchState, id: &str) {
     let i = s.items.get_mut(id).expect("carded id");
     let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));
     i.quiet_repost |= same;
+    i.repost |= i.card.is_some();
     i.card = None;
     i.recorded = None;
     s.board_dirty = true;

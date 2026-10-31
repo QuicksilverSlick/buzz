@@ -315,7 +315,6 @@ async fn bench_cards_snapshot() {
             "plain",
             "previousAnswer",
             "project",
-            "queued",
             "recommend",
             "recommender",
             "recorded",
@@ -327,6 +326,7 @@ async fn bench_cards_snapshot() {
             "title",
             "updatedAt",
             "validity",
+            "waitsFor",
             "writer"
         ]
     );
@@ -361,7 +361,7 @@ async fn bench_cards_snapshot() {
         ("action", Value::Null),
         ("backToYou", json!(false)),
         ("previousAnswer", Value::Null),
-        ("queued", json!(false)),
+        ("waitsFor", Value::Null),
     ] {
         assert_eq!(item[k], v, "{k}");
     }
