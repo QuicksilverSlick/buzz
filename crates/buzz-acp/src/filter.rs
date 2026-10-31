@@ -371,6 +371,20 @@ pub async fn match_event(
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
 ) -> Option<MatchedRule> {
+    match_event_addressed(event, channel_id, rules, agent_pubkey_hex, false).await
+}
+
+/// [`match_event`], where `addressed` stands in for the `p` tag naming the
+/// agent: the event is its owner talking in their one-on-one DM (see
+/// [`crate::owner_dm`]), so it passes `require_mention` untagged. Every other
+/// condition of a rule still applies.
+pub async fn match_event_addressed(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    addressed: bool,
+) -> Option<MatchedRule> {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
     for (index, rule) in rules.iter().enumerate() {
@@ -388,11 +402,12 @@ pub async fn match_event(
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
         if rule.require_mention {
-            let mentioned = event.tags.iter().any(|tag| {
-                let s = tag.as_slice();
-                s.first().map(|k| k.as_str()) == Some("p")
-                    && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
-            });
+            let mentioned = addressed
+                || event.tags.iter().any(|tag| {
+                    let s = tag.as_slice();
+                    s.first().map(|k| k.as_str()) == Some("p")
+                        && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
+                });
             if !mentioned {
                 continue;
             }
