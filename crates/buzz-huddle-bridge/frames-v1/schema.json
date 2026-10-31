@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "buzz-huddle-bridge/frames-v1",
+  "description": "Text frames between a PC voice bridge and Talos /df/voice. Audio is binary PCM16 LE mono 24 kHz. $defs/to_talos are PC to Talos and $defs/to_pc Talos to PC; each side accepts only the other side's frames, with no extra fields. t_ms, start_ms, end_ms: session audio ms, the ms of PCM the PC has sent on this socket, live and replayed alike. from_ms, to_ms: unix ms on the sender's clock; the PC widens each secret window by a skew margin on both sides and starts dropping on receipt, so skew only widens it; replay windows are best effort. Between replay and replay_end the PC sends only replayed PCM, no live audio. expires_at, until: unix seconds. span: per-session speaker span id. token: floor generation. Talos refuses an open whose agent is not the socket's NIP-98 signer, and a resume whose lease is not keyed to that pubkey and huddle. speaker, onset and roster grant no authority: turns, waking and labels only.",
+  "oneOf": [{"$ref": "#/$defs/to_talos"}, {"$ref": "#/$defs/to_pc"}],
+  "$defs": {
+    "hex": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "format": "uuid"},
+    "n": {"type": "integer", "minimum": 0},
+    "seed": {"type": "object", "required": ["intersection_hash", "input"], "properties": {"intersection_hash": {"type": "string"}, "input": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": false},
+    "event": {"type": "object", "required": ["id", "pubkey", "created_at", "kind", "tags", "content", "sig"]},
+    "to_talos": {"type": "object", "required": ["v", "type"], "properties": {"v": {"const": 1}}, "unevaluatedProperties": false, "oneOf": [
+      {"properties": {"type": {"const": "open"}, "huddle": {"$ref": "#/$defs/uuid"}, "agent": {"$ref": "#/$defs/hex"}, "proofs": {"type": "object", "required": ["agent_record", "added"], "properties": {"agent_record": {"$ref": "#/$defs/event"}, "added": {"$ref": "#/$defs/event"}}, "additionalProperties": false}, "seed": {"$ref": "#/$defs/seed"}, "profile": {"type": "object", "required": ["voice", "persona", "aliases"], "properties": {"voice": {"type": "string"}, "persona": {"type": "string"}, "aliases": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}}, "required": ["type", "huddle", "agent", "proofs", "seed", "profile"]},
+      {"properties": {"type": {"const": "resume"}, "lease_id": {"type": "string"}}, "required": ["type", "lease_id"]},
+      {"properties": {"type": {"const": "seed"}, "intersection_hash": {"type": "string"}, "input": {"type": "array", "items": {"type": "object"}}}, "required": ["type", "intersection_hash", "input"]},
+      {"properties": {"type": {"const": "speaker"}, "span": {"$ref": "#/$defs/n"}, "pubkey": {"$ref": "#/$defs/hex"}, "role": {"enum": ["owner", "admitted"]}, "echo": {"type": "boolean"}, "t_ms": {"$ref": "#/$defs/n"}}, "required": ["type", "span", "pubkey", "role", "echo", "t_ms"]},
+      {"properties": {"type": {"const": "onset"}, "pubkey": {"$ref": "#/$defs/hex"}}, "required": ["type", "pubkey"]},
+      {"properties": {"type": {"const": "replay"}, "span": {"$ref": "#/$defs/n"}, "from_ms": {"$ref": "#/$defs/n"}, "to_ms": {"$ref": "#/$defs/n"}}, "required": ["type", "span", "from_ms", "to_ms"]},
+      {"properties": {"type": {"const": "replay_end"}, "span": {"$ref": "#/$defs/n"}}, "required": ["type", "span"]},
+      {"properties": {"type": {"const": "roster"}, "humans": {"type": "array", "items": {"$ref": "#/$defs/hex"}}, "voices": {"type": "array", "items": {"$ref": "#/$defs/hex"}}}, "required": ["type", "humans", "voices"]},
+      {"properties": {"type": {"const": "tool_result"}, "id": {"type": "string"}, "ok": {"type": "boolean"}, "text": {"type": "string"}}, "required": ["type", "id", "ok", "text"]},
+      {"properties": {"type": {"const": "handoff"}, "kind": {"enum": ["money", "card"]}, "text": {"type": "string"}}, "required": ["type", "kind", "text"]},
+      {"properties": {"type": {"const": "pong"}, "t": {"$ref": "#/$defs/n"}}, "required": ["type", "t"]}
+    ]},
+    "to_pc": {"type": "object", "required": ["v", "type"], "properties": {"v": {"const": 1}}, "unevaluatedProperties": false, "oneOf": [
+      {"properties": {"type": {"const": "opened"}, "lease_id": {"type": "string"}, "expires_at": {"$ref": "#/$defs/n"}}, "required": ["type", "lease_id", "expires_at"]},
+      {"properties": {"type": {"const": "transcript"}, "dir": {"enum": ["in", "out"]}, "delta": {"type": "string"}, "start_ms": {"$ref": "#/$defs/n"}, "end_ms": {"$ref": "#/$defs/n"}}, "required": ["type", "dir", "delta", "start_ms", "end_ms"]},
+      {"properties": {"type": {"const": "tool"}, "id": {"type": "string"}, "name": {"type": "string"}, "args": {"type": "object"}}, "required": ["type", "id", "name", "args"]},
+      {"properties": {"type": {"const": "floor"}, "holder": {"oneOf": [{"$ref": "#/$defs/hex"}, {"type": "null"}]}, "token": {"$ref": "#/$defs/n"}}, "required": ["type", "holder", "token"]},
+      {"properties": {"type": {"const": "mute"}, "on": {"type": "boolean"}}, "required": ["type", "on"]},
+      {"properties": {"type": {"const": "quiet"}}, "required": ["type"]},
+      {"properties": {"type": {"const": "awake"}, "expires_at": {"$ref": "#/$defs/n"}}, "required": ["type", "expires_at"]},
+      {"properties": {"type": {"const": "reseed"}, "reason": {"type": "string"}}, "required": ["type", "reason"]},
+      {"properties": {"type": {"const": "replay_req"}, "from_ms": {"$ref": "#/$defs/n"}, "to_ms": {"$ref": "#/$defs/n"}}, "required": ["type", "from_ms", "to_ms"]},
+      {"properties": {"type": {"const": "elevated"}, "until": {"$ref": "#/$defs/n"}}, "required": ["type", "until"]},
+      {"properties": {"type": {"const": "secret"}, "from_ms": {"$ref": "#/$defs/n"}, "to_ms": {"$ref": "#/$defs/n"}}, "required": ["type", "from_ms", "to_ms"]},
+      {"properties": {"type": {"const": "meter"}, "seconds": {"$ref": "#/$defs/n"}, "left_usd": {"type": "number"}, "today_left_s": {"$ref": "#/$defs/n"}}, "required": ["type", "seconds", "left_usd", "today_left_s"]},
+      {"properties": {"type": {"const": "notice"}, "kind": {"enum": ["cap80", "cap100", "offline"]}, "text": {"type": "string"}}, "required": ["type", "kind", "text"]},
+      {"properties": {"type": {"const": "summary"}, "text": {"type": "string"}, "read_channels": {"type": "array", "items": {"$ref": "#/$defs/uuid"}}}, "required": ["type", "text", "read_channels"]},
+      {"properties": {"type": {"const": "ping"}, "t": {"$ref": "#/$defs/n"}}, "required": ["type", "t"]},
+      {"properties": {"type": {"const": "close"}, "reason": {"type": "string"}}, "required": ["type", "reason"]}
+    ]}
+  }
+}

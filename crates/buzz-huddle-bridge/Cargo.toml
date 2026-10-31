@@ -1,0 +1,17 @@
+[package]
+name = "buzz-huddle-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Huddle audio bridge between the relay room and one agent voice"
+
+[dependencies]
+buzz-audio-client = { path = "../buzz-audio-client", default-features = false, features = ["webpki-roots"] }
+nostr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
