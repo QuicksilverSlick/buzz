@@ -72,17 +72,22 @@ function matchesLocal(query: string, values: Values): boolean {
   return prMentionScore(text, pr.number) >= (pr.explicit ? 2 : 1);
 }
 
-/** The first `limit` matching hits, one per id. */
-function take(candidates: Candidate[], query: string, limit: number) {
-  const ids = new Set<string>();
-  const hits = candidates.filter((candidate) => {
-    if (ids.has(candidate.id) || !matchesLocal(query, candidate.text)) {
-      return false;
+/** The first `limit` hits that match, one per id (caches can share a note). */
+function take<T>(
+  items: Iterable<T>,
+  query: string,
+  limit: number,
+  toHit: (item: T) => Candidate | null,
+): SurfaceHit[] {
+  const hits = new Map<string, SurfaceHit>();
+  for (const item of items) {
+    if (hits.size >= limit) break;
+    const hit = toHit(item);
+    if (hit && !hits.has(hit.id) && matchesLocal(query, hit.text)) {
+      hits.set(hit.id, hit);
     }
-    ids.add(candidate.id);
-    return true;
-  });
-  return hits.slice(0, limit);
+  }
+  return [...hits.values()];
 }
 
 // Rows truncate it.
@@ -96,32 +101,29 @@ export function inboxHits(
   query: string,
   limit = 4,
 ): SurfaceHit[] {
-  const candidates = items.flatMap((item): Candidate[] => {
+  return take(items, query, limit, (item) => {
     const { benchCard, color, type, workbench } = classify(item);
-    if (benchCard) return [];
-    const { channelLabel, preview, senderLabel, subject } = item;
-    return [
-      {
-        surface: "inbox",
-        id: item.id,
-        kind: type,
-        title: firstLine(preview) || subject,
-        meta: formatInboxTypeLabel(item),
-        chips: workbench ? [workbench] : [],
-        color,
-        target: { to: "inbox", item: item.id },
-        text: [
-          subject,
-          preview,
-          senderLabel,
-          channelLabel,
-          item.categoryLabel,
-          ...item.mentionNames,
-        ],
-      },
-    ];
+    if (benchCard) return null;
+    const { channelLabel, id, preview, senderLabel, subject } = item;
+    return {
+      surface: "inbox",
+      id,
+      kind: type,
+      title: firstLine(preview) || subject,
+      meta: formatInboxTypeLabel(item),
+      chips: workbench ? [workbench] : [],
+      color,
+      target: { to: "inbox", item: id },
+      text: [
+        subject,
+        preview,
+        senderLabel,
+        channelLabel,
+        item.categoryLabel,
+        ...item.mentionNames,
+      ],
+    };
   });
-  return take(candidates, query, limit);
 }
 
 /**
@@ -177,7 +179,7 @@ export function projectHits(
     const ids = { repositoryId: repository.id, pullRequestId: pr.id };
     candidates.push(hit(project, "pull-request", found, ids));
   }
-  return take(candidates, query, limit);
+  return take(candidates, query, limit, (candidate) => candidate);
 }
 
 export function workflowHits(
@@ -185,7 +187,7 @@ export function workflowHits(
   query: string,
   limit = 3,
 ): SurfaceHit[] {
-  const candidates = list.map(({ workflow, channelName }): Candidate => {
+  return take(list, query, limit, ({ workflow, channelName }) => {
     const { definition, id, name } = workflow;
     const summary = getWorkflowTriggerSummary(definition);
     return {
@@ -200,7 +202,6 @@ export function workflowHits(
       text: [name, getWorkflowDescription(definition), summary, channelName],
     };
   });
-  return take(candidates, query, limit);
 }
 
 /** Pulse has no page per note: a note opens its author's profile. */
@@ -209,7 +210,7 @@ export function noteHits(
   query: string,
   limit = 3,
 ): SurfaceHit[] {
-  const candidates = notes.map((note): Candidate => {
+  return take(notes, query, limit, (note) => {
     const topics = note.tags.flatMap(([name, value]) =>
       name === "t" && value ? [value] : [],
     );
@@ -225,7 +226,6 @@ export function noteHits(
       text: [note.content, ...topics],
     };
   });
-  return take(candidates, query, limit);
 }
 
 /** Name and public description only: never the prompt, env or commands. */
@@ -234,7 +234,10 @@ export function personaHits(
   query: string,
   limit = 3,
 ): SurfaceHit[] {
-  const candidates = personas.map(
+  return take(
+    personas,
+    query,
+    limit,
     (persona): Candidate => ({
       surface: "agent-library",
       id: persona.id,
@@ -249,5 +252,4 @@ export function personaHits(
       text: [persona.displayName, persona.description],
     }),
   );
-  return take(candidates, query, limit);
 }

@@ -280,17 +280,11 @@ export function useSearchResults({
     () => findBenchCards(benchSnapshot, benchQuery),
     [benchQuery, benchSnapshot],
   );
-  // Inbox, Projects, Workflows, Pulse and the agent library: unscoped only.
+  // Inbox, Projects, Workflows, Pulse and the agent library: the cards'
+  // rules, but unscoped only.
   const surfaceHits = useSurfaceSearchResults({
     channels,
-    enabled:
-      enabled &&
-      !scopeChannelId &&
-      !parsedQuery.in &&
-      !parsedQuery.from &&
-      parsedQuery.since === null &&
-      parsedQuery.until === null &&
-      ftsQuery.length >= MIN_SEARCH_QUERY_LENGTH,
+    enabled: Boolean(benchQuery) && scope === null,
     query: ftsQuery,
   });
 
