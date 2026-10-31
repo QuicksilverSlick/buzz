@@ -41,12 +41,8 @@ const ABOUT: &str = "Dreamforge owner dashboard";
 const POLL: Duration = Duration::from_secs(2);
 const TAG_TTL_SECS: u64 = 3600;
 const BOARD_MAX_AGE_SECS: u64 = 86_400;
-/// Open cards on the relay at once; what it is sized for: publish (a). It
-/// gates new posts only, and past it cards queue (`BenchState::queued`).
+/// Card slots for new posts; sized, with `publish::OVER_CAP`, at publish (a).
 const MAX_CARDS: usize = 30;
-/// How far past MAX_CARDS a card that preempts (`item::preempts`) or that
-/// the owner tapped on the desktop (`commands::bench_bump`) may post.
-const OVER_CAP: usize = 10;
 /// The relay's HTTP budget is 300/min; a 429 gates the whole desktop.
 const MAX_POSTS_PER_TICK: usize = 4;
 /// The relay clamps created_at at +-900 s.
@@ -931,9 +927,8 @@ fn live_card(i: &item::Item) -> Option<&Posted> {
     i.card.as_ref().filter(|c| same_drop(c, i))
 }
 
-/// Forget a card that is gone from the relay. The owner was already pinged
-/// for a card of the same Drop, so its replacement goes out quietly; it
-/// keeps the card's `MAX_CARDS` place till it posts (`Item::repost`).
+/// Forget a card that is gone from the relay. It keeps its place (`repost`);
+/// one of the same Drop, whose owner was pinged, reposts quietly.
 fn forget_card(s: &mut BenchState, id: &str) {
     let i = s.items.get_mut(id).expect("carded id");
     let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));

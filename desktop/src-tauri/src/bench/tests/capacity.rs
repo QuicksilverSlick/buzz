@@ -157,11 +157,11 @@ async fn critical_cards_and_re_asks_post_past_the_cap_up_to_over_cap() {
     assert!(b.s.items["orchestrator/hold-7"].card.is_some());
     assert!(!cards_deleted(&b, before, &first));
     // Up to MAX_CARDS + OVER_CAP; past it even a critical card queues, first.
-    for n in 0..OVER_CAP {
+    for n in 0..publish::OVER_CAP {
         b.drop_file("orchestrator", &format!("c{n}"), &drop_json(&[]));
     }
     b.settle(16).await;
-    assert_eq!(live(&b), MAX_CARDS + OVER_CAP);
+    assert_eq!(live(&b), MAX_CARDS + publish::OVER_CAP);
     assert_eq!(queued(&b), ["c9", "hold-36", "hold-37", "hold-38"]);
     assert!(board(&b).contains("Card slots: 40 of 30 in use, 4 queued"));
     save_state(&b.root, &b.s, &mut String::new()).unwrap();
