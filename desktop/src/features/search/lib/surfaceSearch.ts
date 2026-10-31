@@ -5,11 +5,16 @@
  * names where it opens; the dialog navigates.
  */
 
+import { getLibraryPersonas } from "@/features/agents/lib/catalog";
 import {
   formatInboxTypeLabel,
   type InboxItem,
 } from "@/features/home/lib/inbox";
 import type { InboxClass } from "@/features/home/lib/inboxClass";
+import {
+  filterInboxItems,
+  matchesInboxAllView,
+} from "@/features/home/lib/inboxViewHelpers";
 import {
   type ProjectColor,
   projectColorOf,
@@ -51,6 +56,8 @@ type Candidate = SurfaceHit & { text: Values };
  * anything else matches every word, as the Projects search does.
  */
 function matchesLocal(query: string, values: Values): boolean {
+  // shortcut: a repo in the query ("reset#792") is ignored, as the Messages
+  // section does; check pr.repo if rows that name another repo get noisy.
   const pr = parsePrQuery(query);
   if (!pr) return matchesProjectsSearch(query, values);
   const text = values.filter(Boolean).join("\n");
@@ -79,14 +86,21 @@ function take<T>(
 const firstLine = (text: string) => text.trim().split("\n")[0] ?? "";
 const joined = (...parts: Values) => parts.filter(Boolean).join(" · ") || null;
 
-/** Inbox rows; a Bench card's post is left to the Bench cards section. */
+/**
+ * Only rows the Inbox's All view lists, so each one opens a row; a Bench
+ * card's post is left to the Bench cards section.
+ */
 export function inboxHits(
-  items: readonly InboxItem[],
+  items: InboxItem[],
   classify: (item: InboxItem) => InboxClass,
+  ownedAgents: ReadonlySet<string>,
   query: string,
   limit = 4,
 ): SurfaceHit[] {
-  return take(items, query, limit, (item) => {
+  const listed = filterInboxItems(items).filter((item) =>
+    matchesInboxAllView(item, ownedAgents),
+  );
+  return take(listed, query, limit, (item) => {
     const { benchCard, color, type, workbench } = classify(item);
     if (benchCard) return null;
     const { channelLabel, id, preview, senderLabel, subject } = item;
@@ -167,14 +181,17 @@ export function projectHits(
   return take(candidates, query, limit, (candidate) => candidate);
 }
 
-/** Name and public description only: never the prompt, env or commands. */
+/**
+ * The Agents screen's library (active personas), by name and public
+ * description only: never the prompt, env or commands.
+ */
 export function personaHits(
   personas: readonly AgentPersona[],
   query: string,
   limit = 3,
 ): SurfaceHit[] {
   return take(
-    personas,
+    getLibraryPersonas(personas),
     query,
     limit,
     (persona): Candidate => ({

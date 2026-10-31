@@ -1,7 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
-import { usePersonasQuery } from "@/features/agents/hooks";
+import {
+  managedAgentsQueryKey,
+  usePersonasQuery,
+} from "@/features/agents/hooks";
+import { mergeOwnedAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import { withoutOwnWorkflowPosts } from "@/features/home/hooks";
@@ -21,7 +25,12 @@ import {
   type SurfaceHit,
 } from "@/features/search/lib/surfaceSearch";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import type { Channel, HomeFeedResponse } from "@/shared/api/types";
+import type {
+  Channel,
+  HomeFeedResponse,
+  ManagedAgent,
+  UsersBatchResponse,
+} from "@/shared/api/types";
 import { useFeatureEnabled } from "@/shared/features";
 
 /**
@@ -56,18 +65,30 @@ export function useSurfaceSearchResults({
         .getQueriesData<T>({ queryKey })
         .flatMap(([, data]) => (data ? [data] : []));
     const [feed] = cached<HomeFeedResponse>("home-feed");
+    // The Inbox's own profiles: sender names, and which agents are yours.
+    const profiles = Object.assign(
+      {},
+      ...cached<UsersBatchResponse>("users-batch").map((r) => r.profiles),
+    );
     const items = buildInboxItems({
       channels,
       currentPubkey: viewer,
       feed: feed && withoutOwnWorkflowPosts(feed, viewer, relaySelf),
+      profiles,
       relaySelfPubkey: relaySelf,
     });
+    const owned = mergeOwnedAgentPubkeys(
+      queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey),
+      profiles,
+      viewer,
+    );
     const chips = inboxProjects(projects ?? [], viewer, viewerAgents);
     return [
       ...personaHits(personas ?? [], query),
       ...inboxHits(
         items,
         (item) => classifyInboxItem(item, benchSnapshot, chips),
+        owned,
         query,
       ),
       ...(projectsOn

@@ -266,10 +266,20 @@ test("global search finds Inbox rows, projects and agent-library personas", asyn
   await section("inbox").click();
   await expect(row).toHaveAttribute("aria-current", "true");
 
+  // Channel activity the Inbox hides stays a message result.
   await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("shipped");
+  await expect(section("messages").first()).toContainText(
+    "Engineering shipped the desktop build.",
+  );
+  await expect(section("inbox")).toHaveCount(0);
+
   await input.fill("release captain");
   await section("agent-library").click();
   await expect(page).toHaveURL(/#\/agents\?.*profilePersona=release-captain/);
+  await expect(page.getByTestId("user-profile-panel")).toContainText(
+    "Release Captain",
+  );
 
   // Projects the app already loaded; search never fetches them.
   await page.keyboard.press("ControlOrMeta+k");

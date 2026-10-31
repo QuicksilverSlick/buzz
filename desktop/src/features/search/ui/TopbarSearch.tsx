@@ -61,10 +61,10 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "direct-messages",
   "people",
   "agents",
+  "bench",
   "agent-library",
   "inbox",
   "projects",
-  "bench",
   "messages",
   "actions",
 ] as const;
