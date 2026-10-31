@@ -73,25 +73,6 @@ test("Projects find repositories, and cached pull requests by branch", () => {
   assert.deepEqual(find([legacy], "relay"), ["repository:r2"]);
 });
 
-test("Workflows match their trigger summary; notes match their topics", () => {
-  const definition = { trigger: { on: "schedule", cron: "0 9 * * 1-5" } };
-  const workflow = { id: "w1", name: "Standup", status: "active", definition };
-  const [hit] = s.workflowHits([{ workflow, channelName: "ops" }], "standup");
-  assert.deepEqual([hit.kind, hit.chips], ["schedule", ["active"]]);
-  const summary = hit.meta.replace(" · #ops", "");
-  const bySummary = s.workflowHits([{ workflow, channelName: "" }], summary);
-  assert.equal(bySummary.length, 1);
-
-  const tags = [["t", "release"]];
-  const note = { id: "n1", pubkey: "ab", content: "Shipped\nmore", tags };
-  const notes = [note, { ...note, id: "n2", tags: [] }];
-  const [found] = s.noteHits(notes, "release");
-  assert.deepEqual(
-    [found.title, found.meta, found.target.pubkey],
-    ["Shipped", "#release", "ab"],
-  );
-});
-
 test("Personas match name and description, never prompt or env", () => {
   const persona = {
     id: "p1",

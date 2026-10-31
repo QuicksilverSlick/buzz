@@ -1,4 +1,4 @@
-import { Activity, Bot, Zap } from "lucide-react";
+import { Bot } from "lucide-react";
 import type { ComponentType } from "react";
 
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
@@ -21,10 +21,6 @@ import { useProjectsQuery } from "@/features/projects/hooks";
 import { PROJECT_EVENT_VISUALS } from "@/features/projects/ui/ProjectEventTypeIcon";
 import type { SurfaceHit } from "@/features/search/lib/surfaceSearch";
 import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
-import {
-  TRIGGER_ACCENTS,
-  TRIGGER_ICONS,
-} from "@/features/workflows/ui/WorkflowCard";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
@@ -107,18 +103,11 @@ function surfaceVisual({ kind, surface }: SurfaceHit): Visual {
         : "Repository";
     return { icon, label, text: iconClassName };
   }
-  if (surface === "workflows") {
-    const tile = TRIGGER_ACCENTS[kind];
-    return { icon: TRIGGER_ICONS[kind] ?? Zap, label: "Workflow", tile };
-  }
-  return surface === "pulse"
-    ? { icon: Activity, label: "Pulse note" }
-    : { icon: Bot, label: "Agent library", tile: "rounded-squircle" };
+  return { icon: Bot, label: "Agent library", tile: "rounded-squircle" };
 }
 
 /**
- * An Inbox row, project, workflow, note or agent-library persona in global
- * search, in its screen's icon and colours, with its project dot.
+ * An Inbox row, project or agent-library persona in global search, in its screen's icon and colours, with its project dot.
  */
 export function SurfaceResultRow({
   hit,

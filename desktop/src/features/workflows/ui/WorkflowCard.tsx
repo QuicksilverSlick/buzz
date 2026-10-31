@@ -46,7 +46,7 @@ type WorkflowCardProps = {
   onDelete: (workflow: Workflow) => void;
 };
 
-export const TRIGGER_ICONS: Record<string, LucideIcon> = {
+const TRIGGER_ICONS: Record<string, LucideIcon> = {
   diff_posted: GitPullRequest,
   message_posted: MessageSquare,
   reaction_added: SmilePlus,
@@ -64,7 +64,7 @@ const ACTION_ICONS: Record<string, LucideIcon> = {
   set_channel_topic: Hash,
 };
 
-export const TRIGGER_ACCENTS: Record<string, string> = {
+const TRIGGER_ACCENTS: Record<string, string> = {
   diff_posted: "border-violet-400/30 bg-violet-600 text-white",
   message_posted: "border-blue-400/30 bg-blue-600 text-white",
   reaction_added: "border-pink-400/30 bg-pink-600 text-white",

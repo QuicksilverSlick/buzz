@@ -1,8 +1,8 @@
 /**
  * Global search over what the app already holds for its other screens:
  * Inbox rows, Projects (projects, repositories and the Buzz Git pull
- * requests the Projects screen cached), Workflows, Pulse notes and the agent
- * library. Pure: each hit names where it opens; the dialog navigates.
+ * requests the Projects screen cached) and the agent library. Pure: each hit
+ * names where it opens; the dialog navigates.
  */
 
 import {
@@ -18,37 +18,22 @@ import { matchesProjectsSearch } from "@/features/projects/lib/projectsSearch";
 import type { Project } from "@/features/projects/projectModels";
 import type { ProjectsWorkItemsResult } from "@/features/projects/projectWorkItems";
 import { parsePrQuery, prMentionScore } from "@/features/search/lib/prNumber";
-import {
-  getWorkflowDescription,
-  getWorkflowDisplayStatus,
-  getWorkflowTriggerSummary,
-  getWorkflowTriggerType,
-} from "@/features/workflows/ui/workflowDefinition";
 import type { AgentPersona } from "@/shared/api/personaTypes";
-import type { UserNote } from "@/shared/api/socialTypes";
-import type { Workflow } from "@/shared/api/workflowTypes";
 
-export type SurfaceKey =
-  | "inbox"
-  | "projects"
-  | "workflows"
-  | "pulse"
-  | "agent-library";
+export type SurfaceKey = "inbox" | "projects" | "agent-library";
 
 type ProjectIds = { repositoryId?: string; pullRequestId?: string };
 
 export type SurfaceTarget =
   | { to: "inbox"; item: string }
   | ({ to: "project"; projectId: string } & ProjectIds)
-  | { to: "workflow"; id: string }
-  | { to: "profile"; pubkey: string }
   | { to: "persona"; personaId: string };
 
 export type SurfaceHit = {
   surface: SurfaceKey;
   id: string;
-  /** Inbox type, "project", "repository", "pull-request", the workflow's
-   * trigger, "note" or "persona": the row's icon and label. */
+  /** Inbox type, "project", "repository", "pull-request" or "persona": the
+   * row's icon and label. */
   kind: string;
   title: string;
   meta: string | null;
@@ -72,7 +57,7 @@ function matchesLocal(query: string, values: Values): boolean {
   return prMentionScore(text, pr.number) >= (pr.explicit ? 2 : 1);
 }
 
-/** The first `limit` hits that match, one per id (caches can share a note). */
+/** The first `limit` hits that match, one per id. */
 function take<T>(
   items: Iterable<T>,
   query: string,
@@ -180,52 +165,6 @@ export function projectHits(
     candidates.push(hit(project, "pull-request", found, ids));
   }
   return take(candidates, query, limit, (candidate) => candidate);
-}
-
-export function workflowHits(
-  list: ReadonlyArray<{ workflow: Workflow; channelName: string }>,
-  query: string,
-  limit = 3,
-): SurfaceHit[] {
-  return take(list, query, limit, ({ workflow, channelName }) => {
-    const { definition, id, name } = workflow;
-    const summary = getWorkflowTriggerSummary(definition);
-    return {
-      surface: "workflows",
-      id,
-      kind: getWorkflowTriggerType(definition) ?? "workflow",
-      title: name,
-      meta: joined(summary, channelName && `#${channelName}`),
-      chips: [getWorkflowDisplayStatus(workflow)],
-      color: null,
-      target: { to: "workflow", id },
-      text: [name, getWorkflowDescription(definition), summary, channelName],
-    };
-  });
-}
-
-/** Pulse has no page per note: a note opens its author's profile. */
-export function noteHits(
-  notes: readonly UserNote[],
-  query: string,
-  limit = 3,
-): SurfaceHit[] {
-  return take(notes, query, limit, (note) => {
-    const topics = note.tags.flatMap(([name, value]) =>
-      name === "t" && value ? [value] : [],
-    );
-    return {
-      surface: "pulse",
-      id: note.id,
-      kind: "note",
-      title: firstLine(note.content),
-      meta: topics.map((topic) => `#${topic}`).join(" ") || null,
-      chips: [],
-      color: null,
-      target: { to: "profile", pubkey: note.pubkey },
-      text: [note.content, ...topics],
-    };
-  });
 }
 
 /** Name and public description only: never the prompt, env or commands. */

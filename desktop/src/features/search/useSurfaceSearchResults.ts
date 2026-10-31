@@ -16,15 +16,12 @@ import type { Project } from "@/features/projects/projectModels";
 import type { ProjectsWorkItemsResult } from "@/features/projects/projectWorkItems";
 import {
   inboxHits,
-  noteHits,
   personaHits,
   projectHits,
   type SurfaceHit,
-  workflowHits,
 } from "@/features/search/lib/surfaceSearch";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import type { UserNotesResponse } from "@/shared/api/socialTypes";
-import type { Channel, HomeFeedResponse, Workflow } from "@/shared/api/types";
+import type { Channel, HomeFeedResponse } from "@/shared/api/types";
 import { useFeatureEnabled } from "@/shared/features";
 
 /**
@@ -43,8 +40,6 @@ export function useSurfaceSearchResults({
 }): SurfaceHit[] {
   const queryClient = useQueryClient();
   const projectsOn = useFeatureEnabled("projects");
-  const workflowsOn = useFeatureEnabled("workflows");
-  const pulseOn = useFeatureEnabled("pulse");
   const viewer = useIdentityQuery().data?.pubkey;
   const relaySelf = useRelaySelfQuery().data;
   const viewerAgents = useViewerAgentPubkeys();
@@ -68,9 +63,6 @@ export function useSurfaceSearchResults({
       relaySelfPubkey: relaySelf,
     });
     const chips = inboxProjects(projects ?? [], viewer, viewerAgents);
-    const notes = ["global-notes", "pulse-timeline", "my-notes", "liked-notes"]
-      .flatMap((key) => cached<UserNotesResponse>(key))
-      .flatMap((response) => response.notes);
     return [
       ...personaHits(personas ?? [], query),
       ...inboxHits(
@@ -85,15 +77,6 @@ export function useSurfaceSearchResults({
             query,
           )
         : []),
-      ...(workflowsOn
-        ? workflowHits(
-            cached<Array<{ workflow: Workflow; channelName: string }>>(
-              "workflows-all",
-            ).flat(),
-            query,
-          )
-        : []),
-      ...(pulseOn ? noteHits(notes, query) : []),
     ];
   }, [
     benchSnapshot,
@@ -102,12 +85,10 @@ export function useSurfaceSearchResults({
     personas,
     projects,
     projectsOn,
-    pulseOn,
     query,
     queryClient,
     relaySelf,
     viewer,
     viewerAgents,
-    workflowsOn,
   ]);
 }

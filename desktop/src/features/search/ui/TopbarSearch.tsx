@@ -64,8 +64,6 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "agent-library",
   "inbox",
   "projects",
-  "workflows",
-  "pulse",
   "bench",
   "messages",
   "actions",
@@ -251,10 +249,6 @@ function getSectionTitle(sectionKey: SearchResultSectionKey) {
       return "Inbox";
     case "projects":
       return "Projects";
-    case "workflows":
-      return "Workflows";
-    case "pulse":
-      return "Pulse";
     case "bench":
       return "Bench cards";
     case "messages":
@@ -441,8 +435,7 @@ export function TopbarSearch({
   // An opened Bench card keeps the focus the Bench gives it.
   const cardOpenedRef = React.useRef(false);
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
-  const { goAgents, goBench, goHome, goProfile, goProject, goWorkflow } =
-    useAppNavigation();
+  const { goAgents, goBench, goHome, goProject } = useAppNavigation();
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
   const {
@@ -612,9 +605,7 @@ export function TopbarSearch({
         else if (target.to === "project") {
           const { projectId, to: _, ...ids } = target;
           void goProject(projectId, ids);
-        } else if (target.to === "workflow") void goWorkflow(target.id);
-        else if (target.to === "profile") void goProfile(target.pubkey);
-        else void goAgents({ profilePersona: target.personaId });
+        } else void goAgents({ profilePersona: target.personaId });
         return;
       }
 
@@ -652,9 +643,7 @@ export function TopbarSearch({
       goAgents,
       goBench,
       goHome,
-      goProfile,
       goProject,
-      goWorkflow,
       highlightQuery,
       onBrowseChannels,
       onCreateAgent,
