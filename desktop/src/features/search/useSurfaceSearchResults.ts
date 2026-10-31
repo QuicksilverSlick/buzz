@@ -61,7 +61,7 @@ export function useSurfaceSearchResults({
         .flatMap(([, data]) => (data ? [data] : []));
     const [feed] = cached<HomeFeedResponse>("home-feed");
     // The Inbox's own profiles: sender names, and which agents are yours.
-    const profiles = Object.assign(
+    const profiles: UsersBatchResponse["profiles"] = Object.assign(
       {},
       ...cached<UsersBatchResponse>("users-batch").map((r) => r.profiles),
     );
