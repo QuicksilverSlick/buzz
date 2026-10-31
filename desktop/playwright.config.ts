@@ -46,6 +46,7 @@ export default defineConfig({
         "**/messaging.spec.ts",
         "**/bestie.spec.ts",
         "**/bench-screen.spec.ts",
+        "**/bench-global-search.spec.ts",
         "**/color-key.spec.ts",
         "**/message-feedback-snapshots.spec.ts",
         "**/message-copy-link.spec.ts",
