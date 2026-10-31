@@ -225,9 +225,15 @@ test("global search finds a Bench card by PR number and opens it", async ({
   await expect(focused).toBeFocused();
 });
 
-test("global search finds Inbox rows and agent-library personas", async ({
+test("global search finds Inbox rows, projects and agent-library personas", async ({
   page,
 }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "buzz-feature-overrides-v1",
+      JSON.stringify({ projects: true }),
+    ),
+  );
   await installMockBridge(page, {
     personas: [
       {
@@ -274,4 +280,15 @@ test("global search finds Inbox rows and agent-library personas", async ({
   await expect(page.getByTestId("user-profile-panel")).toContainText(
     "Release Captain",
   );
+
+  // Projects the app already loaded; search never fetches them.
+  await page.keyboard.press("ControlOrMeta+k");
+  await input.fill("relay-tools");
+  await expect(section("projects").first()).toContainText("relay-tools");
+  await waitForAnimations(page);
+  await dialog.screenshot({
+    path: "test-results/bench-search/04-projects-dialog.png",
+  });
+  await section("projects").first().click();
+  await expect(page).toHaveURL(/#\/projects\/[^/?]+/);
 });
