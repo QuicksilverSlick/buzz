@@ -144,6 +144,65 @@ test("Bench screen answers a pending card and shows it recorded", async ({
   await expect(page.getByTestId("sidebar-bench-count")).toHaveCount(0);
 });
 
+test("a card waiting for a slot says why, and a tap posts it next", async ({
+  page,
+}) => {
+  // Off the relay: no card event, queued behind the Bench's 30 live cards.
+  const queued = benchSnapshot(null);
+  if (!queued.enabled) throw new Error("the Bench is on");
+  queued.maxCards = 30;
+  queued.items[0] = { ...queued.items[0], cardEventId: null, queued: true };
+  await installMockBridge(page, { benchCards: queued });
+  await page.goto("/");
+  await page.getByTestId("open-bench-view").click();
+
+  await expect(page.getByTestId("bench-queued")).toHaveText(
+    "1 card waits off the relay: the Bench keeps 30 cards live at once, and each posts when a slot frees. Tap one below to post it now.",
+  );
+  const card = page
+    .getByTestId("bench-section-needsYou")
+    .getByTestId("bench-card");
+  await expect(card).toContainText(
+    "Queued: the Bench keeps 30 cards live on the relay; this one posts when a slot frees.",
+  );
+  const ship = card.getByRole("button", { name: /^1\. Ship it/ });
+  await expect(ship).toBeEnabled();
+  await ship.click();
+  const sent = (command: string) =>
+    page.evaluate(
+      (name) =>
+        (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
+          .filter((entry) => entry.command === name)
+          .map((entry) => entry.payload),
+      command,
+    );
+  await expect.poll(() => sent("bench_bump")).toEqual([{ itemId: ITEM_ID }]);
+  await expect(
+    card.getByText(
+      "Posting this card now. Tap your answer again once it's live.",
+    ),
+  ).toBeVisible();
+  // The tap posted the card; it answered nothing.
+  expect(await sent("bench_answer")).toEqual([]);
+
+  // The Bench's next tick posts it: the alarm clears and the tap answers.
+  await page.evaluate((next) => {
+    const config = window.__BUZZ_E2E__;
+    if (config) config.mock = { ...config.mock, benchCards: next };
+  }, benchSnapshot(null));
+  await expect(page.getByTestId("bench-queued")).toHaveCount(0, {
+    timeout: 10_000,
+  });
+  const live = page
+    .getByTestId("bench-section-needsYou")
+    .getByTestId("bench-card");
+  await expect(live).not.toContainText("Queued:");
+  await live.getByRole("button", { name: /^1\. Ship it/ }).click();
+  await expect
+    .poll(() => sent("bench_answer"))
+    .toEqual([{ itemId: ITEM_ID, option: 0, cardEventId: "e".repeat(64) }]);
+});
+
 test("a live card hides its keycap pills; other messages keep theirs", async ({
   page,
 }) => {

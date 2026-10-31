@@ -510,6 +510,73 @@ test("Craig's recorded answer: the owner overrides it, never undoes it", async (
   );
 });
 
+function bumpCalls() {
+  return ipcCalls.filter((c) => c.cmd === "bench_bump").map((c) => c.args);
+}
+
+test("a queued card says why, and a tap posts it next instead of answering", async () => {
+  ipcHandlers.set("bench_bump", () => Promise.resolve(null));
+  // Hold the 30 s wait so the test can run it out.
+  const waits = [];
+  const realSetTimeout = dom.window.setTimeout;
+  dom.window.setTimeout = (fn, ms, ...rest) =>
+    ms === 30_000 ? waits.push(fn) : realSetTimeout(fn, ms, ...rest);
+  try {
+    const queued = card({ cardEventId: null, queued: true });
+    await act(async () => {
+      render(wrap(benchCard({ card: queued, maxCards: 30 })));
+    });
+    assert.ok(
+      screen.getByText(
+        "Queued: the Bench keeps 30 cards live on the relay; this one posts when a slot frees. Tap an option to post it now.",
+      ),
+    );
+    assert.equal(optionButton("1. Ship it").disabled, false, "not grey");
+    await act(async () => {
+      fireEvent.click(optionButton("1. Ship it"));
+    });
+    assert.deepEqual(bumpCalls(), [{ itemId: "dreamforge/ship-it" }]);
+    assert.deepEqual(answerCalls(), [], "a bump answers nothing");
+    assert.ok(
+      screen.getByText(
+        "Posting this card now. Tap your answer again once it's live.",
+      ),
+    );
+    assert.equal(optionButton("2. Hold").disabled, true, "one bump at a time");
+    // It never waits on nothing: past 30 s it says so and may go again.
+    assert.equal(waits.length, 1);
+    await act(async () => waits[0]());
+    assert.ok(
+      screen.getByText(
+        "Not posted after 30 s. The Bench may be offline; try again.",
+      ),
+    );
+    assert.equal(optionButton("2. Hold").disabled, false);
+  } finally {
+    dom.window.setTimeout = realSetTimeout;
+  }
+});
+
+test("a bump the Bench refuses says why", async () => {
+  ipcHandlers.set("bench_bump", () =>
+    Promise.reject("this card's channel isn't ready for cards yet"),
+  );
+  await act(async () => {
+    render(wrap(benchCard({ card: card({ cardEventId: null }) })));
+  });
+  assert.ok(screen.getByText("Waiting for the Bench to post this card."));
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  await waitFor(() =>
+    screen.getByText(
+      "Couldn't post it: this card's channel isn't ready for cards yet",
+    ),
+  );
+  assert.equal(optionButton("1. Ship it").disabled, false);
+  assert.deepEqual(answerCalls(), []);
+});
+
 test("a receipt shows the request, the answer and the outcome as inert text", async () => {
   const request = scoped({
     title: "Send the <b>new</b> email?",

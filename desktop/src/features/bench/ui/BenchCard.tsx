@@ -8,6 +8,9 @@ import {
   type BenchCard as BenchCardData,
   type BenchOptionView,
   type SafeBenchLink,
+  BENCH_BUMP_POSTING,
+  BENCH_BUMP_TIMEOUT_MESSAGE,
+  BENCH_BUMP_TIMEOUT_MS,
   BENCH_SAVE_TIMEOUT_MS,
   INITIAL_BENCH_ANSWER_STATE,
   benchAnswerReducer,
@@ -34,7 +37,7 @@ import {
   BenchCardBlocks,
   BenchCardDetails,
 } from "@/features/bench/ui/BenchCardFields";
-import { useBenchAnswer } from "@/features/bench/useBenchCards";
+import { useBenchAnswer, useBenchBump } from "@/features/bench/useBenchCards";
 import { buildMessageLink } from "@/features/messages/lib/messageLink";
 import { openPopoverLink } from "@/features/messages/lib/openPopoverLink";
 import { cn } from "@/shared/lib/cn";
@@ -58,7 +61,8 @@ function formatBenchTime(unixSeconds: number): string {
  * answer, and Open thread, on every card that has one, beside when the card
  * was created. A closed card is its receipt: the question, the answer and
  * the outcome. A `retiredPost` (one a newer card replaced) is read-only, from
- * its own text, so it never answers twice.
+ * its own text, so it never answers twice. A card not on the relay yet says
+ * why, and a tap on it posts it next (`bench_bump`).
  */
 export function BenchCard({
   card,
@@ -67,6 +71,7 @@ export function BenchCard({
   onOther,
   projectLabel,
   retiredPost,
+  maxCards,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
@@ -75,6 +80,8 @@ export function BenchCard({
   /** Leads the muted line: the Bench screen's All tab names the project. */
   projectLabel?: string;
   retiredPost?: BenchRetiredPost;
+  /** The snapshot's maxCards, for why a queued card waits. */
+  maxCards?: number;
 }) {
   if (retiredPost) return <BenchRetiredCard card={card} post={retiredPost} />;
   return card.request ? (
@@ -86,6 +93,7 @@ export function BenchCard({
   ) : (
     <BenchQuestionCard
       card={card}
+      maxCards={maxCards}
       onOther={onOther}
       ownerPubkey={ownerPubkey}
       projectLabel={projectLabel}
@@ -96,21 +104,24 @@ export function BenchCard({
 
 function BenchQuestionCard({
   card,
+  maxCards,
   ownerPubkey,
   viewerPubkey,
   onOther,
   projectLabel,
 }: {
   card: BenchCardData;
+  maxCards?: number;
   ownerPubkey: string | null;
   viewerPubkey?: string;
   onOther?: () => void;
   projectLabel?: string;
 }) {
-  const { interactive, readOnlyReason } = benchCardMode(
+  const { interactive, readOnlyReason, bumpable } = benchCardMode(
     card,
     ownerPubkey,
     viewerPubkey,
+    maxCards,
   );
   const byOwner = card.answer?.byOwner ?? true;
   const [storedState, dispatch] = React.useReducer(
@@ -139,11 +150,47 @@ function BenchQuestionCard({
     return () => window.clearTimeout(timer);
   }, [attempt, saving]);
 
+  // A tap on a card off the relay posts it next; it answers nothing, and
+  // says so until the card is live (a new row) or the wait runs out.
+  const [bump, setBump] = React.useState<{
+    attempt: number;
+    error: string | null;
+  } | null>(null);
+  const bumpAttempt = bump?.attempt ?? 0;
+  const posting = bump !== null && bump.error === null;
+  React.useEffect(() => {
+    if (!posting) return;
+    const timer = window.setTimeout(
+      () =>
+        setBump((b) =>
+          b?.attempt === bumpAttempt && b.error === null
+            ? { ...b, error: BENCH_BUMP_TIMEOUT_MESSAGE }
+            : b,
+        ),
+      BENCH_BUMP_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [bumpAttempt, posting]);
+  const { mutateAsync: postNext } = useBenchBump();
+
   const { mutateAsync: answer } = useBenchAnswer();
   const handleOption = (option: number) => {
     // Only the card on screen: the Bench refuses it once it is replaced.
     const cardEventId = card.cardEventId;
-    if (!cardEventId) return;
+    if (!cardEventId) {
+      if (!bumpable || posting) return;
+      const attempt = bumpAttempt + 1;
+      setBump({ attempt, error: null });
+      postNext(card.id).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setBump((b) =>
+          b?.attempt === attempt
+            ? { attempt, error: `Couldn't post it: ${message}` }
+            : b,
+        );
+      });
+      return;
+    }
     const action = {
       type: "click",
       option,
@@ -165,8 +212,9 @@ function BenchQuestionCard({
     );
   };
 
+  const clickable = interactive || (bumpable === true && !posting);
   const options =
-    card.kind === "pending" ? benchOptionViews(card, state, interactive) : [];
+    card.kind === "pending" ? benchOptionViews(card, state, clickable) : [];
   const recordedLine = benchRecordedLine(card, formatBenchTime);
   const overrides = interactive && card.recorded !== null && !byOwner;
   const other =
@@ -231,7 +279,14 @@ function BenchQuestionCard({
             {state.error}
           </p>
         ) : null}
-        {readOnlyReason ? (
+        {bump?.error ? (
+          <p className="mt-1.5 text-destructive [overflow-wrap:anywhere]">
+            {bump.error}
+          </p>
+        ) : null}
+        {posting ? (
+          <p className="mt-1.5 text-muted-foreground">{BENCH_BUMP_POSTING}</p>
+        ) : readOnlyReason ? (
           <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
         ) : null}
       </div>

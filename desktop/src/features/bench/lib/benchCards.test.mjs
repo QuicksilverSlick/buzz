@@ -16,6 +16,7 @@ import {
   benchOptionViews,
   benchPlainView,
   benchPreviousAnswerLine,
+  benchQueuedLine,
   benchReceipt,
   benchRecordedLine,
   benchRowState,
@@ -228,6 +229,47 @@ test("mode: read-only for another viewer, no owner, stale or superseded", () => 
     assert.equal(mode.interactive, false);
     assert.match(mode.readOnlyReason ?? "", reason);
   }
+});
+
+test("mode: a card off the relay says why, and a tap on it posts it next", () => {
+  const queued = benchCardMode(
+    card({ cardEventId: null, queued: true }),
+    OWNER,
+    OWNER,
+    30,
+  );
+  assert.deepEqual(queued, {
+    interactive: false,
+    readOnlyReason:
+      "Queued: the Bench keeps 30 cards live on the relay; this one posts when a slot frees. Tap an option to post it now.",
+    bumpable: true,
+  });
+  assert.deepEqual(benchCardMode(card({ cardEventId: null }), OWNER, OWNER), {
+    interactive: false,
+    readOnlyReason: "Waiting for the Bench to post this card.",
+    bumpable: true,
+  });
+  // An answered card whose card was retired: nothing to post or answer.
+  const retired = card({
+    cardEventId: null,
+    answer: { option: 0, answeredAt: 1 },
+  });
+  assert.equal(benchCardMode(retired, OWNER, OWNER).bumpable, undefined);
+});
+
+test("queued line: the header counts every card waiting for a slot", () => {
+  assert.equal(benchQueuedLine({ items: [card()], maxCards: 30 }), null);
+  assert.equal(
+    benchQueuedLine({
+      items: [card({ queued: true }), card(), card({ queued: true })],
+      maxCards: 30,
+    }),
+    "2 cards wait off the relay: the Bench keeps 30 cards live at once, and each posts when a slot frees. Tap one below to post it now.",
+  );
+  assert.match(
+    benchQueuedLine({ items: [card({ queued: true })], maxCards: 30 }) ?? "",
+    /^1 card waits off the relay/,
+  );
 });
 
 test("mode: decision and status cards are never interactive", () => {

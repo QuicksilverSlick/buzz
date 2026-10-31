@@ -105,6 +105,8 @@ export type BenchCard = {
   updatedAt: string;
   /** The live card's kind 9 id (a receipt's kept card); null when none. */
   cardEventId: string | null;
+  /** Open and waiting off the relay for a slot (absent on older snapshots). */
+  queued?: boolean;
   answer: BenchAnswer | null;
   /** 0-based option the card text shows as Recorded; null = unanswered. */
   recorded: number | null;
@@ -139,6 +141,8 @@ export type BenchSnapshot = {
   ownerPubkey: string | null;
   lastError: string | null;
   lastTick: string;
+  /** How many open cards the Bench keeps on the relay at once. */
+  maxCards?: number;
   items: BenchCard[];
 };
 
@@ -349,12 +353,30 @@ export type BenchCardMode = {
   interactive: boolean;
   /** Why a pending card's options are read-only. */
   readOnlyReason: string | null;
+  /** Not on the relay yet: an option tap posts it next (`bench_bump`). */
+  bumpable?: true;
 };
+
+/** "Queued: the Bench keeps 30 cards live on the relay; ..." */
+function queuedReason(maxCards: number | undefined): string {
+  return `Queued: the Bench keeps ${maxCards ?? "a fixed number of"} cards live on the relay; this one posts when a slot frees. Tap an option to post it now.`;
+}
+
+/** The Bench header's alarm when cards wait for a slot; null when none do. */
+export function benchQueuedLine(
+  snapshot: Pick<BenchSnapshot, "items" | "maxCards">,
+): string | null {
+  const n = snapshot.items.filter((card) => card.queued).length;
+  if (n === 0) return null;
+  const wait = n === 1 ? "1 card waits" : `${n} cards wait`;
+  return `${wait} off the relay: the Bench keeps ${snapshot.maxCards ?? "a fixed number of"} cards live at once, and each posts when a slot frees. Tap one below to post it now.`;
+}
 
 export function benchCardMode(
   card: BenchCard,
   ownerPubkey: string | null,
   viewerPubkey: string | undefined,
+  maxCards?: number,
 ): BenchCardMode {
   if (card.kind !== "pending") {
     return { interactive: false, readOnlyReason: null };
@@ -364,13 +386,18 @@ export function benchCardMode(
     readOnlyReason,
   });
   // Only the Bench screen shows an item without a live card: an answered one
-  // whose card was retired, or one the Bench has yet to (re)post.
+  // whose card was retired, or one the Bench has yet to (re)post, which a
+  // tap posts next.
   if (!card.cardEventId) {
-    return readOnly(
-      card.answer
-        ? "This card is no longer live."
-        : "Waiting for the Bench to post this card in #bench.",
-    );
+    if (card.answer) return readOnly("This card is no longer live.");
+    return {
+      ...readOnly(
+        card.queued
+          ? queuedReason(maxCards)
+          : "Waiting for the Bench to post this card.",
+      ),
+      bumpable: true,
+    };
   }
   if (card.validity === "superseded") {
     return readOnly("Superseded: this card is being retired.");
@@ -515,6 +542,13 @@ function linkScheme(url: string): SafeBenchLink["scheme"] | null {
   if (parsed.protocol === "buzz:" && url.startsWith("buzz://")) return "buzz";
   return null;
 }
+
+/** How long a tap on a card off the relay waits for it to post. */
+export const BENCH_BUMP_TIMEOUT_MS = 30_000;
+export const BENCH_BUMP_POSTING =
+  "Posting this card now. Tap your answer again once it's live.";
+export const BENCH_BUMP_TIMEOUT_MESSAGE =
+  "Not posted after 30 s. The Bench may be offline; try again.";
 
 /** How long a click waits for the snapshot to show it recorded. */
 export const BENCH_SAVE_TIMEOUT_MS = 15_000;
