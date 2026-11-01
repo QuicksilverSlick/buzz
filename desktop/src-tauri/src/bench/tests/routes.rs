@@ -578,6 +578,17 @@ async fn routed_bench() -> (Bench, Keys, String) {
 #[tokio::test]
 async fn a_reason_after_a_tap_is_told_beside_the_answer() {
     let (mut b, _agent, card) = routed_bench().await;
+    // The desktop says the reason reaches the route target, and only then.
+    let told = |b: &Bench| {
+        save_state(&b.root, &b.s, &mut String::new()).unwrap();
+        let snap = serde_json::to_value(crate::bench::commands::cards(&b.root)).unwrap();
+        let items = snap["items"].as_array().unwrap();
+        items.iter().find(|i| i["id"] == ITEM).unwrap()["repliesTold"].clone()
+    };
+    assert_eq!(told(&b), json!(true));
+    b.s.unroutable = vec!["orchestrator: not a managed agent here".to_string()];
+    assert_eq!(told(&b), json!(false));
+    b.s.unroutable.clear();
     let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now);
     let before = b.posts().len();
     let text = "Waiting on the relay quote";

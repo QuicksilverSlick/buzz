@@ -223,9 +223,7 @@ function BenchQuestionCard({
           ) : null}
         </fieldset>
       ) : null}
-      {interactive && card.kind === "pending" && card.cardEventId ? (
-        <BenchWhyBox card={card} cardEventId={card.cardEventId} />
-      ) : null}
+      <BenchWhyBox card={card} live={interactive && card.kind === "pending"} />
       <div aria-live="polite" className="text-xs">
         {saving ? (
           <p className="mt-1.5 text-muted-foreground">Saving...</p>
@@ -294,6 +292,7 @@ function BenchReceiptCard({
       >
         {receipt.answeredLine}
       </p>
+      <BenchWhyBox card={card} live={false} />
       <section
         aria-label="Outcome"
         className="mt-2.5 border-t border-border/70 pt-2"
@@ -555,6 +554,7 @@ function BenchOptionButton({
         "h-auto min-h-8 max-w-full justify-start whitespace-normal py-1.5 text-left",
         option.pending && "ring-1 ring-ring",
       )}
+      data-bench-option={option.index}
       disabled={option.disabled}
       onClick={() => onSelect(option.index)}
       size="sm"

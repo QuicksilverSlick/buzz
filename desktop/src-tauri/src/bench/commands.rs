@@ -89,6 +89,9 @@ struct Card {
     back_to_you: bool,
     /// The answer the card came back from.
     previous_answer: Option<CardPrevious>,
+    /// A reply here reaches an agent: the writer's route target, in the
+    /// card's channel and not an answerer on it, as publish (a3) tells it.
+    replies_told: bool,
 }
 
 /// 0-based, like `options`.
@@ -172,6 +175,7 @@ fn card(i: &item::Item, owner_set: &[String]) -> Card {
             by_name: p.by_name.clone(),
             answered_at: p.answered_at,
         }),
+        replies_told: false,
     }
 }
 
@@ -189,10 +193,32 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
         [] => vec![s.owner_pubkey.clone()],
         keys => keys.to_vec(),
     };
+    // routes.json as written, less what the last tick refused (`unroutable`).
+    let routes: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(root.join("routes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+    let told = |i: &item::Item| {
+        let refused = format!("{}: ", i.writer);
+        let to = routes
+            .get(&i.writer)
+            .map(|to| to.trim().to_ascii_lowercase());
+        to.is_some_and(|to| {
+            super::channels::joined(&s, &super::channels::card_channel(&s, i)).contains(&to)
+                && !s.unroutable.iter().any(|u| u.starts_with(&refused))
+                && !i
+                    .stamp
+                    .iter()
+                    .flat_map(|st| &st.answerers)
+                    .any(|a| a.pk == to)
+        })
+    };
     let items = s
         .items
         .values()
         .map(|i| Card {
+            replies_told: told(i),
             waits_for: if s.queued.contains(&i.id) {
                 Some("slot")
             } else if i.kind == ItemKind::Pending

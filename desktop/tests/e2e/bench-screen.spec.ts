@@ -385,6 +385,7 @@ function holdSnapshot(recorded: number | null): BenchCards {
       writer: "steward",
       title: "Ship buzz PR 104?",
       options: ["Ship it", "Send it back", "Keep holding"],
+      repliesTold: true,
     },
     {
       ...card,
@@ -395,6 +396,7 @@ function holdSnapshot(recorded: number | null): BenchCards {
       cardEventId: "c".repeat(64),
       answer: null,
       recorded: null,
+      repliesTold: true,
     },
   ];
   return snapshot;
@@ -429,6 +431,10 @@ test("a hold with a reason sends the tap, then one reply on the card", async ({
   await expect(why).toBeFocused();
   await expect(page.getByText("Sent to steward as a reply")).toBeVisible();
   await why.fill("Waiting on the mobile build");
+  // Send waits for the tick to record the tap, so the reason goes beside it.
+  await expect(
+    page.getByRole("button", { name: "Send", exact: true }),
+  ).toBeDisabled();
 
   // The tick records the tap: the card moves to Answered mid-reason.
   await page.evaluate((next) => {
@@ -464,7 +470,7 @@ test("a hold without a reason sends only the tap; Ship it never asks", async ({
   await installMockBridge(page, { benchCards: holdSnapshot(null) });
   await page.goto("/");
   await page.getByTestId("open-bench-view").click();
-  const box = page.getByRole("form", { name: "Why? (optional)" });
+  const box = page.getByTestId("bench-card-why");
   await page.getByRole("button", { name: /^2\. Send back to Reset/ }).click();
   await expect(page.getByText("Sent to orchestrator as a reply")).toBeVisible();
   await page.getByRole("button", { name: "Skip", exact: true }).click();

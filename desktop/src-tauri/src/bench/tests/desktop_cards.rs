@@ -386,6 +386,7 @@ async fn bench_cards_snapshot() {
             "recommend",
             "recommender",
             "recorded",
+            "repliesTold",
             "reply",
             "request",
             "scoped",
@@ -430,6 +431,8 @@ async fn bench_cards_snapshot() {
         ("backToYou", json!(false)),
         ("previousAnswer", Value::Null),
         ("waitsFor", Value::Null),
+        // No routes.json: a reply here reaches no agent.
+        ("repliesTold", json!(false)),
     ] {
         assert_eq!(item[k], v, "{k}");
     }

@@ -129,6 +129,8 @@ export type BenchCard = {
   /** Re-dropped after an answer, and waiting again. */
   backToYou?: boolean;
   previousAnswer?: BenchPreviousAnswer | null;
+  /** A reply here reaches the writer's agent; absent reads as not. */
+  repliesTold?: boolean;
 };
 
 export type BenchSnapshot = {
