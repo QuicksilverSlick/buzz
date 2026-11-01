@@ -80,6 +80,19 @@ function errorText(error: unknown): string {
 }
 
 /**
+ * The steward kit adds the reason to the card's PR as a comment. Its card ids
+ * name the repo by its short name (`hold-reset-<pr>-...`). Only reset and talos
+ * are known private: buzz is public, and a repo new to the lane gets the
+ * warning until it is added here.
+ */
+function prCommentHint(card: BenchCardData): string {
+  if (card.writer !== "steward") return "";
+  return /^steward\/(?:hold|stack)-(?:reset|talos)-\d/.test(card.id)
+    ? "It's added to the PR as a comment. "
+    : "It's added to the PR as a comment; treat it as public. ";
+}
+
+/**
  * The optional one-line reason after a hold-type tap. Send posts it as the
  * owner's reply in the card's thread (`bench_reply`), which the Bench tells
  * the card's writer; Skip (or Escape) sends nothing more. Send waits until
@@ -252,6 +265,7 @@ export function BenchWhyBox({
         {told
           ? `Sent to ${card.writer} as a reply on this card.`
           : `Posted as a reply on this card; no agent is told for ${card.writer}.`}{" "}
+        {prCommentHint(card)}
         {recorded
           ? "Skip, and only your tap goes."
           : "Send opens once the card records your tap."}

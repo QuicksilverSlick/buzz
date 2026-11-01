@@ -1014,7 +1014,7 @@ test("Why? after a hold tap: survives a remount, keeps its text on a failed send
   });
   assert.ok(
     screen.getByText(
-      "Sent to steward as a reply on this card. Send opens once the card records your tap.",
+      "Sent to steward as a reply on this card. It's added to the PR as a comment; treat it as public. Send opens once the card records your tap.",
     ),
   );
   await act(async () => {
@@ -1133,7 +1133,7 @@ test("Why?: Enter sends and focus goes back to the tap; Escape skips the same wa
   assert.equal(document.activeElement, input);
   assert.equal(
     document.getElementById(input.getAttribute("aria-describedby")).textContent,
-    "Sent to steward as a reply on this card. Skip, and only your tap goes.",
+    "Sent to steward as a reply on this card. It's added to the PR as a comment; treat it as public. Skip, and only your tap goes.",
   );
   await act(async () => {
     fireEvent.change(input, { target: { value: "Waiting on Craig" } });
@@ -1170,4 +1170,54 @@ test("Why?: Enter sends and focus goes back to the tap; Escape skips the same wa
   assert.equal(why(), null);
   assert.equal(document.activeElement, optionButton("2. Hold"));
   assert.equal(ipcCalls.filter((c) => c.cmd === "bench_reply").length, 1);
+});
+
+test("Why? on a steward card says the reason goes on the PR, and public unless the repo is known private", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  const hint = async (overrides) => {
+    cleanup();
+    const held = card({ cardEventId: "8".repeat(64), ...overrides });
+    await act(async () => {
+      render(wrap(benchCard({ card: held })));
+    });
+    await act(async () => {
+      fireEvent.click(optionButton("2. Hold"));
+    });
+    const input = screen.getByRole("textbox", { name: "Why? (optional)" });
+    return document.getElementById(input.getAttribute("aria-describedby"))
+      .textContent;
+  };
+  const steward = (id) => ({ id, writer: "steward", repliesTold: true });
+  const said = (pr) =>
+    `Sent to steward as a reply on this card. ${pr} Send opens once the card records your tap.`;
+  const onPublicPr = said(
+    "It's added to the PR as a comment; treat it as public.",
+  );
+  const onPr = said("It's added to the PR as a comment.");
+  const head = "a".repeat(12);
+  assert.equal(
+    await hint(steward(`steward/hold-buzz-104-${head}-${head}`)),
+    onPublicPr,
+  );
+  assert.equal(
+    await hint(steward(`steward/stack-buzz-7-11-${head}`)),
+    onPublicPr,
+  );
+  // A repo new to the lane warns until it is known private.
+  assert.equal(
+    await hint(steward(`steward/hold-newrepo-104-${head}-${head}`)),
+    onPublicPr,
+  );
+  assert.equal(
+    await hint(steward(`steward/hold-reset-104-${head}-${head}`)),
+    onPr,
+  );
+  assert.equal(
+    await hint(steward(`steward/hold-talos-17-${head}-${head}`)),
+    onPr,
+  );
+  assert.equal(
+    await hint({ id: "dreamforge/hold-buzz-104", writer: "dreamforge" }),
+    "Posted as a reply on this card; no agent is told for dreamforge. Send opens once the card records your tap.",
+  );
 });

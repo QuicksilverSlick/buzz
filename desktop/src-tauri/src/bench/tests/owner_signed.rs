@@ -841,7 +841,7 @@ async fn an_approval_untapped_on_a_forgotten_card_and_closed_out_is_withdrawn_on
     // Untapped, its card deleted by hand, and closed out inside the settle.
     reply(&b, &[&list]);
     b.tick().await.unwrap();
-    forget_card(&mut b.s, ASK);
+    publish::forget_card(&b.ctx, &mut b.s, ASK);
     close_out(&b);
     let before = b.posts().len();
     b.settle(3).await;

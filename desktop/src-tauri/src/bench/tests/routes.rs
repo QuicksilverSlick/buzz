@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use super::answers::{last_query, posted, reply, tap, ITEM};
-use super::channels::thread_reply;
+use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
+use super::channels::{bound_bench, thread_reply, ASK};
 use super::*;
 
 /// The owner's answer, as the owner's own message.
@@ -855,4 +855,209 @@ async fn a_reply_on_a_card_posted_while_routed_is_told() {
     let n = settle_past(&mut b, 2).await;
     assert_eq!(n.len(), 1);
     assert!(content(&n[0]).contains(&r1.id.to_hex()));
+}
+
+/// `outbox/<id>.reply.json`, as written.
+fn reply_file(b: &Bench, id: &str) -> Option<Value> {
+    std::fs::read_to_string(b.root.join(format!("outbox/{id}.reply.json")))
+        .ok()
+        .map(|t| serde_json::from_str(&t).unwrap())
+}
+
+fn whole(e: &nostr::Event) -> Option<Value> {
+    Some(serde_json::to_value(e).unwrap())
+}
+
+/// A card scoped as a steward hold card is: it recommends an option.
+async fn hold_bench() -> (Bench, String) {
+    let mut b = Bench::new(Gate::Open, &[]).await;
+    let hold = drop_json(&[("recommend", json!(1))]);
+    b.drop_file("orchestrator", "relay-choice", &hold);
+    b.settle(6).await;
+    let card = b.card(ITEM).event_id;
+    (b, card)
+}
+
+/// bench_reply's line lands whole and signed, with or without a tap, and the
+/// tap keeps its own file: a reply is never an answer.
+#[tokio::test]
+async fn the_owners_reply_lands_whole_and_signed_and_is_never_an_answer() {
+    let (mut b, card) = hold_bench().await;
+    let before = b.posts().len();
+    let text = "Waiting on the relay quote";
+    crate::bench::commands::reply_card(&b.ctx, &b.s, ITEM, &card, text, b.now)
+        .await
+        .unwrap();
+    let why: nostr::Event = serde_json::from_value(b.posts()[before].0.clone()).unwrap();
+    reply(&b, &[&why]);
+    assert_eq!(reply_file(&b, ITEM), None);
+    b.tick().await.unwrap();
+    let file = reply_file(&b, ITEM).unwrap();
+    for field in [
+        "id",
+        "pubkey",
+        "kind",
+        "created_at",
+        "tags",
+        "content",
+        "sig",
+    ] {
+        assert_eq!(file[field], whole(&why).unwrap()[field], "{field}");
+    }
+    assert_eq!(tag_value(&file, "client").unwrap(), "bench:why");
+    let signed: nostr::Event = serde_json::from_value(file).unwrap();
+    assert!(signed.verify().is_ok() && signed.sig == why.sig && signed.content == text);
+    assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
+
+    // Written only when it would change: a tick with nothing new leaves it.
+    let path = b.root.join(format!("outbox/{ITEM}.reply.json"));
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    b.tick().await.unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+
+    let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&hold, &why]);
+    b.tick().await.unwrap();
+    assert_eq!(outbox(&b).unwrap()["reaction"], whole(&hold).unwrap());
+    assert_eq!(reply_file(&b, ITEM), whole(&why));
+    // Undoing the tap takes its answer; the reply is still on the card.
+    reply(&b, &[&why]);
+    b.tick().await.unwrap();
+    assert!(outbox(&b).is_none());
+    assert_eq!(reply_file(&b, ITEM), whole(&why));
+}
+
+/// A stamped answerer's reply is the card's Other, and a members.txt key
+/// counts as the owner's for answers, but only the owner's own key is the
+/// one a writer can pin. The owner's notices and an owner's "2" are no reply.
+#[tokio::test]
+async fn only_the_owners_own_key_writes_a_reply_file() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let craig = thread_reply(&p.craig, &card, "Not yet", b.now, &[]);
+    reply(&b, &[&list, &craig]);
+    b.tick().await.unwrap();
+    let by = b.s.items[ASK].reply.as_ref().unwrap().by.clone();
+    assert_eq!(by, super::channels::hex(&p.craig));
+    assert_eq!(reply_file(&b, ASK), None);
+    // The owner's older reply is the file's, past Craig's newer one.
+    let older = craig.created_at.as_secs() - 1;
+    let mine = thread_reply(&b.ctx.owner, &card, "Holding", older, &[]);
+    reply(&b, &[&list, &craig, &mine]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ASK), whole(&mine));
+
+    let (mut b, card) = hold_bench().await;
+    let phone = Keys::generate();
+    let hex = phone.public_key().to_hex();
+    std::fs::write(b.root.join("members.txt"), &hex).unwrap();
+    let theirs = thread_reply(&phone, &card, "From the phone", b.now, &[]);
+    reply(&b, &[&theirs]);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].reply.as_ref().unwrap().by, hex);
+    assert_eq!(reply_file(&b, ITEM), None);
+    // Older than the phone's, so only the owner's key alone can pick it.
+    let older = theirs.created_at.as_secs() - 1;
+    let mine = thread_reply(&b.ctx.owner, &card, "Holding", older, &[]);
+    reply(&b, &[&theirs, &mine]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), whole(&mine));
+
+    let notice = nostr::EventBuilder::new(nostr::Kind::from(9u16), "The owner chose: Stay")
+        .tags([
+            nostr::Tag::parse(["e", card.as_str(), "", "reply"]).unwrap(),
+            nostr::Tag::parse(["client", "bench:route:x@1"]).unwrap(),
+        ])
+        .sign_with_keys(&b.ctx.owner)
+        .unwrap();
+    let chose = thread_reply(&b.ctx.owner, &card, "2", b.now, &[]);
+    reply(&b, &[&notice, &chose]);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ITEM].answer.as_ref().unwrap().option, 1);
+    assert!(outbox(&b).is_some());
+    assert_eq!(reply_file(&b, ITEM), None);
+}
+
+#[tokio::test]
+async fn the_newest_owner_reply_wins_and_a_deleted_one_hands_back() {
+    let (mut b, card) = hold_bench().await;
+    let first = thread_reply(&b.ctx.owner, &card, "First thought", b.now, &[]);
+    let second = thread_reply(&b.ctx.owner, &card, "Second thought", b.now + 1, &[]);
+    reply(&b, &[&second, &first]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), whole(&second));
+    reply(&b, &[&first]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), whole(&first));
+    reply(&b, &[]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), None);
+}
+
+/// The reason stays with its card: the relay still showing the reply never
+/// brings the file back for the closed card or for the one after it.
+#[tokio::test]
+async fn the_reply_file_goes_when_the_card_closes_or_is_replaced() {
+    let (mut b, card) = hold_bench().await;
+    let why = thread_reply(&b.ctx.owner, &card, "Why", b.now, &[]);
+    reply(&b, &[&why]);
+    b.tick().await.unwrap();
+    assert!(reply_file(&b, ITEM).is_some());
+    let done = drop_json(&[
+        ("kind", json!("status")),
+        ("state", json!("done")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+    ]);
+    b.drop_file("orchestrator", "relay-choice", &done);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), None);
+    b.settle(2).await;
+    assert_eq!(reply_file(&b, ITEM), None);
+
+    // Asked again: a new Drop and a new card.
+    let (mut b, card) = hold_bench().await;
+    let why = thread_reply(&b.ctx.owner, &card, "Why", b.now, &[]);
+    reply(&b, &[&why]);
+    b.tick().await.unwrap();
+    let again = drop_json(&[("recommend", json!(1)), ("title", json!("Asked again"))]);
+    b.drop_file("orchestrator", "relay-choice", &again);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), None);
+    b.settle(2).await;
+    assert_ne!(b.card(ITEM).event_id, card);
+    assert_eq!(reply_file(&b, ITEM), None);
+
+    // The same Drop on a new event, its card gone from the relay: nothing
+    // comes back from the old card, and a reply on the new one counts.
+    let (mut b, card) = hold_bench().await;
+    let why = thread_reply(&b.ctx.owner, &card, "Why", b.now, &[]);
+    reply(&b, &[&why]);
+    b.tick().await.unwrap();
+    publish::forget_card(&b.ctx, &mut b.s, ITEM);
+    assert_eq!(reply_file(&b, ITEM), None);
+    b.settle(2).await;
+    let new = b.card(ITEM).event_id;
+    assert_ne!(new, card);
+    assert_eq!(reply_file(&b, ITEM), None);
+    let next = thread_reply(&b.ctx.owner, &new, "Why now", b.now, &[]);
+    reply(&b, &[&why, &next]);
+    b.tick().await.unwrap();
+    assert_eq!(reply_file(&b, ITEM), whole(&next));
+
+    // A rebuild finds a newer card of another Drop, which is not live, so
+    // no read of it could clear the file.
+    let stale = format!("bench:card:{ITEM}@abcd.4");
+    let newer = kind9(&b.ctx.writer, b.now + 1, Some(stale.as_str()));
+    reply(&b, &[&newer, &next]);
+    b.s.needs_rebuild = true;
+    b.tick().await.unwrap();
+    assert_eq!(b.card(ITEM).event_id, newer.id.to_hex());
+    assert_eq!(reply_file(&b, ITEM), None);
 }

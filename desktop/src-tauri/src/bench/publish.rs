@@ -8,9 +8,9 @@ use std::sync::{Mutex, PoisonError};
 
 use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
-    forget_card, item, live_card, local_hhmm, next_ts, post_as_writer, query, query_writer,
-    same_drop, save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS,
-    MAX_CARDS, RECOVER_LIMIT,
+    item, live_card, local_hhmm, next_ts, outbox, post_as_writer, query, query_writer, same_drop,
+    save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS,
+    RECOVER_LIMIT,
 };
 use crate::events;
 
@@ -71,6 +71,19 @@ pub(super) fn in_use(s: &BenchState, now: u64) -> usize {
         })
         .count();
     kept + open(s).filter(|i| placed(i)).count()
+}
+
+/// Forget a card that is gone from the relay. It keeps its place (`repost`);
+/// one of the same Drop, whose owner was pinged, reposts quietly.
+pub(super) fn forget_card(ctx: &Ctx<'_>, s: &mut BenchState, id: &str) {
+    let i = s.items.get_mut(id).expect("carded id");
+    let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));
+    i.quiet_repost |= same;
+    i.repost |= i.card.is_some();
+    i.card = None;
+    i.recorded = None;
+    s.board_dirty = true;
+    outbox::remove_reply(&ctx.root, id);
 }
 
 /// Twice the relay's +-900 s created_at window: past it the relay refuses an
@@ -475,7 +488,7 @@ pub(super) async fn publish(
             }
             // A hand-deleted card: the answer stays and is never reposted; an
             // unanswered one comes back through (c).
-            Err(e) if e.contains("not found") => forget_card(s, &id),
+            Err(e) if e.contains("not found") => forget_card(ctx, s, &id),
             Err(e) => return Err(e),
         }
     }
@@ -501,7 +514,7 @@ pub(super) async fn publish(
                 let i = s.items.get_mut(&id).expect("receipt id");
                 i.card.as_mut().expect("receipt card").hash = hash;
             }
-            Err(e) if e.contains("not found") => forget_card(s, &id),
+            Err(e) if e.contains("not found") => forget_card(ctx, s, &id),
             Err(e) => return Err(e),
         }
     }
@@ -636,7 +649,7 @@ pub(super) async fn publish(
                 // tick. The relay refused it, so an owner's never landed.
                 Err(e) if thread.is_some() && e.contains("not found") => {
                     s.items.get_mut(&id).expect("routed id").owner_sent = None;
-                    forget_card(s, &id);
+                    forget_card(ctx, s, &id);
                     continue;
                 }
                 r => r?,
@@ -678,7 +691,7 @@ pub(super) async fn publish(
         );
         match posted.await {
             Err(e) if thread.is_some() && e.contains("not found") => {
-                forget_card(s, &id);
+                forget_card(ctx, s, &id);
                 continue;
             }
             r => r?,
@@ -719,7 +732,7 @@ pub(super) async fn publish(
         } else {
             delete(ctx, s, &ch, &card.event_id, now).await?;
         }
-        forget_card(s, &id);
+        forget_card(ctx, s, &id);
     }
 
     // (c) Post missing cards, adopting a recovered orphan when its hash matches.
