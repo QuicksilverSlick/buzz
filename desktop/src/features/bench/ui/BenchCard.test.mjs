@@ -43,6 +43,7 @@ let QueryClient;
 let QueryClientProvider;
 let TooltipProvider;
 let BenchCard;
+let clearBenchWhys;
 let formatBenchCreated;
 let useBenchCardForMessage;
 
@@ -177,12 +178,14 @@ before(async () => {
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
   ({ BenchCard } = await import("./BenchCard.tsx"));
+  ({ clearBenchWhys } = await import("./BenchWhyBox.tsx"));
   ({ formatBenchCreated } = await import("../lib/benchCards.ts"));
   ({ useBenchCardForMessage } = await import("../useBenchCards.ts"));
 });
 
 afterEach(() => {
   cleanup?.();
+  clearBenchWhys?.();
   for (const client of clients.splice(0)) {
     client.cancelQueries();
     client.clear();
@@ -988,4 +991,183 @@ test("a retired post is read-only, from its own text, with a link to the live ca
   );
   assert.equal(root.querySelector("button, fieldset"), null);
   cleanup();
+});
+
+test("Why? after a hold tap: survives a remount, keeps its text on a failed send, closes on undo", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  ipcHandlers.set("bench_reply", () =>
+    Promise.reject(
+      '"2" reads as an answer on this card; say it in other words',
+    ),
+  );
+  const held = card({
+    cardEventId: "4".repeat(64),
+    writer: "steward",
+    repliesTold: true,
+  });
+  const why = () => screen.queryByRole("textbox", { name: "Why? (optional)" });
+  await act(async () => {
+    render(wrap(benchCard({ card: held })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.ok(
+    screen.getByText(
+      "Sent to steward as a reply on this card. Send opens once the card records your tap.",
+    ),
+  );
+  await act(async () => {
+    fireEvent.change(why(), { target: { value: " 2 " } });
+  });
+  assert.equal(screen.getByRole("button", { name: "Send" }).disabled, true);
+  // The Bench screen moves an answered card to another section: a remount.
+  cleanup();
+  const recorded = card({
+    ...held,
+    recorded: 1,
+    answer: { option: 1, answeredAt: 1 },
+  });
+  await act(async () => {
+    render(wrap(benchCard({ card: recorded })));
+  });
+  assert.equal(why().value, " 2 ");
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  });
+  assert.deepEqual(
+    ipcCalls.map((c) => [c.cmd, c.args.text ?? c.args.option]),
+    [
+      ["bench_answer", 1],
+      ["bench_reply", "2"],
+    ],
+  );
+  assert.equal(
+    screen.getByRole("alert").textContent,
+    'Couldn\'t send the reason: "2" reads as an answer on this card; say it in other words',
+  );
+  assert.equal(why().value, " 2 ", "the text stays to retry");
+  // Undoing the hold closes the box.
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.equal(answerCalls().at(-1).option, null);
+  assert.equal(why(), null);
+});
+
+test("Why? never sends before the tap is recorded, says no agent hears it, and says so when the card outran it", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.reject("relay unreachable"));
+  const held = card({
+    cardEventId: "5".repeat(64),
+    options: ["Ship it", "Keep holding"],
+  });
+  const why = () => screen.queryByRole("textbox", { name: "Why? (optional)" });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: held })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Keep holding"));
+  });
+  assert.ok(screen.getByText("Couldn't save: relay unreachable"));
+  await act(async () => {
+    fireEvent.change(why(), { target: { value: "Waiting on Craig" } });
+  });
+  const send = screen.getByRole("button", { name: "Send" });
+  assert.equal(send.disabled, true);
+  assert.equal(send.title, "Waiting for the card to record your tap");
+  assert.ok(
+    screen.getByText(
+      "Posted as a reply on this card; no agent is told for dreamforge. Send opens once the card records your tap.",
+    ),
+  );
+  // Enter does nothing either: a failed tap never lets the reason go.
+  await act(async () => {
+    fireEvent.submit(why().closest("form"));
+  });
+  assert.deepEqual(
+    ipcCalls.map((c) => c.cmd),
+    ["bench_answer"],
+  );
+  // The card is replaced before the reason went: say so, never drop it.
+  await act(async () => {
+    view.rerender(
+      wrap(benchCard({ card: { ...held, cardEventId: "6".repeat(64) } })),
+    );
+  });
+  assert.equal(why(), null);
+  const lost =
+    'This card changed before your reason went, so it was not sent: "Waiting on Craig"';
+  assert.ok(screen.getByText(lost));
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+  });
+  assert.equal(screen.queryByText(lost), null);
+});
+
+test("Why?: Enter sends and focus goes back to the tap; Escape skips the same way", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  ipcHandlers.set("bench_reply", () => Promise.resolve(null));
+  const held = card({
+    cardEventId: "7".repeat(64),
+    writer: "steward",
+    repliesTold: true,
+  });
+  const why = () => screen.queryByRole("textbox", { name: "Why? (optional)" });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: held })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  const recorded = {
+    ...held,
+    recorded: 1,
+    answer: { option: 1, answeredAt: 1 },
+  };
+  await act(async () => {
+    view.rerender(wrap(benchCard({ card: recorded })));
+  });
+  const input = why();
+  assert.equal(document.activeElement, input);
+  assert.equal(
+    document.getElementById(input.getAttribute("aria-describedby")).textContent,
+    "Sent to steward as a reply on this card. Skip, and only your tap goes.",
+  );
+  await act(async () => {
+    fireEvent.change(input, { target: { value: "Waiting on Craig" } });
+  });
+  await act(async () => {
+    fireEvent.submit(input.closest("form"));
+  });
+  assert.deepEqual(ipcCalls.at(-1), {
+    cmd: "bench_reply",
+    args: {
+      itemId: held.id,
+      cardEventId: "7".repeat(64),
+      text: "Waiting on Craig",
+    },
+  });
+  assert.equal(
+    screen.getByTestId("bench-card-why-sent").textContent,
+    "Your reason went to steward as a reply on this card.",
+  );
+  assert.equal(document.activeElement, optionButton("2. Hold"));
+
+  cleanup();
+  await act(async () => {
+    render(wrap(benchCard({ card: card({ id: "steward/other" }) })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  let kept;
+  await act(async () => {
+    kept = fireEvent.keyDown(why(), { key: "Escape" });
+  });
+  assert.equal(kept, false, "the box takes Escape, not mark-as-read");
+  assert.equal(why(), null);
+  assert.equal(document.activeElement, optionButton("2. Hold"));
+  assert.equal(ipcCalls.filter((c) => c.cmd === "bench_reply").length, 1);
 });

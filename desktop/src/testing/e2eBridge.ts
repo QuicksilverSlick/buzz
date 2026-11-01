@@ -15427,6 +15427,9 @@ export function maybeInstallE2eTauriMocks() {
       // and leaves `recorded` to the configured snapshot.
       case "bench_answer":
         return null;
+      // The real command posts the owner's reply in the card's thread.
+      case "bench_reply":
+        return null;
       case "set_prevent_sleep_active":
         return null;
       case "set_window_vibrancy":

@@ -110,21 +110,35 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
 /// The notice for a free-text reply on a card (its Other): any scoped card,
 /// and an unscoped one whose writer has a route. Like an
 /// answer notice it carries no reply text: the agent reads the reply itself
-/// in the thread, with the trust it gives that person.
+/// in the thread, with the trust it gives that person. A reply beside the
+/// same person's answer (a hold's reason, say) leaves that answer to its
+/// own notice, which waits for the settle.
 pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
     let Some(r) = &item.reply else {
         return String::new();
     };
     let id = &item.id;
-    format!(
-        "Bench reply \u{b7} {id}\nCard: {}\n{} replied in this thread at {hhmm} instead of \
-         choosing an option. Read their reply (event {}) in this thread, answer them there, \
-         and when it is settled close the card by re-dropping {id} as a decision or status \
-         with the outcome.",
+    let head = format!(
+        "Bench reply \u{b7} {id}\nCard: {}\n{} replied in this thread at {hhmm}",
         plain_text(&item.title, usize::MAX),
         answerer_text(item, r.by_name.as_deref(), r.role),
-        r.event_id
-    )
+    );
+    let theirs = item.answer.as_ref().filter(|a| a.by == r.by);
+    match theirs.and_then(|a| Some((a.option, item.options.get(a.option)?))) {
+        Some((n, o)) => format!(
+            "{head} beside their answer {}. {}. Read their reply (event {}) in this thread and \
+             answer them there; act on the answer as its own Bench answer notice says.",
+            n + 1,
+            plain_text(o, usize::MAX),
+            r.event_id
+        ),
+        None => format!(
+            "{head} instead of choosing an option. Read their reply (event {}) in this thread, \
+             answer them there, and when it is settled close the card by re-dropping {id} as a \
+             decision or status with the outcome.",
+            r.event_id
+        ),
+    }
 }
 
 /// Text the owner's own message may carry: exactly what both apps showed

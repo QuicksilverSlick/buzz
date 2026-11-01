@@ -109,6 +109,27 @@ export function useBenchAnswer() {
   });
 }
 
+export type BenchReplyInput = {
+  itemId: string;
+  /** The card the owner saw: the Bench refuses a reply on any other. */
+  cardEventId: string;
+  /** One line; the Bench refuses text it would read as an option. */
+  text: string;
+};
+
+/**
+ * The owner's one-line reply in the card's thread, through `bench_reply`
+ * (the Bench's own relay and keys, like a tap): the Bench reads it as the
+ * card's Other and tells the card's writer.
+ */
+export function sendBenchReply({
+  itemId,
+  cardEventId,
+  text,
+}: BenchReplyInput): Promise<void> {
+  return invokeTauri<void>("bench_reply", { itemId, cardEventId, text });
+}
+
 /**
  * The sidebar's Bench badge: null while the Bench is not enabled (the entry
  * hides), else how many items need the owner. The sidebar is always mounted,
