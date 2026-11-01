@@ -26,7 +26,10 @@ const CHUNK: usize = 480; // 20 ms at 24 kHz.
 const SENT_CAP: usize = 4_096;
 const TAPS: usize = 31;
 /// A tick gap past this is a stall: audio queued through it is dropped, never played late.
-const STALL_MS: u64 = 5 * TICK_MS;
+pub(crate) const STALL_MS: u64 = 5 * TICK_MS;
+/// How long an index that changed hands is held back. v2 frames carry no occupancy epoch, so a
+/// delayed frame of the old occupant would otherwise be heard as the new one.
+const QUARANTINE_MS: u64 = 500;
 
 /// Who the voice may hear. The caller computes `admitted` with the agent's author gate and
 /// `agents` from the room's `bot` roles, trusted 30177 records, Talos, and this agent itself.
@@ -117,6 +120,15 @@ pub enum Out {
     Pcm(Vec<u8>),
 }
 
+/// One admitted human's decoded level this tick, for barge-in. `isolated` marks the owner's
+/// desktop on headphones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Level {
+    pub index: u8,
+    pub isolated: bool,
+    pub dbov: i8,
+}
+
 /// One send-log entry: this span's audio filled session ms `from_ms..to_ms`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sent {
@@ -191,6 +203,9 @@ pub struct Input {
     output_until_ms: u64,
     secret: Vec<Range<u64>>,
     last_tick_ms: Option<u64>,
+    levels: Vec<Level>,
+    /// Index to the unix ms its frames are heard again.
+    quarantine: HashMap<u8, u64>,
 }
 
 impl Input {
@@ -213,24 +228,61 @@ impl Input {
 
     /// Replace the peer map from a relay snapshot (the initial `Joined::peers`).
     pub fn set_roster(&mut self, peers: &[Peer]) {
-        self.roster.clear();
-        self.add_peers(peers);
-    }
-
-    /// Add or replace peers; a slot whose occupant changed loses its state.
-    fn add_peers(&mut self, peers: &[Peer]) {
-        let entries = peers.iter().map(|p| (p.index, (p.pubkey.clone(), p.epoch)));
-        self.roster.extend(entries);
+        self.roster = peers.iter().map(|p| (p.index, key(p))).collect();
         self.prune();
     }
 
+    /// Rebuild the peer map from a full snapshot after a gap: a new socket's after a reconnect,
+    /// or the relay's `roster` resync after missed deltas. An index whose occupant changed, or
+    /// is new, is not heard for 500 ms. Every index the snapshot does not list counts as a `left`
+    /// missed in the gap, even one never seen (its `joined` may have been missed too), so a
+    /// `joined` reusing it within 500 ms is held back as after a `left`.
+    pub fn rejoin(&mut self, peers: &[Peer], now_ms: u64) {
+        // ponytail: holds all 256 indices, so a brand-new join right after a resync waits 500 ms.
+        for i in 0..=u8::MAX {
+            if !peers.iter().any(|p| p.index == i) {
+                self.quarantine.insert(i, now_ms + QUARANTINE_MS);
+            }
+        }
+        for p in peers {
+            if self.roster.get(&p.index) != Some(&key(p)) {
+                self.quarantine.insert(p.index, now_ms + QUARANTINE_MS);
+            }
+        }
+        self.set_roster(peers);
+    }
+
+    /// Add or replace peers; a slot whose occupant changed loses its state. An index that
+    /// changed hands, or that `left` or a snapshot freed under 500 ms ago, is not heard for
+    /// 500 ms from `now_ms`; one never used, or whose occupant stayed, is heard at once.
+    fn add_peers(&mut self, peers: &[Peer], now_ms: u64) {
+        for p in peers {
+            let changed = match self.roster.insert(p.index, key(p)) {
+                Some(old) => old != key(p),
+                None => self.held(p.index, now_ms),
+            };
+            if changed {
+                self.quarantine.insert(p.index, now_ms + QUARANTINE_MS);
+            }
+        }
+        self.prune();
+    }
+
+    fn held(&self, index: u8, now_ms: u64) -> bool {
+        self.quarantine
+            .get(&index)
+            .is_some_and(|&until| now_ms < until)
+    }
+
     /// Apply a relay control message. `roster` is the full snapshot; `joined` adds its peers
-    /// (all of them locally, only the newcomer from another pod); `left` drops one.
-    pub fn on_control(&mut self, msg: &serde_json::Value) {
+    /// (all of them locally, only the newcomer from another pod); `left` drops one, and a
+    /// `joined` reusing its index within 500 ms is held back. `now_ms` is the clock `on_audio`
+    /// checks the quarantine against.
+    pub fn on_control(&mut self, msg: &serde_json::Value, now_ms: u64) {
         match msg["type"].as_str() {
             Some(kind @ ("joined" | "roster")) => match parse_peers(msg) {
-                Ok(peers) if kind == "roster" => self.set_roster(&peers),
-                Ok(peers) => self.add_peers(&peers),
+                Ok(peers) if kind == "roster" => self.rejoin(&peers, now_ms),
+                Ok(peers) => self.add_peers(&peers, now_ms),
                 Err(e) => tracing::warn!(error = %e, "huddle bridge: bad roster"),
             },
             Some("left") => {
@@ -239,6 +291,7 @@ impl Input {
                     .and_then(|i| u8::try_from(i).ok())
                 {
                     self.roster.remove(&index);
+                    self.quarantine.insert(index, now_ms + QUARANTINE_MS);
                     self.prune();
                 }
             }
@@ -252,6 +305,9 @@ impl Input {
         let Some((index, header, opus)) = parse_relay_frame(data) else {
             return;
         };
+        if self.held(index, now_ms) {
+            return;
+        }
         let Some(key) = self.roster.get(&index) else {
             return;
         };
@@ -305,9 +361,16 @@ impl Input {
         self.pending.clear();
     }
 
-    /// The voice's own output plays until `unix_ms` (set by the output path).
+    /// The voice's own output, sent and queued, plays until `unix_ms`. The output path sets it
+    /// every step, so a flush (a cut, a lost floor) ends the half-duplex window there, plus its
+    /// tail.
     pub fn set_output_until(&mut self, unix_ms: u64) {
-        self.output_until_ms = self.output_until_ms.max(unix_ms);
+        self.output_until_ms = unix_ms;
+    }
+
+    /// Each admitted human's level at the last tick.
+    pub fn levels(&self) -> impl Iterator<Item = Level> + '_ {
+        self.levels.iter().copied()
     }
 
     /// Talos marked unix ms `from_ms..to_ms`, on its clock, secret; it arrived at `now_ms`. The
@@ -422,7 +485,8 @@ impl Input {
             .filter(|(pk, _)| *pk == self.policy.owner)
             .count();
         let desktop_here = self.route.here && owner_peers == 1;
-        for slot in self.slots.values_mut() {
+        self.levels.clear();
+        for (&index, slot) in self.slots.iter_mut() {
             slot.last.clear();
             // Age bounds the ring, so sparse ticks can't keep audio past RING_MS.
             slot.ring.retain(|(t, _)| fresh(*t, now_ms));
@@ -433,9 +497,8 @@ impl Input {
             } else {
                 None
             };
-            let loud = pcm
-                .as_ref()
-                .is_some_and(|pcm| audio_level_dbov(pcm) >= t.speech_dbov);
+            let dbov = pcm.as_deref().map_or(-127, audio_level_dbov);
+            let loud = dbov >= t.speech_dbov;
             // ponytail: the route names the desktop only when the owner has one peer here.
             // Upgrade: have the desktop write its peer index into the route file.
             let desktop = desktop_here && slot.key.0 == self.policy.owner;
@@ -444,8 +507,13 @@ impl Input {
             } else {
                 t.remote_tail_ms
             };
-            slot.echo = !(desktop && self.route.isolated)
-                && now_ms < self.output_until_ms.saturating_add(tail);
+            let isolated = desktop && self.route.isolated;
+            self.levels.push(Level {
+                index,
+                isolated,
+                dbov,
+            });
+            slot.echo = !isolated && now_ms < self.output_until_ms.saturating_add(tail);
             if let Some(pcm) = pcm {
                 slot.last = slot.down.process(&pcm);
                 // A replay or preroll never carries secret audio or the voice's own echo.
@@ -456,10 +524,10 @@ impl Input {
                     }
                 }
             }
-            // An onset in the echo goes out once the echo clears, if the talk goes on.
+            // An onset in the echo goes out on speech once the echo clears, not on its hangover.
             let onset = slot.hear(loud, now_ms, &t);
             slot.onset = (slot.onset || onset) && slot.talking;
-            if slot.onset && !slot.echo {
+            if slot.onset && !slot.echo && loud {
                 slot.onset = false;
                 out.push(Out::Frame(ToTalos::Onset {
                     pubkey: slot.key.0.clone(),
@@ -593,6 +661,10 @@ impl Input {
             self.floor = None;
         }
     }
+}
+
+fn key(p: &Peer) -> (String, u8) {
+    (p.pubkey.clone(), p.epoch)
 }
 
 /// A ring entry stamped `t` is still inside the ring at `now_ms`. One stamped ahead of `now_ms`
@@ -788,11 +860,11 @@ mod tests {
         ];
         let out = run(&mut input, &mut now, 400, &mut others);
         assert!(frames(&out).is_empty() && !voiced(&out));
-        // A new occupant of slot 4 that the gate admits is heard. From another pod `joined`
-        // lists only the newcomer, and everyone else stays.
+        // A new occupant of slot 4 that the gate admits is heard, after its 500 ms hold. From
+        // another pod `joined` lists only the newcomer, and everyone else stays.
         let peers = serde_json::json!([{"pubkey": GUEST, "peer_index": 4, "epoch": 1}]);
-        input.on_control(&serde_json::json!({"type": "joined", "peers": peers}));
-        let out = run(&mut input, &mut now, 400, &mut others);
+        input.on_control(&serde_json::json!({"type": "joined", "peers": peers}), now);
+        let out = run(&mut input, &mut now, 800, &mut others);
         let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
         assert_eq!(frames(&out)[0], &onset(GUEST));
         let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
@@ -804,11 +876,11 @@ mod tests {
             humans: humans.iter().map(|pk| pk.to_string()).collect(),
             voices: voices.iter().map(|pk| pk.to_string()).collect(),
         };
-        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}));
+        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}), now);
         assert_eq!(input.roster_frame(), roster(&[OWNER, GUEST], &[AGENT]));
         // `roster` is the full snapshot.
         let peers = serde_json::json!([{"pubkey": OWNER, "peer_index": 1}]);
-        input.on_control(&serde_json::json!({"type": "roster", "peers": peers}));
+        input.on_control(&serde_json::json!({"type": "roster", "peers": peers}), now);
         assert_eq!(input.roster_frame(), roster(&[OWNER], &[]));
     }
 
@@ -890,6 +962,12 @@ mod tests {
             pubkey: GUEST.into(),
         };
         assert_eq!(frames(&out), [&onset]);
+        // Talk that ends inside the echo (to +1.1 s) sends none, though its hangover outlasts it.
+        input = self::input();
+        input.set_output_until(now + 500);
+        let mut out = run(&mut input, &mut now, 850, &mut [talker(2, 0.3, None)]);
+        out.extend(run(&mut input, &mut now, 800, &mut []));
+        assert!(frames(&out).is_empty(), "{:?}", frames(&out));
     }
 
     #[test]
@@ -1034,6 +1112,207 @@ mod tests {
             input.tick(late);
             assert!(input.slots[&1].ring.iter().all(|(t, _)| *t == late));
         }
+    }
+
+    #[test]
+    fn a_rejoin_holds_back_indices_that_changed_hands_for_500_ms() {
+        let mut input = input();
+        let mut now = T0;
+        // The new socket's snapshot swaps the owner and the guest.
+        let peers = [(1, GUEST), (2, OWNER)].map(|(index, pk)| Peer {
+            index,
+            pubkey: pk.into(),
+            epoch: 0,
+        });
+        input.rejoin(&peers, now);
+        let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert!(frames(&out).is_empty(), "quarantined");
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(GUEST)]);
+        // An index whose occupant stayed is heard at once.
+        input.rejoin(&peers, now);
+        let out = run(&mut input, &mut now, 400, &mut [talker(2, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(OWNER)]);
+        // The relay's resync after missed deltas is the same stale view.
+        let swap = [(1, OWNER), (2, GUEST)]
+            .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}));
+        input.on_control(&serde_json::json!({"type": "roster", "peers": swap}), now);
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert!(frames(&out).is_empty(), "quarantined");
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(OWNER)]);
+    }
+
+    #[test]
+    fn a_roster_resync_before_any_tick_or_after_a_stall_holds_back_from_now() {
+        let swap = [(1, GUEST), (2, OWNER)]
+            .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}));
+        let msg = serde_json::json!({"type": "roster", "peers": swap});
+        let onset = ToTalos::Onset {
+            pubkey: GUEST.into(),
+        };
+        // The last tick was never, or a minute ago: neither is the clock the hold runs on.
+        for stall in [None, Some(60_000)] {
+            let mut input = input();
+            let mut now = T0;
+            if let Some(gap) = stall {
+                run(&mut input, &mut now, 100, &mut []);
+                now += gap;
+            }
+            input.on_control(&msg, now);
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert!(frames(&out).is_empty(), "quarantined ({stall:?})");
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert_eq!(frames(&out), [&onset]);
+        }
+    }
+
+    fn joined(peers: &[(u8, &str)]) -> serde_json::Value {
+        let peers: Vec<_> = peers
+            .iter()
+            .map(|(i, pk)| serde_json::json!({"pubkey": pk, "peer_index": i}))
+            .collect();
+        serde_json::json!({"type": "joined", "peers": peers})
+    }
+
+    #[test]
+    fn a_joined_reusing_an_index_holds_it_back_for_500_ms() {
+        let onset = ToTalos::Onset {
+            pubkey: GUEST.into(),
+        };
+        // `joined` hands the owner's index to the guest, or `left` frees it and `joined` reuses
+        // it 400 ms later: the hold runs 500 ms from the `joined` either way.
+        for gap in [None, Some(400)] {
+            let mut input = input();
+            let mut now = T0;
+            if let Some(gap) = gap {
+                let left = serde_json::json!({"type": "left", "peer_index": 1});
+                input.on_control(&left, now);
+                run(&mut input, &mut now, gap, &mut []);
+            }
+            input.on_control(&joined(&[(1, GUEST)]), now);
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert!(frames(&out).is_empty(), "quarantined ({gap:?})");
+            let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+            assert_eq!(frames(&out), [&onset]);
+        }
+    }
+
+    /// A frame on `index` at `at` is taken in as `pubkey`'s: the hold, probed directly.
+    fn takes(input: &mut Input, index: u8, pubkey: &str, at: u64) -> bool {
+        input.on_audio(&talker(index, 0.3, None).frame(), at);
+        input.slots.get(&index).is_some_and(|s| s.key.0 == pubkey)
+    }
+
+    /// `index` is `pubkey`'s exactly 500 ms after `at`: refused at +499, taken at +500.
+    fn held_500_ms(input: &mut Input, index: u8, pubkey: &str, at: u64) -> bool {
+        !takes(input, index, pubkey, at + 499) && takes(input, index, pubkey, at + 500)
+    }
+
+    #[test]
+    fn every_hold_is_500_ms_to_the_ms() {
+        let peers = |list: &[(u8, &str)]| -> Vec<Peer> {
+            let peer = |&(index, pk): &(u8, &str)| Peer {
+                index,
+                pubkey: pk.into(),
+                epoch: 0,
+            };
+            list.iter().map(peer).collect()
+        };
+        // The owner's index goes to the guest, in a reconnect's snapshot or live in `joined`.
+        let mut swapped = input();
+        swapped.rejoin(&peers(&[(1, GUEST), (2, OWNER)]), T0);
+        assert!(held_500_ms(&mut swapped, 1, GUEST, T0), "rejoin");
+        let mut swapped = input();
+        swapped.on_control(&joined(&[(1, GUEST)]), T0);
+        assert!(held_500_ms(&mut swapped, 1, GUEST, T0), "joined");
+        // `left` frees it, or a resync or a reconnect's snapshot no longer lists it (a `left`
+        // missed in the gap). A `joined` reusing it under 500 ms later is held 500 ms from the
+        // `joined`; one 500 ms later is heard at once.
+        let resync =
+            serde_json::json!({"type": "roster", "peers": [{"pubkey": GUEST, "peer_index": 2}]});
+        let left = serde_json::json!({"type": "left", "peer_index": 1});
+        for what in ["left", "resync", "reconnect"] {
+            for gap in [0, 250, 499, 500] {
+                let mut input = input();
+                match what {
+                    "left" => input.on_control(&left, T0),
+                    "resync" => input.on_control(&resync, T0),
+                    _ => input.rejoin(&peers(&[(2, GUEST)]), T0),
+                }
+                let at = T0 + gap;
+                input.on_control(&joined(&[(1, GUEST)]), at);
+                let ok = if gap < 500 {
+                    held_500_ms(&mut input, 1, GUEST, at)
+                } else {
+                    takes(&mut input, 1, GUEST, at)
+                };
+                assert!(ok, "{what}, then joined at +{gap} ms");
+            }
+        }
+        // An index the bridge never saw (its `joined` and `left` both missed) is held too.
+        for resync in [true, false] {
+            let mut input = input();
+            if resync {
+                input.on_control(&serde_json::json!({"type": "roster", "peers": []}), T0);
+            } else {
+                input.rejoin(&[], T0);
+            }
+            input.on_control(&joined(&[(5, GUEST)]), T0 + 10);
+            assert!(
+                held_500_ms(&mut input, 5, GUEST, T0 + 10),
+                "never-seen index, resync {resync}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_joined_on_a_fresh_or_unchanged_index_is_heard_at_once() {
+        let onset = |pk: &str| ToTalos::Onset { pubkey: pk.into() };
+        let mut input = input();
+        let mut now = T0;
+        // The first snapshot holds nothing back.
+        let out = run(&mut input, &mut now, 400, &mut [talker(1, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(OWNER)]);
+        // A local `joined` lists everyone: the newcomer on an index never used, the rest unchanged.
+        input.on_control(&joined(&[(1, OWNER), (2, GUEST), (5, GUEST)]), now);
+        let mut ts = [talker(2, 0.3, None), talker(5, 0.3, None)];
+        let out = run(&mut input, &mut now, 400, &mut ts);
+        assert_eq!(frames(&out), [&onset(GUEST), &onset(GUEST)]);
+        // An index freed 500 ms ago or more is fresh again.
+        input.on_control(&serde_json::json!({"type": "left", "peer_index": 2}), now);
+        run(&mut input, &mut now, 500, &mut []);
+        input.on_control(&joined(&[(2, GUEST)]), now);
+        let out = run(&mut input, &mut now, 400, &mut [talker(2, 0.3, None)]);
+        assert_eq!(frames(&out), [&onset(GUEST)]);
+    }
+
+    #[test]
+    fn levels_mark_the_isolated_desktop_and_a_cut_ends_the_echo_window() {
+        let mut input = input();
+        input.set_awake(true);
+        let mut now = T0;
+        input.set_route(Route {
+            here: true,
+            isolated: true,
+        });
+        input.set_output_until(now + 5_000);
+        let mut ts = [talker(1, 0.3, None), talker(2, 0.3, None)];
+        let out = run(&mut input, &mut now, 1_000, &mut ts);
+        let mut levels: Vec<_> = input.levels().collect();
+        levels.sort_by_key(|l| l.index);
+        let marks: Vec<_> = levels.iter().map(|l| (l.index, l.isolated)).collect();
+        assert_eq!(marks, [(1, true), (2, false)]);
+        assert!(levels.iter().all(|l| l.dbov > -20));
+        // The owner holds the floor; the guest on speakers is in the echo for 5 s, unless a cut
+        // ends the window: then only its 600 ms tail is left, and its audio is forwarded.
+        assert!(input.who_said(0, u64::MAX).all(|s| s.pubkey == OWNER));
+        assert!(voiced(&out));
+        ts[0].2 = 0.0;
+        input.set_output_until(now);
+        run(&mut input, &mut now, 1_000, &mut ts);
+        assert!(input.who_said(0, u64::MAX).any(|s| s.pubkey == GUEST));
     }
 
     #[test]
