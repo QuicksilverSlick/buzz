@@ -510,6 +510,111 @@ test("Craig's recorded answer: the owner overrides it, never undoes it", async (
   );
 });
 
+function bumpCalls() {
+  return ipcCalls.filter((c) => c.cmd === "bench_bump").map((c) => c.args);
+}
+
+test("a queued card says why, and a tap posts it next instead of answering", async () => {
+  ipcHandlers.set("bench_bump", () => Promise.resolve(null));
+  // Hold the 30 s wait so the test can run it out.
+  const waits = [];
+  const realSetTimeout = dom.window.setTimeout;
+  dom.window.setTimeout = (fn, ms, ...rest) =>
+    ms === 30_000 ? waits.push(fn) : realSetTimeout(fn, ms, ...rest);
+  try {
+    const queued = card({ cardEventId: null, waitsFor: "slot" });
+    await act(async () => {
+      render(wrap(benchCard({ card: queued, maxCards: 30 })));
+    });
+    const reason = screen.getByText(
+      "Queued: the Bench posts a new card only while fewer than 30 slots are in use; this one posts when a slot frees. Tap an option to post it now.",
+    );
+    assert.equal(optionButton("1. Ship it").disabled, false, "not grey");
+    // The button says what a tap does: it posts the card.
+    assert.equal(
+      optionButton("1. Ship it").getAttribute("aria-describedby"),
+      reason.id,
+    );
+    await act(async () => {
+      fireEvent.click(optionButton("1. Ship it"));
+    });
+    assert.deepEqual(bumpCalls(), [{ itemId: "dreamforge/ship-it" }]);
+    assert.deepEqual(answerCalls(), [], "a bump answers nothing");
+    assert.ok(
+      screen.getByText(
+        "Posting this card now. Tap your answer again once it's live.",
+      ),
+    );
+    // The tapped option keeps focus, busy; the rest wait: one bump at a time.
+    assert.equal(optionButton("1. Ship it").disabled, false);
+    assert.equal(optionButton("1. Ship it").getAttribute("aria-busy"), "true");
+    assert.equal(optionButton("2. Hold").disabled, true);
+    assert.equal(
+      screen.getByRole("group", { name: "Answer" }).getAttribute("aria-busy"),
+      "true",
+    );
+    // It never waits on nothing: past 30 s it says so and may go again.
+    assert.equal(waits.length, 1);
+    await act(async () => waits[0]());
+    assert.ok(
+      screen.getByText(
+        "Not posted after 30 s. The Bench may be offline; try again.",
+      ),
+    );
+    assert.equal(optionButton("2. Hold").disabled, false);
+  } finally {
+    dom.window.setTimeout = realSetTimeout;
+  }
+});
+
+test("a bump the Bench refuses says why", async () => {
+  const full =
+    "all 40 card slots are in use, the Bench's limit; answer or close a card first";
+  ipcHandlers.set("bench_bump", () => Promise.reject(full));
+  const queued = card({ cardEventId: null, waitsFor: "slot" });
+  await act(async () => {
+    render(wrap(benchCard({ card: queued, maxCards: 30 })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  await waitFor(() => screen.getByText(`Couldn't post it: ${full}`));
+  assert.equal(optionButton("1. Ship it").disabled, false);
+  assert.deepEqual(answerCalls(), []);
+});
+
+test("the live card a tap posted says that tap answered nothing", async () => {
+  ipcHandlers.set("bench_bump", () => Promise.resolve(null));
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  const queued = card({
+    id: "dreamforge/posted",
+    cardEventId: null,
+    waitsFor: "slot",
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: queued, maxCards: 30 })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  // It posts: the Bench screen keys the row by its card, so a new row.
+  const live = { ...queued, cardEventId: "e".repeat(64), waitsFor: null };
+  await act(async () => {
+    view.rerender(wrap(benchCard({ card: live, key: live.cardEventId })));
+  });
+  const posted =
+    "Posted at your request. Your earlier tap didn't answer it; tap your answer now.";
+  assert.ok(screen.getByText(posted));
+  assert.equal(document.activeElement, optionButton("2. Hold"));
+  assert.deepEqual(answerCalls(), [], "nothing answered on its own");
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.equal(answerCalls().length, 1);
+  assert.equal(screen.queryByText(posted), null);
+});
+
 test("a receipt shows the request, the answer and the outcome as inert text", async () => {
   const request = scoped({
     title: "Send the <b>new</b> email?",
