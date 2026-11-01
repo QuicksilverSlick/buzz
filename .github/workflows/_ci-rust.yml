@@ -27,7 +27,7 @@ env:
 jobs:
   rust-lint:
     name: Rust Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust)
     permissions:
@@ -37,6 +37,7 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
+          prefix-key: v0-rust-ubuntu2404
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Format check
         run: just fmt-check
@@ -47,7 +48,7 @@ jobs:
 
   unit-tests:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -58,6 +59,7 @@ jobs:
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
+          prefix-key: v0-rust-ubuntu2404
           key: sherpa-cache-v1
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install cargo-nextest
@@ -75,7 +77,7 @@ jobs:
 
   server-cross-compile:
     name: Server Cross-Compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     if: inputs.lane == 'cross-compile' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -91,6 +93,7 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
+          prefix-key: v0-rust-ubuntu2404
           key: cross-${{ matrix.target }}
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install cross
@@ -222,7 +225,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [rust-lint, unit-tests, server-cross-compile, windows-rust]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     outputs:

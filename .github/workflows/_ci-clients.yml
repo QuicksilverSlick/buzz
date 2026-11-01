@@ -25,7 +25,7 @@ env:
 jobs:
   web:
     name: Web
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.web)
     permissions:
@@ -61,7 +61,7 @@ jobs:
   # matrix result. Test shards split files, so each compiles only its own.
   mobile:
     name: Mobile (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Dreamforge will publish its own phone app (plan Q8), but the fork does not build it
     # yet. Drop this block/buzz guard (here and on ci.yml's mobile jobs) with slice A2.
@@ -257,7 +257,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [web, mobile, mobile-swift]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     outputs:
