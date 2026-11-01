@@ -269,7 +269,11 @@ async fn bench_reply_posts_one_owner_line_in_the_card_thread() {
     assert_eq!(ev["content"], json!("Waiting on the quote"));
     assert_eq!(
         ev["tags"],
-        json!([["h", b.channel()], ["e", card, "", "reply"]])
+        json!([
+            ["h", b.channel()],
+            ["e", card, "", "reply"],
+            ["client", "bench:why"]
+        ])
     );
 
     let ask = b.card(ASK).event_id;
@@ -311,7 +315,10 @@ async fn bench_reply_posts_one_owner_line_in_the_card_thread() {
     .await
     .unwrap();
     let ev = &b.posts()[posts].0;
-    assert_eq!(ev["tags"], json!([["h", X], ["e", ask, "", "reply"]]));
+    assert_eq!(
+        ev["tags"],
+        json!([["h", X], ["e", ask, "", "reply"], ["client", "bench:why"]])
+    );
 }
 
 #[tokio::test]
