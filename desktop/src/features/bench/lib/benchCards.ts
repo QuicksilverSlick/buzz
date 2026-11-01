@@ -105,6 +105,11 @@ export type BenchCard = {
   updatedAt: string;
   /** The live card's kind 9 id (a receipt's kept card); null when none. */
   cardEventId: string | null;
+  /**
+   * Why an open card has no card on the relay yet: queued for a slot, or its
+   * channel is not ready; null (or absent, on older snapshots) otherwise.
+   */
+  waitsFor?: "slot" | "channel" | null;
   answer: BenchAnswer | null;
   /** 0-based option the card text shows as Recorded; null = unanswered. */
   recorded: number | null;
@@ -139,6 +144,8 @@ export type BenchSnapshot = {
   ownerPubkey: string | null;
   lastError: string | null;
   lastTick: string;
+  /** How many open cards the Bench keeps on the relay at once. */
+  maxCards?: number;
   items: BenchCard[];
 };
 
@@ -349,12 +356,30 @@ export type BenchCardMode = {
   interactive: boolean;
   /** Why a pending card's options are read-only. */
   readOnlyReason: string | null;
+  /** Not on the relay yet: an option tap posts it next (`bench_bump`). */
+  bumpable?: true;
 };
+
+/** "the Bench posts a new card only while fewer than 30 slots are in use" */
+function capRule(maxCards: number | undefined): string {
+  return `the Bench posts a new card only while fewer than ${maxCards ?? "its limit of"} slots are in use`;
+}
+
+/** The Bench header's alarm when cards wait for a slot; null when none do. */
+export function benchQueuedLine(
+  snapshot: Pick<BenchSnapshot, "items" | "maxCards">,
+): string | null {
+  const n = snapshot.items.filter((card) => card.waitsFor === "slot").length;
+  if (n === 0) return null;
+  const wait = n === 1 ? "1 card waits" : `${n} cards wait`;
+  return `${wait} off the relay: ${capRule(snapshot.maxCards)}, and each posts when a slot frees. Tap one below to post it now.`;
+}
 
 export function benchCardMode(
   card: BenchCard,
   ownerPubkey: string | null,
   viewerPubkey: string | undefined,
+  maxCards?: number,
 ): BenchCardMode {
   if (card.kind !== "pending") {
     return { interactive: false, readOnlyReason: null };
@@ -364,13 +389,27 @@ export function benchCardMode(
     readOnlyReason,
   });
   // Only the Bench screen shows an item without a live card: an answered one
-  // whose card was retired, or one the Bench has yet to (re)post.
+  // whose card was retired, or one the Bench has yet to (re)post. A queued
+  // one says why, and the owner's tap posts it next.
   if (!card.cardEventId) {
-    return readOnly(
-      card.answer
-        ? "This card is no longer live."
-        : "Waiting for the Bench to post this card in #bench.",
-    );
+    if (card.answer) return readOnly("This card is no longer live.");
+    if (card.waitsFor === "channel") {
+      return readOnly(
+        "Waiting: this card's channel isn't ready for cards yet.",
+      );
+    }
+    if (card.waitsFor !== "slot") {
+      return readOnly("Waiting for the Bench to post this card.");
+    }
+    const queued = `Queued: ${capRule(maxCards)}; this one posts when a slot frees.`;
+    const owner =
+      ownerPubkey !== null &&
+      (viewerPubkey === undefined || sameKey(viewerPubkey, ownerPubkey));
+    if (!owner) return readOnly(queued);
+    return {
+      ...readOnly(`${queued} Tap an option to post it now.`),
+      bumpable: true,
+    };
   }
   if (card.validity === "superseded") {
     return readOnly("Superseded: this card is being retired.");
@@ -515,6 +554,17 @@ function linkScheme(url: string): SafeBenchLink["scheme"] | null {
   if (parsed.protocol === "buzz:" && url.startsWith("buzz://")) return "buzz";
   return null;
 }
+
+/** How long a tap on a card off the relay waits for it to post. */
+export const BENCH_BUMP_TIMEOUT_MS = 30_000;
+export const BENCH_BUMP_POSTING =
+  "Posting this card now. Tap your answer again once it's live.";
+export const BENCH_BUMP_TIMEOUT_MESSAGE =
+  "Not posted after 30 s. The Bench may be offline; try again.";
+/** How long the live card that replaces a tapped one still says so (BUMP_SECS). */
+export const BENCH_BUMP_HINT_MS = 120_000;
+export const BENCH_BUMP_POSTED =
+  "Posted at your request. Your earlier tap didn't answer it; tap your answer now.";
 
 /** How long a click waits for the snapshot to show it recorded. */
 export const BENCH_SAVE_TIMEOUT_MS = 15_000;
