@@ -989,3 +989,56 @@ test("a retired post is read-only, from its own text, with a link to the live ca
   assert.equal(root.querySelector("button, fieldset"), null);
   cleanup();
 });
+
+test("Why? after a hold tap: survives a remount, keeps its text on a failed send, closes on undo", async () => {
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  ipcHandlers.set("bench_reply", () =>
+    Promise.reject(
+      '"2" reads as an answer on this card; say it in other words',
+    ),
+  );
+  const held = card({ cardEventId: "4".repeat(64), writer: "steward" });
+  const why = () => screen.queryByRole("textbox", { name: "Why? (optional)" });
+  await act(async () => {
+    render(wrap(benchCard({ card: held })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.ok(screen.getByText(/^Sent to steward as a reply on this card\./));
+  await act(async () => {
+    fireEvent.change(why(), { target: { value: " 2 " } });
+  });
+  // The Bench screen moves an answered card to another section: a remount.
+  cleanup();
+  const recorded = card({
+    ...held,
+    recorded: 1,
+    answer: { option: 1, answeredAt: 1 },
+  });
+  await act(async () => {
+    render(wrap(benchCard({ card: recorded })));
+  });
+  assert.equal(why().value, " 2 ");
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  });
+  assert.deepEqual(
+    ipcCalls.map((c) => [c.cmd, c.args.text ?? c.args.option]),
+    [
+      ["bench_answer", 1],
+      ["bench_reply", "2"],
+    ],
+  );
+  assert.equal(
+    screen.getByRole("alert").textContent,
+    'Couldn\'t send the reason: "2" reads as an answer on this card; say it in other words',
+  );
+  assert.equal(why().value, " 2 ", "the text stays to retry");
+  // Undoing the hold closes the box.
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.equal(answerCalls().at(-1).option, null);
+  assert.equal(why(), null);
+});

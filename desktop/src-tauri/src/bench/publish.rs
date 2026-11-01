@@ -191,7 +191,7 @@ fn slot<'a>(s: &'a mut BenchState, id: &str, ends: bool) -> &'a mut item::Item {
 }
 
 /// A card's thread: under the root it was posted in reply to, if any.
-fn thread_of(
+pub(super) fn thread_of(
     card: Option<&Posted>,
     root: Option<&str>,
 ) -> Result<Option<events::ThreadRef>, String> {

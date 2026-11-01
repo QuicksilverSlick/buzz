@@ -7,6 +7,7 @@ import {
   INITIAL_BENCH_ANSWER_STATE,
   answerTarget,
   benchAnswerReducer,
+  benchAsksWhy,
   benchCardMarkerItemId,
   benchCardMode,
   benchCreatedSeconds,
@@ -945,6 +946,15 @@ test("labels: For names each answerer and role; owner-only has none", () => {
   assert.equal(benchForLabel(scoped()), "For Craig · Decider");
   assert.equal(benchForLabel(card()), null);
   assert.equal(benchSeverityChip("critical").label, "Your decision");
+});
+
+test("asks why: hold, send back and close options only", () => {
+  const asks =
+    "Hold|Keep holding|Send it back|Send back to Reset Worker|Close it|Hold for now|  hold  ";
+  for (const label of asks.split("|")) assert.ok(benchAsksWhy(label), label);
+  const never =
+    "Ship it|Merge it|Merge it when checks pass|Got it|Not yet|Holder|Withhold|Close|Send|";
+  for (const label of never.split("|")) assert.ok(!benchAsksWhy(label), label);
 });
 
 test("options: the recommended option is marked", () => {

@@ -638,6 +638,21 @@ function shownOption(card: BenchCard): number | null {
   );
 }
 
+/**
+ * Options that hold, send back or close a card ("Hold", "Keep holding",
+ * "Send it back", "Send back to Reset Worker", "Close it"): a tap on one
+ * offers an optional Why? box, so the writer hears the reason. Only these
+ * openings, so a Ship it or Merge it never asks.
+ */
+const ASKS_WHY = /^(?:hold|keep holding|send (?:it )?back|close it)\b/i;
+
+export function benchAsksWhy(option: string): boolean {
+  return ASKS_WHY.test(option.trim());
+}
+
+/** The longest Why? line `bench_reply` sends (commands.rs REPLY_MAX). */
+export const BENCH_REASON_MAX = 300;
+
 export function benchOptionViews(
   card: BenchCard,
   state: BenchAnswerState,

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 import type { BenchCards } from "../../src/features/bench/lib/benchCards";
 import { installMockBridge } from "../helpers/bridge";
@@ -371,4 +371,110 @@ test("a replaced card's post shows read-only from its own text and links the liv
   // In its own channel the jump lands on the live card (here, its thread).
   await retired.getByRole("link", { name: "Go to the newer card" }).click();
   await expect(page).toHaveURL(new RegExp(cardId));
+});
+
+/** A steward hold card (answered `recorded`) and an Orchestrator card. */
+function holdSnapshot(recorded: number | null): BenchCards {
+  const snapshot = benchSnapshot(recorded);
+  if (!snapshot.enabled) throw new Error("the Bench is on");
+  const [card] = snapshot.items;
+  snapshot.items = [
+    {
+      ...card,
+      id: "steward/hold-104",
+      writer: "steward",
+      title: "Ship buzz PR 104?",
+      options: ["Ship it", "Send it back", "Keep holding"],
+    },
+    {
+      ...card,
+      id: "orchestrator/pr-767",
+      writer: "orchestrator",
+      title: "Merge PR 767?",
+      options: ["Merge it", "Send back to Reset Worker", "Hold"],
+      cardEventId: "c".repeat(64),
+      answer: null,
+      recorded: null,
+    },
+  ];
+  return snapshot;
+}
+
+/** The Bench commands sent, in order, as [command, payload]. */
+function sent(page: Page) {
+  return page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
+      .filter(
+        (e) => e.command === "bench_answer" || e.command === "bench_reply",
+      )
+      .map((e) => [e.command, e.payload]),
+  );
+}
+
+const tap = (itemId: string, cardEventId: string, option: number) => [
+  "bench_answer",
+  { itemId, cardEventId, option },
+];
+
+test("a hold with a reason sends the tap, then one reply on the card", async ({
+  page,
+}) => {
+  await installMockBridge(page, { benchCards: holdSnapshot(null) });
+  await page.goto("/");
+  await page.getByTestId("open-bench-view").click();
+  await page.getByRole("button", { name: /^3\. Keep holding/ }).click();
+  const hold = tap("steward/hold-104", "e".repeat(64), 2);
+  await expect.poll(() => sent(page)).toEqual([hold]);
+  const why = page.getByRole("textbox", { name: "Why? (optional)" });
+  await expect(why).toBeFocused();
+  await expect(page.getByText("Sent to steward as a reply")).toBeVisible();
+  await why.fill("Waiting on the mobile build");
+
+  // The tick records the tap: the card moves to Answered mid-reason.
+  await page.evaluate((next) => {
+    const config = window.__BUZZ_E2E__;
+    if (config) config.mock = { ...config.mock, benchCards: next };
+  }, holdSnapshot(2));
+  const answered = page.getByTestId("bench-section-answered");
+  await expect(answered.getByTestId("bench-card-recorded")).toHaveText(
+    /^Recorded: 3\. Keep holding/,
+    { timeout: 10_000 },
+  );
+  await expect(why).toHaveValue("Waiting on the mobile build");
+  await answered.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(answered.getByTestId("bench-card-why-sent")).toHaveText(
+    "Your reason went to steward as a reply on this card.",
+  );
+  expect(await sent(page)).toEqual([
+    hold,
+    [
+      "bench_reply",
+      {
+        itemId: "steward/hold-104",
+        cardEventId: "e".repeat(64),
+        text: "Waiting on the mobile build",
+      },
+    ],
+  ]);
+});
+
+test("a hold without a reason sends only the tap; Ship it never asks", async ({
+  page,
+}) => {
+  await installMockBridge(page, { benchCards: holdSnapshot(null) });
+  await page.goto("/");
+  await page.getByTestId("open-bench-view").click();
+  const box = page.getByRole("form", { name: "Why? (optional)" });
+  await page.getByRole("button", { name: /^2\. Send back to Reset/ }).click();
+  await expect(page.getByText("Sent to orchestrator as a reply")).toBeVisible();
+  await page.getByRole("button", { name: "Skip", exact: true }).click();
+  await expect(box).toHaveCount(0);
+  await page.getByRole("button", { name: /^1\. Ship it/ }).click();
+  const ship = tap("steward/hold-104", "e".repeat(64), 0);
+  await expect.poll(() => sent(page)).toContainEqual(ship);
+  await expect(box).toHaveCount(0);
+  expect(await sent(page)).toEqual([
+    tap("orchestrator/pr-767", "c".repeat(64), 1),
+    ship,
+  ]);
 });

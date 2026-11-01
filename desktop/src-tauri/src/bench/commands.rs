@@ -1,7 +1,9 @@
 //! Desktop cards: `bench_cards`, a read-only view of state.json for the
 //! Dreamforge Bench screen, `bench_answer`, which answers a card with the
 //! owner's own keycap reaction so the running tick records it like a phone
-//! tap, and `bench_bump`, which asks the tick to post a queued card next.
+//! tap, `bench_reply`, the owner's one-line reply in a card's thread (a
+//! hold's reason), and `bench_bump`, which asks the tick to post a queued
+//! card next.
 //! None writes state.json; none returns or logs key material.
 
 use std::path::Path;
@@ -334,16 +336,74 @@ async fn remove_reaction(ctx: &Ctx<'_>, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `option`: Some(i) answers with option i (0-based), None clears the answer,
-/// on the card `card_event_id` names. The Bench relay and keys, never the
-/// app's active community.
-#[tauri::command]
-pub(crate) async fn bench_answer(
-    item_id: String,
-    card_event_id: String,
-    option: Option<u8>,
-    state: tauri::State<'_, AppState>,
+/// The longest reply `reply_card` sends: one line (the desktop's
+/// BENCH_REASON_MAX).
+pub(crate) const REPLY_MAX: usize = 300;
+
+/// bench_reply's relay half: the owner's one-line reply in the thread of the
+/// live card `card_event_id`, from the owner's keys on the Bench relay, where
+/// the tick reads it as the card's Other and tells the writer's route target
+/// (`item::pick_reply`, publish (a3)). Never an answer: text the tick would
+/// read as one (`item::answer_option`) is refused, so a reason sent after a
+/// tap never changes the tap. No p tags, so it is told (`item::tell_reply`).
+pub(crate) async fn reply_card(
+    ctx: &Ctx<'_>,
+    s: &BenchState,
+    item_id: &str,
+    card_event_id: &str,
+    text: &str,
+    now: u64,
 ) -> Result<(), String> {
+    let item = s
+        .items
+        .get(item_id)
+        .ok_or_else(|| format!("no Bench item {item_id:?}"))?;
+    if item.kind != ItemKind::Pending {
+        return Err(format!("{item_id} is not a pending item"));
+    }
+    let card = match live_card(item) {
+        Some(c) if c.event_id == card_event_id => c,
+        _ => return Err(CARD_CHANGED.to_string()),
+    };
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > REPLY_MAX || text.chars().any(char::is_control) {
+        return Err(format!(
+            "a reply here is one line of 1 to {REPLY_MAX} characters"
+        ));
+    }
+    if s.owner_pubkey != ctx.owner.public_key().to_hex() {
+        return Err("owner identity changed; refusing to reply".to_string());
+    }
+    let ch = super::channels::card_channel(s, item);
+    let ch = uuid::Uuid::parse_str(&ch).map_err(|e| e.to_string())?;
+    let thread = super::publish::thread_of(Some(card), item.reply_to.as_deref())?;
+    let ev = events::build_message(
+        ch,
+        text,
+        thread.as_ref(),
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &ctx.base,
+    )?
+    .custom_created_at(nostr::Timestamp::from(now))
+    .sign_with_keys(&ctx.owner)
+    .map_err(|e| e.to_string())?;
+    if item::answer_option(item, &card.event_id, &ev, None).is_some() {
+        return Err(format!(
+            "\"{text}\" reads as an answer on this card; say it in other words"
+        ));
+    }
+    super::submit(ctx, &ev, &ctx.owner, None).await?;
+    Ok(())
+}
+
+/// The Bench relay and keys for a desktop command, never the app's active
+/// community, with the state the last tick saved.
+fn desk_ctx(state: &AppState) -> Result<(Ctx<'_>, BenchState), String> {
     let env = std::env::var("BUZZ_BENCH_RELAY_URL").ok();
     let relay =
         super::relay_ws_from(env.as_deref()).ok_or("the Bench is disabled in this build")?;
@@ -353,7 +413,7 @@ pub(crate) async fn bench_answer(
     }
     let (s, _) = load_state(&root);
     let ctx = Ctx {
-        state: state.inner(),
+        state,
         base: crate::relay::relay_http_base_url(&relay),
         owner: state.signing_keys()?,
         writer: super::writer_keys()?,
@@ -361,8 +421,35 @@ pub(crate) async fn bench_answer(
         agents: Vec::new(),
         access: Vec::new(),
     };
+    Ok((ctx, s))
+}
+
+/// `option`: Some(i) answers with option i (0-based), None clears the answer,
+/// on the card `card_event_id` names.
+#[tauri::command]
+pub(crate) async fn bench_answer(
+    item_id: String,
+    card_event_id: String,
+    option: Option<u8>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let (ctx, s) = desk_ctx(state.inner())?;
     let now = nostr::Timestamp::now().as_secs();
     answer_card(&ctx, &s, &item_id, &card_event_id, option, now).await
+}
+
+/// The owner's one-line reply (a hold's reason, say) on the card
+/// `card_event_id` names, in its thread (`reply_card`).
+#[tauri::command]
+pub(crate) async fn bench_reply(
+    item_id: String,
+    card_event_id: String,
+    text: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let (ctx, s) = desk_ctx(state.inner())?;
+    let now = nostr::Timestamp::now().as_secs();
+    reply_card(&ctx, &s, &item_id, &card_event_id, &text, now).await
 }
 
 /// Ask the running tick to post `item_id` next, past `MAX_CARDS` up to

@@ -34,6 +34,10 @@ import {
   BenchCardBlocks,
   BenchCardDetails,
 } from "@/features/bench/ui/BenchCardFields";
+import {
+  BenchWhyBox,
+  benchWhyAfterClick,
+} from "@/features/bench/ui/BenchWhyBox";
 import { useBenchAnswer } from "@/features/bench/useBenchCards";
 import { buildMessageLink } from "@/features/messages/lib/messageLink";
 import { openPopoverLink } from "@/features/messages/lib/openPopoverLink";
@@ -54,11 +58,14 @@ function formatBenchTime(unixSeconds: number): string {
  * was written by an agent, so it renders as plain React text: never
  * markdown, never HTML. Option buttons answer through `bench_answer` with the
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
- * it. `onOther` opens the card's thread: Other, where a reply is the
- * answer, and Open thread, on every card that has one, beside when the card
- * was created. A closed card is its receipt: the question, the answer and
- * the outcome. A `retiredPost` (one a newer card replaced) is read-only, from
- * its own text, so it never answers twice.
+ * it. A tap on a hold-type option (Hold, Keep holding, Send it back, Close
+ * it) also offers an optional Why? line, sent as the owner's reply on the
+ * card (`BenchWhyBox`); the tap never waits on it. `onOther` opens the
+ * card's thread: Other, where a reply is the answer, and Open thread, on
+ * every card that has one, beside when the card was created. A closed card
+ * is its receipt: the question, the answer and the outcome. A `retiredPost`
+ * (one a newer card replaced) is read-only, from its own text, so it never
+ * answers twice.
  */
 export function BenchCard({
   card,
@@ -154,6 +161,7 @@ function BenchQuestionCard({
     // Unchanged attempt: a save is still in flight, so the click is ignored.
     if (next.attempt === storedState.attempt) return;
     dispatch(action);
+    benchWhyAfterClick(card, cardEventId, next.target);
     answer({ itemId: card.id, cardEventId, option: next.target }).catch(
       (error: unknown) => {
         dispatch({
@@ -214,6 +222,9 @@ function BenchQuestionCard({
             </Button>
           ) : null}
         </fieldset>
+      ) : null}
+      {interactive && card.kind === "pending" && card.cardEventId ? (
+        <BenchWhyBox card={card} cardEventId={card.cardEventId} />
       ) : null}
       <div aria-live="polite" className="text-xs">
         {saving ? (
