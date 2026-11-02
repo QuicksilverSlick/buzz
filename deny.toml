@@ -15,6 +15,11 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # zip < 9: ZipArchive::extract aborts the process on a symlink entry with a large declared size. First seen 2 Nov 2026,
+    # fixed only in 9.0.0. Two copies remain and neither takes an archive a stranger chose. Root 8.6.0: only via mesh-llm into
+    # buzz-mesh-smoke, whose harnesses never ship. Desktop 4.6.1: only via tauri-plugin-updater, which verifies the update's
+    # signature before it extracts. Our own use is zip 9. Remove this when mesh-llm moves off zip 8 and the updater is >= 2.14.1.
+    { id = "RUSTSEC-2026-0429", reason = "zip < 9: mesh-llm into the unshipped smoke harness; tauri-plugin-updater extracts only signed updates; no fixed version for mesh-llm yet" },
     # Desktop workspace (desktop/src-tauri) — unmaintained crates with no safe upgrade.
     # audiopus_sys: via `opus` 0.3 (huddle Opus decoder); fix is switching Opus bindings.
     { id = "RUSTSEC-2026-0150", reason = "desktop: audiopus_sys via opus; no maintained replacement adopted yet" },
