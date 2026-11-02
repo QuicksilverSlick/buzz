@@ -15430,6 +15430,10 @@ export function maybeInstallE2eTauriMocks() {
       // The real command posts the owner's reply in the card's thread.
       case "bench_reply":
         return null;
+      // The real command asks the Bench to post a queued card next; the
+      // mock leaves `cardEventId` to the configured snapshot.
+      case "bench_bump":
+        return null;
       case "set_prevent_sleep_active":
         return null;
       case "set_window_vibrancy":
