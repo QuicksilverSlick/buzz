@@ -17,9 +17,9 @@ const OWNER = "a".repeat(64);
 const OTHER = "b".repeat(64);
 const CHANNEL = "11111111-1111-4111-8111-111111111111";
 
-test("the palette is eight distinct colors with their classes written out", () => {
-  assert.equal(PROJECT_COLORS.length, 8);
-  assert.equal(new Set(PROJECT_COLORS.map((c) => c.id)).size, 8);
+test("the palette is ten distinct colors with their classes written out", () => {
+  assert.equal(PROJECT_COLORS.length, 10);
+  assert.equal(new Set(PROJECT_COLORS.map((c) => c.id)).size, 10);
   for (const color of PROJECT_COLORS) {
     assert.equal(
       color.text,
@@ -55,6 +55,11 @@ test("a project with no known color gets the same one from its d-tag", () => {
     Array.from({ length: 64 }, (_, i) => fallbackProjectColor(`p-${i}`).id),
   );
   assert.ok(spread.size >= 6, "fallbacks spread over the palette");
+  // A larger palette recolors nothing: the hash stays over the first eight.
+  const first = PROJECT_COLORS.slice(0, 8).map((c) => c.id);
+  for (const id of spread) assert.ok(first.includes(id), id);
+  assert.equal(reset.id, "red");
+  assert.equal(fallbackProjectColor("dreamforge").id, "teal");
 });
 
 test("a new project takes the owner's first unused color, then cycles", () => {
@@ -81,7 +86,7 @@ test("a new project takes the owner's first unused color, then cycles", () => {
     nextProjectColor([mine(undefined, "old")], OWNER).id,
     fallback.id,
   );
-  // All eight taken: back to the first; then the next one taken least.
+  // All taken: back to the first; then the next one taken least.
   const all = ids.map((id) => mine(id));
   assert.equal(nextProjectColor(all, OWNER).id, ids[0]);
   assert.equal(nextProjectColor([...all, mine(ids[0])], OWNER).id, ids[1]);

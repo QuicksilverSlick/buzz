@@ -487,7 +487,7 @@ function registrySnapshot(
   };
 }
 
-test("registry tabs: Talos beside Dreamforge, and old areas follow", async ({
+test("registry tabs: Talos beside Dreamforge, old areas follow, Other says why", async ({
   page,
 }) => {
   await installMockBridge(page, { benchCards: registrySnapshot(REGISTRY) });
@@ -506,11 +506,17 @@ test("registry tabs: Talos beside Dreamforge, and old areas follow", async ({
     "Talos, part of Dreamforge",
   );
   await expect(page.getByTestId("bench-projects-notice")).toHaveCount(0);
+  await expect(page.getByTestId("bench-other-reason")).toHaveCount(0);
 
   await page.getByTestId("bench-tab-talos").click();
   const status = page.getByTestId("bench-section-status");
   await expect(status.getByText("Card dreamforge-talos")).toBeVisible();
   await expect(status.getByText("Card buzz")).toHaveCount(0);
+
+  await page.getByTestId("bench-tab-other").click();
+  await expect(page.getByTestId("bench-other-reason")).toHaveText(
+    "1 card names no project: factory (1). A project's alias in projects.json gives them a tab.",
+  );
 });
 
 test("a missing registry shows the built-in tabs and says so", async ({
@@ -530,4 +536,30 @@ test("a missing registry shows the built-in tabs and says so", async ({
   await expect(page.getByTestId("bench-tab-dreamforge")).toContainText(
     "Dreamforge2",
   );
+});
+
+test("past six project tabs the rest wait in More, and a pick shows inline", async ({
+  page,
+}) => {
+  const extra = ["alpha", "bravo", "charlie", "delta", "echo"].map((slug) => ({
+    slug,
+    label: slug.toUpperCase(),
+    parent: null,
+    aliases: [],
+  }));
+  await installMockBridge(page, {
+    benchCards: registrySnapshot([...REGISTRY, ...extra]),
+  });
+  await page.goto("/#/bench");
+  // Dreamforge, Talos, 28 Day Reset, ALPHA, BRAVO, CHARLIE inline.
+  await expect(page.getByTestId("bench-tab-charlie")).toBeVisible();
+  await expect(page.getByTestId("bench-tab-delta")).toHaveCount(0);
+  await expect(page.getByTestId("bench-tab-more")).toHaveText("More (2)");
+  await page.getByTestId("bench-tab-more").click();
+  await page.getByRole("menuitem", { name: /^ECHO/ }).click();
+  await expect(page.getByTestId("bench-tab-echo")).toHaveAttribute(
+    "data-state",
+    "active",
+  );
+  await expect(page.getByTestId("bench-tab-more")).toHaveText("More (1)");
 });

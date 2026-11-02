@@ -7,10 +7,13 @@ import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
 import { benchCardPlace } from "./benchCardLayout.ts";
 import {
   BUILT_IN_WORKBENCHES,
+  INLINE_PROJECT_TABS,
   adoptBenchProjects,
   benchTabs,
   cardWorkbench,
+  otherReason,
   slugWorkbench,
+  splitBenchTabs,
   workbenchColor,
   workbenchCounts,
   workbenchSnapshot,
@@ -246,4 +249,59 @@ test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow
   adoptBenchProjects({ ...SEEDED, projects: null });
   assert.equal(workbenches(), BUILT_IN_WORKBENCHES);
   assert.equal(cardWorkbench(VECTORS.cards[0]), "dreamforge");
+});
+
+test("Other says why its cards are there, each name once, largest first", () => {
+  const other = (area, project = null, validity = "current") => ({
+    area,
+    project,
+    validity,
+  });
+  assert.equal(otherReason([other("gone", null, "stale")]), null);
+  assert.match(
+    otherReason([other("factory")]),
+    /^1 card names no project: factory \(1\)\. /,
+  );
+  assert.match(
+    otherReason([other("your-desktop"), other("fathom"), other("x", "fathom")]),
+    /^3 cards name no project: fathom \(2\), your-desktop \(1\)\. /,
+  );
+});
+
+test("past six project tabs the rest wait in More, those needing the owner first", () => {
+  const ids = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+  const tabs = [
+    { id: "all", label: "All" },
+    ...ids.map((id) => ({ id, label: id })),
+    { id: "other", label: "Other" },
+  ];
+  const counts = { g: { needsYou: 0 }, h: { needsYou: 0 }, i: { needsYou: 2 } };
+  const shown = (open) => {
+    const { inline, more } = splitBenchTabs(tabs, open, counts);
+    return [inline.map((t) => t.id).join(""), more.map((t) => t.id).join("")];
+  };
+  assert.equal(INLINE_PROJECT_TABS, 6);
+  assert.deepEqual(shown("all"), ["allabcdefother", "igh"]);
+  // The open tab shows beside the six; an open tab among them adds none.
+  assert.deepEqual(shown("h"), ["allabcdefhother", "ig"]);
+  assert.deepEqual(shown("a"), ["allabcdefother", "igh"]);
+  // Six or fewer: no More.
+  assert.equal(splitBenchTabs(tabs.slice(0, 7), "all", null).more.length, 0);
+});
+
+test("a tab with no project of its own never borrows another tab's color", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  adoptBenchProjects(SEEDED);
+  const [dreamforge, talos, reset] = workbenches();
+  // Talos's own slug color is lime, which Reset already shows.
+  assert.equal(fallbackProjectColor("talos").id, "lime");
+  const projects = [project("28-day-reset", "28 Day Reset", "lime")];
+  assert.equal(workbenchColor(reset, projects, VIEWER).id, "lime");
+  assert.equal(
+    workbenchColor(dreamforge, projects, VIEWER),
+    fallbackProjectColor("dreamforge"),
+  );
+  assert.equal(workbenchColor(talos, projects, VIEWER).id, "sky");
+  // Without the clash, its own slug's color.
+  assert.equal(workbenchColor(talos, [], VIEWER).id, "lime");
 });

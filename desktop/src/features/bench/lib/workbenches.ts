@@ -15,6 +15,7 @@ import type {
 import { benchSections } from "@/features/bench/lib/benchScreen";
 import {
   fallbackProjectColor,
+  PROJECT_COLORS,
   type ProjectColor,
   projectColorOf,
 } from "@/features/projects/lib/projectColors";
@@ -90,17 +91,42 @@ export function adoptBenchProjects(cards: BenchCards | null | undefined): void {
     : BUILT_IN_WORKBENCHES;
 }
 
+export type BenchTabEntry = { id: BenchTab; label: string; parent?: string };
+
 /** All, the projects, then Other. */
-export function benchTabs(): ReadonlyArray<{
-  id: BenchTab;
-  label: string;
-  parent?: string;
-}> {
+export function benchTabs(): readonly BenchTabEntry[] {
   return [
     { id: "all", label: "All" },
     ...current.map(({ id, label, parent }) => ({ id, label, parent })),
     { id: "other", label: "Other" },
   ];
+}
+
+/** The tab strip is sized for this many projects (design section 8). */
+export const INLINE_PROJECT_TABS = 6;
+
+/**
+ * Past INLINE_PROJECT_TABS the rest wait in More, those that need the owner
+ * first. All, Other and the open tab always show.
+ */
+export function splitBenchTabs(
+  tabs: readonly BenchTabEntry[],
+  open: BenchTab,
+  counts: Record<BenchTab, WorkbenchCount> | null,
+): { inline: BenchTabEntry[]; more: BenchTabEntry[] } {
+  const needs = (t: BenchTabEntry) => counts?.[t.id]?.needsYou ?? 0;
+  const inline: BenchTabEntry[] = [];
+  const more: BenchTabEntry[] = [];
+  let projects = 0;
+  for (const t of tabs) {
+    const fixed = t.id === "all" || t.id === "other";
+    if (!fixed) projects += 1;
+    (fixed || t.id === open || projects <= INLINE_PROJECT_TABS
+      ? inline
+      : more
+    ).push(t);
+  }
+  return { inline, more: more.sort((a, b) => needs(b) - needs(a)) };
 }
 
 /**
@@ -139,22 +165,54 @@ export function compareProjectIds(
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
 }
 
+type ColorProjects = ReadonlyArray<
+  Pick<Project, "color" | "dtag" | "id" | "legacy" | "name" | "owner">
+>;
+
 /**
  * A workbench's color: the viewer's own project for it, else one of their
- * agents' (which they can recolor too), else the color a project with its
- * first slug gets. Then a d-tag equal to a slug (in slug order) beats one
- * that only starts with one or names it, an announced project beats a
- * repository-only one, then address order. Never a stranger's project, and
- * never recency: a recolor moves nothing.
+ * agents' (which they can recolor too); else the color a project with its
+ * first slug gets, or, when another tab already shows that, the first color
+ * no tab shows (so Talos, with no app project yet, never looks like Reset).
+ * Earlier tabs keep theirs, and past the palette colors repeat.
  */
+// ponytail: tabs^2 x projects per call, fine for the 6 to 12 tabs the strip is
+// sized for; a per-render color map if the registry nears its 50 projects.
 export function workbenchColor(
   workbench: Workbench,
-  projects: ReadonlyArray<
-    Pick<Project, "color" | "dtag" | "id" | "legacy" | "name" | "owner">
-  >,
+  projects: ColorProjects,
   viewerPubkey: string | undefined,
   viewerAgentPubkeys: ReadonlySet<string> = new Set(),
 ): ProjectColor {
+  const own = (w: Workbench) =>
+    ownProjectColor(w, projects, viewerPubkey, viewerAgentPubkeys);
+  const color = own(workbench);
+  if (color) return color;
+  const shown = new Set(current.flatMap((w) => own(w)?.id ?? []));
+  for (const w of current) {
+    if (own(w)) continue;
+    const slug = fallbackProjectColor(w.slugs[0]);
+    const pick = shown.has(slug.id)
+      ? (PROJECT_COLORS.find((c) => !shown.has(c.id)) ?? slug)
+      : slug;
+    if (w.id === workbench.id) return pick;
+    shown.add(pick.id);
+  }
+  return fallbackProjectColor(workbench.slugs[0]);
+}
+
+/**
+ * The project that colors a workbench: a d-tag equal to a slug (in slug
+ * order) beats one that only starts with one or names it, an announced project
+ * beats a repository-only one, then address order. Never a stranger's project,
+ * and never recency: a recolor moves nothing.
+ */
+function ownProjectColor(
+  workbench: Workbench,
+  projects: ColorProjects,
+  viewerPubkey: string | undefined,
+  viewerAgentPubkeys: ReadonlySet<string>,
+): ProjectColor | null {
   const viewer = viewerPubkey ? normalizePubkey(viewerPubkey) : undefined;
   const whose = (project: (typeof projects)[number]) => {
     const owner = normalizePubkey(project.owner);
@@ -177,9 +235,7 @@ export function workbenchColor(
       (a, b) =>
         whose(a) - whose(b) || rank(a) - rank(b) || compareProjectIds(a, b),
     );
-  return project
-    ? projectColorOf(project)
-    : fallbackProjectColor(workbench.slugs[0]);
+  return project ? projectColorOf(project) : null;
 }
 
 /** The card's project, else its area, else its writer; else Other. */
@@ -193,6 +249,27 @@ export function cardWorkbench(
       current.find((w) => w.writers.includes(card.writer))
     )?.id ?? "other"
   );
+}
+
+/**
+ * Why the Other tab's cards are there and how they get a tab: "3 cards name
+ * no project: fathom (2), your-desktop (1)."
+ */
+export function otherReason(
+  cards: ReadonlyArray<Pick<BenchCard, "area" | "project" | "validity">>,
+): string | null {
+  const live = cards.filter((card) => card.validity === "current");
+  if (live.length === 0) return null;
+  const names = new Map<string, number>();
+  for (const { area, project } of live) {
+    names.set(project ?? area, (names.get(project ?? area) ?? 0) + 1);
+  }
+  const list = [...names]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => `${name} (${count})`)
+    .join(", ");
+  const lead = live.length === 1 ? "1 card names" : `${live.length} cards name`;
+  return `${lead} no project: ${list}. A project's alias in projects.json gives them a tab.`;
 }
 
 export function workbenchLabel(id: WorkbenchId): string {
