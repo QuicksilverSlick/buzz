@@ -670,7 +670,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     assert_eq!(scan_inbox(root, now).len(), 3);
 
     let mut s = BenchState::default();
-    assert!(intake(&mut s, root, NOW, None, false));
+    assert!(intake(&mut s, root, NOW, 0, None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(
         (item.writer.as_str(), item.updated_at.as_str()),
@@ -698,7 +698,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     }
     assert!(inbox.join("old.rejected.json").exists());
     assert!(root.join("inbox/Bad Writer/z.json").exists());
-    assert!(!intake(&mut s, root, NOW, None, false));
+    assert!(!intake(&mut s, root, NOW, 0, None, false));
 
     // An identical re-drop is a no-op; a reworded one keeps the card.
     let card = Posted {
@@ -711,7 +711,14 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     s.items.get_mut("orchestrator/good").unwrap().card = Some(card.clone());
     std::fs::write(inbox.join("good.json"), drop_json(&[])).unwrap();
     backdate("orchestrator/good.json");
-    assert!(!intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
+    assert!(!intake(
+        &mut s,
+        root,
+        "2026-09-13T15:00:00Z",
+        0,
+        None,
+        false
+    ));
     assert_eq!(s.items["orchestrator/good"].updated_at, NOW);
     std::fs::write(
         inbox.join("good.json"),
@@ -719,7 +726,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     )
     .unwrap();
     backdate("orchestrator/good.json");
-    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
+    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z", 0, None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(item.card, Some(card));
     assert_ne!(item.hash, item.card.as_ref().unwrap().hash);
@@ -767,6 +774,8 @@ struct Relay {
     admins_down: Mutex<bool>,
     /// Its clock once set: an event over 900 s off is refused, first.
     clock: Mutex<Option<u64>>,
+    /// A /query naming this id in its `#e` fails with a 500.
+    e_down: Mutex<Option<String>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -852,6 +861,10 @@ async fn fake_query(
     if q[0]["kinds"] == json!([39001]) && *r.admins_down.lock().unwrap() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    let down = r.e_down.lock().unwrap().clone().map(|id| json!(id));
+    if down.is_some_and(|id| q[0]["#e"].as_array().is_some_and(|e| e.contains(&id))) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut evs = r.query_reply.lock().unwrap().clone();
     if let Some(authors) = q[0]["authors"].as_array() {
         evs.retain(|e| authors.contains(&e["pubkey"]));
@@ -924,6 +937,7 @@ impl Bench {
             keys: Keys::generate(),
             admins_down: Mutex::new(false),
             clock: Mutex::new(None),
+            e_down: Mutex::new(None),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
@@ -1464,5 +1478,6 @@ mod owner_signed;
 mod owner_word;
 mod projects;
 mod receipts;
+mod replaced;
 mod routes;
 mod scoped;

@@ -177,6 +177,8 @@ export type BenchPost = {
  */
 export function benchPostCard(item: BenchCard, text: string): BenchPost {
   const lines = text.split("\n");
+  // An old post's first line (bench/replaced.rs): its Closed note says the same.
+  if (lines[0]?.endsWith("A tap here doesn't count.")) lines.shift();
   if (lines[0] === "Back to you") lines.shift();
   const meta = (lines.shift() ?? "").split(" · ").slice(1).join(" · ");
   const title = /^\*\*([^*]+)\*\*$/.exec(lines[0] ?? "")?.[1];

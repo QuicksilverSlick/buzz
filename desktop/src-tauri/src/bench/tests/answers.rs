@@ -414,12 +414,13 @@ async fn ack_by_redrop_clears_answer_and_keeps_the_old_card() {
     );
     let old_board = board_id(&b);
     b.settle(3).await;
-    // A new question after an answer: the answered card stays on the relay as
-    // it is, a new one is posted and seeded, the board follows; the tap on
-    // the old card counts no more.
+    // A new question after an answer: the answered card stays on the relay, a
+    // new one is posted and seeded, the board follows; the old card then says
+    // the tap on it counts no more (tests/replaced.rs).
     let posts = b.posts()[before..].to_vec();
-    assert_eq!(b.kinds()[before..], [9, 7, 7, 9, 5]);
-    assert_eq!(tag_value(&posts[4].0, "e").unwrap(), old_board);
+    assert_eq!(b.kinds()[before..], [9, 7, 7, 40003, 9, 5]);
+    assert_eq!(tag_value(&posts[5].0, "e").unwrap(), old_board);
+    assert_eq!(tag_value(&posts[3].0, "e").unwrap(), card.event_id);
     let item = &b.s.items[ITEM];
     assert!(item.answer.is_none() && item.recorded.is_none());
     assert!(outbox(&b).is_none());
@@ -564,7 +565,11 @@ async fn stale_card_never_supplies_an_answer() {
     assert!(b.s.items[ITEM].answer.is_none());
     assert!(outbox(&b).is_none());
     let queries = b.relay.queries.lock().unwrap().clone();
-    let poll = queries.iter().rev().find(|q| q[0]["kinds"] == json!([7]));
+    // Named apart from the watch on the stale card, which is never the poll.
+    let poll = queries
+        .iter()
+        .rev()
+        .find(|q| q[0]["kinds"] == json!([7]) && q[0]["#e"] != json!([card.event_id]));
     assert_eq!(poll.unwrap()[0]["#e"], json!([other]));
     // (c) reposted it fresh; the owner's tap still on the stale card keeps
     // it on the relay, so (b) never retires it.

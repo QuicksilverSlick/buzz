@@ -5,7 +5,7 @@
 use super::answers::{last_query, reply, tap, ITEM};
 use super::*;
 
-fn close_out(b: &Bench, title: &str) {
+pub(super) fn close_out(b: &Bench, title: &str) {
     let drop = drop_json(&[
         ("kind", json!("decision")),
         ("decidedBy", json!("claude")),

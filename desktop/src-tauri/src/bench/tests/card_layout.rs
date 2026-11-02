@@ -47,6 +47,13 @@ fn the_shared_vector_is_the_card_the_bench_posts() {
     let closed = render_closed(&text)
         + &thread_line("8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10", &"e".repeat(64));
     assert_eq!(closed, v["closed"].as_str().unwrap());
+    // Its first line says so before anything else (the phone's old post).
+    let item = check(&overrides).unwrap();
+    let mut s = BenchState::default();
+    s.items.insert(item.id.clone(), item.clone());
+    let replaced = crate::bench::replaced::old_post(&s, &item.id, &text)
+        + &thread_line("8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10", &"e".repeat(64));
+    assert_eq!(replaced, v["replaced"].as_str().unwrap());
     // Every label, bold, once, in the writer's order.
     let labels: Vec<&str> = v["labels"]
         .as_array()
