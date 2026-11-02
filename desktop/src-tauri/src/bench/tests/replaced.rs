@@ -3,8 +3,11 @@
 //! harness are in scope.
 
 use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
+use super::channels::X;
+use super::receipts::close_out;
 use super::*;
-use crate::bench::replaced::{closed, WATCH_MAX};
+use crate::bench::channels::ChannelCheck;
+use crate::bench::replaced::{closed, tick as old_posts_tick, WATCH_MAX};
 
 const REPLACED: &str = "Replaced by a newer card. A tap here doesn't count.";
 
@@ -62,6 +65,59 @@ fn names(q: &Value, id: &str) -> bool {
         .is_some_and(|ids| ids.contains(&json!(id)))
 }
 
+/// The board's text as last posted or edited.
+fn board(b: &Bench) -> String {
+    let id = b.s.board.as_ref().unwrap().event_id.clone();
+    let posts = b.posts();
+    let is_board = |e: &Value| {
+        e["id"] == id.as_str() || (e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(&id))
+    };
+    let (e, _) = posts.iter().rev().find(|(e, _)| is_board(e)).unwrap();
+    content(e).to_string()
+}
+
+/// Ticks in which the clock reads `hhmm`.
+async fn ticks_at(b: &mut Bench, hhmm: &str, n: usize) {
+    for _ in 0..n {
+        b.now += 2;
+        tick(&b.ctx, &mut b.s, b.now, hhmm, NOW).await.unwrap();
+    }
+}
+
+/// One run of the old posts' own tick on `budget` posts; what it left of them.
+async fn old_tick(b: &mut Bench, mut budget: usize) -> usize {
+    let owners = [b.owner_hex()];
+    old_posts_tick(&b.ctx, &mut b.s, &mut budget, b.now, "14:05", &owners).await;
+    budget
+}
+
+/// An old post with no history, its id made from `n`, in `ch`.
+fn old_card(b: &mut Bench, n: usize, ch: &str) -> Posted {
+    let old = Posted {
+        event_id: format!("{n:064x}"),
+        ..b.card(ITEM)
+    };
+    closed(
+        &mut b.s,
+        &format!("orchestrator/old-{n}"),
+        ch,
+        &old,
+        None,
+        b.now,
+    );
+    old
+}
+
+/// The /queries made since `from` as the writer, the Bench's own lookups.
+fn lookups(b: &Bench, from: usize) -> usize {
+    let writer = json!([b.writer_hex()]);
+    let queries = b.relay.queries.lock().unwrap();
+    queries[from..]
+        .iter()
+        .filter(|q| q[0]["authors"] == writer)
+        .count()
+}
+
 /// An owner's answer on the seeded card, then a new question: the old card is
 /// left behind. Returns it and that answer's tap, all on the fake relay.
 async fn answered_then_replaced() -> (Bench, Posted, nostr::Event) {
@@ -88,8 +144,9 @@ async fn a_re_ask_edits_the_old_post_first_line_and_takes_its_seeds_off() {
     relay.push(&answer);
     reply(&b, &relay);
     b.tick().await.unwrap();
+    let at = b.s.items[ITEM].answer.as_ref().unwrap().hhmm.clone();
     redrop(&b, "Relay choice, reworded");
-    b.settle(3).await;
+    ticks_at(&mut b, "23:59", 3).await;
 
     let edited = last_edit(&b, &old.event_id);
     let text = content(&edited);
@@ -97,9 +154,12 @@ async fn a_re_ask_edits_the_old_post_first_line_and_takes_its_seeds_off() {
         text.starts_with(&format!("{REPLACED}\n🔴 · Dreamforge · orchestrator\n")),
         "{text}"
     );
-    // What it showed stays: the question it asked and what was recorded on it.
+    // What it showed stays: the question it asked and what was recorded on it,
+    // at the time it was recorded, not the time it was replaced.
     assert!(text.contains("**Relay choice**"), "{text}");
-    assert!(text.contains("\nRecorded: 2. Move · "), "{text}");
+    let recorded = format!("\nas of {at}\nRecorded: 2. Move · {at}\n");
+    assert!(text.contains(&recorded), "{text}");
+    assert!(!text.contains("23:59"), "{text}");
     assert!(text.contains("\n\nClosed: a tap or reply here is no longer read."));
     assert!(!text.contains("Tap one number"), "{text}");
     assert!(text.ends_with(&thread_line(&b.channel(), &old.event_id)));
@@ -144,6 +204,28 @@ async fn a_touched_stale_card_says_so_first_too() {
         // A heart is no keycap, so it is told nothing.
         assert!(replies(&b).is_empty());
     }
+}
+
+/// A receipt stores no time for its Outcome: the old post shows when the
+/// close-out came in, not when a new question replaced it.
+#[tokio::test]
+async fn an_old_receipt_keeps_its_outcome_time() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old = b.card(ITEM);
+    let answer = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&answer]);
+    b.tick().await.unwrap();
+    close_out(&b, "Moved the relay");
+    b.settle(2).await;
+    redrop(&b, "Relay choice, reworded");
+    ticks_at(&mut b, "23:59", 3).await;
+    let came_in = chrono::DateTime::parse_from_rfc3339(NOW).unwrap();
+    let came_in = local_hhmm(came_in.timestamp() as u64);
+    let edited = last_edit(&b, &old.event_id);
+    let text = content(&edited);
+    assert!(text.starts_with(REPLACED), "{text}");
+    assert!(text.contains(&format!("\n\nOutcome · {came_in}")), "{text}");
+    assert!(!text.contains("23:59"), "{text}");
 }
 
 /// `pending_reword_deletes_and_reposts_never_edits` pins the post; a deleted
@@ -301,22 +383,253 @@ async fn only_keycaps_that_are_new_are_a_tap() {
 #[tokio::test]
 async fn at_the_first_read_a_tap_from_before_the_replacement_is_no_new_tap() {
     for (late, want) in [(false, 0), (true, 1)] {
-        let mut b = seeded_bench(Gate::Open, &[]).await;
-        let old = b.card(ITEM);
-        let answer = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], b.now);
-        reply(&b, &[&answer]);
-        b.tick().await.unwrap();
-        redrop(&b, "Relay choice, reworded");
-        // The tick that takes this drop reads as of the tick's clock.
-        let at = b.now + 2;
+        let (mut b, old, answer) = answered_then_replaced().await;
+        // Its first read is yet to come, and the live poll never saw this tap.
+        b.s.replaced[0].read = false;
+        let at = b.s.replaced[0].at;
         let when = if late { at } else { at - 1 };
-        let tap2 = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[1], when);
+        let tap2 = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], when);
         reply(&b, &[&answer, &tap2]);
         b.settle(3).await;
         assert_eq!(replies(&b).len(), want, "late: {late}");
         assert!(b.s.items[ITEM].answer.is_none());
         assert!(outbox(&b).is_none());
     }
+}
+
+/// A tap the live poll read in the very tick the writer asked again: the old
+/// post says it is recorded and the new card comes back from it, so no reply
+/// says otherwise.
+#[tokio::test]
+async fn a_tap_recorded_in_the_tick_of_the_re_ask_is_no_new_tap() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old = b.card(ITEM);
+    let first = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&first]);
+    b.tick().await.unwrap();
+    redrop(&b, "Relay choice, reworded");
+    let second = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[1], b.now + 2);
+    reply(&b, &[&first, &second]);
+    b.settle(3).await;
+    assert!(replies(&b).is_empty());
+    let edited = last_edit(&b, &old.event_id);
+    assert!(content(&edited).contains("\nRecorded: 2. Move · "));
+    assert_eq!(b.s.items[ITEM].previous.as_ref().unwrap().option, 1);
+}
+
+/// His phone's clock runs ahead and the writer asks again within that lead: the
+/// answer it recorded, on the card or in a receipt, is no new tap and is never
+/// told it didn't count. A keycap it hasn't seen still is one.
+#[tokio::test]
+async fn a_recorded_answer_from_a_clock_ahead_is_no_new_tap() {
+    for (lead, receipt) in [(5, false), (60, false), (600, false), (600, true)] {
+        let mut b = seeded_bench(Gate::Open, &[]).await;
+        let old = b.card(ITEM);
+        let answer = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[1], b.now + lead);
+        reply(&b, &[&answer]);
+        b.tick().await.unwrap();
+        assert!(b.s.items[ITEM].answer.is_some());
+        if receipt {
+            close_out(&b, "Moved the relay");
+            b.settle(2).await;
+        }
+        redrop(&b, "Relay choice, reworded");
+        b.settle(3).await;
+        assert!(replies(&b).is_empty(), "lead {lead}, receipt {receipt}");
+        assert!(b.s.replaced[0].watch);
+        let stray = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], b.now);
+        reply(&b, &[&answer, &stray]);
+        b.settle(1).await;
+        assert_eq!(replies(&b).len(), 1, "lead {lead}, receipt {receipt}");
+    }
+}
+
+/// A tap after the item closed out: nothing is asked, so no live card is named.
+#[tokio::test]
+async fn a_tap_after_a_close_out_is_told_nothing_is_asked() {
+    let (mut b, old, answer) = answered_then_replaced().await;
+    close_out(&b, "Moved the relay");
+    b.settle(2).await;
+    let stray = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&answer, &stray]);
+    b.settle(2).await;
+    let told = replies(&b);
+    assert_eq!(told.len(), 1);
+    let text = content(&told[0]);
+    assert!(text.ends_with("This is no longer asked."), "{text}");
+    assert!(!text.contains("live card"), "{text}");
+}
+
+/// A channel that isn't ready: nothing there is read, edited or counted against
+/// the cap, and it all resumes when the channel is ready.
+#[tokio::test]
+async fn an_old_post_in_a_channel_not_ready_waits() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let olds: Vec<String> = (0..=WATCH_MAX)
+        .map(|n| old_card(&mut b, n, X).event_id)
+        .collect();
+    let read = |b: &Bench| {
+        let queries = b.relay.queries.lock().unwrap();
+        queries.iter().any(|q| olds.iter().any(|id| names(q, id)))
+    };
+    b.settle(2).await;
+    assert!(!read(&b));
+    let edited = |e: &Value| tag_value(e, "e").is_some_and(|id| olds.contains(&id));
+    assert!(!b.posts().iter().any(|(e, _)| edited(e)));
+    assert!(!board(&b).contains("Old cards"), "{}", board(&b));
+
+    let writer = b.writer_hex();
+    b.s.joined.insert(X.to_string(), vec![writer]);
+    let check = ChannelCheck {
+        checked_at: b.now,
+        ok_at: b.now,
+        refused: None,
+    };
+    b.s.channels.insert(X.to_string(), check);
+    b.settle(2).await;
+    assert!(read(&b));
+    let watched = format!("Watched for a tap: {}.", WATCH_MAX + 1);
+    assert!(board(&b).contains(&watched), "{}", board(&b));
+}
+
+/// A post that would not update, then does: a refused removal isn't done, and
+/// once one goes through the board stops saying so though it's still watched.
+#[tokio::test]
+async fn a_watched_post_that_recovers_clears_the_board() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    let old = old_card(&mut b, 1, &ch);
+    let seed = tap(&b.ctx.writer, &old.event_id, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&seed]);
+    *b.relay.clock.lock().unwrap() = Some(b.now + 10_000);
+    b.tick().await.unwrap();
+    let retry = b.s.replaced[0].retry_at;
+    assert_eq!(retry, b.now + 60);
+    assert!(!b.s.replaced[0].seeds_off);
+    *b.relay.clock.lock().unwrap() = None;
+    b.tick().await.unwrap();
+    assert!(board(&b).contains("Would not update: 1."), "{}", board(&b));
+    b.now = retry;
+    b.settle(2).await;
+    let r = &b.s.replaced[0];
+    assert!(r.seeds_off && r.watch);
+    assert_eq!(r.retry_at, 0);
+    assert!(!board(&b).contains("Old cards"), "{}", board(&b));
+}
+
+/// A seed already gone is as good as removed: its post stays watched.
+#[tokio::test]
+async fn a_seed_gone_from_the_relay_counts_as_removed() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    let old = old_card(&mut b, 1, &ch);
+    let seed = tap(&b.ctx.writer, &old.event_id, OPTION_EMOJI[0], b.now);
+    b.relay.gone.lock().unwrap().insert(seed.id.to_hex());
+    reply(&b, &[&seed]);
+    b.tick().await.unwrap();
+    let r = &b.s.replaced[0];
+    assert!(r.seeds_off && r.watch);
+    assert_eq!(r.retry_at, 0);
+}
+
+/// Each removal and each reply is charged to the post budget.
+#[tokio::test]
+async fn removals_and_replies_stop_at_the_post_budget() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    let old = old_card(&mut b, 1, &ch);
+    let seeds = [0, 1].map(|n| tap(&b.ctx.writer, &old.event_id, OPTION_EMOJI[n], b.now));
+    reply(&b, &[&seeds[0], &seeds[1]]);
+    assert_eq!(old_tick(&mut b, 1).await, 0);
+    assert_eq!(removed(&b).len(), 1);
+    assert!(!b.s.replaced[0].seeds_off);
+    assert_eq!(old_tick(&mut b, 2).await, 0);
+    assert!(b.s.replaced[0].seeds_off);
+
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    for n in 1..=2 {
+        old_card(&mut b, n, &ch);
+    }
+    let owner = b.owner_hex();
+    for r in &mut b.s.replaced {
+        r.seeds_off = true;
+        r.tapped = Some(owner.clone());
+    }
+    assert_eq!(old_tick(&mut b, 1).await, 0);
+    assert_eq!(replies(&b).len(), 1);
+    assert!(b.s.replaced[1].tapped.is_some());
+}
+
+/// With no post left to spend, the lookups before a removal or a reply wait too.
+#[tokio::test]
+async fn no_budget_no_lookup() {
+    for seeds_off in [false, true] {
+        let mut b = seeded_bench(Gate::Open, &[]).await;
+        let ch = b.channel();
+        old_card(&mut b, 1, &ch);
+        b.s.replaced[0].seeds_off = seeds_off;
+        b.s.replaced[0].tapped = Some(b.owner_hex());
+        let from = b.relay.queries.lock().unwrap().len();
+        old_tick(&mut b, 0).await;
+        assert_eq!(lookups(&b, from), 0, "seeds off: {seeds_off}");
+    }
+}
+
+/// Old posts with no seeds left spend no post, so their lookups have their own
+/// cap: a run of them drains over a few ticks, not one query each in one tick.
+#[tokio::test]
+async fn lookups_are_capped_per_tick() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    for n in 1..=3 {
+        old_card(&mut b, n, &ch);
+    }
+    for want in 1..=3 {
+        let from = b.relay.queries.lock().unwrap().len();
+        assert_eq!(old_tick(&mut b, 4).await, 4);
+        assert_eq!(lookups(&b, from), 1);
+        let done = b.s.replaced.iter().filter(|r| r.seeds_off).count();
+        assert_eq!(done, want);
+    }
+    // The lookup before each reply counts the same.
+    let owner = b.owner_hex();
+    for r in &mut b.s.replaced {
+        r.tapped = Some(owner.clone());
+    }
+    let from = b.relay.queries.lock().unwrap().len();
+    old_tick(&mut b, 4).await;
+    assert_eq!(lookups(&b, from), 1);
+}
+
+/// A read that keeps failing fails no tick (lastError stops the kit's approvals).
+/// Past a minute the board says taps go unanswered, until a read goes through.
+#[tokio::test]
+async fn a_read_that_keeps_failing_is_on_the_board_until_one_goes_through() {
+    const SAYS: &str = "Can't read them for taps right now";
+    let (mut b, old, answer) = answered_then_replaced().await;
+    reply(&b, &[&answer]);
+    b.settle(3).await;
+    assert!(b.s.replaced[0].seeds_off);
+    *b.relay.e_down.lock().unwrap() = Some(old.event_id.clone());
+    b.settle(2).await;
+    assert!(!board(&b).contains(SAYS), "not after a failure or two");
+    b.now += 60;
+    b.settle(2).await;
+    assert!(board(&b).contains(SAYS), "{}", board(&b));
+    *b.relay.e_down.lock().unwrap() = None;
+    b.settle(2).await;
+    assert!(!board(&b).contains(SAYS), "{}", board(&b));
+
+    // Nothing left to read says the same, though the read would still fail.
+    *b.relay.e_down.lock().unwrap() = Some(old.event_id.clone());
+    b.settle(1).await;
+    b.now += 60;
+    b.settle(1).await;
+    assert!(board(&b).contains(SAYS), "{}", board(&b));
+    b.s.replaced.clear();
+    b.settle(2).await;
+    assert!(!board(&b).contains(SAYS), "{}", board(&b));
 }
 
 #[tokio::test]
@@ -395,6 +708,10 @@ async fn past_the_cap_the_oldest_go_unread_and_the_board_says_so() {
             None,
             b.now,
         );
+    }
+    // Lookups have a cap of their own (`lookups_are_capped_per_tick`).
+    for r in &mut b.s.replaced {
+        r.seeds_off = true;
     }
     b.settle(2).await;
     // The poll names the one live card; this is the read of the old ones.
@@ -493,27 +810,9 @@ async fn a_reply_with_no_live_card_says_where_things_stand() {
     b.s.items.get_mut(ITEM).unwrap().card = None;
     b.s.queued = vec![ITEM.to_string()];
     b.s.replaced[0].seeds_off = true;
-    let mut budget = 0;
-    crate::bench::replaced::tick(
-        &b.ctx,
-        &mut b.s,
-        &mut budget,
-        b.now,
-        "14:05",
-        &[b.ctx.owner.public_key().to_hex()],
-    )
-    .await;
+    old_tick(&mut b, 0).await;
     assert!(replies(&b).is_empty(), "no budget, so it waits");
-    let mut budget = 1;
-    crate::bench::replaced::tick(
-        &b.ctx,
-        &mut b.s,
-        &mut budget,
-        b.now,
-        "14:05",
-        &[b.ctx.owner.public_key().to_hex()],
-    )
-    .await;
+    old_tick(&mut b, 1).await;
     let told = replies(&b);
     assert_eq!(told.len(), 1);
     assert!(

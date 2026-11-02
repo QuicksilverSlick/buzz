@@ -37,6 +37,14 @@ const WATCH_SECS: u64 = 86_400;
 pub(super) const WATCH_MAX: usize = 100;
 /// An old post that would not update is tried again this soon.
 const RETRY_SECS: u64 = 60;
+/// A read of the old posts failing this long goes on the board.
+const READ_ALARM_SECS: u64 = 60;
+/// Lookups one tick spends on old posts, beside its read: +30/min at most, and
+/// only while a post is owed work, so neither a run of posts with no seeds nor
+/// a failing relay costs a query per post. With the read's 30, the poll's 120
+/// and 120 posts, every ceiling at once is the relay's 300. The rest only wait
+/// for a later tick: 28 drops a day (1 Nov 2026) would take seconds to drain.
+const LOOKUPS_PER_TICK: usize = 1;
 
 /// An old post still owed its edit, its seeds' removal or its one reply, or
 /// still watched for a tap. In state.json, so a restart resumes it.
@@ -55,9 +63,11 @@ pub(crate) struct Replaced {
     pub seeds_off: bool,
     /// Read for a tap: the newest old post of its item, not told yet.
     pub watch: bool,
-    /// The owner's keycaps it already had at its first read: no new taps.
-    /// None before that read.
-    pub seen: Option<Vec<String>>,
+    /// The owner's keycaps that are no new tap: the answer it was left behind
+    /// with, whatever its clock says, and what its first read found from before.
+    pub seen: Vec<String>,
+    /// Its first read is done.
+    pub read: bool,
     /// The key behind a new tap, until its one reply is on the relay.
     pub tapped: Option<String>,
     /// Set once an update failed, until one goes through: not before this.
@@ -75,7 +85,8 @@ impl Replaced {
             shown: None,
             seeds_off: false,
             watch: true,
-            seen: None,
+            seen: Vec::new(),
+            read: false,
             tapped: None,
             retry_at: 0,
         }
@@ -103,11 +114,12 @@ pub(super) fn left_behind(s: &mut BenchState, new: &item::Item, now: u64) {
         return;
     };
     let Some(card) = &old.card else { return };
-    let root = old.request.as_deref().unwrap_or(old).reply_to.as_deref();
+    let asked = old.request.as_deref().unwrap_or(old);
     let ch = card_channel(s, old);
     let r = Replaced {
         shown: Some(Box::new(old.clone())),
-        ..Replaced::new(&new.id, &ch, card, root, now)
+        seen: asked.answer.iter().map(|a| a.reaction_id.clone()).collect(),
+        ..Replaced::new(&new.id, &ch, card, asked.reply_to.as_deref(), now)
     };
     add(s, r);
 }
@@ -138,6 +150,18 @@ pub(super) fn old_post(s: &BenchState, id: &str, shows: &str) -> String {
     format!("{first}\n{}", item::render_closed(shows))
 }
 
+/// The time an old post's text shows: its answer's, else when its Drop came in
+/// (a receipt's Outcome). The tick that replaced it only changed its first line.
+fn shown_at(i: &item::Item, hhmm: &str) -> String {
+    let answered = i.answer.as_ref().map(|a| a.hhmm.as_str());
+    let came_in = chrono::DateTime::parse_from_rfc3339(&i.updated_at).ok();
+    match (answered.filter(|t| !t.is_empty()), came_in) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(t)) => super::local_hhmm(t.timestamp() as u64),
+        (None, None) => hhmm.to_string(),
+    }
+}
+
 /// The one reply to a tap on an old post, pointing to where a tap counts.
 fn told(s: &BenchState, r: &Replaced) -> String {
     let said = "That tap didn't count: this card is no longer read, so nothing was recorded.";
@@ -154,7 +178,7 @@ fn told(s: &BenchState, r: &Replaced) -> String {
 }
 
 /// The board's lines when a limit here bites; none, and `section` hides them.
-pub(super) fn alarm(s: &BenchState) -> Vec<String> {
+pub(super) fn alarm(s: &BenchState, now: u64) -> Vec<String> {
     let watched = s
         .replaced
         .iter()
@@ -163,6 +187,15 @@ pub(super) fn alarm(s: &BenchState) -> Vec<String> {
     let over = watched.saturating_sub(WATCH_MAX);
     let stuck = s.replaced.iter().filter(|r| r.retry_at != 0).count();
     let mut lines = Vec::new();
+    if s.replaced_unread
+        .is_some_and(|since| now >= since + READ_ALARM_SECS)
+    {
+        lines.push(
+            "Can't read them for taps right now, so a tap on one gets no reply. Tried again \
+             every tick: answer on the live card."
+                .to_string(),
+        );
+    }
     if over > 0 {
         lines.push(format!(
             "Watched for a tap: {watched}. Only the newest {WATCH_MAX} are read, so a tap on any \
@@ -180,11 +213,12 @@ pub(super) fn alarm(s: &BenchState) -> Vec<String> {
     lines
 }
 
-/// Read the watched posts for keycaps from the owner's keys. Any it had at its
-/// first read from before it was replaced is no new tap (its time is the
-/// tapping device's, so it only decides that first read: `at` is when this
-/// tick began, so a tap since the live poll's last read still counts as new);
-/// any other keycap, whatever its clock says, is.
+/// Read the watched posts for keycaps from the owner's keys. The answer it was
+/// left behind with, and any it had at its first read from before it was
+/// replaced, are no new tap (a keycap's time is the tapping device's, so it only
+/// decides that first read: `at` is when this tick began, so a tap since the
+/// live poll's last read still counts as new); any other keycap, whatever its
+/// clock says, is.
 async fn read(ctx: &Ctx<'_>, s: &mut BenchState, now: u64, owner_set: &[String]) {
     let watched: Vec<usize> = (0..s.replaced.len())
         .rev()
@@ -192,6 +226,7 @@ async fn read(ctx: &Ctx<'_>, s: &mut BenchState, now: u64, owner_set: &[String])
         .take(WATCH_MAX)
         .collect();
     if watched.is_empty() {
+        s.replaced_unread = None;
         return;
     }
     let (cards, chans): (Vec<&str>, BTreeSet<&str>) = watched
@@ -207,24 +242,25 @@ async fn read(ctx: &Ctx<'_>, s: &mut BenchState, now: u64, owner_set: &[String])
         // Read whole again next tick, so nothing is lost by this one.
         Err(e) => {
             eprintln!("bench: old cards not read: {e}");
+            s.replaced_unread.get_or_insert(now);
             return;
         }
     };
+    s.replaced_unread = None;
     for i in watched {
         let r = &mut s.replaced[i];
-        let first = r.seen.is_none();
-        let seen = r.seen.get_or_insert_with(Vec::new);
+        let first = !std::mem::replace(&mut r.read, true);
         for e in &events {
             let (id, by) = (e.id.to_hex(), e.pubkey.to_hex());
             let tap = e.kind.as_u16() == 7
                 && item::reaction_target(e) == Some(r.card.event_id.as_str())
                 && item::OPTION_EMOJI.contains(&e.content.as_str())
                 && owner_set.contains(&by);
-            if !tap || seen.contains(&id) {
+            if !tap || r.seen.contains(&id) {
                 continue;
             }
             if first && e.created_at.as_secs() < r.at {
-                seen.push(id);
+                r.seen.push(id);
             } else {
                 r.tapped.get_or_insert(by);
             }
@@ -235,13 +271,15 @@ async fn read(ctx: &Ctx<'_>, s: &mut BenchState, now: u64, owner_set: &[String])
 /// What the old post `i` is still owed, in order: the edit, its seeds off (the
 /// relay's own untap: a kind 5 by the reaction's author, and a removed one
 /// never comes back from /query, so this resumes), its one reply. Ok(false):
-/// the tick's budget ran out first. The relay is asked before the reply goes,
-/// so a crash after it landed and before state saved never sends it twice.
+/// the tick's budget or lookups ran out first. The relay is asked before the
+/// reply goes, so a crash after it landed and before state saved never sends
+/// it twice.
 async fn finish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     i: usize,
     budget: &mut usize,
+    lookups: &mut usize,
     now: u64,
     hhmm: &str,
 ) -> Result<bool, String> {
@@ -251,8 +289,8 @@ async fn finish(
         if !spend(budget, 1) {
             return Ok(false);
         }
-        let text = old_post(s, &r.item, &item::render_card(shown, hhmm));
-        let text = text + &item::thread_line(ch, card);
+        let text = item::render_card(shown, &shown_at(shown, hhmm));
+        let text = old_post(s, &r.item, &text) + &item::thread_line(ch, card);
         edit(ctx, s, ch, card, &text, now).await?;
         s.replaced[i].shown = None;
     }
@@ -264,7 +302,7 @@ async fn finish(
         })
     };
     if !r.seeds_off {
-        if *budget == 0 {
+        if *budget == 0 || !spend(lookups, 1) {
             return Ok(false);
         }
         for seed in query_writer(ctx, s, mine(7), now).await? {
@@ -283,7 +321,7 @@ async fn finish(
         s.replaced[i].seeds_off = true;
     }
     if let Some(by) = &r.tapped {
-        if *budget == 0 {
+        if *budget == 0 || !spend(lookups, 1) {
             return Ok(false);
         }
         let marker = format!("bench:replaced:{}@{}", r.item, &card[..16]);
@@ -329,12 +367,13 @@ pub(super) async fn tick(
     owner_set: &[String],
 ) {
     read(ctx, s, now, owner_set).await;
+    let mut lookups = LOOKUPS_PER_TICK;
     for i in 0..s.replaced.len() {
         let r = &s.replaced[i];
         if r.idle() || now < r.retry_at || !ready(s, &r.channel) {
             continue;
         }
-        match finish(ctx, s, i, budget, now, hhmm).await {
+        match finish(ctx, s, i, budget, &mut lookups, now, hhmm).await {
             Ok(false) => return,
             Ok(true) => s.replaced[i].retry_at = 0,
             // Gone from the relay: nothing is left to edit or to reply under.

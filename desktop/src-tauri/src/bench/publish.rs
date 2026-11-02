@@ -857,7 +857,7 @@ pub(super) async fn publish(
         &format!("Card slots: {used} of {MAX_CARDS} in use, {n} queued"),
         (n > 0 || used > MAX_CARDS).then_some(why).into_iter(),
     );
-    let old = super::replaced::alarm(s);
+    let old = super::replaced::alarm(s, now);
     item::section(&mut text, "Old cards", old.into_iter());
     let hash = item::board_hash(&text);
     let aged = s

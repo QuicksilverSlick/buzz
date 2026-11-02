@@ -145,8 +145,9 @@ pub(crate) struct BenchState {
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.
     kept_at: Vec<(String, u64)>,
-    /// Old posts still owed an edit or a reply, or watched for a tap.
+    /// Old posts owed an edit or a reply or watched for a tap; since when their read fails.
     replaced: Vec<replaced::Replaced>,
+    replaced_unread: Option<u64>,
     /// Live cards whose owner's page was cut this tick, or every item while
     /// roles.json does not read: their answers are unread, so nothing
     /// expires, restamps, routes, retires or replaces them.
@@ -338,8 +339,7 @@ pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt 
                 }
             }
             // Thread replies the Bench never edits or retires.
-            Some((target, _))
-                if target.starts_with("route:") || target.starts_with("replaced:") => {}
+            Some((t, _)) if t.starts_with("route:") || t.starts_with("replaced:") => {}
             _ => r.stray_ids.push(e.id.to_hex()),
         }
     }

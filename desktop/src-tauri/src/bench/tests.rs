@@ -772,6 +772,8 @@ struct Relay {
     admins_down: Mutex<bool>,
     /// Its clock once set: an event over 900 s off is refused, first.
     clock: Mutex<Option<u64>>,
+    /// A /query naming this id in its `#e` fails with a 500.
+    e_down: Mutex<Option<String>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -857,6 +859,10 @@ async fn fake_query(
     if q[0]["kinds"] == json!([39001]) && *r.admins_down.lock().unwrap() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    let down = r.e_down.lock().unwrap().clone().map(|id| json!(id));
+    if down.is_some_and(|id| q[0]["#e"].as_array().is_some_and(|e| e.contains(&id))) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut evs = r.query_reply.lock().unwrap().clone();
     if let Some(authors) = q[0]["authors"].as_array() {
         evs.retain(|e| authors.contains(&e["pubkey"]));
@@ -928,6 +934,7 @@ impl Bench {
             keys: Keys::generate(),
             admins_down: Mutex::new(false),
             clock: Mutex::new(None),
+            e_down: Mutex::new(None),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
