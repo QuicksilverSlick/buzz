@@ -235,9 +235,9 @@ test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow
       ["other", "Other", undefined],
     ],
   );
-  for (const c of VECTORS.cards) {
-    assert.equal(cardWorkbench(c), c.tab, JSON.stringify(c));
-    assert.deepEqual(benchCardPlace(c), c.header, JSON.stringify(c));
+  for (const [project, area, writer, tab, header] of VECTORS.cards) {
+    assert.equal(cardWorkbench({ project, area, writer }), tab, area);
+    assert.deepEqual(benchCardPlace({ project, area }), header, area);
   }
   // The built-in writers stay with their slug; a new project has none.
   assert.deepEqual(workbenches()[0].writers, BUILT_IN_WORKBENCHES[1].writers);
@@ -248,7 +248,10 @@ test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow
   assert.equal(workbenches(), tabs);
   adoptBenchProjects({ ...SEEDED, projects: null });
   assert.equal(workbenches(), BUILT_IN_WORKBENCHES);
-  assert.equal(cardWorkbench(VECTORS.cards[0]), "dreamforge");
+  assert.equal(
+    cardWorkbench({ project: null, area: "dreamforge-talos", writer: "x" }),
+    "dreamforge",
+  );
 });
 
 test("Other says why its cards are there, each name once, largest first", () => {
