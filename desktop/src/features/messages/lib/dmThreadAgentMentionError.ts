@@ -5,6 +5,8 @@ export const DM_THREAD_AGENT_MENTION_ERROR =
   "Agents must already be in a DM to be mentioned in its threads. Start a new conversation that includes the agent.";
 export const DM_THREAD_MEMBERS_LOADING_ERROR =
   "Checking conversation members. Try again in a moment.";
+export const DM_NON_MEMBER_MENTION_ERROR =
+  "Only members of this conversation can be mentioned from the Inbox. Open the conversation to include someone new.";
 
 /**
  * Why a DM thread reply may not mention an agent, or null when it may.

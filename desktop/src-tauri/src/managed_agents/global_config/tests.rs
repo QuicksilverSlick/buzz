@@ -301,6 +301,7 @@ fn bare_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "agent".to_string(),
@@ -366,6 +367,7 @@ fn persona(id: &str, model: Option<&str>, provider: Option<&str>) -> AgentDefini
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.to_string(),
         display_name: "Test Persona".to_string(),
@@ -724,6 +726,7 @@ fn record_runtime_wins_over_persona_runtime_for_command_resolution() {
     let persona = AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "p1".to_string(),
         display_name: "Goose persona".to_string(),

@@ -110,6 +110,20 @@ export function useBenchAnswer() {
 }
 
 /**
+ * Asks the Bench to post a card waiting off the relay next (`bench_bump`),
+ * then refreshes the snapshot. It answers nothing: the owner taps again once
+ * the card is live.
+ */
+export function useBenchBump() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (itemId: string) => invokeTauri<void>("bench_bump", { itemId }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: BENCH_CARDS_QUERY_KEY }),
+  });
+}
+
+/**
  * The sidebar's Bench badge: null while the Bench is not enabled (the entry
  * hides), else how many items need the owner. The sidebar is always mounted,
  * so it refreshes on its own slow timer; the Bench screen's 3 s poll and the

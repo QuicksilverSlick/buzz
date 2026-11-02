@@ -26,7 +26,7 @@ jobs:
   # relayReconnectReplay.test.mjs), so Rust changes select this job too.
   desktop-js:
     name: Desktop JS
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Keep in sync with JS_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
     if: github.event_name == 'push' || inputs.desktop || inputs.rust
@@ -66,7 +66,7 @@ jobs:
   # cache read-only; the mesh-llm feature pulls its own dependency graph.
   desktop-tauri:
     name: Desktop Tauri (${{ matrix.lane }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A lane needs up to ~15m. ci-apt-retry.sh bounds the apt step at ~45m worst
     # case (update ~14m + install ~31m); 65m fits both, so a degraded mirror
     # fails with the wrapper's error instead of the job timeout.
@@ -99,6 +99,7 @@ jobs:
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
+          prefix-key: v0-rust-ubuntu2404
           workspaces: desktop/src-tauri
           shared-key: ${{ matrix.cache }}
           save-if: ${{ matrix.save-cache && github.event_name != 'pull_request' }}
@@ -127,7 +128,7 @@ jobs:
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A smoke shard needs ~12m, and Chromium dependency setup is bounded by
     # ci-apt-retry.sh (~31m worst case). Leave time for the full suite
     # and its reports to finish.
@@ -165,6 +166,10 @@ jobs:
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      # GitHub moved ubuntu-latest to 26.04, where Playwright 1.60 can't install
+      # Chromium. Every Linux CI job stays on 24.04, so relay binaries and the
+      # jobs that run them share one glibc. Rust caches carry the image in their
+      # prefix-key. Move them together, after a Playwright bump that supports 26.04.
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: cd desktop && pnpm exec playwright install chromium
@@ -198,7 +203,7 @@ jobs:
 
   desktop:
     name: Desktop
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: [desktop-js, desktop-tauri, desktop-smoke-e2e, desktop-windows-build]
     if: always() && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
@@ -266,7 +271,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [desktop]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     outputs:

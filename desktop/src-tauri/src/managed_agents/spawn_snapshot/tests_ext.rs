@@ -470,3 +470,40 @@ fn definitionless_instance_retains_its_stored_session_policy() {
         AcpSessionPolicy::Thread
     );
 }
+
+#[test]
+fn switching_the_voice_while_running_requires_restart() {
+    // buzz-acp reads BUZZ_ACP_VOICE_PROFILE only at launch (huddle voices, slice 9).
+    let under = |enabled: Option<bool>| {
+        let mut record = record();
+        record.persona_id = Some("voice-persona".into());
+        let mut definition = persona("voice-persona", None, "You are a test agent.");
+        definition.voice_profile = enabled.map(|enabled| crate::managed_agents::VoiceProfile {
+            enabled,
+            voice: Some("marin".into()),
+            ..Default::default()
+        });
+        prospective_spawn_config_snapshot(
+            &record,
+            &[definition],
+            &[],
+            "wss://ws.example",
+            &Default::default(),
+            false,
+        )
+    };
+    let fields = |entries: Vec<RestartDiffEntry>| -> Vec<String> {
+        entries.into_iter().map(|e| e.field).collect()
+    };
+    let (on, off) = (under(Some(true)), under(Some(false)));
+    assert_eq!(
+        fields(policy_transition_diff(&off, &on)),
+        vec!["voice_profile"]
+    );
+    assert_eq!(
+        fields(policy_transition_diff(&on, &off)),
+        vec!["voice_profile"]
+    );
+    // A switched-off profile never reaches buzz-acp, so editing it doesn't badge.
+    assert!(policy_transition_diff(&under(None), &off).is_empty());
+}

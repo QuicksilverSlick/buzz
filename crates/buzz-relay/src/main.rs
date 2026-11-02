@@ -295,44 +295,75 @@ where
     }
 }
 
+/// Prompt retries allowed while rows timestamped now route to an empty catch-all
+/// awaiting advancement. With the 5 s to 60 s backoff they span about five
+/// minutes, after which the normal period applies until that changes.
+const PARTITION_ADVANCE_RETRY_LIMIT: u32 = 8;
+
 /// Retry missing diagnostics promptly, without tying audit recovery to readiness.
-/// Delays start after each attempt finishes, so slow audits cannot cause bursts.
+/// Also retries promptly, a bounded number of times, while the current month
+/// routes to an empty catch-all awaiting advancement, so a failed first pass on
+/// a fresh install does not wait a full period. Delays start after each attempt finishes, so slow audits
+/// cannot cause bursts.
 struct PartitionAuditSchedule {
     period: std::time::Duration,
     next_delay: std::time::Duration,
     retry_delay: std::time::Duration,
     has_completed_audit: bool,
+    advance_pending: bool,
+    advance_retries_left: u32,
 }
 
 impl PartitionAuditSchedule {
-    fn new(period: std::time::Duration, has_completed_audit: bool) -> Self {
-        Self {
+    /// `startup` is the startup attempt's outcome, as for [`Self::record_attempt`].
+    fn new(period: std::time::Duration, startup: Option<bool>) -> Self {
+        let mut schedule = Self {
             period,
-            next_delay: if has_completed_audit {
-                period
-            } else {
-                std::time::Duration::ZERO
-            },
+            next_delay: std::time::Duration::ZERO,
             retry_delay: std::time::Duration::from_secs(5),
-            has_completed_audit,
+            has_completed_audit: false,
+            advance_pending: false,
+            advance_retries_left: PARTITION_ADVANCE_RETRY_LIMIT,
+        };
+        if startup.is_some() {
+            schedule.record_attempt(startup);
         }
+        schedule
     }
 
     async fn wait(&self) {
         tokio::time::sleep(self.next_delay).await;
     }
 
-    /// A completed audit counts even when its verdict is unsafe.
-    fn record_attempt(&mut self, completed: bool) {
-        self.has_completed_audit |= completed;
-        if self.has_completed_audit {
-            self.next_delay = self.period;
+    /// Records one attempt: `None` when no audit completed, otherwise whether
+    /// catch-all advancement is still pending. A completed audit counts even
+    /// when its verdict is unsafe. A failed attempt keeps the last known
+    /// pending state.
+    fn record_attempt(&mut self, advance_pending: Option<bool>) {
+        if let Some(pending) = advance_pending {
+            self.has_completed_audit = true;
+            self.advance_pending = pending;
+        }
+        if !self.advance_pending {
+            self.advance_retries_left = PARTITION_ADVANCE_RETRY_LIMIT;
+        }
+        let retry = if !self.has_completed_audit {
+            true
+        } else if self.advance_pending && self.advance_retries_left > 0 {
+            self.advance_retries_left -= 1;
+            true
         } else {
+            false
+        };
+        if retry {
             self.next_delay = self.retry_delay;
             self.retry_delay = self
                 .retry_delay
                 .saturating_mul(2)
                 .min(std::time::Duration::from_secs(60));
+        } else {
+            self.next_delay = self.period;
+            self.retry_delay = std::time::Duration::from_secs(5);
         }
     }
 }
@@ -507,7 +538,8 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         info!("Postgres connected (writer + lazy read replica pool)");
         // Reader-down at boot must not crash or block the relay; this warn-only
         // ping is the sole boot-time visibility that the replica is unreachable
-        // (the lazy pool with min_connections=0 dials nothing until first use).
+        // (the lazy pool dials nothing at construction). On success it also
+        // fills the reader's warm floor in the background.
         db.spawn_read_pool_boot_ping();
     } else {
         info!("Postgres connected");
@@ -611,37 +643,47 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // seeding an empty-host community that no request can ever resolve to.
     let mut step = StepTimer::start(StartupStep::MembershipBootstrap);
     let deployment_community = {
+        use buzz_relay::handlers::community_provisioning::{
+            ensure_deployment_community, verify_reserved_hosts_unbound,
+        };
+        if let Some(policy) = config.nip_fi_provision_binding.as_ref() {
+            verify_reserved_hosts_unbound(&db, policy).await?;
+        }
         let host = buzz_relay::tenant::relay_url_authority(&config.relay_url);
-        if host.is_empty() {
-            if config.require_relay_membership {
-                return Err(anyhow::anyhow!(
-                    "Cannot derive a community host from BUZZ_RELAY_URL ({:?}); a resolvable host is required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true",
-                    config.relay_url
-                ));
+        if host.is_empty() && config.require_relay_membership {
+            return Err(anyhow::anyhow!(
+                "Cannot derive a community host from BUZZ_RELAY_URL ({:?}); a resolvable host is required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true",
+                config.relay_url
+            ));
+        }
+        match ensure_deployment_community(&db, config.nip_fi_provision_binding.as_ref(), &host)
+            .await
+        {
+            Ok(Some(record)) => {
+                info!(host = %record.host, community = %record.id, "Deployment community ensured");
+                Some(buzz_core::tenant::TenantContext::resolved(
+                    record.id,
+                    record.host,
+                ))
             }
-            step.degrade();
-            error!(
-                relay_url = %config.relay_url,
-                "Could not derive a community host from relay_url; skipping membership backfill/bootstrap (non-fatal, membership not required)"
-            );
-            None
-        } else {
-            match db.ensure_configured_community_for_bootstrap(&host).await {
-                Ok(record) => {
-                    info!(host = %record.host, community = %record.id, "Deployment community ensured");
-                    Some(record.id)
+            Ok(None) => {
+                step.degrade();
+                error!(
+                    relay_url = %config.relay_url,
+                    "Could not derive a community host from relay_url; skipping membership backfill/bootstrap (non-fatal, membership not required)"
+                );
+                None
+            }
+            Err(e) => {
+                if config.require_relay_membership {
+                    error!("Fatal: failed to ensure deployment community with membership enforcement enabled: {e}");
+                    return Err(anyhow::anyhow!(
+                        "Failed to ensure deployment community (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
+                    ));
                 }
-                Err(e) => {
-                    if config.require_relay_membership {
-                        error!("Fatal: failed to ensure deployment community with membership enforcement enabled: {e}");
-                        return Err(anyhow::anyhow!(
-                            "Failed to ensure deployment community (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
-                        ));
-                    }
-                    step.degrade();
-                    error!("Failed to ensure deployment community (non-fatal, membership not required): {e}");
-                    None
-                }
+                step.degrade();
+                error!("Failed to ensure deployment community (non-fatal, membership not required): {e}");
+                None
             }
         }
     };
@@ -650,8 +692,21 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // Idempotent — safe to run every startup. Must run before bootstrap_owner
     // so that existing allowlist users become relay members before the owner
     // is promoted (otherwise enabling membership locks everyone out).
-    if let Some(community) = deployment_community {
-        match db.backfill_from_allowlist(community).await {
+    //
+    // Both steps write the NIP-43 membership list in their own transaction.
+    // This listener isn't up yet, but in a rolling deploy other replicas have
+    // live subscribers; the newest list is fanned out once pub/sub is ready.
+    let mut startup_membership_list = None;
+    if let Some(tenant) = &deployment_community {
+        match db
+            .backfill_from_allowlist(tenant.community(), &relay_keypair)
+            .await
+            .map(|write| {
+                if write.snapshot.is_some() {
+                    startup_membership_list = write.snapshot;
+                }
+                write.outcome
+            }) {
             Ok(0) => {}
             Ok(n) => info!("Backfilled {n} pubkey_allowlist entries into relay_members"),
             Err(e) => {
@@ -672,10 +727,18 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
 
     // NIP-43: ensure the configured relay owner always holds the owner role
     // within the deployment community.
-    if let (Some(community), Some(owner_pubkey)) =
-        (deployment_community, config.relay_owner_pubkey.as_ref())
+    if let (Some(tenant), Some(owner_pubkey)) =
+        (&deployment_community, config.relay_owner_pubkey.as_ref())
     {
-        match db.bootstrap_owner(community, owner_pubkey).await {
+        match db
+            .bootstrap_owner(tenant.community(), owner_pubkey, &relay_keypair)
+            .await
+            .map(|write| {
+                if write.snapshot.is_some() {
+                    startup_membership_list = write.snapshot;
+                }
+                write.outcome
+            }) {
             Ok(()) => info!(pubkey = %owner_pubkey, "Relay owner bootstrapped"),
             Err(e) => {
                 if config.require_relay_membership {
@@ -693,19 +756,6 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                     );
                 }
             }
-        }
-    }
-    step.finish();
-
-    // NIP-33: backfill d_tag for any existing parameterized replaceable events
-    // that predate the column addition. Idempotent — no-ops when fully populated.
-    let mut step = StepTimer::start(StartupStep::DTagBackfill);
-    match db.backfill_d_tags().await {
-        Ok(0) => {}
-        Ok(n) => info!("Backfilled d_tag for {n} NIP-33 events"),
-        Err(e) => {
-            step.degrade();
-            error!("Failed to backfill d_tags: {e}");
         }
     }
     step.finish();
@@ -849,8 +899,48 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
             ));
         }
     }
+    // NIP-FI database community source. The startup load runs before any
+    // listener binds, so the pod can never report ready without a snapshot;
+    // a failed load fails startup and the orchestrator retries.
+    if config.nip_fi.builds_resolver() {
+        let step = StepTimer::start(StartupStep::NipFiSnapshotLoad);
+        // `Config::from_env` refuses the database source without it.
+        let policy = config
+            .nip_fi_provision_binding
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("NIP-FI: no provisioning binding policy"))?;
+        let registry = config
+            .nip_fi
+            .registry
+            .all_policies()
+            .map(|p| p.issuer().to_owned())
+            .collect();
+        let resolver = Arc::new(buzz_relay::nip_fi_resolver::DatabaseResolver::new(
+            Arc::new(app_state.db.clone()),
+            policy,
+            registry,
+            config.nip_fi_resolver_bounds.clone(),
+        ));
+        resolver
+            .refresh()
+            .await
+            .map_err(|e| anyhow::anyhow!("NIP-FI: startup binding snapshot load failed: {e:?}"))?;
+        step.finish();
+        info!("NIP-FI: binding snapshot loaded");
+        app_state.nip_fi_resolver = Some(resolver);
+    }
     let state = Arc::new(app_state);
-    let has_startup_partition_audit = startup_partition_audit.is_some();
+    if let Some(tenant) = &deployment_community {
+        buzz_relay::handlers::side_effects::fan_out_nip43_membership_list(
+            tenant,
+            &state,
+            startup_membership_list,
+        )
+        .await;
+    }
+    let startup_partition_attempt = startup_partition_audit
+        .as_ref()
+        .map(|audit| audit.awaits_catch_all_advance(partition_policy));
     if let Some(audit) = startup_partition_audit {
         state.record_partition_audit(audit);
     }
@@ -863,7 +953,7 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         let audit_interval = state.config.partition_audit_interval;
         tokio::spawn(async move {
             let mut schedule =
-                PartitionAuditSchedule::new(audit_interval, has_startup_partition_audit);
+                PartitionAuditSchedule::new(audit_interval, startup_partition_attempt);
             loop {
                 schedule.wait().await;
                 let db = &partition_state.db;
@@ -885,7 +975,12 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                     counted_partition_audit(db.audit_partitions(PARTITION_MANAGER_MONTHS_AHEAD))
                         .await
                 };
-                schedule.record_attempt(result.is_ok());
+                schedule.record_attempt(
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|audit| audit.awaits_catch_all_advance(partition_policy)),
+                );
                 match result {
                     Ok(audit) => partition_state.record_partition_audit(audit),
                     Err(error) => warn!(%error, "Periodic partition catalog audit failed"),
@@ -905,6 +1000,10 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // The refresh task is owned: a `CancellationToken` + `JoinHandle` let the
     // process cancel it cleanly on shutdown instead of leaking the task.
     let jwks_refresh_cancel = CancellationToken::new();
+    // The binding refresh loop stops with the JWKS loop on shutdown.
+    if let Some(resolver) = state.nip_fi_resolver.clone() {
+        tokio::spawn(resolver.run_refresh_loop(jwks_refresh_cancel.child_token()));
+    }
     let jwks_refresh_handle = if let Some(jwks_source) = state.nip_fi_jwks_source.clone() {
         let jwks_configs = state.config.nip_fi.jwks_configs.clone();
         info!(
@@ -1053,65 +1152,6 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         }
     }
     step.finish();
-
-    // NIP-43: reconcile the event-backed roster for every provisioned
-    // community before opening the listener. `relay_members` is canonical;
-    // this repairs pre-snapshot communities and any publication that failed
-    // after a membership transaction committed.
-    if config.require_relay_membership {
-        let mut step = StepTimer::start(StartupStep::Nip43Reconcile);
-        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
-            &state,
-            buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Bootstrap,
-        )
-        .await
-        {
-            Ok(summary) => {
-                if summary.failed > 0 {
-                    step.degrade();
-                }
-                info!(
-                    count = summary.repaired,
-                    failed = summary.failed,
-                    "NIP-43 membership snapshots reconciled on startup"
-                );
-            }
-            Err(error) => {
-                step.degrade();
-                tracing::warn!(%error, "NIP-43 membership snapshot startup reconciliation failed")
-            }
-        }
-        step.finish();
-
-        let reconcile_state = Arc::clone(&state);
-        let interval_secs = std::env::var("BUZZ_NIP43_RECONCILE_INTERVAL_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(60)
-            .max(1);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
-                    &reconcile_state,
-                    buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Maintenance,
-                )
-                .await
-                {
-                    Ok(summary) if summary.repaired > 0 => {
-                        info!(count = summary.repaired, "NIP-43 membership snapshots repaired")
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "periodic NIP-43 membership snapshot reconciliation failed"
-                    ),
-                }
-            }
-        });
-    }
 
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
     // but don't have corresponding events (e.g. seeded via direct SQL inserts).
@@ -2046,23 +2086,31 @@ async fn run_periodic_until_cancelled<Tick, TickFuture>(
 ///    grace, this backstops the whole drain and force-exits the process if
 ///    exceeded. It bounds everything after the grace, not the grace itself.
 ///
-/// A single WebSocket can therefore stay open, from SIGTERM, for up to:
+/// Each socket's teardown after the grace runs in stages, each with its own
+/// budget:
 ///
-/// ```text
-///   5s grace  +  up to 20s jitter  +  up to 5s close-frame ack  =  30s
-///   (fixed)      (MAX_DRAIN_JITTER_MS)  (RESTART_CLOSE_ACK_TIMEOUT)
-/// ```
+/// - up to 20s jitter before the relay sends its restart Close
+///   ([`buzz_relay::config::MAX_DRAIN_JITTER_MS`]);
+/// - up to 5s for the writer to acknowledge sending that Close
+///   (`RESTART_CLOSE_ACK_TIMEOUT` in `state.rs`). If the acknowledgement
+///   times out, the connection is cancelled and its teardown can spend a
+///   separate 1s flushing the terminal frame (`WS_TERMINAL_FLUSH_TIMEOUT` in
+///   `connection.rs`);
+/// - up to 1s waiting for the client's Close reply (the same constant). This
+///   wait starts only once the reader has returned and the writer has joined.
 ///
-/// The 5s grace runs before the 30s hard-drain clock starts, so the jitter
-/// (capped at [`buzz_relay::config::MAX_DRAIN_JITTER_MS`] = 20s) plus the
-/// per-connection close-frame ack wait (`RESTART_CLOSE_ACK_TIMEOUT` = 5s in
-/// `state.rs`) sum to 25s and stay inside the 30s hard drain. Total worst
-/// case from SIGTERM to forced exit is 5s + 30s = 35s. Both fit inside the
-/// chart's `terminationGracePeriodSeconds: 60` (`deploy/charts/buzz/values.yaml`),
-/// which leaves headroom but assumes no `preStop` hook adds further delay.
-/// With jitter off (`BUZZ_DRAIN_JITTER_MS=0`, the default) sockets close
-/// all-at-once right after the grace, so the per-socket delay collapses to
-/// roughly the 5s grace plus the ack wait.
+/// These are stage budgets, not a guaranteed per-socket total: after a
+/// successful acknowledgement nothing cancels the reader, so a silent peer
+/// does not go straight into the peer wait. The 30s hard drain is what bounds
+/// every socket. The configured process shutdown budget, from SIGTERM to
+/// forced exit, is 5s + 30s = 35s, which fits within the chart's
+/// `terminationGracePeriodSeconds: 60` (`deploy/charts/buzz/values.yaml`).
+/// That leaves headroom but assumes no `preStop` hook adds further delay.
+/// With jitter off (`BUZZ_DRAIN_JITTER_MS=0`, the default), `drain_all()`
+/// queues every restart Close right after the grace and cancels the
+/// connections immediately, without waiting for any acknowledgement. The
+/// terminal-flush and peer-wait budgets then apply only to sockets whose
+/// teardown reaches those stages.
 const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn serve(
@@ -2409,7 +2457,7 @@ fn dropped_in_memory_keys(
 async fn run_usage_metrics_tick(
     state: &AppState,
     emission_scope: &EmissionScope,
-    leader: &mut Option<buzz_db::UsageMetricsLeader>,
+    leader: &mut Option<buzz_db::SessionLeader>,
     emitted_in_memory: &mut HashSet<InMemoryMetricKey>,
     fleet_schedule: &mut FleetUsageSchedule,
 ) -> anyhow::Result<()> {
@@ -2451,7 +2499,7 @@ async fn run_usage_metrics_tick(
     if leader.is_none() && !demoted {
         *leader = state
             .db
-            .try_lock_usage_metrics(USAGE_METRICS_LOCK_KEY)
+            .try_lock_session_leader(USAGE_METRICS_LOCK_KEY)
             .await?;
         if leader.is_some() {
             info!("Acquired usage metrics leader lock");
@@ -2658,6 +2706,7 @@ fn emit_fleet_stock_metrics(snapshot: buzz_db::usage::FleetStockSnapshot) {
         ("forum", snapshot.channels_forum),
         ("dm", snapshot.channels_dm),
         ("workflow", snapshot.channels_workflow),
+        ("system", snapshot.channels_system),
     ] {
         metrics::gauge!("buzz_total_channels", "type" => kind).set(value as f64);
     }
@@ -2801,7 +2850,7 @@ async fn emit_db_usage_metrics(
     // Zero-fill across all (community, channel_type) pairs so a type that
     // drops to zero emits 0 rather than retaining its last nonzero value.
     {
-        const CHANNEL_TYPES: &[&str] = &["stream", "forum", "dm", "workflow"];
+        const CHANNEL_TYPES: &[&str] = &["stream", "forum", "dm", "workflow", "system"];
         let rows: HashMap<(Uuid, &str), i64> = channel_rows
             .into_iter()
             .filter_map(|r| {
@@ -3133,7 +3182,10 @@ mod tests {
         .expect("read effective audit writer GUCs");
         assert_eq!(lock, "500ms");
         assert_eq!(idle, "1min");
-        assert_eq!(statement, "0");
+        assert_eq!(
+            statement, "5min",
+            "a disabled statement timeout installs the maximum"
+        );
         let push: String = sqlx::query_scalar("SELECT current_setting('buzz.push_enabled')")
             .fetch_one(&pool)
             .await
@@ -3186,12 +3238,12 @@ mod tests {
         let period = Duration::from_secs(900);
 
         let immediate_start = tokio::time::Instant::now();
-        let mut schedule = PartitionAuditSchedule::new(period, false);
+        let mut schedule = PartitionAuditSchedule::new(period, None);
         schedule.wait().await;
         assert_eq!(tokio::time::Instant::now(), immediate_start);
 
         // Failure of the first periodic attempt must not delay recovery by 15 minutes.
-        schedule.record_attempt(false);
+        schedule.record_attempt(None);
         schedule.wait().await;
         assert_eq!(
             tokio::time::Instant::now() - immediate_start,
@@ -3199,18 +3251,27 @@ mod tests {
         );
 
         let delayed_start = tokio::time::Instant::now();
-        let schedule = PartitionAuditSchedule::new(period, true);
+        let schedule = PartitionAuditSchedule::new(period, Some(false));
         schedule.wait().await;
         assert_eq!(tokio::time::Instant::now() - delayed_start, period);
+
+        // A startup pass that left an empty catch-all awaiting advance retries soon.
+        let pending_start = tokio::time::Instant::now();
+        let schedule = PartitionAuditSchedule::new(period, Some(true));
+        schedule.wait().await;
+        assert_eq!(
+            tokio::time::Instant::now() - pending_start,
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn partition_audit_recovery_backoff_is_bounded_and_completion_ends_retries() {
         let period = Duration::from_secs(900);
-        let mut schedule = PartitionAuditSchedule::new(period, false);
+        let mut schedule = PartitionAuditSchedule::new(period, None);
         schedule.wait().await;
         for seconds in [5, 10, 20, 40, 60, 60, 60] {
-            schedule.record_attempt(false);
+            schedule.record_attempt(None);
             let start = tokio::time::Instant::now();
             schedule.wait().await;
             assert_eq!(
@@ -3221,8 +3282,8 @@ mod tests {
 
         // Completion, not a serving-safe verdict, ends recovery. Later failures
         // retain the cached audit and use the normal cadence.
-        for completed in [true, false, false] {
-            schedule.record_attempt(completed);
+        for attempt in [Some(false), None, None] {
+            schedule.record_attempt(attempt);
             let start = tokio::time::Instant::now();
             schedule.wait().await;
             assert_eq!(tokio::time::Instant::now() - start, period);
@@ -3231,14 +3292,62 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn partition_audit_retries_wait_after_slow_attempts() {
-        let mut schedule = PartitionAuditSchedule::new(Duration::from_secs(900), false);
+        let mut schedule = PartitionAuditSchedule::new(Duration::from_secs(900), None);
         schedule.wait().await;
         tokio::time::advance(Duration::from_secs(120)).await;
-        schedule.record_attempt(false);
+        schedule.record_attempt(None);
         let finished = tokio::time::Instant::now();
         schedule.wait().await;
         assert_eq!(
             tokio::time::Instant::now() - finished,
+            Duration::from_secs(5)
+        );
+    }
+
+    /// Waits one scheduled delay and returns how long it was.
+    async fn partition_audit_delay(schedule: &PartitionAuditSchedule) -> Duration {
+        let start = tokio::time::Instant::now();
+        schedule.wait().await;
+        tokio::time::Instant::now() - start
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partition_advance_retries_are_bounded_and_reset_once_advanced() {
+        let period = Duration::from_secs(900);
+        let mut schedule = PartitionAuditSchedule::new(period, Some(true));
+        let mut delays = vec![partition_audit_delay(&schedule).await.as_secs()];
+        // Failed attempts keep the pending state and spend the same budget.
+        for attempt in [
+            None,
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        ] {
+            schedule.record_attempt(attempt);
+            delays.push(partition_audit_delay(&schedule).await.as_secs());
+        }
+        assert_eq!(delays, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(
+            usize::try_from(super::PARTITION_ADVANCE_RETRY_LIMIT).ok(),
+            Some(delays.len())
+        );
+
+        // The budget is spent: a catch-all that never advances falls back to
+        // the normal period instead of retrying forever.
+        for attempt in [Some(true), None, Some(true)] {
+            schedule.record_attempt(attempt);
+            assert_eq!(partition_audit_delay(&schedule).await, period);
+        }
+
+        // Advancing resets the budget and backoff for a later pending catch-all.
+        schedule.record_attempt(Some(false));
+        assert_eq!(partition_audit_delay(&schedule).await, period);
+        schedule.record_attempt(Some(true));
+        assert_eq!(
+            partition_audit_delay(&schedule).await,
             Duration::from_secs(5)
         );
     }

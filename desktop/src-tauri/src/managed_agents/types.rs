@@ -117,6 +117,10 @@ pub struct AgentDefinition {
     /// older clients and is omitted from storage/public events for stable bytes.
     #[serde(default, skip_serializing_if = "super::AcpSessionPolicy::is_channel")]
     pub session_policy: super::AcpSessionPolicy,
+    /// Huddle voice profile; `None` (no voice) is the default. Local only:
+    /// never carried on the public persona event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_profile: Option<super::VoiceProfile>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -189,6 +193,7 @@ impl AgentDefinition {
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
             definition_capabilities: self.capabilities,
+            definition_voice_profile: self.voice_profile,
             relay_mesh: None,
             effort_level: None,
         }
@@ -231,6 +236,7 @@ impl ManagedAgentRecord {
             parallelism: self.definition_parallelism,
             capabilities: self.definition_capabilities.clone(),
             session_policy: self.session_policy,
+            voice_profile: self.definition_voice_profile.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         })
@@ -511,6 +517,11 @@ pub struct ManagedAgentRecord {
     /// and re-serializes byte-identically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub definition_capabilities: Vec<String>,
+    /// The definition's huddle voice, absorbed from
+    /// `AgentDefinition.voice_profile`. Instances resolve through their
+    /// definition, so this stays `None` on keyed records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_voice_profile: Option<super::VoiceProfile>,
     /// Typed marker for relay-mesh agents. `Some(_)` means this agent runs its
     /// inference through Buzz's relay-mesh local endpoint; the `model_ref` is
     /// the served model id to route to. `None` is a normal agent.

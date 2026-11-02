@@ -242,7 +242,18 @@ impl RelayInfo {
             supported_nips.push(NIP_RELAY_MEMBERSHIP);
         }
 
-        let mut supported_extensions = vec!["nip-er".to_string(), "nip-ar".to_string()];
+        let mut supported_extensions = vec![
+            "nip-er".to_string(),
+            "nip-ar".to_string(),
+            // NIP-CL: identity tags, labels and system channels.
+            "nip-cl".to_string(),
+            // Bridge `/query` search accepts `search_sort: "newest"`.
+            "buzz-search-sort".to_string(),
+            // kind:9002 `unlisted` (NOSTR.md, Unlisted channels). A relay
+            // without it ignores the tag beside `visibility`, so a client
+            // checks this before opening a channel as unlisted.
+            "buzz-unlisted-channels".to_string(),
+        ];
         let gif = gif_provider.map(|provider| {
             supported_extensions.push("buzz-gif".to_string());
             GifDescriptor {
@@ -659,6 +670,26 @@ mod tests {
             .supported_extensions
             .expect("extensions")
             .contains(&"buzz-gif".to_string()));
+    }
+
+    /// Clients refuse NIP-CL labels and system channels, newest-first
+    /// search, and unlisted channels unless the relay says it supports them,
+    /// so every document must advertise all three.
+    #[test]
+    fn advertises_nip_cl_search_sort_and_unlisted_extensions() {
+        let info = RelayInfo::build(
+            None,
+            None,
+            RelayCapabilityFlags::default(),
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            None,
+            None,
+        );
+        let extensions = info.supported_extensions.expect("extensions");
+        assert!(extensions.contains(&"nip-cl".to_string()));
+        assert!(extensions.contains(&"buzz-search-sort".to_string()));
+        assert!(extensions.contains(&"buzz-unlisted-channels".to_string()));
     }
 
     /// NIP-WP → NIP-11 mirror: a set workspace icon is served in the standard

@@ -503,6 +503,17 @@ export function MessageThreadPanel({
   if (!threadHead) {
     return null;
   }
+  // A sub-thread's head hides the root's other participants: never one-on-one.
+  const threadParticipants =
+    threadHead.rootId || threadRepliesPending || threadRepliesError
+      ? null
+      : [
+          threadHead,
+          ...threadReplies.flatMap(({ message, summary }) => [
+            message,
+            ...(summary?.participants ?? []).map(({ id }) => ({ pubkey: id })),
+          ]),
+        ];
   const threadScrollRegion = (
     <AuxiliaryPanelBody
       className="overflow-y-auto overflow-x-hidden overscroll-contain pb-24"
@@ -835,6 +846,7 @@ export function MessageThreadPanel({
               audienceContext={{
                 type: "thread",
                 rootTags: threadHead.tags,
+                participants: threadParticipants,
               }}
               channelId={channelId}
               channelName={channelName}

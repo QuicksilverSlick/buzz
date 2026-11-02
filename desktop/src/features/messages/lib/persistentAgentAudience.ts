@@ -160,21 +160,30 @@ export function removePersistentAgentAudienceMembersIfUnchanged({
   return true;
 }
 
+/** Adds the pubkeys that are neither present nor excluded; returns those. */
 export function initializePersistentAgentAudience(
   scope: string,
   pubkeys: Iterable<string>,
-): void {
-  if (!scope) return;
+): string[] {
+  if (!scope) return [];
   const excluded = excludedPubkeysByScope.get(scope);
   const initialPubkeys = normalizePubkeys(pubkeys).filter(
     (pubkey) =>
       !(audiences[scope] ?? []).includes(pubkey) && !excluded?.has(pubkey),
   );
-  if (initialPubkeys.length === 0) return;
+  if (initialPubkeys.length === 0) return [];
   setPersistentAgentAudience(scope, [
     ...(audiences[scope] ?? []),
     ...initialPubkeys,
   ]);
+  return initialPubkeys;
+}
+
+export function isPersistentAgentAudienceMemberExcluded(
+  scope: string,
+  pubkey: string,
+): boolean {
+  return excludedPubkeysByScope.get(scope)?.has(pubkey) ?? false;
 }
 
 export function addPersistentAgentAudienceMember(

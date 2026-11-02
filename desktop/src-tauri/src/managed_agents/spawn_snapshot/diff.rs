@@ -78,7 +78,7 @@ fn policy_for(path: &str) -> MaskPolicy {
     match path {
         // Arbitrary user text — a rendered before/after would be unbounded as
         // well as unreadable.
-        "system_prompt" | "team_instructions" => MaskPolicy::Text,
+        "system_prompt" | "team_instructions" | "voice_profile" => MaskPolicy::Text,
         // Arbitrary CLI arguments: `--token=...` is legal, so no part of the
         // value may be disclosed. Same for the relay URL — `normalize_relay_url`
         // rejects userinfo but deliberately preserves query strings, so

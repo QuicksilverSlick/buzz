@@ -110,6 +110,8 @@ type InboxDetailPaneProps = {
   isSinglePanelView?: boolean;
   hasThreadContextLoadError?: boolean;
   isThreadContextLoading?: boolean;
+  /** The fetched thread may be missing older replies (fetch limit hit). */
+  isThreadContextTruncated?: boolean;
   /** The relay reported the thread root as deleted. */
   isThreadRootDeleted?: boolean;
   item: InboxItem | null;
@@ -204,6 +206,7 @@ function InboxMessageDetailPane({
   isSinglePanelView = false,
   hasThreadContextLoadError = false,
   isThreadContextLoading = false,
+  isThreadContextTruncated = false,
   isThreadRootDeleted = false,
   item,
   messages = EMPTY_CONTEXT_MESSAGES,
@@ -558,10 +561,20 @@ function InboxMessageDetailPane({
       : null;
   const isThreadContext =
     !isDirectMessage && hasInboxThreadContext(item, messages);
-  const threadRootTags = isThreadContext
-    ? (displayMessages.find((message) => message.id === item.conversationId)
-        ?.tags ?? [])
-    : [];
+  const conversationRoot = displayMessages.find(
+    (message) => message.id === item.conversationId,
+  );
+  const threadRootTags = isThreadContext ? (conversationRoot?.tags ?? []) : [];
+  const threadParticipants =
+    isThreadContextLoading ||
+    hasThreadContextLoadError ||
+    isThreadContextTruncated ||
+    !conversationRoot
+      ? null
+      : displayMessages.map(({ authorPubkey, tags }) => ({
+          pubkey: authorPubkey,
+          tags,
+        }));
   const contextLabel = isThreadContext
     ? isDirectMessage
       ? `Thread with ${item.senderLabel}`
@@ -889,6 +902,7 @@ function InboxMessageDetailPane({
                   : {
                       type: "thread",
                       rootTags: threadRootTags,
+                      participants: threadParticipants,
                     }
               }
               channelId={item.item.channelId}

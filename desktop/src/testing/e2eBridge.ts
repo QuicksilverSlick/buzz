@@ -164,6 +164,7 @@ type MockRelayAgentSeed = {
 type MockPersonaSeed = {
   id?: string;
   displayName: string;
+  description?: string | null;
   avatarUrl?: string | null;
   systemPrompt: string;
   updatedAt?: string;
@@ -567,6 +568,8 @@ type E2eConfig = {
     agentMetricArchiveDefaultEnabled?: boolean;
     // The `bench_cards` snapshot; absent means the Bench is not enabled.
     benchCards?: BenchCards;
+    // Extra `search_messages` hits, matched like the seeded ones.
+    searchHits?: RawSearchHit[];
     saveSubscriptions?: Array<{
       scope_type: string;
       scope_value: string;
@@ -1075,6 +1078,7 @@ type RawPersona = {
   respond_to_allowlist?: string[];
   parallelism?: number | null;
   session_policy?: "channel" | "thread";
+  voice_profile?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 };
@@ -2734,6 +2738,7 @@ function resetMockPersonas(config?: E2eConfig) {
       id: persona.id ?? crypto.randomUUID(),
       display_name: persona.displayName,
       avatar_url: persona.avatarUrl ?? null,
+      description: persona.description ?? null,
       system_prompt: persona.systemPrompt,
       runtime: persona.runtime ?? null,
       model: persona.model ?? null,
@@ -8978,6 +8983,7 @@ type PersonaBehaviorInput = {
   respondToAllowlist?: string[];
   parallelism?: number;
   sessionPolicy?: "channel" | "thread";
+  voice?: { voiceWithoutOwner: boolean } & Record<string, unknown>;
 };
 
 /** Mirrors `apply_persona_behavior`: replace all four as a unit. */
@@ -8995,6 +9001,10 @@ function applyMockPersonaBehavior(
       : [];
   persona.parallelism = behavior.parallelism ?? null;
   persona.session_policy = behavior.sessionPolicy ?? "channel";
+  const { voiceWithoutOwner, ...voice } = behavior.voice ?? {};
+  persona.voice_profile = behavior.voice
+    ? { ...voice, voice_without_owner: voiceWithoutOwner }
+    : null;
 }
 
 async function handleCreatePersona(args: {
@@ -10134,6 +10144,7 @@ async function handleSearchMessages(
         });
       }
     }
+    mockHits.push(...(config?.mock?.searchHits ?? []));
 
     const authorSet = args.authors?.length
       ? new Set(args.authors.map((author) => author.toLowerCase()))
@@ -15415,6 +15426,10 @@ export function maybeInstallE2eTauriMocks() {
       // The real command publishes the owner's keycap; the mock accepts it
       // and leaves `recorded` to the configured snapshot.
       case "bench_answer":
+        return null;
+      // The real command asks the Bench to post a queued card next; the
+      // mock leaves `cardEventId` to the configured snapshot.
+      case "bench_bump":
         return null;
       case "set_prevent_sleep_active":
         return null;

@@ -99,6 +99,22 @@ fn search_messages_filter_requests_prefix_mode_for_topbar_typeahead() {
 }
 
 #[test]
+fn search_messages_filter_matches_a_number_exactly() {
+    let mode = |q: &str| {
+        build_search_messages_filter(q, 12, None, None, None, None)
+            .get("search_mode")
+            .cloned()
+    };
+    for q in ["792", " 792 ", "#792"] {
+        assert!(mode(q).is_none(), "{q} must match 792 exactly");
+    }
+    // "-12" would be NOT 12 in the relay's full-text syntax.
+    for q in ["pro", "792d", "pr792", "-12", "lost -5", "release 12"] {
+        assert_eq!(mode(q), Some(serde_json::json!("prefix")), "{q}");
+    }
+}
+
+#[test]
 fn search_messages_filter_emits_operator_fields() {
     let authors =
         vec!["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string()];

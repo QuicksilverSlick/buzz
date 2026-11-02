@@ -110,20 +110,12 @@ pub(crate) async fn connect_audio_relay(
     let keys = state.keys.lock().map_err(|e| e.to_string())?.clone();
 
     // TTS interrupt flags — recv task cancels TTS when remote humans speak.
-    let (
-        tts_cancel,
-        tts_active,
-        local_tts_publishers,
-        remote_stt_pipeline,
-        agent_pubkeys,
-        human_floor,
-    ) = {
+    let (tts_cancel, tts_active, local_tts_publishers, agent_pubkeys, human_floor) = {
         let hs = state.huddle()?;
         (
             Arc::clone(&hs.tts_cancel),
             Arc::clone(&hs.tts_active),
             Arc::clone(&hs.local_tts_publishers),
-            Arc::clone(&hs.remote_stt_pipeline),
             Arc::clone(&hs.agent_pubkeys),
             hs.human_floor.clone(),
         )
@@ -144,6 +136,13 @@ pub(crate) async fn connect_audio_relay(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // Slice 9: voiced agents read this desktop's output route from a file.
+    super::audio_output::spawn_output_route_writer(
+        app_handle.clone(),
+        channel_id.to_owned(),
+        output_device_name.clone(),
+        cancel.clone(),
+    );
 
     tokio::spawn(async move {
         if let Err(e) = audio_relay_pipeline(AudioRelayPipelineArgs {
@@ -156,7 +155,6 @@ pub(crate) async fn connect_audio_relay(
             tts_cancel,
             tts_active,
             local_tts_publishers,
-            remote_stt_pipeline,
             agent_pubkeys,
             human_floor,
             output_device_name,
@@ -350,7 +348,6 @@ struct AudioRelayPipelineArgs {
     tts_cancel: Arc<AtomicBool>,
     tts_active: Arc<AtomicBool>,
     local_tts_publishers: super::tts::LocalTtsPublishers,
-    remote_stt_pipeline: Arc<std::sync::Mutex<Option<std::sync::Weak<super::stt::SttPipeline>>>>,
     agent_pubkeys: Arc<std::sync::Mutex<Vec<String>>>,
     human_floor: super::human_floor::HumanFloor,
     output_device_name: Option<String>,
@@ -367,7 +364,6 @@ async fn audio_relay_pipeline(args: AudioRelayPipelineArgs) -> Result<(), String
         tts_cancel,
         tts_active,
         local_tts_publishers,
-        remote_stt_pipeline,
         agent_pubkeys,
         human_floor,
         output_device_name,
@@ -400,8 +396,10 @@ async fn audio_relay_pipeline(args: AudioRelayPipelineArgs) -> Result<(), String
                 continue; // Malformed batch.
             }
             let samples: Vec<f32> = pcm_bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
 
             let mut tx = ws_tx_send.lock().await;
@@ -432,7 +430,6 @@ async fn audio_relay_pipeline(args: AudioRelayPipelineArgs) -> Result<(), String
         tts_active,
         tts_cancel,
         local_tts_publishers,
-        remote_stt_pipeline,
         agent_pubkeys,
         human_floor,
     ));
@@ -488,30 +485,14 @@ pub(crate) async fn fetch_channel_members_with_roles(
     Ok(members)
 }
 
-/// Fetch channel members, optionally filtered by role (e.g., "bot" for agents).
+/// Fetch all channel member pubkeys. Use `roster::fetch_huddle_roster` to
+/// tell agents from people.
 pub(crate) async fn fetch_channel_members(
     channel_id: &str,
-    role_filter: Option<&str>,
     state: &AppState,
 ) -> Result<Vec<String>, String> {
     let all = fetch_channel_members_with_roles(channel_id, state).await?;
-    Ok(all
-        .into_iter()
-        .filter(|(_, role)| role_filter.is_none_or(|r| role.as_deref() == Some(r)))
-        .map(|(pubkey, _)| pubkey)
-        .collect())
-}
-
-/// Count human (non-bot) members remaining in a channel.
-pub(crate) async fn count_human_members(
-    channel_id: &str,
-    state: &AppState,
-) -> Result<usize, String> {
-    let all = fetch_channel_members_with_roles(channel_id, state).await?;
-    Ok(all
-        .iter()
-        .filter(|(_, role)| role.as_deref() != Some("bot"))
-        .count())
+    Ok(all.into_iter().map(|(pubkey, _)| pubkey).collect())
 }
 
 #[cfg(test)]

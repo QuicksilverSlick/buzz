@@ -1,3 +1,4 @@
+import AuthenticationServices
 import AVFoundation
 import BuzzPushKit
 import DeclaredAgeRange
@@ -29,6 +30,8 @@ import os.log
     endpointGrantStore: endpointGrantStore,
     keychainAccessGroup: pushKeychainAccessGroup
   )
+  private var communityKeyboardChannel: FlutterMethodChannel?
+  private var communityKeyboardObserver: NSObjectProtocol?
   private var hapticsChannel: FlutterMethodChannel?
   private var qrScannerChannel: FlutterMethodChannel?
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
@@ -43,8 +46,13 @@ import os.log
   private var nativeEmojiPickerCoordinator: NativeEmojiPickerCoordinator?
   private var nativeAddMembersSheetCoordinator: NativeAddMembersSheetCoordinator?
   private var nativeConfirmationDialogCoordinator: NativeConfirmationDialogCoordinator?
+  private var nativeProfileSetupCoordinator: NativeProfileSetupCoordinator?
+  private var nativeCommunityEntryCoordinator: NativeCommunityEntryCoordinator?
   private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
   private var nativeMessageActionSurfaceSupportChannel: FlutterMethodChannel?
+  private var identityFilePlugin: IdentityFilePlugin?
+  private var hostedHpkeChannel: FlutterMethodChannel?
+  private var browserAuthBridge: BuzzBrowserAuthBridge?
   private var huddleMediaPlugin: HuddleMediaPlugin?
 
   override func application(
@@ -59,7 +67,46 @@ import os.log
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BuzzIosMediaCarousel") {
+      registrar.register(IosMediaCarouselFactory(messenger: registrar.messenger()), withId: "buzz/ios_media_carousel")
+    }
+
     let messenger = engineBridge.applicationRegistrar.messenger()
+    let keyboardChannel = FlutterMethodChannel(
+      name: "buzz/community_keyboard", binaryMessenger: messenger)
+    communityKeyboardChannel = keyboardChannel
+    if let observer = communityKeyboardObserver {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    communityKeyboardObserver = NotificationCenter.default.addObserver(
+      forName: UIResponder.keyboardWillShowNotification, object: nil, queue: .main
+    ) { _ in
+      // Deliver after UIKit finishes preparing the keyboard in this run-loop turn.
+      DispatchQueue.main.async {
+        keyboardChannel.invokeMethod("willShow", arguments: nil)
+      }
+    }
+    identityFilePlugin = IdentityFilePlugin(messenger: messenger)
+    browserAuthBridge = BuzzBrowserAuthBridge(messenger: messenger)
+    hostedHpkeChannel = FlutterMethodChannel(name: "buzz/hosted_hpke", binaryMessenger: messenger)
+    hostedHpkeChannel?.setMethodCallHandler { call, result in
+      guard call.method == "seal" else { result(FlutterMethodNotImplemented); return }
+      guard #available(iOS 17.0, *) else {
+        result(FlutterError(code: "unsupported", message: "Backup requires iOS 17 or later", details: nil)); return
+      }
+      guard let args = call.arguments as? [String: Any],
+        let recipient = args["recipient"] as? FlutterStandardTypedData,
+        let plaintext = args["plaintext"] as? FlutterStandardTypedData,
+        let aad = args["aad"] as? FlutterStandardTypedData else {
+        result(FlutterError(code: "invalid_input", message: nil, details: nil)); return
+      }
+      do {
+        let sealed = try HostedHpkeBackup.seal(recipient: recipient.data, plaintext: plaintext.data, aad: aad.data)
+        result(["enc": FlutterStandardTypedData(bytes: sealed.enc), "ciphertext": FlutterStandardTypedData(bytes: sealed.ciphertext)])
+      } catch {
+        result(FlutterError(code: "backup_unavailable", message: nil, details: nil))
+      }
+    }
     huddleMediaPlugin = HuddleMediaPlugin(messenger: messenger)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BuzzIosNavigationBar") {
       registrar.register(IosNavigationBarFactory(messenger: messenger, parent: registrar.viewController), withId: "buzz/ios_navigation_bar")
@@ -262,6 +309,12 @@ import os.log
         forPlugin: "BuzzNativeConfirmationDialog"
       )?.viewController
     )
+
+    nativeProfileSetupCoordinator = NativeProfileSetupCoordinator(messenger: messenger) { [weak self] engine in
+      let channel = FlutterMethodChannel(name: "buzz/media_upload", binaryMessenger: engine.binaryMessenger)
+      channel.setMethodCallHandler { [weak self] call, result in self?.handleMediaUploadMethodCall(call, result: result) }
+    }
+    nativeCommunityEntryCoordinator = NativeCommunityEntryCoordinator(messenger: messenger)
 
     let nativeProfileTextEditorRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzNativeProfileTextEditor"
@@ -1073,11 +1126,76 @@ import os.log
 }
 
 extension BuzzPushNavigationTarget {
-  fileprivate var flutterArguments: [String: String] {
-    [
+  var flutterArguments: [String: String] {
+    var arguments = [
       "eventId": eventID,
       "communityId": communityID,
       "channelId": channelID,
     ]
+    arguments["threadRootId"] = threadRootID
+    return arguments
+  }
+}
+
+
+/// Keeps the authentication callback scoped to the system browser session.
+private final class BuzzBrowserAuthBridge: NSObject, ASWebAuthenticationPresentationContextProviding {
+  private let channel: FlutterMethodChannel
+  private var session: ASWebAuthenticationSession?
+  private var pending: FlutterResult?
+  private var attemptID: UUID?
+
+  init(messenger: FlutterBinaryMessenger) {
+    channel = FlutterMethodChannel(name: "buzz/browser_auth", binaryMessenger: messenger)
+    super.init()
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { return }
+      if call.method == "cancel" {
+        self.session?.cancel()
+        self.finish(nil, code: "cancelled")
+        result(nil)
+        return
+      }
+      guard call.method == "start" else { result(FlutterMethodNotImplemented); return }
+      guard self.session == nil,
+        let args = call.arguments as? [String: String],
+        let raw = args["url"], let url = URL(string: raw),
+        url.scheme == "https",
+        ["app.builderlab.xyz", "app.builderlabstaging.xyz"].contains(url.host ?? ""),
+        url.path == "/api/goose/v1/auth/login", url.user == nil, url.password == nil,
+        url.port == nil, url.fragment == nil
+      else { result(FlutterError(code: "unavailable", message: nil, details: nil)); return }
+      self.pending = result
+      let attemptID = UUID()
+      self.attemptID = attemptID
+      let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "xyz.block.buzz.mobile") { [weak self] callback, error in
+        DispatchQueue.main.async {
+          guard self?.attemptID == attemptID else { return }
+          let cancelled = (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin
+          self?.finish(callback?.absoluteString, code: cancelled ? "cancelled" : "unavailable")
+        }
+      }
+      session.presentationContextProvider = self
+      session.prefersEphemeralWebBrowserSession = false
+      #if DEBUG
+      session.prefersEphemeralWebBrowserSession = args["ephemeral"] == "true"
+      #endif
+      self.session = session
+      if !session.start() { self.finish(nil, code: "unavailable") }
+    }
+  }
+
+  private func finish(_ callback: String?, code: String) {
+    let result = pending
+    attemptID = nil
+    pending = nil
+    session = nil
+    if let callback { result?(callback) }
+    else { result?(FlutterError(code: code, message: nil, details: nil)) }
+  }
+
+  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+    UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }.first(where: { $0.isKeyWindow }) ?? ASPresentationAnchor()
   }
 }

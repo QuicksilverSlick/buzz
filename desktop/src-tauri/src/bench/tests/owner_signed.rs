@@ -838,14 +838,10 @@ async fn an_approval_untapped_on_a_forgotten_card_and_closed_out_is_withdrawn_on
     b.tick().await.unwrap();
     b.now += ROUTE_SETTLE_SECS;
     b.settle(2).await;
-    // Untapped, crowded out past MAX_CARDS, and closed out inside the settle.
+    // Untapped, its card deleted by hand, and closed out inside the settle.
     reply(&b, &[&list]);
     b.tick().await.unwrap();
-    for i in 0..MAX_CARDS {
-        b.drop_file("orchestrator", &format!("c{i:02}"), &drop_json(&[]));
-    }
-    b.tick().await.unwrap();
-    assert!(b.s.items[ASK].card.is_none());
+    forget_card(&mut b.s, ASK);
     close_out(&b);
     let before = b.posts().len();
     b.settle(3).await;

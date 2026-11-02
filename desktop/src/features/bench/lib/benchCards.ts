@@ -10,6 +10,12 @@
  */
 
 import type { TimelineReaction } from "@/features/messages/types";
+import {
+  REPO_SHORT,
+  type RepoShort,
+  parsePrQuery,
+  prMentionScore,
+} from "@/features/search/lib/prNumber";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSeverity = "critical" | "attention" | "info" | "good";
@@ -99,6 +105,11 @@ export type BenchCard = {
   updatedAt: string;
   /** The live card's kind 9 id (a receipt's kept card); null when none. */
   cardEventId: string | null;
+  /**
+   * Why an open card has no card on the relay yet: queued for a slot, or its
+   * channel is not ready; null (or absent, on older snapshots) otherwise.
+   */
+  waitsFor?: "slot" | "channel" | null;
   answer: BenchAnswer | null;
   /** 0-based option the card text shows as Recorded; null = unanswered. */
   recorded: number | null;
@@ -133,6 +144,8 @@ export type BenchSnapshot = {
   ownerPubkey: string | null;
   lastError: string | null;
   lastTick: string;
+  /** How many open cards the Bench keeps on the relay at once. */
+  maxCards?: number;
   items: BenchCard[];
 };
 
@@ -343,12 +356,30 @@ export type BenchCardMode = {
   interactive: boolean;
   /** Why a pending card's options are read-only. */
   readOnlyReason: string | null;
+  /** Not on the relay yet: an option tap posts it next (`bench_bump`). */
+  bumpable?: true;
 };
+
+/** "the Bench posts a new card only while fewer than 30 slots are in use" */
+function capRule(maxCards: number | undefined): string {
+  return `the Bench posts a new card only while fewer than ${maxCards ?? "its limit of"} slots are in use`;
+}
+
+/** The Bench header's alarm when cards wait for a slot; null when none do. */
+export function benchQueuedLine(
+  snapshot: Pick<BenchSnapshot, "items" | "maxCards">,
+): string | null {
+  const n = snapshot.items.filter((card) => card.waitsFor === "slot").length;
+  if (n === 0) return null;
+  const wait = n === 1 ? "1 card waits" : `${n} cards wait`;
+  return `${wait} off the relay: ${capRule(snapshot.maxCards)}, and each posts when a slot frees. Tap one below to post it now.`;
+}
 
 export function benchCardMode(
   card: BenchCard,
   ownerPubkey: string | null,
   viewerPubkey: string | undefined,
+  maxCards?: number,
 ): BenchCardMode {
   if (card.kind !== "pending") {
     return { interactive: false, readOnlyReason: null };
@@ -358,13 +389,27 @@ export function benchCardMode(
     readOnlyReason,
   });
   // Only the Bench screen shows an item without a live card: an answered one
-  // whose card was retired, or one the Bench has yet to (re)post.
+  // whose card was retired, or one the Bench has yet to (re)post. A queued
+  // one says why, and the owner's tap posts it next.
   if (!card.cardEventId) {
-    return readOnly(
-      card.answer
-        ? "This card is no longer live."
-        : "Waiting for the Bench to post this card in #bench.",
-    );
+    if (card.answer) return readOnly("This card is no longer live.");
+    if (card.waitsFor === "channel") {
+      return readOnly(
+        "Waiting: this card's channel isn't ready for cards yet.",
+      );
+    }
+    if (card.waitsFor !== "slot") {
+      return readOnly("Waiting for the Bench to post this card.");
+    }
+    const queued = `Queued: ${capRule(maxCards)}; this one posts when a slot frees.`;
+    const owner =
+      ownerPubkey !== null &&
+      (viewerPubkey === undefined || sameKey(viewerPubkey, ownerPubkey));
+    if (!owner) return readOnly(queued);
+    return {
+      ...readOnly(`${queued} Tap an option to post it now.`),
+      bumpable: true,
+    };
   }
   if (card.validity === "superseded") {
     return readOnly("Superseded: this card is being retired.");
@@ -509,6 +554,17 @@ function linkScheme(url: string): SafeBenchLink["scheme"] | null {
   if (parsed.protocol === "buzz:" && url.startsWith("buzz://")) return "buzz";
   return null;
 }
+
+/** How long a tap on a card off the relay waits for it to post. */
+export const BENCH_BUMP_TIMEOUT_MS = 30_000;
+export const BENCH_BUMP_POSTING =
+  "Posting this card now. Tap your answer again once it's live.";
+export const BENCH_BUMP_TIMEOUT_MESSAGE =
+  "Not posted after 30 s. The Bench may be offline; try again.";
+/** How long the live card that replaces a tapped one still says so (BUMP_SECS). */
+export const BENCH_BUMP_HINT_MS = 120_000;
+export const BENCH_BUMP_POSTED =
+  "Posted at your request. Your earlier tap didn't answer it; tap your answer now.";
 
 /** How long a click waits for the snapshot to show it recorded. */
 export const BENCH_SAVE_TIMEOUT_MS = 15_000;
@@ -865,6 +921,40 @@ export function benchDeadlineSeconds(deadline: string | null): number | null {
   return Number.isFinite(ms) ? Math.floor(ms / 1_000) : null;
 }
 
+/**
+ * When the card was created, in unix seconds: when the Bench took its drop
+ * (a changed re-drop is a new card), or for a receipt its question's, whose
+ * card it kept. Null if unparseable.
+ */
+export function benchCreatedSeconds(card: BenchCard): number | null {
+  return benchDeadlineSeconds((card.request ?? card).updatedAt);
+}
+
+const CREATED_THIS_YEAR = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+const CREATED_OTHER_YEAR = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+/** Local "Oct 29, 5:44 PM"; "Oct 29, 2025, 5:44 PM" from another year. */
+export function formatBenchCreated(
+  unixSeconds: number,
+  nowSeconds = Date.now() / 1_000,
+): string {
+  const date = new Date(unixSeconds * 1_000);
+  const thisYear =
+    date.getFullYear() === new Date(nowSeconds * 1_000).getFullYear();
+  return (thisYear ? CREATED_THIS_YEAR : CREATED_OTHER_YEAR).format(date);
+}
+
 const MONTHS = [
   "january",
   "february",
@@ -905,7 +995,8 @@ function searchParts(card: BenchCard): BenchCard[] {
   return card.request ? [card, card.request] : [card];
 }
 
-function searchText(card: BenchCard): string {
+/** Everything search looks at, lowercased, a receipt's request included. */
+export function searchText(card: BenchCard): string {
   return searchParts(card)
     .flatMap((c) => [
       c.id,
@@ -938,25 +1029,47 @@ function searchDates(card: BenchCard): Date[] {
     .map((at) => new Date(at * 1_000));
 }
 
+const AREA_SHORT: Record<string, RepoShort> = {
+  buzz: "buzz",
+  "28-day-reset": "reset",
+  "dreamforge-talos": "talos",
+};
+
+/** The repo a card is about, from the steward's id, a pull link or its area. */
+export function benchCardRepo(card: BenchCard): RepoShort | null {
+  const own = /^steward\/(?:hold-)?(buzz|reset|talos)-/.exec(card.id)?.[1];
+  if (own) return own as RepoShort;
+  for (const { url } of card.links) {
+    const repo = /github\.com\/[^/]+\/([^/]+)\/pull\//.exec(url)?.[1];
+    if (repo && Object.hasOwn(REPO_SHORT, repo.toLowerCase())) {
+      return REPO_SHORT[repo.toLowerCase()];
+    }
+  }
+  return Object.hasOwn(AREA_SHORT, card.area) ? AREA_SHORT[card.area] : null;
+}
+
 /**
  * The Bench search as a card predicate; a receipt matches on its request
- * too. "#689" and "PR 689" match only that PR number ("#689", "PR 689",
- * .../pull/689); a bare "689" matches it as a whole number anywhere, so "28"
- * finds "28 Day Reset" and never "6890" or "3,689"; "2026-10-14" and
- * "Oct 14" also match the local day a card was updated or answered;
- * otherwise every word must be in the card's text, project, writer or names.
- * Empty matches everything.
+ * too. "#689", "PR 689", "pr-689" and "pull/689" match only that PR number
+ * (#689, PR 689, pull request 689, .../pull/689), and "buzz#689" only on a
+ * card that is not about another repo; a bare "689" matches it as a whole
+ * number anywhere, so "28" finds "28 Day Reset" and never "6890", "3,689" or
+ * "689d3e"; "2026-10-14" and "Oct 14" also match the local day a card was
+ * updated or answered; otherwise every word must be in the card's text,
+ * project, writer or names. Empty matches everything.
  */
 export function benchSearch(query: string): (card: BenchCard) => boolean {
   const q = query.trim().toLowerCase();
   if (!q) return () => true;
-  const pr = /^(pr\s*)?(#)?(\d+)$/.exec(q);
+  const pr = parsePrQuery(q);
   if (pr) {
-    const number =
-      pr[1] || pr[2]
-        ? new RegExp(`(?:#|\\bpr\\s*#?|/pull/)${pr[3]}(?!\\d)`)
-        : new RegExp(`(?<![\\d,.])${pr[3]}(?!\\d)`);
-    return (card) => number.test(searchText(card));
+    return (card) => {
+      const repo = pr.repo && benchCardRepo(card);
+      return (
+        (!repo || repo === pr.repo) &&
+        prMentionScore(searchText(card), pr.number) >= (pr.explicit ? 2 : 1)
+      );
+    };
   }
   const day = searchDay(q);
   const words = q.split(/\s+/);

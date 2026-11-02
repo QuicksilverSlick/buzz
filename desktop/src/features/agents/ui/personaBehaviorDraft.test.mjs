@@ -5,6 +5,7 @@ import {
   behaviorForSubmit,
   draftFromBehavior,
   emptyPersonaBehaviorDraft,
+  emptyVoiceDraft,
   personaBehaviorDraftValid,
 } from "./personaBehaviorDraft.ts";
 
@@ -128,6 +129,7 @@ test("draftFromBehavior round-trips a full quad and copies the list", () => {
     parallelism: "3",
     capabilities: [],
     sessionPolicy: "thread",
+    voice: emptyVoiceDraft,
   });
   draft.respondToAllowlist.push("mutated");
   assert.deepEqual(behavior.respondToAllowlist, [HEX], "list must be copied");
@@ -166,4 +168,30 @@ test("edit full-clear submits an explicit empty group, not nothing", () => {
     true,
   );
   assert.equal(noop, undefined, "empty-vs-empty must stay silent");
+});
+
+// ── Huddle voice (slice 9) ───────────────────────────────────────────────────
+
+test("voice submits trimmed values, round-trips, and drops when cleared", () => {
+  const voice = { ...emptyVoiceDraft, enabled: true, voice: " marin " };
+  const draft = {
+    ...emptyPersonaBehaviorDraft,
+    voice: { ...voice, aliases: "Orch, , O " },
+  };
+  const group = behaviorForSubmit(draft, emptyPersonaBehaviorDraft, true);
+  assert.deepEqual(group.voice, {
+    enabled: true,
+    voice: "marin",
+    persona: undefined,
+    aliases: ["Orch", "O"],
+    voiceWithoutOwner: false,
+  });
+  assert.equal(draftFromBehavior(group).voice.aliases, "Orch, O");
+  // Switching off keeps the details; clearing everything drops the key.
+  const off = { ...draft, voice: { ...draft.voice, enabled: false } };
+  assert.equal(behaviorForSubmit(off, draft, true).voice.voice, "marin");
+  assert.equal(
+    behaviorForSubmit(emptyPersonaBehaviorDraft, draft, true).voice,
+    undefined,
+  );
 });

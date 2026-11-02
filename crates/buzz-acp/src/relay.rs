@@ -138,6 +138,20 @@ pub struct ChannelInfo {
     pub channel_type: String,
     /// Channel description from the kind-39000 `about` tag, if present.
     pub description: Option<String>,
+    /// The kind-39000 `p` tags (lowercase hex): the relay lists a DM's
+    /// participants there. Empty when none are listed.
+    pub participants: Vec<String>,
+}
+
+/// The lowercase `p` tags of a kind-39000 event, which name a DM's
+/// participants. The uppercase `P` (the creator) is not one.
+pub(crate) fn participants_from_tags(tags: &[serde_json::Value]) -> Vec<String> {
+    tags.iter()
+        .filter_map(|tag| match tag.as_array()?.as_slice() {
+            [k, v, ..] if k == "p" => Some(v.as_str()?.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
@@ -149,12 +163,17 @@ pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
             match arr.first().and_then(|v| v.as_str()) {
                 Some("hidden") => is_hidden = true,
                 Some("private") => is_private = true,
-                Some("t") => declared_type = arr.get(1).and_then(|v| v.as_str()),
+                // The first `t` is the channel type; later `t` tags are labels.
+                Some("t") if declared_type.is_none() => {
+                    declared_type = arr.get(1).and_then(|v| v.as_str())
+                }
                 _ => {}
             }
         }
     }
-    if declared_type == Some("dm") || is_hidden {
+    // `hidden` marks a DM only on metadata without a declared type; a private
+    // system channel is hidden too.
+    if declared_type == Some("dm") || (declared_type.is_none() && is_hidden) {
         "dm".to_string()
     } else if declared_type == Some("private") || is_private {
         "private".to_string()
@@ -177,7 +196,7 @@ pub(crate) fn merge_discovered_channels(
     channel_uuids: Vec<Uuid>,
     meta_events: &serde_json::Value,
 ) -> HashMap<Uuid, ChannelInfo> {
-    let mut meta_map: HashMap<Uuid, (String, String, Option<String>)> = HashMap::new();
+    let mut meta_map: HashMap<Uuid, (String, String, Option<String>, Vec<String>)> = HashMap::new();
     let mut archived: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     if let Some(arr) = meta_events.as_array() {
         for ev in arr {
@@ -214,7 +233,10 @@ pub(crate) fn merge_discovered_channels(
                         .map(|s| s.trim())
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    meta_map.insert(uuid, (ch_name, ch_type, ch_desc));
+                    meta_map.insert(
+                        uuid,
+                        (ch_name, ch_type, ch_desc, participants_from_tags(tags)),
+                    );
                 }
             }
         }
@@ -225,15 +247,22 @@ pub(crate) fn merge_discovered_channels(
         if archived.contains(&uuid) {
             continue;
         }
-        let (name, channel_type, description) = meta_map
-            .remove(&uuid)
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), None));
+        let (name, channel_type, description, participants) =
+            meta_map.remove(&uuid).unwrap_or_else(|| {
+                (
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    None,
+                    Vec::new(),
+                )
+            });
         map.insert(
             uuid,
             ChannelInfo {
                 name,
                 channel_type,
                 description,
+                participants,
             },
         );
     }
@@ -4207,6 +4236,31 @@ mod recovery_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn channel_type_comes_from_the_first_t_tag_not_a_label() {
+        let tags = vec![
+            serde_json::json!(["d", "c"]),
+            serde_json::json!(["t", "dm"]),
+            serde_json::json!(["t", "workspace"]),
+        ];
+        assert_eq!(channel_type_from_tags(&tags), "dm");
+    }
+
+    /// Mutation: treat any `hidden` metadata as a DM → RED.
+    #[test]
+    fn hidden_means_dm_only_without_a_declared_type() {
+        let system = vec![
+            serde_json::json!(["d", "c"]),
+            serde_json::json!(["t", "system"]),
+            serde_json::json!(["private"]),
+            serde_json::json!(["hidden"]),
+        ];
+        assert_eq!(channel_type_from_tags(&system), "private");
+
+        let legacy_dm = vec![serde_json::json!(["d", "c"]), serde_json::json!(["hidden"])];
+        assert_eq!(channel_type_from_tags(&legacy_dm), "dm");
+    }
+
     async fn nip11_test_client(
         responses: HashMap<String, (u16, String)>,
     ) -> (
@@ -4449,6 +4503,30 @@ mod tests {
         let meta = serde_json::json!([meta_event(channel, "dm", &["t", "dm"])]);
         let map = merge_discovered_channels(vec![channel], &meta);
         assert_eq!(map[&channel].channel_type, "dm");
+    }
+
+    #[test]
+    fn merge_discovered_channels_reads_dm_participants_from_p_tags() {
+        let (dm, stream) = (Uuid::new_v4(), Uuid::new_v4());
+        let (agent, owner) = ("a".repeat(64), "B".repeat(64));
+        let meta = serde_json::json!([
+            meta_event(
+                dm,
+                "dm",
+                &["t", "dm", "p", &agent, "p", &owner, "P", &agent]
+            ),
+            meta_event(stream, "general", &["t", "stream"]),
+        ]);
+        let map = merge_discovered_channels(vec![dm, stream, Uuid::new_v4()], &meta);
+        assert_eq!(
+            map[&dm].participants,
+            [agent, owner.to_ascii_lowercase()],
+            "lowercase p tags only; P is the creator"
+        );
+        assert!(map[&stream].participants.is_empty());
+        assert!(map
+            .values()
+            .any(|info| info.channel_type == "unknown" && info.participants.is_empty()));
     }
 
     #[test]

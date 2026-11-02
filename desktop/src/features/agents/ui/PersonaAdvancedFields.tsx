@@ -1,5 +1,6 @@
 import * as React from "react";
 import { CapabilityGrantsField } from "./CapabilityGrantsField";
+import { VoiceProfileField } from "./VoiceProfileField";
 import { useAgentAccessOwnerOnlyQuery } from "../useAgentAccessOwnerOnly";
 import { Input } from "@/shared/ui/input";
 import { cn } from "@/shared/lib/cn";
@@ -167,6 +168,12 @@ export function PersonaAdvancedFields({
           onBehaviorDraftChange({ ...behaviorDraft, capabilities })
         }
         value={behaviorDraft.capabilities}
+      />
+
+      <VoiceProfileField
+        disabled={disabled}
+        onChange={(voice) => onBehaviorDraftChange({ ...behaviorDraft, voice })}
+        value={behaviorDraft.voice}
       />
 
       {afterRespondTo}

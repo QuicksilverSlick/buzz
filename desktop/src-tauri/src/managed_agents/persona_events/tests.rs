@@ -7,6 +7,7 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "p".repeat(64),
@@ -150,6 +151,7 @@ pub(super) fn sample_persona() -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "test-persona".to_string(),
         display_name: "Test Persona".to_string(),
@@ -397,6 +399,7 @@ fn content_matches_nip_ap_vector() {
     let record = AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "test-agent".to_string(),
         display_name: "Test Agent".to_string(),
@@ -433,6 +436,7 @@ fn round_trip_minimal_persona() {
     let record = AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "minimal".to_string(),
         display_name: "Minimal".to_string(),
@@ -535,6 +539,7 @@ fn quad_absent_definition_hash_stable_across_activation() {
     let record = AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "quad-absent".to_string(),
         display_name: "Test".to_string(),
@@ -585,6 +590,7 @@ fn persona_from_event_content_for_test(content: PersonaEventContent) -> AgentDef
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: content.session_policy,
+        voice_profile: None,
         description: content.description,
         id: "staged".to_string(),
         display_name: content.display_name,

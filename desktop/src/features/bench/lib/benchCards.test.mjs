@@ -9,12 +9,14 @@ import {
   benchAnswerReducer,
   benchCardMarkerItemId,
   benchCardMode,
+  benchCreatedSeconds,
   benchDeadlineSeconds,
   benchEligible,
   benchForLabel,
   benchOptionViews,
   benchPlainView,
   benchPreviousAnswerLine,
+  benchQueuedLine,
   benchReceipt,
   benchRecordedLine,
   benchRowState,
@@ -24,6 +26,7 @@ import {
   benchStateLabel,
   benchValidityLabel,
   createPollGroup,
+  formatBenchCreated,
   indexBenchCards,
   isBenchAnswerKeycap,
   isBenchCandidate,
@@ -226,6 +229,58 @@ test("mode: read-only for another viewer, no owner, stale or superseded", () => 
     assert.equal(mode.interactive, false);
     assert.match(mode.readOnlyReason ?? "", reason);
   }
+});
+
+test("mode: a card off the relay says why, and a tap on it posts it next", () => {
+  const off = (waitsFor) => card({ cardEventId: null, waitsFor });
+  const queued =
+    "Queued: the Bench posts a new card only while fewer than 30 slots are in use; this one posts when a slot frees.";
+  assert.deepEqual(benchCardMode(off("slot"), OWNER, OWNER, 30), {
+    interactive: false,
+    readOnlyReason: `${queued} Tap an option to post it now.`,
+    bumpable: true,
+  });
+  // Only the owner's tap posts it; anyone else is told why it waits.
+  assert.deepEqual(benchCardMode(off("slot"), OWNER, "c".repeat(64), 30), {
+    interactive: false,
+    readOnlyReason: queued,
+  });
+  assert.equal(benchCardMode(off("slot"), null, OWNER, 30).bumpable, undefined);
+  // A channel not ready says so before any tap; about to post, nothing to do.
+  assert.deepEqual(benchCardMode(off("channel"), OWNER, OWNER), {
+    interactive: false,
+    readOnlyReason: "Waiting: this card's channel isn't ready for cards yet.",
+  });
+  assert.deepEqual(benchCardMode(off(null), OWNER, OWNER), {
+    interactive: false,
+    readOnlyReason: "Waiting for the Bench to post this card.",
+  });
+  // An answered card whose card was retired: nothing to post or answer.
+  const retired = card({
+    cardEventId: null,
+    answer: { option: 0, answeredAt: 1 },
+  });
+  assert.equal(benchCardMode(retired, OWNER, OWNER).bumpable, undefined);
+});
+
+test("queued line: the header counts every card waiting for a slot", () => {
+  assert.equal(benchQueuedLine({ items: [card()], maxCards: 30 }), null);
+  assert.equal(
+    benchQueuedLine({
+      items: [
+        card({ waitsFor: "slot" }),
+        card({ waitsFor: "channel" }),
+        card({ waitsFor: "slot" }),
+      ],
+      maxCards: 30,
+    }),
+    "2 cards wait off the relay: the Bench posts a new card only while fewer than 30 slots are in use, and each posts when a slot frees. Tap one below to post it now.",
+  );
+  assert.match(
+    benchQueuedLine({ items: [card({ waitsFor: "slot" })], maxCards: 30 }) ??
+      "",
+    /^1 card waits off the relay/,
+  );
 });
 
 test("mode: decision and status cards are never interactive", () => {
@@ -566,6 +621,19 @@ test("deadline: RFC 3339 to unix seconds, null when unparseable", () => {
   assert.equal(benchDeadlineSeconds("2026-10-14T15:00:00Z"), 1_791_990_000);
   assert.equal(benchDeadlineSeconds("soon"), null);
   assert.equal(benchDeadlineSeconds(null), null);
+});
+
+test("created: the card's drop time, a receipt's question's; local date and time", () => {
+  const asked = card({ updatedAt: "2026-10-12T12:00:00Z" });
+  const receipt = card({ updatedAt: "2026-10-14T12:00:00Z", request: asked });
+  assert.equal(benchCreatedSeconds(asked), 1_791_806_400);
+  assert.equal(benchCreatedSeconds(receipt), 1_791_806_400);
+  assert.equal(benchCreatedSeconds(card({ updatedAt: "soon" })), null);
+  // Local noon, so the day is Oct 12 in every zone; ICU may print U+202F.
+  const now = new Date(2026, 9, 12, 12).getTime() / 1_000;
+  assert.match(formatBenchCreated(now, now), /^Oct 12, 12:00\sPM$/);
+  const lastYear = new Date(2025, 9, 12, 12).getTime() / 1_000;
+  assert.match(formatBenchCreated(lastYear, now), /^Oct 12, 2025, 12:00\sPM$/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1208,7 +1276,42 @@ test("search: a bare number also matches as a whole number in the text", () => {
   const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
   assert.deepEqual(ids("28"), ["w/reset"]);
   assert.deepEqual(ids("689"), ["w/merge"]);
-  assert.deepEqual(ids("#689"), [], "# and PR stay PR numbers only");
+  assert.deepEqual(ids("#28"), [], "# and PR stay PR numbers only");
+  // "pull request 689" names the PR, as the steward's cards write it.
+  assert.deepEqual(ids("#689"), ["w/merge"]);
+});
+
+test("search: a number is a whole token, never inside a hash or a longer one", () => {
+  const cards = [
+    card({ id: "w/hash", body: "commit 792d3edd and a792f" }),
+    card({ id: "w/prhash", title: "#792d3e" }),
+    card({ id: "w/named", body: "Ship pull request 792 of x/y" }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("792"), ["w/named"]);
+  assert.deepEqual(ids("#792"), ["w/named"]);
+  assert.deepEqual(ids("pr-792"), ["w/named"]);
+  assert.deepEqual(ids("pull request 792"), ["w/named"]);
+});
+
+test("search: a repo narrows a PR number; a repo word and a number are words", () => {
+  const cards = [
+    card({ id: "w/day", title: "28 Day Reset: day 14 check-in failed" }),
+    card({
+      id: "steward/hold-buzz-14-0a1b2c3d4e5f",
+      title: "buzz PR 14 waits",
+    }),
+    card({
+      id: "steward/hold-talos-2-0a1b2c3d4e5f",
+      title: "talos PR 2 waits",
+    }),
+  ];
+  const ids = (query) => cards.filter(benchSearch(query)).map((c) => c.id);
+  assert.deepEqual(ids("reset 14"), ["w/day"]);
+  assert.deepEqual(ids("reset 28"), ["w/day"]);
+  assert.deepEqual(ids("buzz#2"), []);
+  assert.deepEqual(ids("talos#2"), ["steward/hold-talos-2-0a1b2c3d4e5f"]);
+  assert.deepEqual(ids("reset pr 14"), []);
 });
 
 test("search: words, names and a receipt's request; empty matches all", () => {

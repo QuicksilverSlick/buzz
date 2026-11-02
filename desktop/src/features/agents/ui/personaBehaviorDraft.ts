@@ -1,6 +1,7 @@
 import type {
   AcpSessionPolicy,
   AgentCapability,
+  AgentVoiceProfile,
   PersonaBehaviorInput,
   RespondToMode,
 } from "@/shared/api/types";
@@ -26,7 +27,19 @@ export type PersonaBehaviorDraft = {
    */
   capabilities: AgentCapability[];
   sessionPolicy: AcpSessionPolicy;
+  /** Huddle voice; `aliases` is the raw comma-separated text. */
+  voice: VoiceDraft;
 };
+
+export type VoiceDraft = {
+  enabled: boolean;
+  voice: string;
+  persona: string;
+  aliases: string;
+  voiceWithoutOwner: boolean;
+};
+
+export const emptyVoiceDraft: VoiceDraft = voiceDraftFrom(undefined);
 
 export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
   respondTo: null,
@@ -34,7 +47,34 @@ export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
   parallelism: "",
   capabilities: [],
   sessionPolicy: "channel",
+  voice: emptyVoiceDraft,
 };
+
+function voiceDraftFrom(voice: AgentVoiceProfile | undefined): VoiceDraft {
+  return {
+    enabled: voice?.enabled ?? false,
+    voice: voice?.voice ?? "",
+    persona: voice?.persona ?? "",
+    aliases: (voice?.aliases ?? []).join(", "),
+    voiceWithoutOwner: voice?.voiceWithoutOwner ?? false,
+  };
+}
+
+/** Absent when nothing is set, so a voiceless definition submits no voice. */
+function voiceFromDraft(draft: VoiceDraft): AgentVoiceProfile | undefined {
+  const aliases = draft.aliases
+    .split(",")
+    .map((alias) => alias.trim())
+    .filter(Boolean);
+  const voice: AgentVoiceProfile = {
+    enabled: draft.enabled,
+    voice: draft.voice.trim() || undefined,
+    persona: draft.persona.trim() || undefined,
+    aliases: aliases.length > 0 ? aliases : undefined,
+    voiceWithoutOwner: draft.voiceWithoutOwner,
+  };
+  return Object.values(voice).some(Boolean) ? voice : undefined;
+}
 
 /** Seed the draft from a dialog-state behavior group (edit/duplicate). */
 export function draftFromBehavior(
@@ -47,6 +87,7 @@ export function draftFromBehavior(
       behavior?.parallelism != null ? String(behavior.parallelism) : "",
     capabilities: [...(behavior?.capabilities ?? [])],
     sessionPolicy: behavior?.sessionPolicy ?? "channel",
+    voice: voiceDraftFrom(behavior?.voice),
   };
 }
 
@@ -62,6 +103,7 @@ export function personaBehaviorDraftValid(draft: PersonaBehaviorDraft) {
 
 function behaviorFromDraft(draft: PersonaBehaviorDraft): PersonaBehaviorInput {
   const parallelism = Number.parseInt(draft.parallelism, 10);
+  const voice = voiceFromDraft(draft.voice);
   const group: PersonaBehaviorInput = {
     respondTo: draft.respondTo ?? undefined,
     // Mode and list travel as a unit; a list without allowlist mode is
@@ -76,6 +118,8 @@ function behaviorFromDraft(draft: PersonaBehaviorDraft): PersonaBehaviorInput {
         ? [...draft.capabilities].sort()
         : undefined,
     sessionPolicy: draft.sessionPolicy,
+    // Omitted, not undefined, so a voiceless group keeps its exact shape.
+    ...(voice ? { voice } : {}),
   };
   return group;
 }

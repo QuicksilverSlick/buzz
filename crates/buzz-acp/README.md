@@ -171,7 +171,7 @@ The gate applies to **all** inbound events — @mentions, DMs, thread replies, a
 
 Under the default `channel` policy, a session scope is the whole channel, so these commands retain their channel-wide behavior. Under the `thread` policy, post the command as a reply in the target thread so `!cancel` or `!rotate` affects only that thread. DMs remain one conversation scope. `!cancel` is a no-op when its scope is idle.
 
-Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, or `!shutdown` after trimming, and must mention this agent with a separate `p` tag. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
+Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, or `!shutdown` after trimming, and must mention this agent with a separate `p` tag, except in a one-on-one owner DM (see Forum Channels below), where an untagged command counts too. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
 
 ```bash
 buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
@@ -269,31 +269,16 @@ Start with **N=2** for most deployments. Increase if queue depth grows under loa
 
 ## Forum Channels
 
-By default, the ACP harness subscribes to actionable stream kinds (9 messages, 40003 edits that add a mention, 46010 workflow approvals, and 40007 reminders). To receive forum events, opt in with `--kinds` and disable the mention filter (forum posts don't @mention agents):
+By default, the ACP harness subscribes to actionable kinds that @mention the agent: 9 messages, 40003 edits that add a mention, 46010 workflow approvals, 40007 reminders, and the forum kinds 45001 posts and 45003 comments. A forum post or comment that tags the agent wakes it under the same author gates as a message, and the agent answers with a forum comment on the post (`buzz messages send --kind 45003 --reply-to <post or comment id>`). Untagged forum activity does not wake it, and votes (45002) are not subscribed.
 
-**CLI flags:**
-```bash
-buzz-acp --kinds 9,40003,46010,40007,45001,45002,45003 --no-mention-filter
-```
-
-**Or with `--subscribe all`:**
-```bash
-buzz-acp --subscribe all --kinds 9,40003,46010,40007,45001,45002,45003
-```
-
-**Per-channel config:**
-```toml
-[channel.CHANNEL_UUID]
-kinds = [9, 46010, 40007, 45001, 45002, 45003]
-require_mention = false
-```
+> **One-on-one owner DMs:** in a DM whose only members are the agent and its owner, the owner's own kind 9 messages need no tag: the agent answers them, and an untagged `!cancel`, `!rotate` or `!shutdown` there is a control command. This applies in the default mentions mode with the mention filter on, unless `--respond-to nobody`. Edits, reminders, approvals, forum posts and comments, and messages from anyone else, other agents included, still need the tag.
 
 Forum event kinds:
 - **45001** — Forum post (thread root)
 - **45002** — Vote on a post or comment
 - **45003** — Comment reply on a forum post
 
-> **Note:** Without `--no-mention-filter` (or `require_mention = false`), the default `subscribe=mentions` mode filters events that don't @mention the agent — forum posts will be invisible.
+> **Opt-in to untagged wakes:** `--no-mention-filter` (or `require_mention = false` in a per-channel config) wakes the agent on every event of its kinds in its channels, tagged or not, including every forum post, comment and, with `--kinds ...,45002`, vote. Use it only for an agent that should answer everything it sees.
 
 ## How It Works
 

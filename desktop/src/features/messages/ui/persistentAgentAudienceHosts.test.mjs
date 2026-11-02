@@ -25,6 +25,34 @@ test("only thread conversation hosts opt into persistent audiences", async () =>
   assert.match(inboxDetail, /type: "thread"/);
   assert.doesNotMatch(threadPanel, /audienceContext=\{[\s\S]*threadRootId/);
   assert.doesNotMatch(inboxDetail, /audienceContext=\{[\s\S]*threadRootId/);
+  // Both thread reply paths feed the one-on-one agent rule.
+  for (const host of [threadPanel, inboxDetail]) {
+    assert.match(
+      host,
+      /audienceContext=[\s\S]*participants: threadParticipants,/,
+    );
+  }
+});
+
+test("the Inbox makes no one-on-one decision from a capped thread fetch", async () => {
+  const [inboxContext, homeView, inboxDetail] = await Promise.all([
+    source("../../home/useInboxThreadContext.ts"),
+    source("../../home/ui/HomeView.tsx"),
+    source("../../home/ui/InboxDetailPane.tsx"),
+  ]);
+  // Older replies (another person's, say) may be missing past the cap.
+  assert.match(
+    inboxContext,
+    /setIsTruncated\(\s*descendantResult\.events\.length >= THREAD_CONTEXT_LIMIT,?\s*\)/,
+  );
+  assert.match(
+    homeView,
+    /isThreadContextTruncated=\{threadContext\.isTruncated\}/,
+  );
+  assert.match(
+    inboxDetail,
+    /const threadParticipants =[^;]*isThreadContextTruncated \|\|[^;]*\? null/,
+  );
 });
 
 test("video review remains explicitly outside persistent audience routing", async () => {

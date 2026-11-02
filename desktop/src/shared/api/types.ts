@@ -748,6 +748,7 @@ export type {
   CatalogSourceCoordinate,
   CreatePersonaInput,
   AgentCapability,
+  AgentVoiceProfile,
   PersonaBehaviorInput,
   UpdatePersonaInput,
 } from "./personaTypes";

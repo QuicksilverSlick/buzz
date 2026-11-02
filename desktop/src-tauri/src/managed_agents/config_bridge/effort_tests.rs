@@ -30,6 +30,7 @@ pub(super) fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),
@@ -103,6 +104,7 @@ fn persona(id: &str, env_vars: BTreeMap<String, String>) -> AgentDefinition {
         capabilities: Vec::new(),
         acp_command: None,
         session_policy: Default::default(),
+        voice_profile: None,
         id: id.to_string(),
         display_name: "P".to_string(),
         avatar_url: None,

@@ -86,6 +86,9 @@ evalexpr = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
 
 [dev-dependencies]
+# Huddle voice bridge. A path dependency makes it a workspace member without a root
+# manifest edit; slice 8a moves it to [dependencies] when the voice module uses it.
+buzz-huddle-bridge = { path = "../buzz-huddle-bridge" }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"

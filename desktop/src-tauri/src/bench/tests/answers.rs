@@ -158,7 +158,7 @@ fn render_board_answered_section() {
     .unwrap();
     let mut first = check(&[("id", json!("zz")), ("title", json!("Earlier tap"))]).unwrap();
     assert_eq!(
-        render_board(&[&open, &done, &first], UUID, "14:05", 0),
+        render_board(&[&open, &done, &first], &[], UUID, "14:05", 0),
         format!(
             "Bench · as of 14:05 · needs you: 3\n\
              {LEGEND}\n\
@@ -180,7 +180,7 @@ fn render_board_answered_section() {
         seeded: 1,
     });
     let all = [&open, &done, &first];
-    let board = render_board(&all, UUID, "14:05", 100);
+    let board = render_board(&all, &[], UUID, "14:05", 100);
     assert_eq!(
         board,
         format!(
@@ -200,9 +200,15 @@ fn render_board_answered_section() {
     // the latest one is, and it changes the hash.
     assert_eq!(
         board_hash(&board),
-        board_hash(&render_board(&all, UUID, "23:59", 50 + ANSWER_KEEP_SECS))
+        board_hash(&render_board(
+            &all,
+            &[],
+            UUID,
+            "23:59",
+            50 + ANSWER_KEEP_SECS
+        ))
     );
-    let late = render_board(&all, UUID, "14:05", 100 + ANSWER_KEEP_SECS + 1);
+    let late = render_board(&all, &[], UUID, "14:05", 100 + ANSWER_KEEP_SECS + 1);
     assert!(
         late.ends_with("→ 2. Move x (https: evil.example) 🟠 24h"),
         "{late:?}"
@@ -621,35 +627,6 @@ async fn truncated_answers_are_reported() {
     assert!(b.s.items[ITEM].answer.is_none() && outbox(&b).is_none());
 }
 
-#[tokio::test]
-async fn kept_answered_cards_count_against_max_cards() {
-    let mut b = seeded_bench(Gate::Open, &[]).await;
-    let owner_tap = tap(&b.ctx.owner, &b.card(ITEM).event_id, OPTION_EMOJI[1], b.now);
-    reply(&b, &[&owner_tap]);
-    b.tick().await.unwrap();
-    for i in 0..MAX_CARDS {
-        b.drop_file("orchestrator", &format!("c{i:02}"), &drop_json(&[]));
-    }
-    b.settle(26).await;
-    // The kept answered card holds one of the MAX_CARDS slots, so the last
-    // pending item (by id) waits for one.
-    let live = b.s.items.values().filter(|i| i.card.is_some()).count();
-    assert_eq!(live, MAX_CARDS);
-    assert!(b.s.items[ITEM].card.is_some());
-    assert!(b.s.items["orchestrator/c28"].card.is_some());
-    assert!(b.s.items["orchestrator/c29"].card.is_none());
-    // A day on it is a receipt only: it stays, and gives its slot back.
-    let card = b.card(ITEM).event_id;
-    let before = b.posts().len();
-    b.now += ANSWER_KEEP_SECS;
-    b.settle(4).await;
-    assert_eq!(b.card(ITEM).event_id, card);
-    assert!(b.s.items["orchestrator/c29"].card.is_some());
-    assert!(!b.posts()[before..]
-        .iter()
-        .any(|(e, _)| e["kind"] == 5 && tag_value(e, "e").as_deref() == Some(card.as_str())));
-}
-
 // ── Saying how to answer ────────────────────────────────────────────────
 
 const LEGEND: &str =
@@ -677,7 +654,7 @@ async fn legend_is_board_line_2_and_lands_by_edit() {
 fn needs_you_lines_are_bullets_not_numbers() {
     let a = check(&[("id", json!("a"))]).unwrap();
     let c = check(&[("id", json!("c")), ("severity", json!("info"))]).unwrap();
-    let board = render_board(&[&a, &c], UUID, "14:05", 0);
+    let board = render_board(&[&a, &c], &[], UUID, "14:05", 0);
     let needs: Vec<&str> = board
         .lines()
         .skip_while(|l| *l != "Needs you")

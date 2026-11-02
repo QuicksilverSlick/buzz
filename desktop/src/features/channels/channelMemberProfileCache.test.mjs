@@ -3,7 +3,10 @@ import test from "node:test";
 
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 
-import { updateCachedChannelMemberDisplayName } from "./channelMemberProfileCache.ts";
+import {
+  updateCachedChannelMemberDisplayName,
+  updateCachedChannelMemberDisplayNames,
+} from "./channelMemberProfileCache.ts";
 
 function member(pubkey, displayName, overrides = {}) {
   return {
@@ -45,6 +48,18 @@ test("updateCachedChannelMemberDisplayName_updatesOnlyMatchingMemberQueries", as
     false,
   );
   assert.equal(queryClient.getQueryState(detailKey)?.isInvalidated, false);
+});
+
+test("updateCachedChannelMemberDisplayName_leavesRostersFreshWhenNameUnchanged", async () => {
+  // A republished kind:0 with the same name must not cost a roster refetch on
+  // the next channel visit.
+  const queryClient = new QueryClient();
+  const matchingKey = ["channels", "general", "members"];
+  queryClient.setQueryData(matchingKey, [member("aabb", "Same name")]);
+
+  await updateCachedChannelMemberDisplayName(queryClient, "aabb", "Same name");
+
+  assert.equal(queryClient.getQueryState(matchingKey)?.isInvalidated, false);
 });
 
 test("updateCachedChannelMemberDisplayName_doesNotRefetchMatchingQueries", async () => {
@@ -128,5 +143,41 @@ test("updateCachedChannelMemberDisplayName_restartsFirstLoadMemberFetches", asyn
     queryClient.getQueryData(matchingKey)[0].displayName,
     "New name",
   );
+  unsubscribe();
+});
+
+test("updateCachedChannelMemberDisplayNames_restartsAnInFlightFetchOncePerBatch", async () => {
+  // A burst of republished agent profiles must not re-issue a loading roster
+  // once per profile: each restart is a full get_channel_members.
+  const queryClient = new QueryClient();
+  const loadingKey = ["channels", "general", "members"];
+  const cachedKey = ["channels", "random", "members"];
+  queryClient.setQueryData(cachedKey, [
+    member("aabb", "Old A"),
+    member("ccdd", "Old C"),
+  ]);
+  const fetchResolvers = [];
+  const observer = new QueryObserver(queryClient, {
+    queryKey: loadingKey,
+    queryFn: () =>
+      new Promise((resolve) => {
+        fetchResolvers.push(resolve);
+      }),
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  assert.equal(fetchResolvers.length, 1);
+
+  await updateCachedChannelMemberDisplayNames(queryClient, [
+    ["AABB", "New A"],
+    ["ccdd", "New C"],
+    ["eeff", "Not cached anywhere"],
+  ]);
+
+  assert.equal(fetchResolvers.length, 2);
+  assert.deepEqual(
+    queryClient.getQueryData(cachedKey).map((row) => row.displayName),
+    ["New A", "New C"],
+  );
+  for (const resolve of fetchResolvers) resolve([]);
   unsubscribe();
 });

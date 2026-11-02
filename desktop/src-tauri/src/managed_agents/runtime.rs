@@ -807,6 +807,13 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // Resolve once and stamp the same value onto the environment and snapshot.
     let acp_session_policy = super::effective_acp_session_policy(record, &personas);
     super::apply_acp_session_policy_env(&mut command, acp_session_policy);
+    let voice_profile =
+        super::voice_profile::enabled_voice_json(record.persona_id.as_deref(), &personas);
+    super::voice_profile::apply_voice_env(
+        &mut command,
+        voice_profile.as_deref(),
+        super::voice_profile::output_route_file(app).as_deref(),
+    );
 
     crate::build_identity::apply_demo_config_home(&mut command)?;
     // Publish-first replay floor: written AFTER the `descriptor.env` loop, the
@@ -862,6 +869,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
             // BUZZ_ACP_CAPABILITIES, so the stamp records what the child
             // actually received rather than a second resolve that could drift.
             capabilities: &granted,
+            voice_profile,
         },
     );
 

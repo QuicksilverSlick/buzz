@@ -80,6 +80,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Definition-owned policy: user env cannot override whether channel
     // threads receive independent ACP sessions.
     "BUZZ_ACP_SESSION_POLICY",
+    // Definition-owned huddle voice: only the definition's switch turns it on.
+    "BUZZ_ACP_VOICE_PROFILE",
+    "BUZZ_ACP_AUDIO_ROUTE_FILE",
     "BUZZ_ACP_NO_PRESENCE",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or
     // ambient env var must not be able to forge setup mode (NotReady) on a

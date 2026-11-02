@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isRelayDependentQueryKey } from "./relayQueryInvalidation.ts";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+
+import {
+  invalidateRelayQueries,
+  isRelayDependentQueryKey,
+} from "./relayQueryInvalidation.ts";
+
+test("reconnect refresh drops users-batch entries before batches re-run", async () => {
+  // A kind:0 published while the socket was down never reached the 10-minute
+  // per-pubkey entry, so an active batch must not re-resolve from it.
+  const queryClient = new QueryClient();
+  const entryKey = ["users-batch-entry", "alice"];
+  queryClient.setQueryData(entryKey, { summary: null, fetchedAt: Date.now() });
+  queryClient.setQueryData(["identity"], { pubkey: "alice" });
+  const entryAtRerun = [];
+  const observer = new QueryObserver(queryClient, {
+    queryKey: ["users-batch", "alice"],
+    queryFn: async () => {
+      entryAtRerun.push(queryClient.getQueryData(entryKey));
+      return { profiles: {}, missing: [] };
+    },
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  await queryClient.getQueryCache().find({ queryKey: ["users-batch", "alice"] })
+    ?.promise;
+  entryAtRerun.length = 0;
+
+  await invalidateRelayQueries(queryClient);
+
+  assert.deepEqual(entryAtRerun, [undefined]);
+  assert.equal(queryClient.getQueryState(["identity"])?.isInvalidated, false);
+  unsubscribe();
+});
 
 test("relay invalidation includes relay-backed channel and profile queries", () => {
   for (const queryKey of [

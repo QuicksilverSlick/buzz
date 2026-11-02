@@ -16,7 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import { relayClient } from "@/shared/api/relayClient";
-import { isRelayDependentQuery } from "@/shared/api/relayQueryInvalidation";
+import { invalidateRelayQueries } from "@/shared/api/relayQueryInvalidation";
 import { relayReconnectController } from "@/shared/api/relayReconnectController";
 
 function buildDeps(onSuccess: () => void, onBackstop: () => void) {
@@ -58,14 +58,12 @@ export function useReconnectRelay(): {
   onSuccessRef.current = React.useCallback(() => {
     // Defer query invalidation so callers render the recovered state first.
     window.setTimeout(() => {
-      void queryClient
-        .invalidateQueries({ predicate: isRelayDependentQuery })
-        .catch((err) => {
-          console.error(
-            "[useReconnectRelay] failed to refresh queries after reconnect:",
-            err,
-          );
-        });
+      void invalidateRelayQueries(queryClient).catch((err) => {
+        console.error(
+          "[useReconnectRelay] failed to refresh queries after reconnect:",
+          err,
+        );
+      });
     }, 0);
   }, [queryClient]);
 

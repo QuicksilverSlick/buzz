@@ -1,3 +1,5 @@
+import type { QueryClient } from "@tanstack/react-query";
+
 const RELAY_QUERY_ROOTS = new Set<string>([
   "archivedIdentities",
   "channel-canvas",
@@ -88,4 +90,17 @@ export function isRelayDependentQueryKey(queryKey: readonly unknown[]) {
 
 export function isRelayDependentQuery(query: { queryKey: readonly unknown[] }) {
   return isRelayDependentQueryKey(query.queryKey);
+}
+
+/**
+ * Refetch every relay-backed query after the socket recovers.
+ *
+ * `users-batch` resolves from per-pubkey `users-batch-entry` caches that stay
+ * fresh for 10 minutes, so invalidating the batches alone would re-run them
+ * against entries that missed every kind:0 published during the gap. Dropping
+ * the entries first makes each active batch fetch its people once.
+ */
+export function invalidateRelayQueries(queryClient: QueryClient) {
+  queryClient.removeQueries({ queryKey: ["users-batch-entry"] });
+  return queryClient.invalidateQueries({ predicate: isRelayDependentQuery });
 }

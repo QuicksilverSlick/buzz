@@ -71,6 +71,7 @@ fn agent_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "agent".to_string(),
@@ -136,6 +137,7 @@ fn persona_with_model(model: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "persona-1".to_string(),
         display_name: "Persona".to_string(),

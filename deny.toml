@@ -41,18 +41,19 @@ ignore = [
     { id = "RUSTSEC-2026-0293", reason = "unused dependency of audited, exactly pinned neteq 0.8.3; no Rust references to ringbuf; other consumers forbidden by bans.deny" },
     # zip < 9 (0367 SUID bits kept, 0368 symlinks escaping the destination, 0369 permissions
     # applied through symlinks): all three are in ZipArchive::extract / ZipStreamReader::extract.
-    # Our own readers never call those: desktop managed_node.rs extract_managed_node_zip (zip 8.6,
-    # direct) and mesh-llm v0.76.2 plugin-manager archive.rs / autoupdate release_fetch.rs (root
-    # lockfile) extract entry by entry with enclosed_name() and plain file writes. The one caller is
-    # tauri-plugin-updater 2.10.1 (zip 4.6.1, desktop): extract_zip() calls extract() for a zip
-    # update on Windows, but only after verify_signature() passes, and our releases ship signed NSIS
-    # .exe updates, not zips. Remove when the desktop, mesh-llm and tauri-plugin-updater move to zip 9.
-    { id = "RUSTSEC-2026-0367", reason = "zip extract() only reached via tauri-plugin-updater after signature check, and we ship .exe updates; our own and mesh-llm readers extract per entry via enclosed_name()" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract() only reached via tauri-plugin-updater after signature check, and we ship .exe updates; our own and mesh-llm readers extract per entry via enclosed_name()" },
-    { id = "RUSTSEC-2026-0369", reason = "zip extract() only reached via tauri-plugin-updater after signature check, and we ship .exe updates; our own and mesh-llm readers extract per entry via enclosed_name()" },
+    # The desktop's own reader (managed_node.rs) is on zip 9 since upstream #8412. zip 8.6.0 stays
+    # via mesh-llm v0.76.2 (mesh-llm-host-runtime / -plugin-manager / -system; root via
+    # buzz-mesh-smoke, desktop via the mesh-llm feature): its readers copy entry by entry with
+    # enclosed_name() and never call extract(); the fix is Mesh-LLM/mesh-llm#2471. zip 4.6.1 stays
+    # via tauri-plugin-updater 2.10.1 (desktop): extract_zip() calls extract() for a zip update on
+    # Windows, but only after verify_signature() passes, and our releases ship signed NSIS .exe
+    # updates, not zips. Remove when mesh-llm and tauri-plugin-updater move to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
     # zvariant / zvariant_derive / zbus_names: unmaintained, "no safe upgrade" (zbus issue 2043).
     # Linux-only D-Bus stack via notify-rust, tauri notification/opener/single-instance plugins
-    # and the secret-service keyring store.
+    # and the secret-service keyring store (desktop), and mesh-llm → keyring 4 (root).
     { id = "RUSTSEC-2026-0370", reason = "zvariant via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via the Linux D-Bus stack (zbus); unmaintained, no safe upgrade" },

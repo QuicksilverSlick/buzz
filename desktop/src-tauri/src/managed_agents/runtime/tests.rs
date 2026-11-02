@@ -296,6 +296,7 @@ fn persona_with_provider(
     crate::managed_agents::AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.to_string(),
         display_name: id.to_string(),

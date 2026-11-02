@@ -8,10 +8,16 @@ import {
   type BenchCard as BenchCardData,
   type BenchOptionView,
   type SafeBenchLink,
+  BENCH_BUMP_HINT_MS,
+  BENCH_BUMP_POSTED,
+  BENCH_BUMP_POSTING,
+  BENCH_BUMP_TIMEOUT_MESSAGE,
+  BENCH_BUMP_TIMEOUT_MS,
   BENCH_SAVE_TIMEOUT_MS,
   INITIAL_BENCH_ANSWER_STATE,
   benchAnswerReducer,
   benchCardMode,
+  benchCreatedSeconds,
   benchDeadlineSeconds,
   benchForLabel,
   benchOptionViews,
@@ -21,6 +27,7 @@ import {
   benchSeverityChip,
   benchStateLabel,
   benchValidityLabel,
+  formatBenchCreated,
   safeBenchLinks,
 } from "@/features/bench/lib/benchCards";
 import {
@@ -32,7 +39,7 @@ import {
   BenchCardBlocks,
   BenchCardDetails,
 } from "@/features/bench/ui/BenchCardFields";
-import { useBenchAnswer } from "@/features/bench/useBenchCards";
+import { useBenchAnswer, useBenchBump } from "@/features/bench/useBenchCards";
 import { buildMessageLink } from "@/features/messages/lib/messageLink";
 import { openPopoverLink } from "@/features/messages/lib/openPopoverLink";
 import { cn } from "@/shared/lib/cn";
@@ -48,15 +55,23 @@ function formatBenchTime(unixSeconds: number): string {
 }
 
 /**
+ * Taps on cards off the relay, by item id: when, and the option. The row
+ * remounts once the card posts (a new key), so the live row reads this to
+ * say the tap answered nothing, and focuses that option.
+ */
+const bumpedTaps = new Map<string, { at: number; option: number }>();
+
+/**
  * A Bench decision card, in #bench or its project channel. Every string here
  * was written by an agent, so it renders as plain React text: never
  * markdown, never HTML. Option buttons answer through `bench_answer` with the
  * owner's keycap; the card shows "Saving..." until the Bench's tick records
  * it. `onOther` opens the card's thread: Other, where a reply is the
- * answer, and Open thread, on every card that has one. A closed card is its
- * receipt: the question, the answer and the outcome. A `retiredPost` (one a
- * newer card replaced) is read-only, from its own text, so it never answers
- * twice.
+ * answer, and Open thread, on every card that has one, beside when the card
+ * was created. A closed card is its receipt: the question, the answer and
+ * the outcome. A `retiredPost` (one a newer card replaced) is read-only, from
+ * its own text, so it never answers twice. A card not on the relay yet says
+ * why, and a tap on it posts it next (`bench_bump`).
  */
 export function BenchCard({
   card,
@@ -65,6 +80,7 @@ export function BenchCard({
   onOther,
   projectLabel,
   retiredPost,
+  maxCards,
 }: {
   card: BenchCardData;
   ownerPubkey: string | null;
@@ -73,6 +89,8 @@ export function BenchCard({
   /** Leads the muted line: the Bench screen's All tab names the project. */
   projectLabel?: string;
   retiredPost?: BenchRetiredPost;
+  /** The snapshot's maxCards, for why a queued card waits. */
+  maxCards?: number;
 }) {
   if (retiredPost) return <BenchRetiredCard card={card} post={retiredPost} />;
   return card.request ? (
@@ -84,6 +102,7 @@ export function BenchCard({
   ) : (
     <BenchQuestionCard
       card={card}
+      maxCards={maxCards}
       onOther={onOther}
       ownerPubkey={ownerPubkey}
       projectLabel={projectLabel}
@@ -94,21 +113,24 @@ export function BenchCard({
 
 function BenchQuestionCard({
   card,
+  maxCards,
   ownerPubkey,
   viewerPubkey,
   onOther,
   projectLabel,
 }: {
   card: BenchCardData;
+  maxCards?: number;
   ownerPubkey: string | null;
   viewerPubkey?: string;
   onOther?: () => void;
   projectLabel?: string;
 }) {
-  const { interactive, readOnlyReason } = benchCardMode(
+  const { interactive, readOnlyReason, bumpable } = benchCardMode(
     card,
     ownerPubkey,
     viewerPubkey,
+    maxCards,
   );
   const byOwner = card.answer?.byOwner ?? true;
   const [storedState, dispatch] = React.useReducer(
@@ -137,11 +159,61 @@ function BenchQuestionCard({
     return () => window.clearTimeout(timer);
   }, [attempt, saving]);
 
+  // A tap on a card off the relay posts it next; it answers nothing, and
+  // says so until the card is live (a new row) or the wait runs out.
+  const [bump, setBump] = React.useState<{
+    attempt: number;
+    option: number;
+    error: string | null;
+  } | null>(null);
+  const bumpAttempt = bump?.attempt ?? 0;
+  const tapped = bump !== null && bump.error === null ? bump.option : null;
+  const posting = tapped !== null;
+  // The live row of a card tapped while queued: the option tapped then.
+  const [posted, setPosted] = React.useState(() => {
+    const tap = bumpedTaps.get(card.id);
+    return card.cardEventId && tap && Date.now() - tap.at < BENCH_BUMP_HINT_MS
+      ? tap.option
+      : null;
+  });
+  const reasonId = React.useId();
+  React.useEffect(() => {
+    if (!posting) return;
+    const timer = window.setTimeout(
+      () =>
+        setBump((b) =>
+          b?.attempt === bumpAttempt && b.error === null
+            ? { ...b, error: BENCH_BUMP_TIMEOUT_MESSAGE }
+            : b,
+        ),
+      BENCH_BUMP_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [bumpAttempt, posting]);
+  const { mutateAsync: postNext } = useBenchBump();
+
   const { mutateAsync: answer } = useBenchAnswer();
   const handleOption = (option: number) => {
     // Only the card on screen: the Bench refuses it once it is replaced.
     const cardEventId = card.cardEventId;
-    if (!cardEventId) return;
+    if (!cardEventId) {
+      if (!bumpable || posting) return;
+      const attempt = bumpAttempt + 1;
+      setBump({ attempt, option, error: null });
+      bumpedTaps.set(card.id, { at: Date.now(), option });
+      postNext(card.id).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        bumpedTaps.delete(card.id);
+        setBump((b) =>
+          b?.attempt === attempt
+            ? { attempt, option, error: `Couldn't post it: ${message}` }
+            : b,
+        );
+      });
+      return;
+    }
+    bumpedTaps.delete(card.id);
+    setPosted(null);
     const action = {
       type: "click",
       option,
@@ -163,8 +235,15 @@ function BenchQuestionCard({
     );
   };
 
-  const options =
-    card.kind === "pending" ? benchOptionViews(card, state, interactive) : [];
+  const clickable = interactive || bumpable === true;
+  // While posting, the tapped option stays enabled and busy, as a save's does.
+  const options = (
+    card.kind === "pending" ? benchOptionViews(card, state, clickable) : []
+  ).map((o) =>
+    posting
+      ? { ...o, pending: o.index === tapped, disabled: o.index !== tapped }
+      : o,
+  );
   const recordedLine = benchRecordedLine(card, formatBenchTime);
   const overrides = interactive && card.recorded !== null && !byOwner;
   const other =
@@ -185,7 +264,7 @@ function BenchQuestionCard({
       ) : null}
       {options.length > 0 ? (
         <fieldset
-          aria-busy={saving}
+          aria-busy={saving || posting}
           aria-label="Answer"
           className={cn(
             "flex flex-wrap gap-1.5",
@@ -194,6 +273,8 @@ function BenchQuestionCard({
         >
           {options.map((option) => (
             <BenchOptionButton
+              autoFocus={option.index === posted}
+              describedBy={bumpable ? reasonId : undefined}
               key={option.index}
               onSelect={handleOption}
               option={option}
@@ -229,11 +310,27 @@ function BenchQuestionCard({
             {state.error}
           </p>
         ) : null}
-        {readOnlyReason ? (
-          <p className="mt-1.5 text-muted-foreground">{readOnlyReason}</p>
+        {bump?.error ? (
+          <p className="mt-1.5 text-destructive [overflow-wrap:anywhere]">
+            {bump.error}
+          </p>
+        ) : null}
+        {posted !== null && card.recorded === null && !saving ? (
+          <p className="mt-1.5 font-medium text-foreground">
+            {BENCH_BUMP_POSTED}
+          </p>
+        ) : null}
+        {posting ? (
+          <p className="mt-1.5 text-muted-foreground" id={reasonId}>
+            {BENCH_BUMP_POSTING}
+          </p>
+        ) : readOnlyReason ? (
+          <p className="mt-1.5 text-muted-foreground" id={reasonId}>
+            {readOnlyReason}
+          </p>
         ) : null}
       </div>
-      <BenchOpenThread card={card} onOpenThread={onOther} />
+      <BenchCardFooter card={card} onOpenThread={onOther} />
     </Card>
   );
 }
@@ -289,7 +386,7 @@ function BenchReceiptCard({
         <p className="text-xs text-muted-foreground">{receipt.outcomeLine}</p>
         <BenchCardText card={card} />
       </section>
-      <BenchOpenThread card={card} onOpenThread={onOther} />
+      <BenchCardFooter card={card} onOpenThread={onOther} />
     </Card>
   );
 }
@@ -391,25 +488,43 @@ function BenchPostNotes({ notes }: { notes: readonly string[] }) {
   ));
 }
 
-/** Hidden until the card has a live (or kept) message to thread on. */
-function BenchOpenThread({
+/**
+ * Open thread at the left, hidden until the card has a live (or kept)
+ * message to thread on; when the card was created at the right.
+ */
+function BenchCardFooter({
   card,
   onOpenThread,
 }: {
   card: BenchCardData;
   onOpenThread?: () => void;
 }) {
-  if (!onOpenThread || !card.cardEventId) return null;
+  const thread = onOpenThread && card.cardEventId;
+  const created = benchCreatedSeconds(card);
+  if (!thread && created === null) return null;
   return (
-    <Button
-      className="-ml-2 mt-1.5 h-7 px-2 text-xs"
-      onClick={onOpenThread}
-      size="sm"
-      type="button"
-      variant="ghost"
-    >
-      Open thread
-    </Button>
+    <div className="mt-1.5 flex items-center gap-2">
+      {thread ? (
+        <Button
+          className="-ml-2 h-7 px-2 text-xs"
+          onClick={onOpenThread}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
+          Open thread
+        </Button>
+      ) : null}
+      {created === null ? null : (
+        <time
+          className="ml-auto text-xs tabular-nums text-muted-foreground"
+          data-testid="bench-card-created"
+          dateTime={new Date(created * 1_000).toISOString()}
+        >
+          {formatBenchCreated(created)}
+        </time>
+      )}
+    </div>
   );
 }
 
@@ -499,9 +614,14 @@ function BenchCardText({ card }: { card: BenchCardData }) {
 }
 
 function BenchOptionButton({
+  autoFocus,
+  describedBy,
   onSelect,
   option,
 }: {
+  autoFocus?: boolean;
+  /** The reason a tap posts the card rather than answering it. */
+  describedBy?: string;
   onSelect: (index: number) => void;
   option: BenchOptionView;
 }) {
@@ -512,6 +632,8 @@ function BenchOptionButton({
   return (
     <Button
       aria-busy={option.pending || undefined}
+      aria-describedby={describedBy}
+      autoFocus={autoFocus}
       aria-label={
         undoable
           ? `${label}${recommended} (recorded, click to undo)`

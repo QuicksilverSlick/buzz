@@ -349,6 +349,21 @@ test("profile panel shows communication actions as quick action tiles", async ({
   await waveAction.click();
   await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
   await expect(page.getByTestId("message-wave-attachment")).toBeVisible();
+  // The wave p-tags the person waved at, like a message from the DM screen.
+  const wavePayload = await page.evaluate(
+    () =>
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
+            command: string;
+            payload: { mentionPubkeys?: string[] | null };
+          }>;
+        }
+      ).__BUZZ_E2E_COMMAND_PAYLOADS__?.findLast(
+        (entry) => entry.command === "send_channel_message",
+      )?.payload,
+  );
+  expect(wavePayload?.mentionPubkeys).toEqual([TEST_IDENTITIES.bob.pubkey]);
 });
 
 test("owned agent profile stays in parity between Agents and its DM", async ({

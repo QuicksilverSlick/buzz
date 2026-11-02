@@ -1309,6 +1309,33 @@ test("re-adding a deleted automatic mention restores its automatic mention state
   ).toBeVisible();
 });
 
+test("an automatic agent mention alone does not broadcast typing", async ({
+  page,
+}) => {
+  const countTypingIndicators = () =>
+    page.evaluate(
+      () =>
+        (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).filter((entry) => {
+          if (entry.command !== "plugin:websocket|send") return false;
+          const data = (
+            entry.payload as { message?: { data?: string } } | undefined
+          )?.message?.data;
+          return data?.includes('"kind":20002') ?? false;
+        }).length,
+    );
+  await installMockBridge(page);
+  await page.goto("/");
+  // The Inbox opens alice's one-on-one thread, which pre-addresses her.
+  const input = page.getByTestId("message-input");
+  await expect(input).toContainText("@alice");
+  await waitForMockLiveSubscription(page, "general");
+  await page.waitForTimeout(500);
+  expect(await countTypingIndicators()).toBe(0);
+
+  await input.pressSequentially("h");
+  await expect.poll(countTypingIndicators).toBe(1);
+});
+
 test("implicit automatic mentions stay out of persisted drafts", async ({
   page,
 }) => {

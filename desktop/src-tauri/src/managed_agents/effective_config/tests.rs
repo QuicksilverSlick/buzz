@@ -10,6 +10,7 @@ fn definition(
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.to_string(),
         display_name: "Test Definition".to_string(),
@@ -46,6 +47,7 @@ fn record(
     ManagedAgentRecord {
         capabilities: Vec::new(),
         definition_capabilities: Vec::new(),
+        definition_voice_profile: None,
         session_policy: Default::default(),
         description: None,
         pubkey: "agent-pk".to_string(),

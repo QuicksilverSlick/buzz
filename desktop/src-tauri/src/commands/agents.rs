@@ -660,6 +660,7 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
         let mut record = ManagedAgentRecord {
             capabilities: minted.capabilities.clone(),
             definition_capabilities: Vec::new(),
+            definition_voice_profile: None,
             pubkey: pubkey.clone(),
             name: name.clone(),
             description: None,

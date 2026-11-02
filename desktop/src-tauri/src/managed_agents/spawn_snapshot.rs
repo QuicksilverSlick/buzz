@@ -84,6 +84,8 @@ pub(crate) struct SpawnConfigInputs<'a> {
     /// — the same slice handed to `build_respond_to_env`, so the stamped
     /// snapshot cannot disagree with what the child's environment received.
     pub capabilities: &'a [String],
+    /// The `BUZZ_ACP_VOICE_PROFILE` value this launch set (`None` while off).
+    pub voice_profile: Option<String>,
 }
 
 /// The effective spawn configuration of one managed-agent process.
@@ -174,6 +176,10 @@ pub(crate) struct SpawnConfigSnapshot {
     /// the raw list instead would badge a restart for a reordering that leaves
     /// `BUZZ_ACP_CAPABILITIES` byte-identical.
     pub capabilities: Vec<String>,
+    /// The huddle voice JSON the harness got, `None` while the switch is off.
+    /// buzz-acp reads it only at launch, like `session_policy`, so a voice
+    /// edit on a running agent must raise restart-required.
+    pub voice_profile: Option<String>,
 }
 
 /// Normalize a grant list the way the spawn environment receives it.
@@ -226,6 +232,7 @@ impl SpawnConfigSnapshot {
             enforced_owner_only,
             session_policy,
             capabilities,
+            voice_profile,
         } = inputs;
         let (respond_to, respond_to_allowlist) =
             super::projected_access_with_policy(record, enforced_owner_only);
@@ -294,6 +301,7 @@ impl SpawnConfigSnapshot {
             effort_level: effective_effort(descriptor),
             session_policy: session_policy.as_str().to_string(),
             capabilities: normalized_capabilities(capabilities),
+            voice_profile,
         }
     }
 
@@ -389,6 +397,10 @@ pub(crate) fn prospective_spawn_config_snapshot(
         // same `personas` slice, so the prospective and stamped sides cannot
         // disagree about what a restart would grant.
         capabilities: &crate::managed_agents::capabilities::resolve_agent_capabilities(
+            record.persona_id.as_deref(),
+            personas,
+        ),
+        voice_profile: crate::managed_agents::voice_profile::enabled_voice_json(
             record.persona_id.as_deref(),
             personas,
         ),

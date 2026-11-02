@@ -514,6 +514,7 @@ fn sample_persona() -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: "custom:helper".to_string(),
         display_name: "Helper".to_string(),

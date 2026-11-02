@@ -171,6 +171,9 @@ export function updateInputFromRequest(
             parallelism: current.behavior?.parallelism,
             capabilities: current.behavior?.capabilities,
             sessionPolicy: current.behavior?.sessionPolicy,
+            ...(current.behavior?.voice
+              ? { voice: current.behavior.voice }
+              : {}),
           },
         }
       : {}),

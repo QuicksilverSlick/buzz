@@ -65,6 +65,21 @@ pub(super) fn joined<'a>(s: &'a BenchState, ch: &str) -> &'a [String] {
     s.joined.get(ch).map_or(&[], Vec::as_slice)
 }
 
+/// Whether thread replies on a card that is not scoped are read: while its
+/// writer's route target is in the card's channel, as publish (a3) needs to
+/// tell it, and for good once one was read, so one bad tick of routes.json
+/// or the agent store never un-engages a card mid-conversation.
+pub(super) fn reads_replies(
+    s: &BenchState,
+    i: &item::Item,
+    routes: &BTreeMap<String, String>,
+) -> bool {
+    i.reply.is_some()
+        || routes
+            .get(&i.writer)
+            .is_some_and(|to| joined(s, &card_channel(s, i)).contains(to))
+}
+
 /// #bench always; a bound channel once the writer is in it and its admin
 /// list passed.
 pub(super) fn channel_ready(s: &BenchState, i: &item::Item) -> bool {

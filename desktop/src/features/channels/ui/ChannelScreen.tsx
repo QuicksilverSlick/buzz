@@ -249,10 +249,6 @@ export function ChannelScreen({
     activeDmPresenceStatus,
     activeChannelEphemeralDisplay,
   } = useActiveChannelHeader(activeChannel, currentPubkey);
-  const sendMessageMutation = useSendMessageMutation(
-    activeChannel,
-    currentIdentity,
-  );
   const toggleReactionMutation = useToggleReactionMutation();
   const deleteMessageMutation = useDeleteMessageMutation(activeChannel);
   const editMessageMutation = useEditMessageMutation(activeChannel);
@@ -388,6 +384,12 @@ export function ChannelScreen({
     }
     return pubkeys;
   }, [knownAgentPubkeys, messageProfiles, communityAgentPubkeys]);
+  // In a group DM only the typed agents are tagged, so only they answer.
+  const sendMessageMutation = useSendMessageMutation(
+    activeChannel,
+    currentIdentity,
+    agentPubkeys,
+  );
   const personasQuery = usePersonasQuery();
   const { personaLookup, respondToLookup } = React.useMemo(() => {
     const agents = managedAgentsQuery.data ?? [];

@@ -10,6 +10,7 @@ fn custom_persona(id: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         capabilities: Vec::new(),
         session_policy: Default::default(),
+        voice_profile: None,
         description: None,
         id: id.to_string(),
         display_name: display_name.to_string(),

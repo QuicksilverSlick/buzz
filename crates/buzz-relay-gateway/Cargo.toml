@@ -1,0 +1,42 @@
+[package]
+name = "buzz-relay-gateway"
+description = "Keyless forwarder between one Worker link and one Buzz relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "buzz_relay_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-relay-gateway"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+axum               = { workspace = true }
+base64             = { workspace = true }
+buzz-auth          = { workspace = true }
+futures-util       = { workspace = true }
+nostr              = { workspace = true }
+reqwest            = { workspace = true }
+# Explicit ring provider, installed in main(): a workspace-wide build unifies
+# ring and aws-lc-rs, and rustls then panics on the first wss:// connect.
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tokio-tungstenite  = { workspace = true }
+tokio-util         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+url                = { workspace = true }
+uuid               = { workspace = true }
+
+[dev-dependencies]
+hex                = { workspace = true }
+sha2               = { workspace = true }

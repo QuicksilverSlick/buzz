@@ -10,7 +10,11 @@ import {
   myRelayMembershipQueryKey,
   relayMembersQueryKey,
 } from "@/features/community-members/hooks";
-import { evictUsersBatchEntries } from "@/features/profile/hooks";
+import { updateCachedChannelMemberDisplayNames } from "@/features/channels/channelMemberProfileCache";
+import {
+  evictUsersBatchEntries,
+  profileQueryKey,
+} from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { relayClient } from "@/shared/api/relayClient";
 import {
@@ -40,18 +44,35 @@ const SUBSCRIBE_RETRY_MAX_MS = 30_000;
 type LiveRelay = Pick<typeof relayClient, "subscribeLive">;
 
 /**
+ * The name a roster refetch would show for a kind:0, by the rule Rust's
+ * `get_channel_members` applies: `display_name`, else `name`, else none (also
+ * for non-JSON content, which the relay rejects at ingest anyway).
+ */
+export function rosterDisplayName(content: string): string | null {
+  let profile: unknown;
+  try {
+    profile = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  const field = (key: string) => {
+    const value = (profile as Record<string, unknown> | null)?.[key];
+    return typeof value === "string" ? value : undefined;
+  };
+  return field("display_name") ?? field("name") ?? null;
+}
+
+/**
  * Push new members and profile edits into the people directory while the app
  * runs.
  *
- * The DM picker, @mention, member pickers and author labels all read cached
- * relay queries (`user-search`, `users-batch`, `user-profile`, `relayMembers`),
- * and nothing told those caches that a kind:0 or kind:13534 had landed, so a
- * member who joined mid-session stayed missing until the app restarted.
+ * The DM picker, @mention, member pickers, author labels, channel rosters and
+ * the viewer's own profile all read cached relay queries, and nothing told
+ * those caches that a kind:0 or kind:13534 had landed, so a member who joined
+ * mid-session stayed missing until the app restarted.
  *
- * Reconnect gaps fall to `useRelayAutoHeal`, which invalidates these roots
- * when the socket recovers. ponytail: it does not evict `users-batch-entry`, so
- * a label edited during a gap can stay stale for the entry's 10-minute
- * freshness; evict on heal if that shows up.
+ * Reconnect gaps fall to `invalidateRelayQueries` (auto-heal and the manual
+ * reconnect), which refetches these roots and drops the per-pubkey entries.
  */
 export function startLiveDirectoryUpdates(
   queryClient: QueryClient,
@@ -65,12 +86,14 @@ export function startLiveDirectoryUpdates(
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let viewerRoleChanged = false;
   let newestMembershipAt = 0;
-  const changedPubkeys = new Set<string>();
+  // pubkey → the roster name its latest kind:0 carries.
+  const changedProfiles = new Map<string, string | null>();
 
   const flush = () => {
     timer = null;
-    const pubkeys = [...changedPubkeys];
-    changedPubkeys.clear();
+    const profiles = [...changedProfiles];
+    changedProfiles.clear();
+    const pubkeys = profiles.map(([pubkey]) => pubkey);
     if (pubkeys.length > 0) {
       // Evict first, or the users-batch re-run resolves from the old entry.
       evictUsersBatchEntries(queryClient, pubkeys);
@@ -90,6 +113,20 @@ export function startLiveDirectoryUpdates(
           ((queryKey[0] === "user-profile" || queryKey[0] === "users-batch") &&
             pubkeys.some((pubkey) => queryKey.includes(pubkey))),
       });
+      // An edit made on another device (or echoed back from this one).
+      if (pubkeys.includes(viewer)) {
+        void queryClient.invalidateQueries({
+          queryKey: profileQueryKey,
+          exact: true,
+        });
+      }
+      // Rosters stay fresh for minutes, so rename their rows in place, in one
+      // pass: each pass cancels and restarts in-flight roster fetches.
+      updateCachedChannelMemberDisplayNames(queryClient, profiles).catch(
+        (error) => {
+          console.error("Couldn’t apply a live profile rename", error);
+        },
+      );
     }
     if (viewerRoleChanged) {
       viewerRoleChanged = false;
@@ -129,7 +166,10 @@ export function startLiveDirectoryUpdates(
       }
       viewerRoleChanged = true;
     } else if (event.kind === KIND_PROFILE) {
-      changedPubkeys.add(normalizePubkey(event.pubkey));
+      changedProfiles.set(
+        normalizePubkey(event.pubkey),
+        rosterDisplayName(event.content),
+      );
     } else {
       return;
     }

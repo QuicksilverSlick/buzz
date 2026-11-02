@@ -164,6 +164,12 @@ pub async fn get_feed(
     })
 }
 
+/// A query that is only a number ("792", "#792") must find 792, never 7928.
+fn is_number(q: &str) -> bool {
+    let digits = q.trim().trim_start_matches('#');
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn build_search_messages_filter(
     q: &str,
     cap: u32,
@@ -180,8 +186,12 @@ fn build_search_messages_filter(
     filter.insert("search".to_string(), serde_json::json!(q.trim()));
     // The desktop topbar is a typeahead surface. This bridge-only extension is
     // consumed before nostr::Filter parsing on the relay, so general WS/NIP-50
-    // search remains word/lexeme-based.
-    filter.insert("search_mode".to_string(), serde_json::json!("prefix"));
+    // search remains word/lexeme-based. A query that is only a number leaves
+    // it out: the relay's full-text default then matches the number as an
+    // exact lexeme, not as a prefix of 7928, and digits carry no operators.
+    if !is_number(q) {
+        filter.insert("search_mode".to_string(), serde_json::json!("prefix"));
+    }
     filter.insert("limit".to_string(), serde_json::json!(cap));
     if let Some(cid) = channel_id {
         filter.insert("#h".to_string(), serde_json::json!([cid]));

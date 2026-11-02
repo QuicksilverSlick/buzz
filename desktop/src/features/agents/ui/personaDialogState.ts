@@ -99,7 +99,8 @@ function behaviorEntry(
     persona.respondTo == null &&
     persona.parallelism == null &&
     capabilities.length === 0 &&
-    (persona.sessionPolicy ?? "channel") === "channel"
+    (persona.sessionPolicy ?? "channel") === "channel" &&
+    !persona.voiceProfile
   ) {
     return {};
   }
@@ -115,6 +116,7 @@ function behaviorEntry(
       // persona that never had a grant still submits byte-identically.
       capabilities: capabilities.length > 0 ? [...capabilities] : undefined,
       sessionPolicy: persona.sessionPolicy ?? "channel",
+      ...(persona.voiceProfile ? { voice: persona.voiceProfile } : {}),
     },
   };
 }

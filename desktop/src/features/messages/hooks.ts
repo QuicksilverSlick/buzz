@@ -37,7 +37,12 @@ import {
 
 export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
-import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import {
+  dmRecipientPubkeys,
+  isGroupDm,
+  messageMentionPubkeys,
+} from "@/features/messages/lib/messageMentionPubkeys";
+import { isAgentDirectoryReady } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
 import {
   clearTimeoutState,
@@ -46,17 +51,30 @@ import {
 import { relayClient, setVisibleChannel } from "@/shared/api/relayClient";
 import { customEmojiQueryKey } from "@/features/custom-emoji/hooks";
 import { channelsQueryKey } from "@/features/channels/hooks";
+import { channelMembersQueryKey } from "@/features/channels/rosterFreshness";
+import {
+  managedAgentsQueryKey,
+  relayAgentsQueryKey,
+} from "@/features/agents/hooks";
 import { reactionEmojiUrl } from "@/shared/api/customEmoji";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import {
   addReaction,
   deleteMessage,
   editMessage,
+  getChannelMembers,
+  listManagedAgents,
+  listRelayAgents,
   removeReaction,
   sendChannelMessage,
 } from "@/shared/api/tauri";
 import { getChannelWindowEvents } from "@/shared/api/channelWindow";
-import type { Channel, Identity, RelayEvent } from "@/shared/api/types";
+import type {
+  Channel,
+  ChannelMember,
+  Identity,
+  RelayEvent,
+} from "@/shared/api/types";
 // Same .mjs the renderer uses, so the cache-update projection can't drift
 // from the on-render overlay.
 import { noteChannelMembershipChange } from "@/shared/api/channelMembershipWrites";
@@ -473,9 +491,16 @@ export function useChannelSubscription(channel: Channel | null) {
   }, [channelId, channelType]);
 }
 
+/**
+ * `groupDmAgentPubkeys` opts in to the group-DM rule (dmRecipientPubkeys): a
+ * group DM tags its people and only the agents typed as @mentions. The DM's
+ * member list and agent directories come from the query cache, or are fetched
+ * when missing or failed, for the channel actually sent to.
+ */
 export function useSendMessageMutation(
   channel: Channel | null,
   identity: Identity | undefined,
+  groupDmAgentPubkeys?: ReadonlySet<string>,
 ) {
   const queryClient = useQueryClient();
 
@@ -544,11 +569,44 @@ export function useSendMessageMutation(
         mentionTags,
         linkPreviewTags,
       } = splitOutgoingTags(mediaTags);
-      const recipientPubkeys = messageMentionPubkeys(
-        effectiveChannel,
-        identity.pubkey,
-        mentionPubkeys,
-      );
+      // A group-DM send reads a cold or failed member list or agent directory
+      // itself (joining any read in flight), and refuses only if that fails.
+      const source = async <T>(
+        queryKey: readonly unknown[],
+        queryFn: () => Promise<T[]>,
+      ): Promise<{ data: T[] | undefined; error: unknown }> => {
+        const state = queryClient.getQueryState<T[]>(queryKey);
+        if (state && isAgentDirectoryReady(state)) return state;
+        return queryClient.fetchQuery({ queryKey, queryFn }).then(
+          (data) => ({ data, error: null }),
+          (error: unknown) => ({ data: undefined, error }),
+        );
+      };
+      const recipientPubkeys =
+        groupDmAgentPubkeys && isGroupDm(effectiveChannel, identity.pubkey)
+          ? await Promise.all([
+              source<ChannelMember>(
+                channelMembersQueryKey(effectiveChannel.id),
+                () => getChannelMembers(effectiveChannel.id),
+              ),
+              source(managedAgentsQueryKey, listManagedAgents),
+              source(relayAgentsQueryKey, listRelayAgents),
+            ]).then(([members, managedAgents, relayAgents]) =>
+              dmRecipientPubkeys({
+                channel: effectiveChannel,
+                senderPubkey: identity.pubkey,
+                explicitMentions: mentionPubkeys ?? [],
+                members,
+                managedAgents,
+                relayAgents,
+                knownAgentPubkeys: groupDmAgentPubkeys,
+              }),
+            )
+          : messageMentionPubkeys(
+              effectiveChannel,
+              identity.pubkey,
+              mentionPubkeys,
+            );
       if (sentFromThreadRootId && parentEventId) {
         throw new Error(
           "A thread message can only be sent as a top-level message.",

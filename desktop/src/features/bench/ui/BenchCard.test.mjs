@@ -12,7 +12,8 @@
  * - Plain fields and labels a writer typed show as bold-labelled fields in
  *   the phone's order, the action as the command one tap approves, details
  *   apart (long ones folded); a card without them renders as before.
- * - Open thread shows on every card that has a thread.
+ * - Open thread shows on every card that has a thread, with when the card
+ *   was created at the right of its row.
  * - A retired post is read-only, from its own text: the card's layout, no
  *   answer buttons, a link to the live card when there is one.
  */
@@ -42,6 +43,7 @@ let QueryClient;
 let QueryClientProvider;
 let TooltipProvider;
 let BenchCard;
+let formatBenchCreated;
 let useBenchCardForMessage;
 
 const CHANNEL = "8f6c1a52-3f0b-4f5e-9a51-0e2f5c7d9b10";
@@ -175,6 +177,7 @@ before(async () => {
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
   ({ BenchCard } = await import("./BenchCard.tsx"));
+  ({ formatBenchCreated } = await import("../lib/benchCards.ts"));
   ({ useBenchCardForMessage } = await import("../useBenchCards.ts"));
 });
 
@@ -507,6 +510,111 @@ test("Craig's recorded answer: the owner overrides it, never undoes it", async (
   );
 });
 
+function bumpCalls() {
+  return ipcCalls.filter((c) => c.cmd === "bench_bump").map((c) => c.args);
+}
+
+test("a queued card says why, and a tap posts it next instead of answering", async () => {
+  ipcHandlers.set("bench_bump", () => Promise.resolve(null));
+  // Hold the 30 s wait so the test can run it out.
+  const waits = [];
+  const realSetTimeout = dom.window.setTimeout;
+  dom.window.setTimeout = (fn, ms, ...rest) =>
+    ms === 30_000 ? waits.push(fn) : realSetTimeout(fn, ms, ...rest);
+  try {
+    const queued = card({ cardEventId: null, waitsFor: "slot" });
+    await act(async () => {
+      render(wrap(benchCard({ card: queued, maxCards: 30 })));
+    });
+    const reason = screen.getByText(
+      "Queued: the Bench posts a new card only while fewer than 30 slots are in use; this one posts when a slot frees. Tap an option to post it now.",
+    );
+    assert.equal(optionButton("1. Ship it").disabled, false, "not grey");
+    // The button says what a tap does: it posts the card.
+    assert.equal(
+      optionButton("1. Ship it").getAttribute("aria-describedby"),
+      reason.id,
+    );
+    await act(async () => {
+      fireEvent.click(optionButton("1. Ship it"));
+    });
+    assert.deepEqual(bumpCalls(), [{ itemId: "dreamforge/ship-it" }]);
+    assert.deepEqual(answerCalls(), [], "a bump answers nothing");
+    assert.ok(
+      screen.getByText(
+        "Posting this card now. Tap your answer again once it's live.",
+      ),
+    );
+    // The tapped option keeps focus, busy; the rest wait: one bump at a time.
+    assert.equal(optionButton("1. Ship it").disabled, false);
+    assert.equal(optionButton("1. Ship it").getAttribute("aria-busy"), "true");
+    assert.equal(optionButton("2. Hold").disabled, true);
+    assert.equal(
+      screen.getByRole("group", { name: "Answer" }).getAttribute("aria-busy"),
+      "true",
+    );
+    // It never waits on nothing: past 30 s it says so and may go again.
+    assert.equal(waits.length, 1);
+    await act(async () => waits[0]());
+    assert.ok(
+      screen.getByText(
+        "Not posted after 30 s. The Bench may be offline; try again.",
+      ),
+    );
+    assert.equal(optionButton("2. Hold").disabled, false);
+  } finally {
+    dom.window.setTimeout = realSetTimeout;
+  }
+});
+
+test("a bump the Bench refuses says why", async () => {
+  const full =
+    "all 40 card slots are in use, the Bench's limit; answer or close a card first";
+  ipcHandlers.set("bench_bump", () => Promise.reject(full));
+  const queued = card({ cardEventId: null, waitsFor: "slot" });
+  await act(async () => {
+    render(wrap(benchCard({ card: queued, maxCards: 30 })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  await waitFor(() => screen.getByText(`Couldn't post it: ${full}`));
+  assert.equal(optionButton("1. Ship it").disabled, false);
+  assert.deepEqual(answerCalls(), []);
+});
+
+test("the live card a tap posted says that tap answered nothing", async () => {
+  ipcHandlers.set("bench_bump", () => Promise.resolve(null));
+  ipcHandlers.set("bench_answer", () => Promise.resolve(null));
+  const queued = card({
+    id: "dreamforge/posted",
+    cardEventId: null,
+    waitsFor: "slot",
+  });
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: queued, maxCards: 30 })));
+  });
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  // It posts: the Bench screen keys the row by its card, so a new row.
+  const live = { ...queued, cardEventId: "e".repeat(64), waitsFor: null };
+  await act(async () => {
+    view.rerender(wrap(benchCard({ card: live, key: live.cardEventId })));
+  });
+  const posted =
+    "Posted at your request. Your earlier tap didn't answer it; tap your answer now.";
+  assert.ok(screen.getByText(posted));
+  assert.equal(document.activeElement, optionButton("2. Hold"));
+  assert.deepEqual(answerCalls(), [], "nothing answered on its own");
+  await act(async () => {
+    fireEvent.click(optionButton("2. Hold"));
+  });
+  assert.equal(answerCalls().length, 1);
+  assert.equal(screen.queryByText(posted), null);
+});
+
 test("a receipt shows the request, the answer and the outcome as inert text", async () => {
   const request = scoped({
     title: "Send the <b>new</b> email?",
@@ -823,6 +931,42 @@ test("Open thread is on question, status and receipt cards with a thread", async
     assert.equal(thread(), null);
     cleanup();
   }
+});
+
+test("when the card was created shows at the bottom right, on Open thread's row", async () => {
+  const created = () => screen.getByTestId("bench-card-created");
+  let view;
+  await act(async () => {
+    view = render(wrap(benchCard({ card: card(), onOther: () => {} })));
+  });
+  const root = view.container.querySelector("[data-testid='bench-card']");
+  const stamp = created();
+  const button = screen.getByRole("button", { name: "Open thread" });
+  assert.equal(stamp.dateTime, "2026-10-12T10:00:00.000Z");
+  // The helper's own text: its format test pins the format, and a fixed
+  // pattern would break when the clock leaves the fixture's year.
+  assert.equal(
+    stamp.textContent,
+    formatBenchCreated(Date.parse("2026-10-12T10:00:00Z") / 1_000),
+  );
+  assert.equal(stamp.parentElement, button.parentElement, "one row");
+  assert.equal(stamp.parentElement, root.lastElementChild, "the card's last");
+  assert.equal(button.nextElementSibling, stamp, "Open thread at the left");
+  assert.ok(stamp.className.includes("ml-auto"), "pushed to the right");
+  cleanup();
+  // No thread: the stamp alone. A receipt's is its question's.
+  const receipt = card({
+    kind: "status",
+    options: [],
+    state: "done",
+    updatedAt: "2026-10-14T10:00:00Z",
+    request: scoped({ cardEventId: null }),
+  });
+  await act(async () => {
+    render(wrap(benchCard({ card: receipt })));
+  });
+  assert.equal(created().dateTime, "2026-10-12T10:00:00.000Z");
+  assert.equal(screen.queryByRole("button", { name: "Open thread" }), null);
 });
 
 test("a retired post is read-only, from its own text, with a link to the live card", async () => {

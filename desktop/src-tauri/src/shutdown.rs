@@ -23,6 +23,11 @@ pub(crate) fn shut_down_app(app: &tauri::AppHandle, shutdown_done: &std::sync::a
         crate::channel_head_cache::flush(app);
         app.state::<crate::terminal_runtime::TerminalSessions>()
             .shutdown_all();
+        // Quitting leaves the huddle, and the route writer's own cleanup never
+        // runs once the runtime stops.
+        if let Some(path) = managed_agents::voice_profile::output_route_file(app) {
+            let _ = std::fs::remove_file(path);
+        }
         if let Err(error) = shutdown_managed_agents(app) {
             eprintln!("buzz-desktop: failed to stop managed agents: {error}");
         }
