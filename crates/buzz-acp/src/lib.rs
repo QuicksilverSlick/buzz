@@ -628,7 +628,8 @@ mod inbound_author_gate {
     }
 
     /// The policy for a key the relay vouches for, not an event's signer: the
-    /// actor in a relay-signed 44100, for the huddle voice module.
+    /// actor in a relay-signed 44100, for the huddle voice module. No listener
+    /// may call this: it skips workflow attribution, as `author_allowed` says.
     pub(crate) async fn voice_admits(
         policy: (&RespondTo, &HashSet<String>),
         pubkey: &str,
@@ -4197,15 +4198,12 @@ async fn run_harness(
                                 // Not from owner — fall through to normal prompt handling.
                             }
 
-                            // A voiced huddle takes no kind 9, typed or spoken, after the owner's
-                            // control commands above. Noted as refused, so a restart's catch-up
-                            // doesn't answer it on the text path either.
-                            if voice.as_ref().is_some_and(|v| v.ignores(kind_u32, ch)) {
-                                tracing::debug!(channel_id = %ch, "voiced huddle: ignoring kind 9");
-                                config.catch_up.note_refused(
-                                    buzz_event.event.id.to_hex(),
-                                    buzz_event.event.created_at.as_secs(),
-                                );
+                            // A voiced huddle takes nothing, typed or spoken, after the owner's
+                            // control commands above.
+                            if voice.as_ref().is_some_and(|voice| {
+                                voice.ignores(&buzz_event.event, ch, &config.catch_up)
+                            }) {
+                                tracing::debug!(channel_id = %ch, kind = kind_u32, "voiced huddle: ignoring");
                                 continue;
                             }
 
@@ -5047,6 +5045,10 @@ async fn run_harness(
 
     if let Some(handle) = relay_observer_publisher_task.take() {
         handle.abort();
+    }
+
+    if let Some(voice) = voice.as_mut() {
+        voice.drain().await;
     }
 
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s

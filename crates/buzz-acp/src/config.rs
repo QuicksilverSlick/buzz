@@ -631,11 +631,12 @@ pub struct CliArgs {
     pub audio_route_file: Option<PathBuf>,
 
     /// Talos for huddle voices, pinned here: the host never comes from a frame.
-    /// Only read while the voice switch is on, and it must be `wss://`.
+    /// Only read while the voice switch is on. Any host but the harness's pinned
+    /// one keeps voice off, with an error in the log.
     #[arg(
         long,
         env = "BUZZ_ACP_VOICE_TALOS_URL",
-        default_value = "wss://dreamforge-talos.russelledeming.workers.dev"
+        default_value = crate::voice::TALOS_URL
     )]
     pub voice_talos_url: String,
 }

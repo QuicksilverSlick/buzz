@@ -22,6 +22,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use tokio::time::{sleep_until, timeout, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -72,8 +73,8 @@ pub(crate) enum Left {
     /// `stop` fired, Talos closed the voice (its reason), the huddle ended, or the bridge couldn't
     /// take a command.
     Done(String),
-    /// The Talos socket dropped, or sent a frame over `frames::MAX_FRAME`. 8e resumes within the
-    /// lease's 20 s.
+    /// The Talos socket dropped or sent a frame over `frames::MAX_FRAME`, which 8e resumes within
+    /// the lease's 20 s, or the bridge panicked.
     Lost,
     /// The relay refused the audio join for good, in its words.
     Refused(String),
@@ -187,11 +188,24 @@ pub(crate) async fn session(
     let left = pump(me, huddle, &mut talos, &cmd, &mut from_room, &mut stop).await;
     // A full queue must not hold up the Close.
     drop(from_room);
-    let _ = cmd.send(Cmd::Leave).await;
-    let end = timeout(LEAVE_WAIT, bridge).await;
-    let _ = timeout(LEAVE_WAIT, talos.close(None)).await;
-    match end {
-        Ok(Ok(End::Refused(why))) if !why.contains("huddle has ended") => Left::Refused(why),
+    let leave = async {
+        let _ = cmd.send(Cmd::Leave).await;
+        bridge.await
+    };
+    // Both at once: a relay slow to close must not keep Talos billing the lease.
+    let (end, _) = tokio::join!(
+        timeout(LEAVE_WAIT, leave),
+        timeout(LEAVE_WAIT, talos.close(None))
+    );
+    how_it_ended(end.ok(), left)
+}
+
+/// How a run ended, now the bridge has had its say.
+fn how_it_ended(bridge: Option<Result<End, JoinError>>, left: Left) -> Left {
+    match bridge {
+        Some(Ok(End::Refused(why))) if !why.contains("huddle has ended") => Left::Refused(why),
+        // It panicked: the room is gone, but the pump's "room ended" would read as a clean end.
+        Some(Err(_)) => Left::Lost,
         _ => left,
     }
 }

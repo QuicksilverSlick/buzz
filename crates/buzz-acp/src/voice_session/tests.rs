@@ -139,6 +139,9 @@ pub(crate) async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'stati
                         if frame == "drop" {
                             return;
                         }
+                        if frame == "stall" {
+                            std::future::pending::<()>().await;
+                        }
                         ws.send(say(frame)).await.unwrap();
                     }
                 }
@@ -400,6 +403,28 @@ async fn a_run_ending_before_opened_still_closes_the_socket() {
     assert!(matches!(left(run).await, Left::NoLease(_)));
     until("Talos's Close", || r.seen.saw("talos:close")).await;
     assert!(!r.seen.saw("audio:join"));
+}
+
+/// Talos's Close ends the bill, so a relay that has stopped reading can't hold it up.
+#[tokio::test]
+async fn a_relay_slow_to_close_doesnt_hold_up_talos_close() {
+    let r = Run::new(None, None, Value::Null).await;
+    let (stop, run) = r.start();
+    until("joined", || r.seen.saw("talos:roster")).await;
+    r.seen.room_sends(json!("stall"));
+    sleep(Duration::from_millis(50)).await;
+    let at = Instant::now();
+    stop.send(()).unwrap();
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+    assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
+    assert_eq!(left(run).await, Left::Done("stopped".into()));
+}
+
+#[tokio::test]
+async fn a_bridge_that_panicked_is_a_lost_run_not_a_clean_end() {
+    let panicked: Result<End, JoinError> = tokio::spawn(async { panic!("in the bridge") }).await;
+    let room_ended = Left::Done("the audio room ended".into());
+    assert_eq!(how_it_ended(Some(panicked), room_ended), Left::Lost);
 }
 
 #[tokio::test]

@@ -2,10 +2,10 @@
 //! run itself.
 //!
 //! Off unless the definition's switch is on: then [`Voice::start`] returns `None`, and the harness
-//! makes no socket, no query and no bill, and takes kind 9 as it always did.
+//! makes no socket, no query and no bill, and takes a huddle's events as it always did.
 //!
-//! With it on, a relay-signed 44100 about this agent starts one task per huddle: find the parent
-//! from the huddle's 48100, check the actor against the author gate, wait for the owner's 48101,
+//! With it on, a relay-signed 44100 about this agent starts one task per huddle: check the actor
+//! against the author gate, find the parent from the huddle's 48100, wait for the owner's 48101,
 //! then run the voice. It leaves on 44101 and 48103, both through the run's `stop`. After a run
 //! that ends any other way, only a newer 48101 brings it back. A decline says one line in the
 //! parent, never in the huddle, and hands the huddle back to the text path.
@@ -16,8 +16,8 @@
 //! ponytail: lifecycle comes from polling `POST /query`, so a voice can trail the owner by 5 s. A
 //! subscription on the parent is the upgrade if that proves too slow.
 //!
-//! ponytail: a kind 9 landing between the 44100 and the 48100 lookup still takes the text path, as
-//! most 44100s are for ordinary channels. That's a moment at the start, before any audio.
+//! ponytail: a huddle stays on the text path until its first run is due, so a typed message isn't
+//! lost while the owner is away. A text turn begun just before can still post once in the huddle.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,14 +26,16 @@ use std::time::Duration;
 use buzz_core::filter::NOTICE_CHANNEL_TYPE_TAG;
 use buzz_core::kind::{
     KIND_HUDDLE_ENDED, KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT,
-    KIND_HUDDLE_STARTED, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
+    KIND_HUDDLE_STARTED, KIND_MEMBER_REMOVED_NOTIFICATION,
 };
-use nostr::{Event, Tag};
+use nostr::{Event, EventId, Tag, Timestamp};
 use serde_json::{json, Value};
-use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+use crate::catch_up::CatchUp;
 use crate::config::{Config, RespondTo};
 use crate::inbound_author_gate::voice_admits;
 use crate::relay::RestClient;
@@ -41,15 +43,27 @@ use crate::voice_profile::VoiceProfile;
 use crate::voice_session::{session, text, Left, Voicing};
 use crate::{remember_gate_notice, OwnerCache};
 
+/// The only Talos a voice dials. Its socket carries the NIP-98, the proofs and room audio, and a
+/// definition's env can set `--voice-talos-url`, so the flag can't name another host. S3's custom
+/// domain joins here.
+pub(crate) const TALOS_URL: &str = "wss://dreamforge-talos.russelledeming.workers.dev";
 const OWNER_GRACE: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_secs(5);
 /// A minute of polls for the 48100, which a desktop posts just after adding its agents.
 const LINK_POLLS: u32 = 12;
 /// An hour of polls for an absent owner: the huddle channel's own TTL.
 const OWNER_POLLS: u32 = 720;
-/// Huddles tracked at once on one agent, each costing a query per poll: 1.6/s of the relay's ~5/s
-/// `/query` budget. Past this a new one gets no voice, with a warning.
+/// Polls until a lease this PC lost has run out, which it does 20 s after its socket dropped.
+const LEASE_POLLS: u32 = 5;
+/// Huddles working at once on one agent, each costing a query per poll: 1.6/s of the relay's ~5/s
+/// `/query` budget. Past this a new one waits for a slot, with a warning, as its 44100 won't come
+/// again. Anyone the gate refuses never waits.
 const MAX_HUDDLES: usize = 8;
+/// The relay's own `MAX_TIMESTAMP_DRIFT_SECS`: how far a 48100 can be ahead of the relay's clock.
+const MAX_DRIFT_SECS: u64 = 900;
+/// Past `voice_session`'s 5 s for both Closes.
+const DRAIN_WAIT: Duration = Duration::from_secs(6);
+const DUPLICATE_HOLDER: &str = "duplicate_holder";
 const STARTS_PAGE: usize = 200;
 const LIFECYCLE_PAGE: usize = 500;
 
@@ -67,10 +81,18 @@ struct Shared {
     respond_to: RespondTo,
     allowlist: HashSet<String>,
     poll: Duration,
-    /// Huddles whose kind 9 is ignored: the gate passed and no line handed them back.
-    voiced: Mutex<HashSet<Uuid>>,
+    /// When this process started. A notice older than this is a replay and earns no line, as `told`
+    /// doesn't survive a restart.
+    started: u64,
+    slots: Semaphore,
+    /// Huddles whose events are ignored, and the 44100 of the task that said so: a run was due and
+    /// no line handed them back.
+    voiced: Mutex<HashMap<Uuid, EventId>>,
     /// Huddles the parent has had a line about.
     told: Mutex<HashSet<(Uuid, String)>>,
+    /// Each huddle's newest 48101 a finished run saw, across a remove and re-add. ponytail: an entry
+    /// a removal leaves stays until restart, at a few bytes per huddle.
+    spent: Mutex<HashMap<Uuid, u64>>,
 }
 
 /// The harness's handle on its voices; the main loop owns it.
@@ -79,6 +101,7 @@ pub(crate) struct Voice {
     shutdown: watch::Receiver<()>,
     /// Dropping a huddle's sender is what removes the agent from it.
     tracked: HashMap<Uuid, watch::Sender<()>>,
+    tasks: JoinSet<()>,
 }
 
 impl Voice {
@@ -98,17 +121,19 @@ impl Voice {
     }
 
     fn new(shared: Shared, shutdown: watch::Receiver<()>) -> Self {
-        let (shared, tracked) = (Arc::new(shared), HashMap::new());
+        let (shared, tracked, tasks) = (Arc::new(shared), HashMap::new(), JoinSet::new());
         Self {
             shared,
             shutdown,
             tracked,
+            tasks,
         }
     }
 
     /// A 44100 or 44101, past the main loop's replay dedup.
     pub(crate) fn on_membership(&mut self, notice: &Event) {
         self.tracked.retain(|_, sender| !sender.is_closed());
+        while self.tasks.try_join_next().is_some() {}
         let huddle = match self.shared.notice_huddle(notice) {
             Ok(huddle) => huddle,
             Err(why) => return tracing::warn!("huddle voice: ignoring a notice: {why}"),
@@ -119,20 +144,33 @@ impl Voice {
             || self.tracked.contains_key(&huddle)
         {
             // Not a huddle, or a repeat add, which changes nothing.
-        } else if self.tracked.len() >= MAX_HUDDLES {
-            tracing::warn!(%huddle, "huddle voice: {MAX_HUDDLES} tracked, so no voice here");
         } else {
             let (sender, removed) = watch::channel(());
             self.tracked.insert(huddle, sender);
             let stop = Stop(removed, self.shutdown.clone());
-            tokio::spawn(self.shared.clone().track(huddle, notice.clone(), stop));
+            self.tasks
+                .spawn(self.shared.clone().track(huddle, notice.clone(), stop));
         }
     }
 
-    /// Whether the main loop drops this event: every kind 9 in a voiced huddle until the rip-out,
-    /// since speech-to-text posts carry no marker and can't be told from typing.
-    pub(crate) fn ignores(&self, kind: u32, channel: Uuid) -> bool {
-        kind == KIND_STREAM_MESSAGE && lock(&self.shared.voiced).contains(&channel)
+    /// Whether the main loop drops this event: all of a voiced huddle's until the rip-out, since
+    /// speech-to-text posts carry no marker, and an edit or reminder would post in the huddle. Noted
+    /// as refused, so a restart's catch-up doesn't answer it on the text path either.
+    pub(crate) fn ignores(&self, event: &Event, channel: Uuid, catch_up: &CatchUp) -> bool {
+        let ignored = lock(&self.shared.voiced).contains_key(&channel);
+        if ignored {
+            catch_up.note_refused(event.id.to_hex(), event.created_at.as_secs());
+        }
+        ignored
+    }
+
+    /// At harness exit, once the shutdown watch has fired: time for every run's Close, or Talos
+    /// bills each lease for 20 s more and a relaunch meets `duplicate_holder`.
+    pub(crate) async fn drain(&mut self) {
+        let all = async { while self.tasks.join_next().await.is_some() {} };
+        if timeout(DRAIN_WAIT, all).await.is_err() {
+            tracing::warn!("huddle voice: a run didn't close in time, so its lease runs out alone");
+        }
     }
 }
 
@@ -140,14 +178,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Talos's socket base. Only `wss://`: the socket carries the NIP-98, the proofs and room audio.
+/// Talos's socket base, once the flag has named [`TALOS_URL`].
 fn pinned_talos(raw: &str) -> Result<String, String> {
     let url = url::Url::parse(raw).map_err(text)?;
-    if url.scheme() != "wss" || !url.has_host() || url.query().is_some() || url.fragment().is_some()
-    {
-        return Err("--voice-talos-url must be a plain wss:// address".into());
+    if url.as_str().trim_end_matches('/') != TALOS_URL {
+        return Err(format!("--voice-talos-url must be {TALOS_URL}"));
     }
-    Ok(url.as_str().trim_end_matches('/').to_owned())
+    Ok(TALOS_URL.to_owned())
 }
 
 fn tag<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
@@ -173,7 +210,7 @@ fn read_lifecycle(events: &[Event], huddle: Uuid, relay: &str, owner: &str) -> (
     for event in events {
         let kind = event.kind.as_u16() as u32;
         if kind == KIND_HUDDLE_ENDED {
-            ended = true;
+            ended |= event.verify().is_ok();
         } else if event.pubkey.to_hex() == relay
             && tag(event, "p").is_some_and(|p| p.eq_ignore_ascii_case(owner))
             && event.verify().is_ok()
@@ -195,7 +232,7 @@ fn read_lifecycle(events: &[Event], huddle: Uuid, relay: &str, owner: &str) -> (
 /// line says the owner left, as `OwnerGone` also covers a join that kept failing.
 fn line_for(left: &Left, owner_here: bool) -> Option<&'static str> {
     match left {
-        Left::NoLease(why) if why == "duplicate_holder" => None,
+        Left::NoLease(why) if why == DUPLICATE_HOLDER => None,
         Left::Done(why) if why == "stopped" || why == "the audio room ended" => None,
         Left::OwnerGone if !owner_here => None,
         _ => Some(LINE_OFF),
@@ -206,6 +243,8 @@ struct Link {
     parent: Uuid,
     started: u64,
     actor: String,
+    /// The notice came before this process did.
+    replayed: bool,
 }
 
 /// What ends a huddle's task: the tracked sender dropping (the agent was removed), or shutdown.
@@ -252,8 +291,11 @@ impl Shared {
             respond_to: config.respond_to.clone(),
             allowlist: config.respond_to_allowlist.clone(),
             poll: POLL,
+            started: Timestamp::now().as_secs(),
+            slots: Semaphore::new(MAX_HUDDLES),
             voiced: Mutex::default(),
             told: Mutex::default(),
+            spent: Mutex::default(),
         })
     }
 
@@ -272,33 +314,62 @@ impl Shared {
     async fn track(self: Arc<Self>, huddle: Uuid, added: Event, stop: Stop) {
         if let Err(why) = self.run(huddle, &added, &stop).await {
             tracing::info!(%huddle, "huddle voice stays out: {why}");
+            lock(&self.spent).remove(&huddle);
         }
-        lock(&self.voiced).remove(&huddle);
+        self.unvoice(huddle, &added);
+    }
+
+    /// Back to the text path, unless a task from a later 44100 holds the huddle by now.
+    fn unvoice(&self, huddle: Uuid, added: &Event) {
+        let mut voiced = lock(&self.voiced);
+        if voiced.get(&huddle) == Some(&added.id) {
+            voiced.remove(&huddle);
+        }
     }
 
     /// `Err` is why this agent stays out, for the log.
     async fn run(&self, huddle: Uuid, added: &Event, stop: &Stop) -> Result<(), String> {
-        let link = tokio::select! {
-            _ = stop.fired() => return Ok(()),
-            link = self.link(huddle, added) => link?,
-        };
+        let content: Value = serde_json::from_str(&added.content).unwrap_or_default();
+        let actor = content["actor"].as_str().ok_or("a notice with no actor")?;
         let gate = (&self.respond_to, &self.allowlist);
         let rest = &self.voicing.rest;
-        let admitted = voice_admits(gate, &link.actor, &self.owner_cache, rest).await;
+        let admitted = voice_admits(gate, actor, &self.owner_cache, rest).await;
+        // Someone refused takes a slot only to say so, and never stands in front of a real huddle.
+        let _slot = if admitted != Some(true) {
+            self.slots.try_acquire().map_err(text)?
+        } else {
+            if self.slots.available_permits() == 0 {
+                tracing::warn!(
+                    %huddle,
+                    "huddle voice: {MAX_HUDDLES} huddles hold every slot, so this one's voice \
+                     waits for one to end; typed messages take the text path until then"
+                );
+            }
+            tokio::select! {
+                _ = stop.fired() => return Ok(()),
+                slot = self.slots.acquire() => slot.map_err(text)?,
+            }
+        };
+        let link = tokio::select! {
+            _ = stop.fired() => return Ok(()),
+            link = self.link(huddle, added, actor) => link?,
+        };
         if admitted != Some(true) {
             // `None` is a failed lookup, not proof they're outside the gate.
             let line = admitted.map_or(LINE_OFF, |_| LINE_GATE);
-            self.say(huddle, link.parent, line).await;
+            if !matches!(self.room_state(huddle, &link).await, Ok((true, _))) {
+                self.say(huddle, &link, line).await;
+            }
             return Err("the actor didn't pass the author gate".into());
         }
-        lock(&self.voiced).insert(huddle);
-        let mut since = 0;
+        let mut since = lock(&self.spent).get(&huddle).copied().unwrap_or(0);
+        let mut looked_again = false;
         loop {
-            since = tokio::select! {
+            let joined = tokio::select! {
                 _ = stop.fired() => return Ok(()),
                 joined = self.owner_join(huddle, &link, since) => joined?,
             };
-            lock(&self.voiced).insert(huddle);
+            lock(&self.voiced).insert(huddle, added.id);
             let until = async {
                 tokio::select! {
                     _ = stop.fired() => {}
@@ -310,46 +381,66 @@ impl Shared {
             let why = format!("{left:?}");
             let why = why.split('(').next();
             tracing::info!(%huddle, ?why, "huddle voice: the run ended");
+            // A lease this PC just lost outlives it and reads as a second holder, so look once more
+            // when it has run out; 8e's resume replaces this. A real holder just refuses again.
+            if matches!(&left, Left::NoLease(why) if why == DUPLICATE_HOLDER) {
+                if !std::mem::replace(&mut looked_again, true) {
+                    tokio::select! {
+                        _ = stop.fired() => return Ok(()),
+                        _ = sleep(self.poll * LEASE_POLLS) => continue,
+                    }
+                }
+                tracing::warn!(%huddle, "huddle voice: another harness holds this voice");
+            }
+            looked_again = false;
             let room = self.room_state(huddle, &link).await;
             let owner_here = room.as_ref().map_or(true, |(_, open)| open.is_some());
-            // What the run saw is spent: only a newer 48101 brings the voice back.
+            // What the run saw is spent: only a newer 48101 brings the voice back. A removal's run
+            // isn't, as an owner who adds the agent back wants it back.
             let newest = room.ok().and_then(|(_, open)| open);
-            since = newest.map_or(since, |newest| newest.max(since));
+            since = newest.map_or(joined, |newest| newest.max(joined));
+            if !matches!(&left, Left::Done(why) if why == "stopped") {
+                lock(&self.spent).insert(huddle, since);
+            }
             if let Some(line) = line_for(&left, owner_here) {
-                self.say(huddle, link.parent, line).await;
-                lock(&self.voiced).remove(&huddle);
+                self.say(huddle, &link, line).await;
+                self.unvoice(huddle, added);
             }
         }
     }
 
-    /// One page of events; a full page warns, as older ones are then unread.
-    async fn read(&self, mut filter: Value, page: usize) -> Result<Vec<Event>, String> {
-        filter["limit"] = page.into();
-        let events = self.voicing.rest.query_raw(&[filter]).await.map_err(text)?;
+    /// One page per filter; a full one warns, as older events are then unread.
+    async fn read(&self, mut filters: Vec<Value>, page: usize) -> Result<Vec<Event>, String> {
+        for filter in &mut filters {
+            filter["limit"] = page.into();
+        }
+        let events = self.voicing.rest.query_raw(&filters).await.map_err(text)?;
         let events: Vec<Event> = serde_json::from_value(events).map_err(text)?;
         if events.len() >= page {
-            tracing::warn!("huddle voice: {page} events on one page, so older ones are unread");
+            tracing::warn!("huddle voice: {page}+ events in one read, so older ones may be unread");
         }
         Ok(events)
     }
 
-    /// The actor, and the parent from the 48100 naming this huddle. The relay checked at ingest
-    /// that its signer created that private ephemeral channel.
-    async fn link(&self, huddle: Uuid, notice: &Event) -> Result<Link, String> {
-        let content: Value = serde_json::from_str(&notice.content).unwrap_or_default();
-        let actor = content["actor"].as_str().ok_or("a notice with no actor")?;
+    /// The parent from the 48100 naming this huddle. The relay checked at ingest that its signer
+    /// created that private ephemeral channel. Its creator could still name the huddle itself, and
+    /// nothing posts there.
+    async fn link(&self, huddle: Uuid, notice: &Event, actor: &str) -> Result<Link, String> {
         let since = notice.created_at.as_secs().saturating_sub(86_400);
         let starts = json!({"kinds": [KIND_HUDDLE_STARTED], "since": since});
         for _ in 0..LINK_POLLS {
-            let events = self.read(starts.clone(), STARTS_PAGE).await;
+            let events = self.read(vec![starts.clone()], STARTS_PAGE).await;
             let events = events.inspect_err(|why| tracing::warn!(%huddle, %why, "huddle voice"));
             for event in events.iter().flatten().filter(|e| names_huddle(e, huddle)) {
-                if let Some(parent) = tag(event, "h").and_then(|h| h.parse().ok()) {
+                let parent = tag(event, "h").and_then(|h| h.parse().ok());
+                if let Some(parent) = parent.filter(|parent| *parent != huddle) {
                     let (started, actor) = (event.created_at.as_secs(), actor.to_owned());
+                    let replayed = notice.created_at.as_secs() < self.started;
                     return Ok(Link {
                         parent,
                         started,
                         actor,
+                        replayed,
                     });
                 }
             }
@@ -359,20 +450,22 @@ impl Shared {
     }
 
     /// At most one line per huddle, in the parent.
-    async fn say(&self, huddle: Uuid, parent: Uuid, line: &str) {
-        if remember_gate_notice(&mut lock(&self.told), (huddle, String::new())) {
+    async fn say(&self, huddle: Uuid, link: &Link, line: &str) {
+        if !link.replayed && remember_gate_notice(&mut lock(&self.told), (huddle, String::new())) {
             let thread = crate::queue::ThreadTags::default();
-            crate::pool::post_notice(&self.voicing.rest, parent, &thread, line, &[]).await;
+            crate::pool::post_notice(&self.voicing.rest, link.parent, &thread, line, &[]).await;
         }
     }
 
     async fn room_state(&self, huddle: Uuid, link: &Link) -> Result<(bool, Option<u64>), String> {
-        let lifecycle = json!({
-            "kinds": [KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_ENDED],
-            "#h": [link.parent],
-            // The 48100's time is the desktop's clock and these are the relay's.
-            "since": link.started.saturating_sub(300),
-        });
+        // The 48100's time is the desktop's clock and these are the relay's.
+        let (h, since) = ([link.parent], link.started.saturating_sub(MAX_DRIFT_SECS));
+        let joins = [KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT];
+        let lifecycle = vec![
+            // Only the relay's: any member can post these kinds, and could bury its off the page.
+            json!({"kinds": joins, "authors": [self.relay], "#h": h, "since": since}),
+            json!({"kinds": [KIND_HUDDLE_ENDED], "#h": h, "since": since}),
+        ];
         let events = self.read(lifecycle, LIFECYCLE_PAGE).await?;
         Ok(read_lifecycle(
             &events,
@@ -391,7 +484,7 @@ impl Shared {
                 Ok((_, Some(joined))) if joined > since => return Ok(joined),
                 // An owner who added it is on the way; anyone else may be alone a while.
                 Ok(_) if since == 0 && link.actor != self.voicing.owner => {
-                    self.say(huddle, link.parent, LINE_WAITING).await;
+                    self.say(huddle, link, LINE_WAITING).await;
                 }
                 Ok(_) => {}
                 Err(why) => tracing::warn!(%huddle, %why, "huddle voice"),
