@@ -10,6 +10,7 @@ import {
 import * as React from "react";
 
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
+import { workbenches } from "@/features/bench/lib/workbenches";
 import { BenchCardSnippet } from "@/features/bench/ui/BenchCardFields";
 import { useBenchSnapshot } from "@/features/bench/useBenchCards";
 import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
@@ -343,9 +344,10 @@ export function InboxListPane({
   const { data: projects } = useProjectsQuery();
   const viewerAgents = useViewerAgentPubkeys();
   const viewerPubkey = useIdentityQuery().data?.pubkey;
+  const benches = workbenches();
   const projectChips = React.useMemo(
-    () => inboxProjects(projects ?? [], viewerPubkey, viewerAgents),
-    [projects, viewerAgents, viewerPubkey],
+    () => inboxProjects(projects ?? [], viewerPubkey, viewerAgents, benches),
+    [benches, projects, viewerAgents, viewerPubkey],
   );
   const channelDescriptions = React.useMemo(
     () =>

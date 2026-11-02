@@ -13,14 +13,14 @@ import {
   benchSections,
 } from "@/features/bench/lib/benchScreen";
 import {
-  BENCH_TABS,
   type BenchTab,
-  WORKBENCHES,
+  benchTabs,
   cardWorkbench,
   workbenchColor,
   workbenchCounts,
   workbenchLabel,
   workbenchSnapshot,
+  workbenches,
 } from "@/features/bench/lib/workbenches";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
 import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
@@ -65,12 +65,12 @@ const SECTIONS: ReadonlyArray<{
   },
 ];
 
-/** The last tab on this device; All the first time or if unreadable. */
+/** The last tab on this device; All the first time or if unreadable. A tab
+ * the registry no longer has shows All, and comes back if it returns. */
 const BENCH_TAB_KEY = "buzz.bench.workbench.v1";
 
 function readBenchTab(): BenchTab {
-  const saved = getStorageItem(BENCH_TAB_KEY);
-  return BENCH_TABS.find((tab) => tab.id === saved)?.id ?? "all";
+  return getStorageItem(BENCH_TAB_KEY) ?? "all";
 }
 
 function errorText(error: unknown): string {
@@ -83,7 +83,7 @@ function errorText(error: unknown): string {
  * things stand. Cards answer through `bench_answer`, which uses the Bench's
  * own relay and keys, so the screen works whichever community is active.
  * Other and Open thread open the card's thread, where a reply is the answer.
- * Project tabs (All, 28 Day Reset, Dreamforge, and Other when it has
+ * Project tabs (All, one per registry project, and Other when it has
  * cards) narrow the board first; search then narrows every section at once.
  * The sidebar badge still counts every project. `focusCardId` (global
  * search's ?card=) shows All, clears the search, and scrolls to and rings
@@ -130,7 +130,7 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
     () => (snapshot ? workbenchCounts(snapshot, viewerPubkey) : null),
     [snapshot, viewerPubkey],
   );
-  const tabs = BENCH_TABS.filter(
+  const tabs = benchTabs().filter(
     (t) => t.id !== "other" || (counts?.other.cards ?? 0) > 0,
   );
   // A saved Other tab that has emptied shows All, and comes back with cards.
@@ -187,9 +187,9 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
             aria-label="Projects"
             className="h-auto flex-wrap justify-start"
           >
-            {tabs.map(({ id, label }) => {
+            {tabs.map(({ id, label, parent }) => {
               const count = counts?.[id];
-              const workbench = WORKBENCHES.find((w) => w.id === id);
+              const workbench = workbenches().find((w) => w.id === id);
               const color = workbench
                 ? workbenchColor(
                     workbench,
@@ -203,6 +203,11 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
                   className="gap-1.5"
                   data-testid={`bench-tab-${id}`}
                   key={id}
+                  title={
+                    parent
+                      ? `${label}, part of ${workbenchLabel(parent)}`
+                      : undefined
+                  }
                   value={id}
                 >
                   {color ? (
@@ -232,6 +237,15 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
           </TabsList>
         </Tabs>
         <div className="space-y-1 text-sm" data-testid="bench-status">
+          {snapshot.projectsNotice ? (
+            <p
+              className="text-amber-700 dark:text-amber-400 [overflow-wrap:anywhere]"
+              data-testid="bench-projects-notice"
+              role="status"
+            >
+              Project tabs: {snapshot.projectsNotice}
+            </p>
+          ) : null}
           <p className="text-muted-foreground" data-testid="bench-last-update">
             {lastTick === null
               ? "Waiting for the Bench's first update."

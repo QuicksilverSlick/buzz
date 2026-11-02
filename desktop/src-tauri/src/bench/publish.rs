@@ -397,6 +397,7 @@ pub(super) async fn publish(
     owner_set: &[String],
     failed: &mut Vec<String>,
 ) -> Result<(), String> {
+    super::projects::refresh(&ctx.root);
     // (a) The live cards: the open ones (`open`), in `item::rank` order.
     // MAX_CARDS gates new posts only: an open card with a place (`placed`:
     // posted, or retired for a refresh and coming back) keeps it, so (b)

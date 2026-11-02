@@ -19,6 +19,7 @@ import {
   isBenchCandidate,
 } from "@/features/bench/lib/benchCards";
 import { benchNeedsYouCount } from "@/features/bench/lib/benchScreen";
+import { adoptBenchProjects } from "@/features/bench/lib/workbenches";
 import { invokeTauri } from "@/shared/api/tauri";
 import { isDocumentVisible } from "@/shared/lib/useDocumentVisible";
 
@@ -38,8 +39,11 @@ export type BenchAnswerInput = {
   option: number | null;
 };
 
-function fetchBenchCards(): Promise<BenchCards> {
-  return invokeTauri<BenchCards>("bench_cards");
+/** Every read also sets the project tabs from the registry it carries. */
+async function fetchBenchCards(): Promise<BenchCards> {
+  const cards = await invokeTauri<BenchCards>("bench_cards");
+  adoptBenchProjects(cards);
+  return cards;
 }
 
 const benchCardsQueryOptions = {

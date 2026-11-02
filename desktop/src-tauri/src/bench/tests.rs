@@ -1458,6 +1458,7 @@ mod desktop_cards;
 mod one_tap;
 mod owner_signed;
 mod owner_word;
+mod projects;
 mod receipts;
 mod routes;
 mod scoped;

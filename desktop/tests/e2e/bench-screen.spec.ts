@@ -441,3 +441,93 @@ test("a replaced card's post shows read-only from its own text and links the liv
   await retired.getByRole("link", { name: "Go to the newer card" }).click();
   await expect(page).toHaveURL(new RegExp(cardId));
 });
+
+// The kit's seed, as bench_cards sends it (bench/projects_vectors.json).
+const REGISTRY = [
+  { slug: "dreamforge", label: "Dreamforge", parent: null, aliases: ["buzz"] },
+  {
+    slug: "reset",
+    label: "28 Day Reset",
+    parent: null,
+    aliases: ["28-day-reset"],
+  },
+  {
+    slug: "talos",
+    label: "Talos",
+    parent: "dreamforge",
+    aliases: ["dreamforge-talos"],
+  },
+];
+
+function registrySnapshot(
+  projects: typeof REGISTRY | null,
+  projectsNotice: string | null = null,
+): BenchCards {
+  const base = benchSnapshot(null);
+  if (!base.enabled) throw new Error("the Bench is on");
+  const status = base.items[1];
+  const card = (writer: string, area: string, n: number) => ({
+    ...status,
+    id: `${writer}/${area}`,
+    writer,
+    area,
+    title: `Card ${area}`,
+    cardEventId: String(n).repeat(64),
+  });
+  return {
+    ...base,
+    items: [
+      card("steward", "dreamforge-talos", 1),
+      card("steward", "buzz", 2),
+      card("orchestrator", "28-day-reset", 3),
+      card("factory", "factory", 4),
+    ],
+    projects,
+    projectsNotice,
+  };
+}
+
+test("registry tabs: Talos beside Dreamforge, and old areas follow", async ({
+  page,
+}) => {
+  await installMockBridge(page, { benchCards: registrySnapshot(REGISTRY) });
+  await page.goto("/#/bench");
+  await expect(
+    page.getByRole("tablist", { name: "Projects" }).getByRole("tab"),
+  ).toHaveText([
+    /^All4/,
+    /^Dreamforge1/,
+    /^Talos1/,
+    /^28 Day Reset1/,
+    /^Other1/,
+  ]);
+  await expect(page.getByTestId("bench-tab-talos")).toHaveAttribute(
+    "title",
+    "Talos, part of Dreamforge",
+  );
+  await expect(page.getByTestId("bench-projects-notice")).toHaveCount(0);
+
+  await page.getByTestId("bench-tab-talos").click();
+  const status = page.getByTestId("bench-section-status");
+  await expect(status.getByText("Card dreamforge-talos")).toBeVisible();
+  await expect(status.getByText("Card buzz")).toHaveCount(0);
+});
+
+test("a missing registry shows the built-in tabs and says so", async ({
+  page,
+}) => {
+  const notice =
+    "C:\\Users\\me\\.dreamforge\\projects.json is missing, so the Bench shows its built-in tabs (28 Day Reset, Dreamforge). This clears by itself once the file reads.";
+  await installMockBridge(page, {
+    benchCards: registrySnapshot(null, notice),
+  });
+  await page.goto("/#/bench");
+  await expect(page.getByTestId("bench-projects-notice")).toHaveText(
+    `Project tabs: ${notice}`,
+  );
+  await expect(page.getByTestId("bench-tab-talos")).toHaveCount(0);
+  // Talos's cards stay where they were: on Dreamforge.
+  await expect(page.getByTestId("bench-tab-dreamforge")).toContainText(
+    "Dreamforge2",
+  );
+});

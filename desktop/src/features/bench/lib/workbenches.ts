@@ -1,10 +1,17 @@
 /**
- * The Bench's project tabs: which workbench (28 Day Reset, Dreamforge, or
- * Other) a card belongs to, read from the card's own project, area or writer.
- * Nothing here changes the drop schema; it only reads what drops already say.
+ * The Bench's project tabs: one per project in the registry the snapshot
+ * carries (~/.dreamforge/projects.json, read by bench/projects.rs), each
+ * sub-product right after its parent, else the built-in list; plus All and
+ * Other. A card's tab comes from its own project, area or writer. Nothing
+ * here changes the drop schema; it only reads what drops already say.
  */
 
-import type { BenchCard, BenchSnapshot } from "@/features/bench/lib/benchCards";
+import type {
+  BenchCard,
+  BenchCards,
+  BenchProject,
+  BenchSnapshot,
+} from "@/features/bench/lib/benchCards";
 import { benchSections } from "@/features/bench/lib/benchScreen";
 import {
   fallbackProjectColor,
@@ -16,19 +23,24 @@ import type { Project } from "@/features/projects/projectModels";
 import { PRODUCT_NAME } from "@/shared/constants/brand";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
-export type WorkbenchId = "reset" | "dreamforge" | "other";
+/** A registry slug, or "other". */
+export type WorkbenchId = string;
 export type BenchTab = "all" | WorkbenchId;
 
 export type Workbench = {
-  id: Exclude<WorkbenchId, "other">;
+  id: string;
   label: string;
-  /** A slug matches when it equals one of these or starts with one plus "-". */
+  /** A slug matches when it equals one of these or starts with one plus
+   * "-"; the longest match wins, so "dreamforge-talos" is Talos's. */
   slugs: readonly string[];
   /** Writer folders whose cards land here when project and area don't say. */
   writers: readonly string[];
+  /** A sub-product's top-level project (Talos under Dreamforge). */
+  parent?: string;
 };
 
-export const WORKBENCHES: readonly Workbench[] = [
+/** The tabs while the registry is missing or invalid (projects.rs built_in). */
+export const BUILT_IN_WORKBENCHES: readonly Workbench[] = [
   {
     id: "reset",
     label: "28 Day Reset",
@@ -43,11 +55,53 @@ export const WORKBENCHES: readonly Workbench[] = [
   },
 ];
 
-export const BENCH_TABS: ReadonlyArray<{ id: BenchTab; label: string }> = [
-  { id: "all", label: "All" },
-  ...WORKBENCHES.map(({ id, label }) => ({ id, label })),
-  { id: "other", label: "Other" },
-];
+// ponytail: one registry per app, set from each bench_cards read; pass it
+// down instead if two Benches ever share a window.
+let current: readonly Workbench[] = BUILT_IN_WORKBENCHES;
+let adopted = "[]";
+
+/** The project tabs, in tab order. */
+export function workbenches(): readonly Workbench[] {
+  return current;
+}
+
+/**
+ * Takes the registry a snapshot carries; with none (missing, invalid, or the
+ * Bench off) the built-in tabs. The writers stay the built-in list's for each
+ * slug until the registry names them (P3). Unchanged, nothing moves.
+ */
+export function adoptBenchProjects(cards: BenchCards | null | undefined): void {
+  const projects = (cards?.enabled && cards.projects) || [];
+  const key = JSON.stringify(projects);
+  if (key === adopted) return;
+  adopted = key;
+  const bench = (p: BenchProject): Workbench => ({
+    id: p.slug,
+    label: p.label,
+    slugs: [p.slug, ...p.aliases],
+    writers: BUILT_IN_WORKBENCHES.find((w) => w.id === p.slug)?.writers ?? [],
+    ...(p.parent ? { parent: p.parent } : {}),
+  });
+  current = projects.length
+    ? projects
+        .filter((p) => !p.parent)
+        .flatMap((p) => [p, ...projects.filter((c) => c.parent === p.slug)])
+        .map(bench)
+    : BUILT_IN_WORKBENCHES;
+}
+
+/** All, the projects, then Other. */
+export function benchTabs(): ReadonlyArray<{
+  id: BenchTab;
+  label: string;
+  parent?: string;
+}> {
+  return [
+    { id: "all", label: "All" },
+    ...current.map(({ id, label, parent }) => ({ id, label, parent })),
+    { id: "other", label: "Other" },
+  ];
+}
 
 /**
  * The workbench a slug or a display name names: "28-day-reset", "reset-q4"
@@ -57,12 +111,17 @@ export function slugWorkbench(
   slug: string | null | undefined,
 ): Workbench | null {
   const s = projectDtagFromName(slug ?? "");
-  if (!s) return null;
-  return (
-    WORKBENCHES.find((w) =>
-      w.slugs.some((known) => s === known || s.startsWith(`${known}-`)),
-    ) ?? null
-  );
+  let best: Workbench | null = null;
+  let length = 0;
+  for (const w of s ? current : []) {
+    for (const known of w.slugs) {
+      if ((s === known || s.startsWith(`${known}-`)) && known.length > length) {
+        best = w;
+        length = known.length;
+      }
+    }
+  }
+  return best;
 }
 
 /** The workbench a project's d-tag, else its name, names. */
@@ -131,13 +190,13 @@ export function cardWorkbench(
     (
       slugWorkbench(card.project) ??
       slugWorkbench(card.area) ??
-      WORKBENCHES.find((w) => w.writers.includes(card.writer))
+      current.find((w) => w.writers.includes(card.writer))
     )?.id ?? "other"
   );
 }
 
 export function workbenchLabel(id: WorkbenchId): string {
-  return WORKBENCHES.find((w) => w.id === id)?.label ?? "Other";
+  return current.find((w) => w.id === id)?.label ?? "Other";
 }
 
 /** The snapshot as one tab sees it; All is the whole Bench. */
@@ -161,7 +220,7 @@ export function workbenchCounts(
   viewer?: string,
 ): Record<BenchTab, WorkbenchCount> {
   const counts = {} as Record<BenchTab, WorkbenchCount>;
-  for (const { id } of BENCH_TABS) {
+  for (const { id } of benchTabs()) {
     const view = workbenchSnapshot(snapshot, id);
     counts[id] = {
       cards: view.items.filter((card) => card.validity === "current").length,

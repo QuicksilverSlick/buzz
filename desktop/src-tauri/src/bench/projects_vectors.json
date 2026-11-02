@@ -1,0 +1,24 @@
+{
+  "note": "The registry as the steward kit seeds it (reference/projects.seed.json), and where cards land by it. tests/projects.rs pins each header the Bench posts (plain::place_in); workbenches.test.mjs pins the same cards' desktop tab and header. tab is a project slug or other; header is the place, then the area when it says more.",
+  "registry": {
+    "version": 1,
+    "projects": [
+      { "slug": "dreamforge", "label": "Dreamforge", "status": "live", "aliases": ["buzz"], "repos": [{ "name": "QuicksilverSlick/buzz" }] },
+      { "slug": "reset", "label": "28 Day Reset", "status": "live", "aliases": ["28-day-reset"], "repos": [{ "name": "QuicksilverSlick/Metabolic-reset" }] },
+      { "slug": "talos", "label": "Talos", "parent": "dreamforge", "status": "onboarding", "aliases": ["dreamforge-talos"], "repos": [{ "name": "QuicksilverSlick/dreamforge-talos" }] }
+    ]
+  },
+  "cards": [
+    { "project": null, "area": "dreamforge-talos", "writer": "steward", "tab": "talos", "header": ["Talos"] },
+    { "project": null, "area": "talos", "writer": "claude", "tab": "talos", "header": ["Talos"] },
+    { "project": null, "area": "dreamforge-talos-voice", "writer": "claude-ai", "tab": "talos", "header": ["Talos", "dreamforge-talos-voice"] },
+    { "project": "talos", "area": "release", "writer": "steward", "tab": "talos", "header": ["Talos", "release"] },
+    { "project": null, "area": "buzz", "writer": "steward", "tab": "dreamforge", "header": ["Dreamforge"] },
+    { "project": null, "area": "dreamforge", "writer": "claude-ai", "tab": "dreamforge", "header": ["Dreamforge"] },
+    { "project": null, "area": "dreamforge-build", "writer": "claude-ai", "tab": "dreamforge", "header": ["Dreamforge", "dreamforge-build"] },
+    { "project": null, "area": "agents", "writer": "claude-ai", "tab": "dreamforge", "header": ["agents"] },
+    { "project": null, "area": "28-day-reset", "writer": "steward", "tab": "reset", "header": ["28 Day Reset"] },
+    { "project": null, "area": "reset", "writer": "orchestrator", "tab": "reset", "header": ["28 Day Reset"] },
+    { "project": null, "area": "factory", "writer": "factory", "tab": "other", "header": ["factory"] }
+  ]
+}

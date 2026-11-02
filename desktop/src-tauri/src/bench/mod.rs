@@ -23,6 +23,7 @@ pub(crate) mod commands;
 mod item;
 mod pick;
 mod plain;
+mod projects;
 mod publish;
 mod roles;
 mod route;
