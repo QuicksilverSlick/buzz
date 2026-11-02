@@ -197,7 +197,7 @@ const LIVE = {
 
 test("a replaced post lays out from its own text as the body it was posted from", () => {
   const body = benchBodyBlocks(vector.drop.body);
-  for (const text of [vector.text, vector.closed]) {
+  for (const text of [vector.text, vector.closed, vector.replaced]) {
     const post = benchPostCard(LIVE, text);
     assert.equal(post.meta, "28 Day Reset · orchestrator");
     assert.equal(
@@ -226,6 +226,15 @@ test("a replaced post lays out from its own text as the body it was posted from"
   ]);
   assert.deepEqual(closed.card.links, []);
   assert.equal(closed.card.deadline, null);
+  // An old post's first line is for the phone: the row says Replaced itself.
+  assert.deepEqual(benchPostCard(LIVE, vector.replaced).notes, closed.notes);
+  const first = vector.replaced.split("\n")[0];
+  for (const line of [first, "No longer asked. A tap here doesn't count."]) {
+    const text = [line, "Back to you", vector.closed].join("\n");
+    const post = benchPostCard(LIVE, text);
+    assert.equal(post.meta, "28 Day Reset · orchestrator");
+    assert.deepEqual(post.notes, closed.notes);
+  }
 });
 
 test("a replaced post's due line, links and other lines; how to answer never shows", () => {
