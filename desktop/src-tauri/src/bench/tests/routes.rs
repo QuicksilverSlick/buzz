@@ -572,6 +572,56 @@ async fn routed_bench() -> (Bench, Keys, String) {
     (b, agent, card)
 }
 
+/// A hold's reason: the owner's tap, then bench_reply's line in the card's
+/// thread. The line is told at once, beside the answer; the answer goes by
+/// its own notice once it settles.
+#[tokio::test]
+async fn a_reason_after_a_tap_is_told_beside_the_answer() {
+    let (mut b, _agent, card) = routed_bench().await;
+    // The desktop says the reason reaches the route target, and only then.
+    let told = |b: &Bench| {
+        save_state(&b.root, &b.s, &mut String::new()).unwrap();
+        let snap = serde_json::to_value(crate::bench::commands::cards(&b.root)).unwrap();
+        let items = snap["items"].as_array().unwrap();
+        items.iter().find(|i| i["id"] == ITEM).unwrap()["repliesTold"].clone()
+    };
+    assert_eq!(told(&b), json!(true));
+    b.s.unroutable = vec!["orchestrator: not a managed agent here".to_string()];
+    assert_eq!(told(&b), json!(false));
+    b.s.unroutable.clear();
+    let hold = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now);
+    let before = b.posts().len();
+    let text = "Waiting on the relay quote";
+    crate::bench::commands::reply_card(&b.ctx, &b.s, ITEM, &card, text, b.now)
+        .await
+        .unwrap();
+    let why: nostr::Event = serde_json::from_value(b.posts()[before].0.clone()).unwrap();
+    reply(&b, &[&hold, &why]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1, "the answer waits for the settle");
+    let item = &b.s.items[ITEM];
+    assert_eq!(item.answer.as_ref().map(|a| a.option), Some(0));
+    let r = item.reply.clone().unwrap();
+    assert_eq!(r.event_id, why.id.to_hex());
+    assert_eq!(
+        content(&n[0]),
+        format!(
+            "Bench reply \u{b7} {ITEM}\nCard: Relay choice\nthe owner replied in this thread at {} \
+             beside their answer 1. Stay. Read their reply (event {}) in this thread and answer \
+             them there; act on the answer as its own Bench answer notice says.\n\
+             Open thread: buzz://message?channel={}&id={card}",
+            local_hhmm(r.at),
+            why.id.to_hex(),
+            b.channel()
+        )
+    );
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).starts_with(&chose(&card, "Stay")));
+}
+
 /// `keys`' reply in `card`'s thread under `parent`, as the desktop builds it.
 fn under(keys: &Keys, card: &str, parent: &nostr::Event, text: &str, at: u64) -> nostr::Event {
     let thread = crate::events::ThreadRef {
