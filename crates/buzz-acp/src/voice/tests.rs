@@ -618,6 +618,44 @@ async fn re_adding_it_opens_again_only_on_a_48101_no_run_has_spent() {
     assert_eq!(talos.opens(), 2, "that 48101 is spent");
 }
 
+/// A task that fails keeps what an earlier run spent, so the next admitted add waits for a newer
+/// 48101 instead of getting a second paid open on this one.
+#[tokio::test]
+async fn a_refused_add_cant_buy_a_second_paid_open_on_a_spent_48101() {
+    let talos = Counted::new(&[OPENED]);
+    let mut w = World::new(ONLY_OWNER, None, Some(talos.clone())).await;
+    w.relay_says(JOINED, "a-1", 0);
+    let owner = w.owner_hex();
+    w.notice(ADDED, &owner);
+    until("the line", || !w.lines().is_empty()).await;
+    w.notice(REMOVED, &owner);
+
+    let stranger = w.stranger();
+    w.notice(ADDED, &stranger);
+    until("the refused task's end", || w.working() == 0).await;
+    w.notice(ADDED, &owner);
+    settle().await;
+    assert_eq!(talos.opens(), 1, "that 48101 is spent");
+
+    w.relay_says(JOINED, "a-2", 5);
+    until("the second open", || talos.opens() == 2).await;
+}
+
+#[tokio::test]
+async fn a_huddle_that_ends_forgets_what_it_spent() {
+    let talos = Counted::new(&[OPENED]);
+    let mut w = World::new(ONLY_OWNER, None, Some(talos.clone())).await;
+    w.relay_says(JOINED, "a-1", 0);
+    let owner = w.owner_hex();
+    w.notice(ADDED, &owner);
+    until("the line", || !w.lines().is_empty()).await;
+    assert!(lock(&w.voice.shared.spent).contains_key(&w.huddle));
+
+    w.relay_says(KIND_HUDDLE_ENDED, "", 0);
+    until("the task's end", || w.working() == 0).await;
+    assert!(lock(&w.voice.shared.spent).is_empty());
+}
+
 /// The owner really left: no line at all, kind 9 stays out, and it waits for them.
 #[tokio::test]
 async fn the_owner_leaving_says_nothing_and_stays_voiced() {

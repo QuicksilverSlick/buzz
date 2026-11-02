@@ -90,8 +90,9 @@ struct Shared {
     voiced: Mutex<HashMap<Uuid, EventId>>,
     /// Huddles the parent has had a line about.
     told: Mutex<HashSet<(Uuid, String)>>,
-    /// Each huddle's newest 48101 a finished run saw, across a remove and re-add. ponytail: an entry
-    /// a removal leaves stays until restart, at a few bytes per huddle.
+    /// Each huddle's newest 48101 a finished run saw, across a remove and re-add or a task that
+    /// fails. ponytail: an entry stays until its huddle is seen to end or a restart, at a few bytes
+    /// per huddle.
     spent: Mutex<HashMap<Uuid, u64>>,
 }
 
@@ -314,7 +315,6 @@ impl Shared {
     async fn track(self: Arc<Self>, huddle: Uuid, added: Event, stop: Stop) {
         if let Err(why) = self.run(huddle, &added, &stop).await {
             tracing::info!(%huddle, "huddle voice stays out: {why}");
-            lock(&self.spent).remove(&huddle);
         }
         self.unvoice(huddle, &added);
     }
@@ -480,7 +480,11 @@ impl Shared {
     async fn owner_join(&self, huddle: Uuid, link: &Link, since: u64) -> Result<u64, String> {
         for _ in 0..OWNER_POLLS {
             match self.room_state(huddle, link).await {
-                Ok((true, _)) => return Err("the huddle ended".into()),
+                Ok((true, _)) => {
+                    // Nothing opens on a huddle that ended, so what it spent has no more to guard.
+                    lock(&self.spent).remove(&huddle);
+                    return Err("the huddle ended".into());
+                }
                 Ok((_, Some(joined))) if joined > since => return Ok(joined),
                 // An owner who added it is on the way; anyone else may be alone a while.
                 Ok(_) if since == 0 && link.actor != self.voicing.owner => {
