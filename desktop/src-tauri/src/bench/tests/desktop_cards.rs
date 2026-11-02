@@ -1,10 +1,13 @@
-//! Desktop cards: bench_cards' snapshot and bench_answer's relay half,
-//! through the fake relay and Bench harness in tests.rs.
+//! Desktop cards: bench_cards' snapshot and bench_answer's and
+//! bench_reply's relay halves, through the fake relay and Bench harness in
+//! tests.rs.
 
 use super::answers::{last_query, outbox, reply, tap, ITEM};
 use super::channels::{bound_bench, hex, ASK, X};
 use super::*;
-use crate::bench::commands::{answer_card, cards, plan_answer, AnswerPlan, CARD_CHANGED};
+use crate::bench::commands::{
+    answer_card, cards, plan_answer, reply_card, AnswerPlan, CARD_CHANGED, REPLY_MAX,
+};
 
 fn plan(add: Option<&'static str>, delete: &[&str]) -> AnswerPlan {
     AnswerPlan {
@@ -246,6 +249,71 @@ async fn bench_answer_refuses_what_it_cannot_answer() {
     assert_eq!(b.relay.queries.lock().unwrap().len(), queries);
 }
 
+/// bench_reply: one owner kind 9 in the live card's thread, trimmed, with no
+/// p tag; nothing for text that is not one line, a card that changed, or
+/// (on a scoped card) text the tick would read as an option.
+#[tokio::test]
+async fn bench_reply_posts_one_owner_line_in_the_card_thread() {
+    let (mut b, _, _) = bound_bench().await;
+    let card = b.card(ITEM).event_id;
+    let before = b.posts().len();
+    reply_card(&b.ctx, &b.s, ITEM, &card, "  Waiting on the quote ", b.now)
+        .await
+        .unwrap();
+    let posted = &b.posts()[before..];
+    assert_eq!(posted.len(), 1);
+    let (ev, tag) = &posted[0];
+    assert_eq!(*tag, None, "owner posts carry no auth tag");
+    assert_eq!(ev["kind"], json!(9));
+    assert_eq!(ev["pubkey"], json!(b.owner_hex()));
+    assert_eq!(ev["content"], json!("Waiting on the quote"));
+    assert_eq!(
+        ev["tags"],
+        json!([["h", b.channel()], ["e", card, "", "reply"]])
+    );
+
+    let ask = b.card(ASK).event_id;
+    let posts = b.posts().len();
+    let (long, other) = ("x".repeat(REPLY_MAX + 1), "ab".repeat(32));
+    let (card, ask_card) = (card.as_str(), ask.as_str());
+    for (id, on, text, want) in [
+        (ITEM, card, "", "one line"),
+        (ITEM, card, "two\nlines", "one line"),
+        (ITEM, card, long.as_str(), "one line"),
+        (ITEM, other.as_str(), "why", CARD_CHANGED),
+        ("orchestrator/nope", card, "why", "no Bench item"),
+        // A scoped card reads "2" or an option's label as that answer.
+        (ASK, ask_card, "2", "reads as an answer"),
+        (ASK, ask_card, " keep the OLD one ", "reads as an answer"),
+    ] {
+        let err = reply_card(&b.ctx, &b.s, id, on, text, b.now)
+            .await
+            .unwrap_err();
+        assert!(err.contains(want), "{id} {text:?}: {err}");
+    }
+    b.s.owner_pubkey = "bb".repeat(32);
+    let err = reply_card(&b.ctx, &b.s, ITEM, card, "why", b.now)
+        .await
+        .unwrap_err();
+    assert!(err.contains("owner identity changed"), "{err}");
+    assert_eq!(b.posts().len(), posts);
+
+    // Words beside a label are a reply, in the scoped card's channel.
+    b.s.owner_pubkey = b.owner_hex();
+    reply_card(
+        &b.ctx,
+        &b.s,
+        ASK,
+        &ask,
+        "Keep the old one until Monday",
+        b.now,
+    )
+    .await
+    .unwrap();
+    let ev = &b.posts()[posts].0;
+    assert_eq!(ev["tags"], json!([["h", X], ["e", ask, "", "reply"]]));
+}
+
 #[tokio::test]
 async fn bench_cards_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -318,6 +386,7 @@ async fn bench_cards_snapshot() {
             "recommend",
             "recommender",
             "recorded",
+            "repliesTold",
             "reply",
             "request",
             "scoped",
@@ -362,6 +431,8 @@ async fn bench_cards_snapshot() {
         ("backToYou", json!(false)),
         ("previousAnswer", Value::Null),
         ("waitsFor", Value::Null),
+        // No routes.json: a reply here reaches no agent.
+        ("repliesTold", json!(false)),
     ] {
         assert_eq!(item[k], v, "{k}");
     }
