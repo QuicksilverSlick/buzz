@@ -250,3 +250,19 @@ test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow
     "dreamforge",
   );
 });
+
+test("the registry recolors no built-in tab, and a dropped alias stays dropped", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  const reset = () => workbenches().find((w) => w.id === "reset");
+  const before = workbenchColor(reset(), [], VIEWER).id;
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(reset().slugs, ["28-day-reset", "reset"]);
+  assert.equal(workbenchColor(reset(), [], VIEWER).id, before);
+  adoptBenchProjects({
+    ...SEEDED,
+    projects: SEEDED.projects.map((p) =>
+      p.slug === "reset" ? { ...p, aliases: [] } : p,
+    ),
+  });
+  assert.deepEqual(reset().slugs, ["reset"]);
+});

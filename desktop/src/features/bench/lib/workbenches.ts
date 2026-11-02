@@ -75,13 +75,24 @@ export function adoptBenchProjects(cards: BenchCards | null | undefined): void {
   const key = JSON.stringify(projects);
   if (key === adopted) return;
   adopted = key;
-  const bench = (p: BenchProject): Workbench => ({
-    id: p.slug,
-    label: p.label,
-    slugs: [p.slug, ...p.aliases],
-    writers: BUILT_IN_WORKBENCHES.find((w) => w.id === p.slug)?.writers ?? [],
-    ...(p.parent ? { parent: p.parent } : {}),
-  });
+  const bench = (p: BenchProject): Workbench => {
+    const built = BUILT_IN_WORKBENCHES.find((w) => w.id === p.slug);
+    const keys = [p.slug, ...p.aliases];
+    return {
+      id: p.slug,
+      label: p.label,
+      // A built-in project's first slug stays first: workbenchColor reads the
+      // slug order, so the registry must not recolor its tab.
+      slugs: [
+        ...new Set([
+          ...(built?.slugs ?? []).filter((s) => keys.includes(s)),
+          ...keys,
+        ]),
+      ],
+      writers: built?.writers ?? [],
+      ...(p.parent ? { parent: p.parent } : {}),
+    };
+  };
   current = projects.length
     ? projects
         .filter((p) => !p.parent)

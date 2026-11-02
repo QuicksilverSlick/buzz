@@ -257,6 +257,15 @@ pub(crate) fn place_in(
     }
 }
 
+/// The place a posted card's header shows ("<marker> · <place> · <writer>",
+/// after any "Back to you" line), for a card recovered from the relay.
+pub(crate) fn shown_place(content: &str) -> Option<String> {
+    content.lines().take(2).find_map(|line| {
+        let (_, rest) = line.split_once(RISK_JOIN)?;
+        Some(rest.rsplit_once(RISK_JOIN)?.0.to_string())
+    })
+}
+
 /// The plain details, after the recommendation as the desktop shows them,
 /// capped like the summary.
 pub(crate) fn details(item: &Item) -> Option<String> {
