@@ -611,11 +611,17 @@ test("the live card a tap posted says that tap answered nothing", async () => {
   assert.ok(screen.getByText(posted));
   assert.equal(document.activeElement, optionButton("2. Hold"));
   assert.deepEqual(answerCalls(), [], "nothing answered on its own");
+  assert.equal(
+    screen.queryByRole("textbox", { name: "Why? (optional)" }),
+    null,
+  );
   await act(async () => {
     fireEvent.click(optionButton("2. Hold"));
   });
   assert.equal(answerCalls().length, 1);
   assert.equal(screen.queryByText(posted), null);
+  // Only the tap that answers asks why; the tap that posted it asked nothing.
+  assert.ok(screen.getByRole("textbox", { name: "Why? (optional)" }));
 });
 
 test("a receipt shows the request, the answer and the outcome as inert text", async () => {
