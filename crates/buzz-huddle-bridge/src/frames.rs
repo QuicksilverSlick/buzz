@@ -10,7 +10,9 @@
 //! `frames-v1/fixtures/` are the contract Talos copies.
 //!
 //! The socket's NIP-98 `u` is the URL as the PC dialed it, `wss://...`, whatever scheme a Worker
-//! reads. `opened` means the voice is live: the PC sends audio from then until `quiet`.
+//! reads. `opened` means the voice is live: the PC sends audio from then until `quiet`. An empty
+//! `roster` means the PC isn't in the room: its audio join just failed. The PC takes no frame
+//! over [`MAX_FRAME`] and treats one as a lost socket, so Talos stays under it.
 //!
 //! Clocks:
 //! - `t_ms`, `start_ms` and `end_ms` are session audio ms: ms of PCM the PC has sent on this
@@ -32,6 +34,9 @@ use serde_json::Value;
 
 /// The `v` every frame carries. An incompatible change bumps it in both repos on the same day.
 pub const VERSION: u64 = 1;
+
+/// The largest frame, text or binary, the PC takes from Talos.
+pub const MAX_FRAME: usize = 1 << 20;
 
 /// PC to Talos. Kept one per line so it reads as the design's list.
 #[rustfmt::skip]

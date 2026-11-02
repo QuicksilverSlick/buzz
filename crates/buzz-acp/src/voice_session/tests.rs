@@ -12,12 +12,38 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::{accept_async, accept_hdr_async};
+use tokio_tungstenite::{accept_async, accept_hdr_async, connect_async};
 
 const VERSION: &str = "this huddle is using audio protocol v1; your client requested v2";
+/// A `refusal` for the fake Talos that means it never answers `open`.
+const SILENT: &str = "silent";
+/// For the tests of the owner's grace; the rest get 30 s, so a slow join can't end them.
+const GRACE: Duration = Duration::from_secs(2);
 
 fn say(frame: Value) -> Message {
     Message::Text(frame.to_string().into())
+}
+
+/// What this thread's tasks log while it's held: `#[tokio::test]` runs them all on one thread.
+struct Logs {
+    file: tempfile::NamedTempFile,
+    _held: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    fn capture() -> Self {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let writer = Arc::new(file.reopen().unwrap());
+        let logger = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer);
+        let _held = tracing::subscriber::set_default(logger.finish());
+        Self { file, _held }
+    }
+
+    fn text(&self) -> String {
+        std::fs::read_to_string(self.file.path()).unwrap()
+    }
 }
 
 /// What the fakes hold and saw. `log` keeps each thing the sockets did, the first time, in order.
@@ -43,6 +69,10 @@ impl Seen {
     fn saw(&self, what: &str) -> bool {
         self.log.lock().unwrap().iter().any(|seen| seen == what)
     }
+
+    fn room_sends(&self, frame: Value) {
+        self.room.lock().unwrap().push(frame);
+    }
 }
 
 async fn listen() -> (TcpListener, String) {
@@ -65,7 +95,8 @@ async fn fake_rest(seen: Seen) -> String {
 }
 
 /// Challenge, the agent's auth, `joined` with the owner in the room or the `refuse` error, then
-/// what the voice plays, and the frames tests queue in `room`.
+/// what the voice plays, and the frames tests queue in `room`, where `"drop"` ends it. One socket
+/// only: any rejoin fails.
 async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> String {
     let (listener, address) = listen().await;
     tokio::spawn(async move {
@@ -100,6 +131,9 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
                 _ = sleep(Duration::from_millis(10)) => {
                     let queued = std::mem::take(&mut *seen.room.lock().unwrap());
                     for frame in queued {
+                        if frame == "drop" {
+                            return;
+                        }
                         ws.send(say(frame)).await.unwrap();
                     }
                 }
@@ -110,8 +144,8 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
 }
 
 /// Answers `open` with `refusal`, or `opened`. Once a roster shows audio is joined it sends the
-/// floor, a burst of voice, a ping, a tool and a reseed; after the answers it sends `end`, or
-/// drops the socket if that's `"drop"`.
+/// floor, a burst of voice, a bad frame, a ping, a tool and a reseed; after the answers it sends
+/// `end`, drops the socket if that's `"drop"`, or sends a frame over the cap if it's `"huge"`.
 async fn fake_talos(
     seen: Seen,
     agent: String,
@@ -133,23 +167,38 @@ async fn fake_talos(
         };
         *seen.open.lock().unwrap() = serde_json::from_str(&open).unwrap();
         seen.note("talos:open");
-        if let Some(reason) = refusal {
-            let close = json!({"v": 1, "type": "close", "reason": reason});
-            ws.send(say(close)).await.unwrap();
-            return;
+        match refusal {
+            Some(SILENT) => {}
+            Some(reason) => {
+                let close = json!({"v": 1, "type": "close", "reason": reason});
+                ws.send(say(close)).await.unwrap();
+                return;
+            }
+            None => {
+                let opened = json!({"v": 1, "type": "opened", "lease_id": "l", "expires_at": 1});
+                ws.send(say(opened)).await.unwrap();
+            }
         }
-        let opened = json!({"v": 1, "type": "opened", "lease_id": "l", "expires_at": 1});
-        ws.send(say(opened)).await.unwrap();
         while let Some(Ok(message)) = ws.next().await {
-            let Message::Text(frame) = message else {
-                continue;
+            let frame = match message {
+                Message::Text(frame) => frame,
+                Message::Close(_) => {
+                    seen.note("talos:close");
+                    continue;
+                }
+                _ => continue,
             };
             match frames::parse(&frame).unwrap() {
-                ToTalos::Roster { .. } if !seen.saw("talos:roster") => {
+                ToTalos::Roster { humans, .. }
+                    if !humans.is_empty() && !seen.saw("talos:roster") =>
+                {
                     seen.note("talos:roster");
                     let script = [
                         say(json!({"v": 1, "type": "floor", "holder": agent, "token": 1})),
                         Message::Binary(vec![0x40; 9_600].into()),
+                        say(
+                            json!({"v": 1, "type": "notice", "kind": "my pass phrase", "text": ""}),
+                        ),
                         say(json!({"v": 1, "type": "ping", "t": 7})),
                         say(json!({"v": 1, "type": "tool", "id": "c", "name": "n", "args": {}})),
                         say(json!({"v": 1, "type": "reseed", "reason": "r"})),
@@ -166,14 +215,16 @@ async fn fake_talos(
                     if end == "drop" {
                         return;
                     }
-                    if !end.is_null() {
+                    if end == "huge" {
+                        let huge = vec![0x40; frames::MAX_FRAME + 1];
+                        let _ = ws.send(Message::Binary(huge.into())).await;
+                    } else if !end.is_null() {
                         ws.send(say(end.clone())).await.unwrap();
                     }
                 }
                 _ => {}
             }
         }
-        seen.note("talos:closed");
     });
     format!("ws://{address}")
 }
@@ -215,7 +266,7 @@ impl Run {
                 persona: String::new(),
                 aliases: Vec::new(),
             },
-            owner_grace: Duration::from_millis(300),
+            owner_grace: Duration::from_secs(30),
         };
         let added = EventBuilder::new(Kind::Custom(44100), "").sign_with_keys(&Keys::generate());
         Self {
@@ -227,6 +278,11 @@ impl Run {
             parent: Uuid::new_v4(),
             added: added.unwrap(),
         }
+    }
+
+    fn short_grace(mut self) -> Self {
+        Arc::get_mut(&mut self.voicing).unwrap().owner_grace = GRACE;
+        self
     }
 
     /// The run on its own task; dropping or sending on the channel is `stop`.
@@ -263,6 +319,7 @@ async fn left(run: tokio::task::JoinHandle<Left>) -> Left {
 
 #[tokio::test]
 async fn talos_opens_before_audio_the_frames_flow_and_stop_closes_both_cleanly() {
+    let logs = Logs::capture();
     let r = Run::new(None, None, Value::Null).await;
     let (stop, run) = r.start();
     until("played and answered", || {
@@ -315,7 +372,29 @@ async fn talos_opens_before_audio_the_frames_flow_and_stop_closes_both_cleanly()
     stop.send(()).unwrap();
     assert_eq!(left(run).await, Left::Done("stopped".into()));
     until("Close 1000", || r.seen.saw("audio:close")).await;
-    until("Talos closed", || r.seen.saw("talos:closed")).await;
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+
+    let logs = logs.text();
+    assert!(logs.contains("a bad frame"), "the bad frame is noted");
+    assert!(!logs.contains("pass phrase"), "but never its text: {logs}");
+}
+
+/// Talos may hold the lease once `open` is out, so neither way out is a bare drop.
+#[tokio::test]
+async fn a_run_ending_before_opened_still_closes_the_socket() {
+    let r = Run::new(Some(SILENT), None, Value::Null).await;
+    let (stop, run) = r.start();
+    until("open", || r.seen.saw("talos:open")).await;
+    stop.send(()).unwrap();
+    assert_eq!(left(run).await, Left::Done("stopped".into()));
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+
+    // Real time: this one waits out OPEN_WAIT.
+    let r = Run::new(Some(SILENT), None, Value::Null).await;
+    let (_stop, run) = r.start();
+    assert!(matches!(left(run).await, Left::NoLease(_)));
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+    assert!(!r.seen.saw("audio:join"));
 }
 
 #[tokio::test]
@@ -339,6 +418,7 @@ async fn talos_closing_or_dropping_leaves_the_room_with_a_clean_close() {
     let (_stop, run) = r.start();
     assert_eq!(left(run).await, Left::Done("idle".into()));
     until("Close 1000", || r.seen.saw("audio:close")).await;
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
 
     let r = Run::new(None, None, json!("drop")).await;
     let (_stop, run) = r.start();
@@ -347,27 +427,88 @@ async fn talos_closing_or_dropping_leaves_the_room_with_a_clean_close() {
 }
 
 #[tokio::test]
-async fn the_owner_going_for_the_grace_ends_the_run_and_coming_back_cancels_it() {
+async fn a_frame_over_the_cap_ends_the_run_as_lost() {
+    let r = Run::new(None, None, json!("huge")).await;
+    let (_stop, run) = r.start();
+    assert_eq!(left(run).await, Left::Lost);
+    until("Close 1000", || r.seen.saw("audio:close")).await;
+}
+
+/// A refusal `run` keeps retrying must not hold the paid lease open for ever.
+#[tokio::test]
+async fn a_join_refused_or_lost_for_the_grace_ends_the_run() {
+    let r = Run::new(None, Some("not a member"), Value::Null)
+        .await
+        .short_grace();
+    let (_stop, run) = r.start();
+    assert_eq!(left(run).await, Left::OwnerGone);
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+
+    // The owner was here, then the socket dropped and the rejoin fails: no roster says they left.
+    let r = Run::new(None, None, Value::Null).await.short_grace();
+    let (_stop, run) = r.start();
+    until("joined", || r.seen.saw("talos:seed")).await;
+    r.seen.room_sends(json!("drop"));
+    assert_eq!(left(run).await, Left::OwnerGone);
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+}
+
+/// Nobody reads the bridge's queue. Voice stops short of the control slots with one alarm, and the
+/// first command that can't get in ends the run. The room's queue, past half, has its own alarm.
+#[tokio::test]
+async fn a_bridge_too_stalled_to_take_a_secret_ends_the_run() {
+    let logs = Logs::capture();
+    let (listener, address) = listen().await;
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let voice = std::iter::repeat_n(Message::Binary(vec![0x40; 2].into()), CMD_SLOTS);
+        let secret = say(json!({"v": 1, "type": "secret", "from_ms": 1, "to_ms": 2}));
+        for frame in voice.chain(std::iter::repeat_n(secret, CONTROL_SLOTS + 1)) {
+            ws.send(frame).await.unwrap();
+        }
+        while let Some(Ok(_)) = ws.next().await {}
+    });
+    let (mut talos, _) = connect_async(format!("ws://{address}")).await.unwrap();
     let r = Run::new(None, None, Value::Null).await;
+    let (cmd, mut cmds) = mpsc::channel(CMD_SLOTS);
+    let (outs, mut from_room) = mpsc::channel(ROOM_SLOTS);
+    for t in 0..ROOM_SLOTS as u64 / 2 + 2 {
+        outs.try_send(Out::Frame(ToTalos::Pong { t })).unwrap();
+    }
+    let stop = std::future::pending();
+    let left = pump(&r.voicing, r.huddle, &mut talos, &cmd, &mut from_room, stop).await;
+    assert!(matches!(left, Left::Done(why) if why.contains("stopped taking commands")));
+    let mut voice = 0;
+    while let Ok(queued) = cmds.try_recv() {
+        voice += matches!(queued, Cmd::Pcm(_)) as usize;
+    }
+    assert_eq!(voice, CMD_SLOTS - CONTROL_SLOTS);
+    let logs = logs.text();
+    assert_eq!(
+        logs.matches("dropping the voice's audio").count(),
+        1,
+        "{logs}"
+    );
+    assert_eq!(logs.matches("falling behind").count(), 1, "{logs}");
+    assert_eq!(logs.matches("command=Secret").count(), 1, "{logs}");
+}
+
+#[tokio::test]
+async fn the_owner_going_for_the_grace_ends_the_run_and_coming_back_cancels_it() {
+    let r = Run::new(None, None, Value::Null).await.short_grace();
     let owner = r.owner.public_key().to_hex();
     let (_stop, mut run) = r.start();
     until("joined", || r.seen.saw("talos:seed")).await;
-    let left_room = json!({"type": "left", "peer_index": 0});
+    r.seen.room_sends(json!({"type": "left", "peer_index": 0}));
     let back = json!({"type": "joined", "peers": [{"pubkey": owner, "peer_index": 2}]});
-    r.seen
-        .room
-        .lock()
-        .unwrap()
-        .extend([left_room.clone(), back]);
-    let waited = timeout(Duration::from_millis(600), &mut run).await;
+    r.seen.room_sends(back);
+    let waited = timeout(GRACE + Duration::from_millis(500), &mut run).await;
     assert!(waited.is_err(), "back inside the grace, so it stays");
-    r.seen
-        .room
-        .lock()
-        .unwrap()
-        .push(json!({"type": "left", "peer_index": 2}));
+    r.seen.room_sends(json!({"type": "left", "peer_index": 2}));
     assert_eq!(left(run).await, Left::OwnerGone);
     until("Close 1000", || r.seen.saw("audio:close")).await;
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
 }
 
 #[tokio::test]
@@ -375,7 +516,7 @@ async fn a_final_relay_refusal_ends_the_run_in_the_relays_words() {
     let r = Run::new(None, Some(VERSION), Value::Null).await;
     let (_stop, run) = r.start();
     assert_eq!(left(run).await, Left::Refused(VERSION.into()));
-    until("Talos closed", || r.seen.saw("talos:closed")).await;
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
 
     let r = Run::new(None, Some("huddle has ended"), Value::Null).await;
     let (_stop, run) = r.start();
@@ -389,7 +530,7 @@ async fn talos_frames_become_the_bridges_commands() {
     let (cmd, mut cmds) = mpsc::channel(8);
     let mut command = |frame: Value| {
         let frame = frames::parse(&frame.to_string()).unwrap();
-        assert!(on_frame(frame, &r.voicing, &cmd).is_none());
+        assert!(matches!(on_frame(frame, &r.voicing, &cmd), Ok(None)));
         cmds.try_recv().unwrap()
     };
     let secret = command(json!({"v": 1, "type": "secret", "from_ms": 1, "to_ms": 2}));
