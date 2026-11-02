@@ -4,6 +4,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import {
   type BenchCard as BenchCardData,
+  benchQueuedLine,
   benchSearch,
 } from "@/features/bench/lib/benchCards";
 import {
@@ -170,6 +171,8 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
     );
   } else {
     const lastTick = benchLastTickSeconds(snapshot.lastTick);
+    // Every tab's cards: the cap holds back the whole Bench, not one tab.
+    const queuedLine = benchQueuedLine(snapshot);
     content = (
       <>
         <Tabs
@@ -234,6 +237,15 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
               ? "Waiting for the Bench's first update."
               : `Last update: ${formatItemTimestamp(lastTick, { withTime: true })}`}
           </p>
+          {queuedLine ? (
+            <p
+              className="text-amber-700 dark:text-amber-400 [overflow-wrap:anywhere]"
+              data-testid="bench-queued"
+              role="status"
+            >
+              {queuedLine}
+            </p>
+          ) : null}
           {snapshot.lastError ? (
             <p
               className="text-destructive [overflow-wrap:anywhere]"
@@ -265,6 +277,7 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
             empty={query.trim() ? "No matching cards." : section.empty}
             focusedId={focusedId}
             key={section.key}
+            maxCards={snapshot.maxCards}
             onOther={openThread}
             ownerPubkey={snapshot.ownerPubkey}
             showProject={tab === "all"}
@@ -310,6 +323,7 @@ function BenchSection({
   cards,
   empty,
   focusedId,
+  maxCards,
   onOther,
   ownerPubkey,
   showProject,
@@ -321,6 +335,7 @@ function BenchSection({
   empty: string;
   /** Global search's pick, ringed until it fades. */
   focusedId: string | null;
+  maxCards: number | undefined;
   onOther: (card: BenchCardData) => void;
   ownerPubkey: string | null;
   /** The All tab names each card's project; a project tab already does. */
@@ -360,6 +375,7 @@ function BenchSection({
             >
               <BenchCard
                 card={card}
+                maxCards={maxCards}
                 onOther={() => onOther(card)}
                 ownerPubkey={ownerPubkey}
                 projectLabel={
