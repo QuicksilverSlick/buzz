@@ -17,6 +17,8 @@ use tokio_tungstenite::{accept_async, accept_hdr_async, connect_async};
 const VERSION: &str = "this huddle is using audio protocol v1; your client requested v2";
 /// A `refusal` for the fake Talos that means it never answers `open`.
 const SILENT: &str = "silent";
+/// A `refuse` for the fake relay that means it takes the socket and never answers.
+const HANG: &str = "hang";
 /// For the tests of the owner's grace; the rest get 30 s, so a slow join can't end them.
 const GRACE: Duration = Duration::from_secs(2);
 
@@ -102,6 +104,9 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
+        if refuse == Some(HANG) {
+            std::future::pending::<()>().await;
+        }
         let challenge = json!({"type": "challenge", "challenge": "c-1"});
         ws.send(say(challenge)).await.unwrap();
         let Some(Ok(Message::Text(auth))) = ws.next().await else {
@@ -451,6 +456,16 @@ async fn a_join_refused_or_lost_for_the_grace_ends_the_run() {
     r.seen.room_sends(json!("drop"));
     assert_eq!(left(run).await, Left::OwnerGone);
     until("Talos's Close", || r.seen.saw("talos:close")).await;
+
+    // A hung join reports nothing for 5 s, the client's limit, so the grace runs from the start:
+    // the run ends at GRACE, not 5 s + GRACE.
+    let r = Run::new(None, Some(HANG), Value::Null).await.short_grace();
+    let (_stop, run) = r.start();
+    let ended = timeout(Duration::from_secs(5), run).await;
+    assert_eq!(
+        ended.expect("waited for the join").unwrap(),
+        Left::OwnerGone
+    );
 }
 
 /// Nobody reads the bridge's queue. Voice stops short of the control slots with one alarm, and the
