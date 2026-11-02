@@ -16,6 +16,8 @@ import {
   type BenchTab,
   benchTabs,
   cardWorkbench,
+  otherReason,
+  splitBenchTabs,
   workbenchColor,
   workbenchCounts,
   workbenchLabel,
@@ -30,6 +32,13 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import { cn } from "@/shared/lib/cn";
 import { formatItemTimestamp } from "@/shared/lib/datetime";
 import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
+import { Button } from "@/shared/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/shared/ui/dropdown-menu";
 import { Input } from "@/shared/ui/input";
 import { PageHeader, SectionHeader } from "@/shared/ui/PageHeader";
 import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
@@ -75,6 +84,10 @@ function readBenchTab(): BenchTab {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function needsYouText(count: number): string {
+  return count === 1 ? "1 needs you" : `${count} need you`;
 }
 
 /**
@@ -173,32 +186,65 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
     const lastTick = benchLastTickSeconds(snapshot.lastTick);
     // Every tab's cards: the cap holds back the whole Bench, not one tab.
     const queuedLine = benchQueuedLine(snapshot);
+    const otherLine =
+      tab === "other"
+        ? otherReason(workbenchSnapshot(snapshot, "other").items)
+        : null;
+    const { inline: inlineTabs, more: moreTabs } = splitBenchTabs(
+      tabs,
+      tab,
+      counts,
+    );
+    const moreNeedsYou = moreTabs.reduce(
+      (sum, t) => sum + (counts?.[t.id]?.needsYou ?? 0),
+      0,
+    );
+    const pickTab = (next: BenchTab) => {
+      setSavedTab(next);
+      setStorageItem(BENCH_TAB_KEY, next);
+    };
+    const tabBody = (id: BenchTab, label: string) => {
+      const count = counts?.[id];
+      const workbench = workbenches().find((w) => w.id === id);
+      const color = workbench
+        ? workbenchColor(workbench, projects ?? [], viewerPubkey, viewerAgents)
+        : null;
+      return (
+        <>
+          {color ? (
+            <span
+              aria-hidden
+              className={cn("size-2 shrink-0 rounded-full", color.dot)}
+              data-project-color={color.id}
+            />
+          ) : null}
+          {label}
+          <span className="font-normal tabular-nums text-muted-foreground">
+            {count?.cards ?? 0}
+          </span>
+          {count && count.needsYou > 0 ? (
+            <span className="text-xs font-medium text-amber-700 dark:text-amber-400">
+              <span aria-hidden className="text-muted-foreground">
+                ·{" "}
+              </span>
+              {needsYouText(count.needsYou)}
+            </span>
+          ) : null}
+        </>
+      );
+    };
     content = (
       <>
-        <Tabs
-          onValueChange={(value) => {
-            const next = value as BenchTab;
-            setSavedTab(next);
-            setStorageItem(BENCH_TAB_KEY, next);
-          }}
-          value={tab}
-        >
-          <TabsList
-            aria-label="Projects"
-            className="h-auto flex-wrap justify-start"
+        <div className="flex flex-wrap items-center gap-2">
+          <Tabs
+            onValueChange={(value) => pickTab(value as BenchTab)}
+            value={tab}
           >
-            {tabs.map(({ id, label, parent }) => {
-              const count = counts?.[id];
-              const workbench = workbenches().find((w) => w.id === id);
-              const color = workbench
-                ? workbenchColor(
-                    workbench,
-                    projects ?? [],
-                    viewerPubkey,
-                    viewerAgents,
-                  )
-                : null;
-              return (
+            <TabsList
+              aria-label="Projects"
+              className="h-auto flex-wrap justify-start"
+            >
+              {inlineTabs.map(({ id, label, parent }) => (
                 <TabsTrigger
                   className="gap-1.5"
                   data-testid={`bench-tab-${id}`}
@@ -210,32 +256,38 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
                   }
                   value={id}
                 >
-                  {color ? (
-                    <span
-                      aria-hidden
-                      className={cn("size-2 shrink-0 rounded-full", color.dot)}
-                      data-project-color={color.id}
-                    />
-                  ) : null}
-                  {label}
-                  <span className="font-normal tabular-nums text-muted-foreground">
-                    {count?.cards ?? 0}
-                  </span>
-                  {count && count.needsYou > 0 ? (
-                    <span className="text-xs font-medium text-amber-700 dark:text-amber-400">
-                      <span aria-hidden className="text-muted-foreground">
-                        ·{" "}
-                      </span>
-                      {count.needsYou === 1
-                        ? "1 needs you"
-                        : `${count.needsYou} need you`}
-                    </span>
-                  ) : null}
+                  {tabBody(id, label)}
                 </TabsTrigger>
-              );
-            })}
-          </TabsList>
-        </Tabs>
+              ))}
+            </TabsList>
+          </Tabs>
+          {moreTabs.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  data-testid="bench-tab-more"
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  More ({moreTabs.length})
+                  {moreNeedsYou > 0 ? ` · ${needsYouText(moreNeedsYou)}` : ""}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {moreTabs.map(({ id, label }) => (
+                  <DropdownMenuItem
+                    className="gap-1.5"
+                    key={id}
+                    onSelect={() => pickTab(id)}
+                  >
+                    {tabBody(id, label)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+        </div>
         <div className="space-y-1 text-sm" data-testid="bench-status">
           {snapshot.projectsNotice ? (
             <p
@@ -244,6 +296,14 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
               role="status"
             >
               Project tabs: {snapshot.projectsNotice}
+            </p>
+          ) : null}
+          {otherLine ? (
+            <p
+              className="text-muted-foreground [overflow-wrap:anywhere]"
+              data-testid="bench-other-reason"
+            >
+              {otherLine}
             </p>
           ) : null}
           <p className="text-muted-foreground" data-testid="bench-last-update">
