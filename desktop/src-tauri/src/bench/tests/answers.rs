@@ -62,6 +62,7 @@ fn pick_answer_rules() {
         created_at: 1,
         hash: item.hash.clone(),
         seeded: 2,
+        place: None,
     });
     // The writer is listed as an approver on purpose: its own seeds must
     // still never count.
@@ -178,6 +179,7 @@ fn render_board_answered_section() {
         created_at: 1,
         hash: card_hash(&first),
         seeded: 1,
+        place: None,
     });
     let all = [&open, &done, &first];
     let board = render_board(&all, &[], UUID, "14:05", 100);

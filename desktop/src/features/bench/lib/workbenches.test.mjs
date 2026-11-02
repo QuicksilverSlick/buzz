@@ -308,3 +308,19 @@ test("a tab with no project of its own never borrows another tab's color", (t) =
   // Without the clash, its own slug's color.
   assert.equal(workbenchColor(talos, [], VIEWER).id, "lime");
 });
+
+test("the registry recolors no built-in tab, and a dropped alias stays dropped", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  const reset = () => workbenches().find((w) => w.id === "reset");
+  const before = workbenchColor(reset(), [], VIEWER).id;
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(reset().slugs, ["28-day-reset", "reset"]);
+  assert.equal(workbenchColor(reset(), [], VIEWER).id, before);
+  adoptBenchProjects({
+    ...SEEDED,
+    projects: SEEDED.projects.map((p) =>
+      p.slug === "reset" ? { ...p, aliases: [] } : p,
+    ),
+  });
+  assert.deepEqual(reset().slugs, ["reset"]);
+});

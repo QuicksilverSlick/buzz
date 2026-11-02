@@ -754,6 +754,7 @@ pub(super) async fn publish(
         let hash = item::card_hash(&item);
         let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
+        let place = super::plain::place(item.project.as_deref(), &item.area);
         let pings = item::card_pings(&item, &s.owner_pubkey, owner_set);
         let pinged: Vec<&str> = pings.iter().map(String::as_str).collect();
         let thread = item
@@ -794,6 +795,7 @@ pub(super) async fn publish(
                     created_at,
                     hash,
                     seeded: 0,
+                    place: Some(place),
                 });
                 i.routed_seen |= seen;
                 i.quiet_repost = false;
@@ -876,6 +878,7 @@ pub(super) async fn publish(
                     created_at: s.last_created_at,
                     hash,
                     seeded: 0,
+                    place: None,
                 });
                 s.board_dirty = false;
                 if let Some(old) = old {

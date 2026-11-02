@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use super::item::{plain_text, valid_name, NAME_MAX};
 
 const LABEL_MAX: usize = 40;
+/// Read on every tick and poll, so capped like a drop; past it the notice says
+/// so. Sized for the design's 50 projects at about 1 KiB each.
+const MAX_BYTES: u64 = super::MAX_DROP_BYTES;
+/// A reason can echo the file; cut as the kit cuts its own (projects.mjs).
+const WHY_MAX: usize = 300;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct Project {
@@ -21,9 +26,14 @@ pub(crate) struct Project {
     /// A sub-product's top-level project (Talos under Dreamforge).
     #[serde(default)]
     pub parent: Option<String>,
-    /// Old areas and names that still mean this project.
-    #[serde(default)]
+    /// Old areas and names that still mean this project. The kit reads a null
+    /// as none, so it does here too.
+    #[serde(default, deserialize_with = "null_is_empty")]
     pub aliases: Vec<String>,
+}
+
+fn null_is_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Option::deserialize(d).map(Option::unwrap_or_default)
 }
 
 impl Project {
@@ -66,10 +76,16 @@ pub(crate) fn built_in() -> Vec<Project> {
 pub(crate) fn load(root: &Path) -> Registry {
     let path = root.parent().unwrap_or(root).join("projects.json");
     let shown = path.display();
-    let read = match std::fs::read_to_string(&path) {
+    let text = std::fs::metadata(&path).and_then(|meta| {
+        (meta.len() <= MAX_BYTES)
+            .then(|| std::fs::read_to_string(&path))
+            .transpose()
+    });
+    let read = match text {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!("{shown} is missing")),
         Err(e) => Err(format!("{shown} can't be read ({e})")),
-        Ok(text) => serde_json::from_str::<File>(&text)
+        Ok(None) => Err(format!("{shown} is over {MAX_BYTES} bytes")),
+        Ok(Some(text)) => serde_json::from_str::<File>(&text)
             .map_err(|e| e.to_string())
             .and_then(|f| validate(&f.projects).map(|()| f.projects))
             .map_err(|e| format!("{shown} can't be used: {e}")),
@@ -82,14 +98,17 @@ pub(crate) fn load(root: &Path) -> Registry {
         Err(why) => Registry {
             projects: None,
             projects_notice: Some(format!(
-                "{why}, so the Bench shows its built-in tabs (28 Day Reset, Dreamforge). This clears by itself once the file reads."
+                "{}, so the Bench shows its built-in tabs (28 Day Reset, Dreamforge). This clears by itself once the file reads.",
+                why.chars().take(WHY_MAX).collect::<String>()
             )),
         },
     }
 }
 
 /// The kit's checks the Bench relies on (lane/projects.mjs laneOf), plus labels
-/// that print as written and slugs that are not a tab of the Bench's own.
+/// that print as written and slugs that are not a tab of the Bench's own. A key
+/// with "--" or a trailing "-" is one no card's normalised name ever equals
+/// (workbenches.ts slugWorkbench): its tab would stay empty with no word why.
 pub(crate) fn validate(projects: &[Project]) -> Result<(), String> {
     if projects.is_empty() {
         return Err("no projects".to_string());
@@ -103,7 +122,8 @@ pub(crate) fn validate(projects: &[Project]) -> Result<(), String> {
             ));
         }
         for k in p.keys() {
-            if !valid_name(k, NAME_MAX) || matches!(k, "all" | "other") {
+            let untidy = k.contains("--") || k.ends_with('-');
+            if !valid_name(k, NAME_MAX) || untidy || matches!(k, "all" | "other") {
                 return Err(format!("project {:?}: {k:?} is not a Bench slug", p.slug));
             }
             if !keys.insert(k) {
@@ -114,7 +134,8 @@ pub(crate) fn validate(projects: &[Project]) -> Result<(), String> {
         if p.parent.is_some() && !projects.iter().any(top) {
             return Err(format!(
                 "project {:?}: parent {:?} is not a top-level project",
-                p.slug, p.parent
+                p.slug,
+                p.parent.as_deref().unwrap_or_default()
             ));
         }
     }
@@ -125,16 +146,32 @@ pub(crate) fn validate(projects: &[Project]) -> Result<(), String> {
 /// cards take its name without a relaunch. None: `built_in()`.
 // ponytail: one process-wide copy; pass it through render_card if a second
 // Bench ever runs in one process.
-static CURRENT: RwLock<Option<Vec<Project>>> = RwLock::new(None);
+type Current = RwLock<Option<Vec<Project>>>;
+
+#[cfg(not(test))]
+fn current<T>(f: impl FnOnce(&Current) -> T) -> T {
+    static CURRENT: Current = RwLock::new(None);
+    f(&CURRENT)
+}
+
+/// Test Benches tick in parallel, one to a thread (`#[tokio::test]`).
+#[cfg(test)]
+fn current<T>(f: impl FnOnce(&Current) -> T) -> T {
+    thread_local!(static CURRENT: Current = const { RwLock::new(None) });
+    CURRENT.with(f)
+}
 
 pub(crate) fn refresh(root: &Path) {
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = load(root).projects;
+    let read = load(root).projects;
+    current(|c| *c.write().unwrap_or_else(|e| e.into_inner()) = read);
 }
 
 pub(crate) fn with_current<T>(f: impl FnOnce(&[Project]) -> T) -> T {
-    let current = CURRENT.read().unwrap_or_else(|e| e.into_inner());
-    match current.as_deref() {
-        Some(projects) => f(projects),
-        None => f(&built_in()),
-    }
+    current(|c| {
+        let current = c.read().unwrap_or_else(|e| e.into_inner());
+        match current.as_deref() {
+            Some(projects) => f(projects),
+            None => f(&built_in()),
+        }
+    })
 }
