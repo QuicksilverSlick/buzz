@@ -20,8 +20,8 @@ fn the_kits_seed_places_every_card_by_slug_or_alias() {
     let projects = seed();
     validate(&projects).unwrap();
     for c in vectors()["cards"].as_array().unwrap() {
-        let header: Vec<String> = serde_json::from_value(c["header"].clone()).unwrap();
-        let (project, area) = (c["project"].as_str(), c["area"].as_str().unwrap());
+        let header: Vec<String> = serde_json::from_value(c[4].clone()).unwrap();
+        let (project, area) = (c[0].as_str(), c[1].as_str().unwrap());
         assert_eq!(
             place_in(&projects, project, area),
             header.join(" \u{b7} "),

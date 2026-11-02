@@ -1,5 +1,5 @@
 {
-  "note": "The registry as the steward kit seeds it (reference/projects.seed.json), and where cards land by it. tests/projects.rs pins each header the Bench posts (plain::place_in); workbenches.test.mjs pins the same cards' desktop tab and header. tab is a project slug or other; header is the place, then the area when it says more.",
+  "note": "The registry as the steward kit seeds it (reference/projects.seed.json), and where cards land by it. tests/projects.rs pins each header the Bench posts (plain::place_in); workbenches.test.mjs pins the same cards' desktop tab and header. A card is [project, area, writer, tab, header]: tab is a project slug or other; header is the place, then the area when it says more.",
   "registry": {
     "version": 1,
     "projects": [
@@ -28,82 +28,16 @@
     ]
   },
   "cards": [
-    {
-      "project": null,
-      "area": "dreamforge-talos",
-      "writer": "steward",
-      "tab": "talos",
-      "header": ["Talos"]
-    },
-    {
-      "project": null,
-      "area": "talos",
-      "writer": "claude",
-      "tab": "talos",
-      "header": ["Talos"]
-    },
-    {
-      "project": null,
-      "area": "dreamforge-talos-voice",
-      "writer": "claude-ai",
-      "tab": "talos",
-      "header": ["Talos", "dreamforge-talos-voice"]
-    },
-    {
-      "project": "talos",
-      "area": "release",
-      "writer": "steward",
-      "tab": "talos",
-      "header": ["Talos", "release"]
-    },
-    {
-      "project": null,
-      "area": "buzz",
-      "writer": "steward",
-      "tab": "dreamforge",
-      "header": ["Dreamforge"]
-    },
-    {
-      "project": null,
-      "area": "dreamforge",
-      "writer": "claude-ai",
-      "tab": "dreamforge",
-      "header": ["Dreamforge"]
-    },
-    {
-      "project": null,
-      "area": "dreamforge-build",
-      "writer": "claude-ai",
-      "tab": "dreamforge",
-      "header": ["Dreamforge", "dreamforge-build"]
-    },
-    {
-      "project": null,
-      "area": "agents",
-      "writer": "claude-ai",
-      "tab": "dreamforge",
-      "header": ["agents"]
-    },
-    {
-      "project": null,
-      "area": "28-day-reset",
-      "writer": "steward",
-      "tab": "reset",
-      "header": ["28 Day Reset"]
-    },
-    {
-      "project": null,
-      "area": "reset",
-      "writer": "orchestrator",
-      "tab": "reset",
-      "header": ["28 Day Reset"]
-    },
-    {
-      "project": null,
-      "area": "factory",
-      "writer": "factory",
-      "tab": "other",
-      "header": ["factory"]
-    }
+    [null, "dreamforge-talos", "steward", "talos", ["Talos"]],
+    [null, "talos", "claude", "talos", ["Talos"]],
+    [null, "dreamforge-talos-x", "x", "talos", ["Talos", "dreamforge-talos-x"]],
+    ["talos", "release", "steward", "talos", ["Talos", "release"]],
+    [null, "buzz", "steward", "dreamforge", ["Dreamforge"]],
+    [null, "dreamforge", "claude-ai", "dreamforge", ["Dreamforge"]],
+    [null, "dreamforge-b", "x", "dreamforge", ["Dreamforge", "dreamforge-b"]],
+    [null, "agents", "claude-ai", "dreamforge", ["agents"]],
+    [null, "28-day-reset", "steward", "reset", ["28 Day Reset"]],
+    [null, "reset", "orchestrator", "reset", ["28 Day Reset"]],
+    [null, "factory", "factory", "other", ["factory"]]
   ]
 }
