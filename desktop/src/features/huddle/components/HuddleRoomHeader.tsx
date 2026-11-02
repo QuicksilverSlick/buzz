@@ -5,6 +5,7 @@ import * as React from "react";
 import { useProfileQuery, useSelfProfileCache } from "@/features/profile/hooks";
 import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { TalkToTalosButton } from "@/features/talos/TalkToTalosButton";
 import { useHuddle, useHuddleLevels } from "../HuddleContext";
 import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
@@ -113,7 +114,7 @@ export function HuddleRoomHeader() {
   if (!state || !isVisible(state)) return null;
 
   return (
-    <header className="flex min-h-24 shrink-0 items-center justify-center border-b border-border/60 bg-background/85 px-6 py-3 backdrop-blur-sm">
+    <header className="relative flex min-h-24 shrink-0 items-center justify-center border-b border-border/60 bg-background/85 px-6 py-3 backdrop-blur-sm">
       <HuddleParticipantsControl
         activeSpeakers={activeSpeakers}
         speakerLevels={participantSpeakerLevels}
@@ -136,6 +137,10 @@ export function HuddleRoomHeader() {
             null,
           pubkey: currentPubkey,
         }}
+      />
+      <TalkToTalosButton
+        className="absolute right-6 top-1/2 -translate-y-1/2"
+        participants={lifecycleParticipants}
       />
     </header>
   );

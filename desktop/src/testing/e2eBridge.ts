@@ -334,6 +334,8 @@ type E2eConfig = {
     };
     /** When set, the mocked `add_agent_to_huddle` command throws. */
     addAgentToHuddleError?: string;
+    talosPubkey?: string;
+    talkToTalosError?: string;
     /** Delay an invocation-time huddle snapshot to exercise hydration ordering. */
     huddleStateReadDelayMs?: number;
     /** Delay (ms) for `sync_agents_to_active_huddle` so e2e tests can hold the
@@ -12410,6 +12412,22 @@ export function maybeInstallE2eTauriMocks() {
           throw new Error("No mock add-agent result configured.");
         }
         return structuredClone(result);
+      }
+      case "get_talos_pubkey":
+        return activeConfig?.mock?.talosPubkey ?? null;
+      case "talk_to_talos":
+        if (activeConfig?.mock?.talkToTalosError) {
+          throw new Error(activeConfig.mock.talkToTalosError);
+        }
+        return null;
+      case "add_talos_to_huddle": {
+        const pubkey = activeConfig?.mock?.talosPubkey;
+        if (!mockHuddle || !pubkey) throw new Error("No active huddle.");
+        mockHuddle.members.push({ pubkey, role: "member" });
+        refreshMockHuddleMembership(activeConfig);
+        persistMockHuddle();
+        await emitMockHuddleState();
+        return null;
       }
       case "remove_agent_from_huddle": {
         const agentPubkey = (payload as { agentPubkey?: string })?.agentPubkey;

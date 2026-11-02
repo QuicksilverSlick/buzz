@@ -1,6 +1,7 @@
 import { isMacPlatform } from "@/shared/lib/platform";
 
 export const HUDDLE_SHORTCUT_EVENT = "buzz:huddle-shortcut";
+export const TALK_TO_TALOS_EVENT = "buzz:talk-to-talos";
 
 export type HuddleShortcutDetail = {
   channelId: string;
@@ -101,6 +102,14 @@ export const KEYBOARD_SHORTCUTS: KeyboardShortcut[] = [
     description: "Show or hide the sidebar",
     keys: "⌘S",
     keysWindows: "Ctrl+S",
+    category: "Navigation",
+  },
+  {
+    id: "talk-to-talos",
+    label: "Talk to Talos",
+    description: "Start a huddle with Talos, or add Talos to this one",
+    keys: "⇧⌘T",
+    keysWindows: "Shift+Ctrl+T",
     category: "Navigation",
   },
   {
