@@ -4,7 +4,7 @@
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
 //! the writer's own events, the reaction poll and the outbox, inbox intake,
 //! the pinned relay helpers and the 2 s loop. `publish` posts a tick's cards
-//! and board; `channels` covers project channels bound in roles.json.
+//! and board; `channels` the channels bound in roles.json; `replaced` old posts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,7 @@ mod item;
 mod pick;
 mod plain;
 mod publish;
+mod replaced;
 mod roles;
 mod route;
 
@@ -144,6 +145,8 @@ pub(crate) struct BenchState {
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.
     kept_at: Vec<(String, u64)>,
+    /// Old posts still owed an edit or a reply, or watched for a tap.
+    replaced: Vec<replaced::Replaced>,
     /// Live cards whose owner's page was cut this tick, or every item while
     /// roles.json does not read: their answers are unread, so nothing
     /// expires, restamps, routes, retires or replaces them.
@@ -334,8 +337,9 @@ pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt 
                     r.cards.insert(id.to_string(), p);
                 }
             }
-            // Answer notices: thread replies the Bench never edits or retires.
-            Some((target, _)) if target.starts_with("route:") => {}
+            // Thread replies the Bench never edits or retires.
+            Some((target, _))
+                if target.starts_with("route:") || target.starts_with("replaced:") => {}
             _ => r.stray_ids.push(e.id.to_hex()),
         }
     }
@@ -382,7 +386,7 @@ fn scan_inbox(
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
 /// new question after an answer, a scoped card's reply or the owner's word
-/// leaves the old card on the relay as it is and gets a card of its own with
+/// leaves the old card on the relay (`replaced`) and gets a card of its own with
 /// nothing told yet, which comes back to whoever answered (`item::Previous`);
 /// anything else (a reply on a card that is not scoped asked nothing of its
 /// own) keeps the card for publish to refresh or close. Each keeps the
@@ -448,6 +452,7 @@ fn intake(
     s: &mut BenchState,
     root: &Path,
     now_iso: &str,
+    now: u64,
     roles: Option<&roles::Roles>,
     roles_bad: bool,
 ) -> bool {
@@ -472,6 +477,7 @@ fn intake(
                     // whether or not state still remembers the answer.
                     let _ = std::fs::remove_file(outbox_path(root, &item.id));
                     let item = carry_card(old, item, &mut s.kept, &mut s.kept_at);
+                    replaced::left_behind(s, &item, now);
                     s.items.insert(item.id.clone(), item);
                     changed = true;
                 }
@@ -1371,16 +1377,10 @@ pub(crate) async fn tick(
     } else {
         poll_answers(ctx, s, now, &owner_set, &routes).await?
     };
-    intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
+    let roles_bad = roles_err.is_some();
+    intake(s, &ctx.root, now_iso, now, roles.as_ref(), roles_bad);
     expire(s, now);
-    restamp(
-        ctx,
-        s,
-        roles.as_ref(),
-        roles_err.is_some(),
-        &owner_set,
-        &routes,
-    );
+    restamp(ctx, s, roles.as_ref(), roles_bad, &owner_set, &routes);
     let mut failed = Vec::new();
     publish::publish(
         ctx,
@@ -1393,6 +1393,7 @@ pub(crate) async fn tick(
         &mut failed,
     )
     .await?;
+    replaced::tick(ctx, s, &mut budget, now, hhmm, &owner_set).await;
     let failed = (!failed.is_empty()).then(|| failed.join("; "));
     done.and(cut.map_or(Ok(()), Err))
         .and(failed.map_or(Ok(()), Err))

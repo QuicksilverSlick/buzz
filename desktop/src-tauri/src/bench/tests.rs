@@ -669,7 +669,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     assert_eq!(scan_inbox(root, now).len(), 3);
 
     let mut s = BenchState::default();
-    assert!(intake(&mut s, root, NOW, None, false));
+    assert!(intake(&mut s, root, NOW, 0, None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(
         (item.writer.as_str(), item.updated_at.as_str()),
@@ -697,7 +697,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     }
     assert!(inbox.join("old.rejected.json").exists());
     assert!(root.join("inbox/Bad Writer/z.json").exists());
-    assert!(!intake(&mut s, root, NOW, None, false));
+    assert!(!intake(&mut s, root, NOW, 0, None, false));
 
     // An identical re-drop is a no-op; a reworded one keeps the card.
     let card = Posted {
@@ -709,7 +709,14 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     s.items.get_mut("orchestrator/good").unwrap().card = Some(card.clone());
     std::fs::write(inbox.join("good.json"), drop_json(&[])).unwrap();
     backdate("orchestrator/good.json");
-    assert!(!intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
+    assert!(!intake(
+        &mut s,
+        root,
+        "2026-09-13T15:00:00Z",
+        0,
+        None,
+        false
+    ));
     assert_eq!(s.items["orchestrator/good"].updated_at, NOW);
     std::fs::write(
         inbox.join("good.json"),
@@ -717,7 +724,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
     )
     .unwrap();
     backdate("orchestrator/good.json");
-    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z", None, false));
+    assert!(intake(&mut s, root, "2026-09-13T15:00:00Z", 0, None, false));
     let item = &s.items["orchestrator/good"];
     assert_eq!(item.card, Some(card));
     assert_ne!(item.hash, item.card.as_ref().unwrap().hash);
@@ -1459,5 +1466,6 @@ mod one_tap;
 mod owner_signed;
 mod owner_word;
 mod receipts;
+mod replaced;
 mod routes;
 mod scoped;

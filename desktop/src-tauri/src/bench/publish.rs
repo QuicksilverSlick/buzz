@@ -109,7 +109,7 @@ fn message(
 
 /// `message`, from the writer.
 #[allow(clippy::too_many_arguments)]
-async fn post_message(
+pub(super) async fn post_message(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     ch: &str,
@@ -191,7 +191,7 @@ fn slot<'a>(s: &'a mut BenchState, id: &str, ends: bool) -> &'a mut item::Item {
 }
 
 /// A card's thread: under the root it was posted in reply to, if any.
-fn thread_of(
+pub(super) fn thread_of(
     card: Option<&Posted>,
     root: Option<&str>,
 ) -> Result<Option<events::ThreadRef>, String> {
@@ -287,7 +287,7 @@ async fn delete(
 }
 
 /// kind 40003 with h+e replacing the text of one of the writer's own kind 9s.
-async fn edit(
+pub(super) async fn edit(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
     ch: &str,
@@ -348,25 +348,28 @@ async fn touched(
 }
 
 /// A stale card kept for what is on it (`touched`), for good: edited closed
-/// from its own text as posted (`item::render_closed`), its thread root (its
-/// parent) ending older cards' root-reply windows there. One gone from the
-/// relay is only kept.
+/// from its own text as posted (`replaced::old_post`), its thread root (its
+/// parent) ending older cards' root-reply windows there, and watched for a tap
+/// (`replaced`). One gone from the relay is only kept.
 async fn close(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
+    id: &str,
     ch: &str,
     card: &Posted,
     now: u64,
 ) -> Result<(), String> {
     let filter = serde_json::json!({ "ids": [card.event_id], "kinds": [9], "#h": [ch] });
     if let Some(e) = query_writer(ctx, s, filter, now).await?.first() {
-        let text = item::render_closed(&e.content) + &item::thread_line(ch, &card.event_id);
+        let text = super::replaced::old_post(s, id, &e.content);
+        let text = text + &item::thread_line(ch, &card.event_id);
         match edit(ctx, s, ch, &card.event_id, &text, now).await {
             Err(err) if !err.contains("not found") => return Err(err),
             _ => {}
         }
         let root = item::parent(e).map(|r| (r.to_string(), card.created_at));
         s.kept_at.extend(root);
+        super::replaced::closed(s, id, ch, card, item::parent(e), now);
     }
     s.kept.push(card.event_id.clone());
     Ok(())
@@ -715,7 +718,7 @@ pub(super) async fn publish(
         // card a record: it stays, as `carry_card` keeps one, but closed,
         // since nothing reads it any more.
         if touched(ctx, s, &ch, &card.event_id, now).await? {
-            close(ctx, s, &ch, &card, now).await?;
+            close(ctx, s, &id, &ch, &card, now).await?;
         } else {
             delete(ctx, s, &ch, &card.event_id, now).await?;
         }
@@ -854,6 +857,8 @@ pub(super) async fn publish(
         &format!("Card slots: {used} of {MAX_CARDS} in use, {n} queued"),
         (n > 0 || used > MAX_CARDS).then_some(why).into_iter(),
     );
+    let old = super::replaced::alarm(s);
+    item::section(&mut text, "Old cards", old.into_iter());
     let hash = item::board_hash(&text);
     let aged = s
         .board

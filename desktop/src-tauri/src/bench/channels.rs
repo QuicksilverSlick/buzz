@@ -83,10 +83,14 @@ pub(super) fn reads_replies(
 /// #bench always; a bound channel once the writer is in it and its admin
 /// list passed.
 pub(super) fn channel_ready(s: &BenchState, i: &item::Item) -> bool {
-    let ch = card_channel(s, i);
+    ready(s, &card_channel(s, i))
+}
+
+/// `channel_ready`, by channel.
+pub(super) fn ready(s: &BenchState, ch: &str) -> bool {
     ch == s.channel_id
-        || (joined(s, &ch).contains(&s.writer_pubkey)
-            && s.channels.get(&ch).is_some_and(|c| c.refused.is_none()))
+        || (joined(s, ch).contains(&s.writer_pubkey)
+            && s.channels.get(ch).is_some_and(|c| c.refused.is_none()))
 }
 
 /// The owner adds the writer, then the route targets of the folders bound to
