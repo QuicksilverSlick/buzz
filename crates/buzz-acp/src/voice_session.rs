@@ -1,9 +1,9 @@
-//! One huddle voice's run in the room (design 2026-10-29 §3.3-§3.5; slice 8a, part 1 of 2):
-//! `open` on `/df/voice` with NIP-98, audio joined through the bridge only after `opened`, the
-//! frame client between the two, and a clean Close on the way out.
+//! One huddle voice's run in the room (design 2026-10-29 §3.3-§3.5; slice 8a): `open` on
+//! `/df/voice` with NIP-98, audio joined through the bridge only after `opened`, the frame client
+//! between the two, and a clean Close on the way out.
 //!
-//! Part 2 decides when to run one: the 44100 actor gate, the owner-present rule, the decline line
-//! and kind 9, behind slice 9's switch. Nothing calls this until then.
+//! The `voice` module decides when to run one: the 44100 actor gate, the owner-present rule, the
+//! decline line and kind 9, behind slice 9's switch. `session` does no check on `added`.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -79,7 +79,7 @@ pub(crate) enum Left {
     Refused(String),
 }
 
-fn text(error: impl std::fmt::Display) -> String {
+pub(crate) fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
@@ -304,7 +304,7 @@ fn on_frame(frame: ToPc, me: &Voicing, cmd: &mpsc::Sender<Cmd>) -> Result<Option
     })
 }
 
-/// The bridge for one run; it rejoins on its own. Until part 2's peer policy, only the owner is
+/// The bridge for one run; it rejoins on its own. Until the peer policy lands, only the owner is
 /// heard: every other peer is outside `admitted`.
 async fn room(
     me: Arc<Voicing>,
@@ -344,4 +344,4 @@ async fn room(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

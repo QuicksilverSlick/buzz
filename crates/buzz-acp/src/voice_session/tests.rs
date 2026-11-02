@@ -20,9 +20,9 @@ const SILENT: &str = "silent";
 /// A `refuse` for the fake relay that means it takes the socket and never answers.
 const HANG: &str = "hang";
 /// For the tests of the owner's grace; the rest get 30 s, so a slow join can't end them.
-const GRACE: Duration = Duration::from_secs(2);
+pub(crate) const GRACE: Duration = Duration::from_secs(2);
 
-fn say(frame: Value) -> Message {
+pub(crate) fn say(frame: Value) -> Message {
     Message::Text(frame.to_string().into())
 }
 
@@ -50,8 +50,8 @@ impl Logs {
 
 /// What the fakes hold and saw. `log` keeps each thing the sockets did, the first time, in order.
 #[derive(Clone, Default)]
-struct Seen {
-    log: Arc<Mutex<Vec<String>>>,
+pub(crate) struct Seen {
+    pub(crate) log: Arc<Mutex<Vec<String>>>,
     talos_auth: Arc<Mutex<String>>,
     open: Arc<Mutex<Value>>,
     audio_auth: Arc<Mutex<Value>>,
@@ -68,7 +68,7 @@ impl Seen {
         }
     }
 
-    fn saw(&self, what: &str) -> bool {
+    pub(crate) fn saw(&self, what: &str) -> bool {
         self.log.lock().unwrap().iter().any(|seen| seen == what)
     }
 
@@ -77,7 +77,7 @@ impl Seen {
     }
 }
 
-async fn listen() -> (TcpListener, String) {
+pub(crate) async fn listen() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     (listener, address)
@@ -99,7 +99,7 @@ async fn fake_rest(seen: Seen) -> String {
 /// Challenge, the agent's auth, `joined` with the owner in the room or the `refuse` error, then
 /// what the voice plays, and the frames tests queue in `room`, where `"drop"` ends it. One socket
 /// only: any rejoin fails.
-async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> String {
+pub(crate) async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> String {
     let (listener, address) = listen().await;
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -151,7 +151,7 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
 /// Answers `open` with `refusal`, or `opened`. Once a roster shows audio is joined it sends the
 /// floor, a burst of voice, a bad frame, a ping, a tool and a reseed; after the answers it sends
 /// `end`, drops the socket if that's `"drop"`, or sends a frame over the cap if it's `"huge"`.
-async fn fake_talos(
+pub(crate) async fn fake_talos(
     seen: Seen,
     agent: String,
     refusal: Option<&'static str>,
@@ -305,7 +305,7 @@ impl Run {
     }
 }
 
-async fn until(what: &str, done: impl Fn() -> bool) {
+pub(crate) async fn until(what: &str, done: impl Fn() -> bool) {
     let wait = async {
         while !done() {
             sleep(Duration::from_millis(5)).await;
