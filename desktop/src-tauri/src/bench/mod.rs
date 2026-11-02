@@ -109,7 +109,7 @@ pub(crate) struct Posted {
     /// Option seeds landed so far.
     #[serde(default)]
     pub seeded: usize,
-    /// A card: its header's place when posted, for the kit's rebuild (bench-card.mjs).
+    /// A card: its header's place when posted. Edits keep it, the kit rebuilds from it.
     pub place: Option<String>,
 }
 
