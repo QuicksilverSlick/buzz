@@ -110,9 +110,10 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
 /// The notice for a free-text reply on a card (its Other): any scoped card,
 /// and an unscoped one whose writer has a route. Like an
 /// answer notice it carries no reply text: the agent reads the reply itself
-/// in the thread, with the trust it gives that person. A reply beside the
-/// same person's answer (a hold's reason, say) leaves that answer to its
-/// own notice, which waits for the settle.
+/// in the thread, with the trust it gives that person, or the owner's in its
+/// signed file (`outbox`). A reply beside the same person's answer (a hold's
+/// reason, say) leaves that answer to its own notice, which waits for the
+/// settle.
 pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
     let Some(r) = &item.reply else {
         return String::new();

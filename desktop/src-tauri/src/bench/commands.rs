@@ -372,6 +372,8 @@ pub(crate) const REPLY_MAX: usize = 300;
 /// (`item::pick_reply`, publish (a3)). Never an answer: text the tick would
 /// read as one (`item::answer_option`) is refused, so a reason sent after a
 /// tap never changes the tap. No p tags, so it is told (`item::tell_reply`).
+/// Its signed `bench:why` marker sets it apart from any other owner reply on
+/// the card: this one is the line whose box said where it goes (`outbox`).
 pub(crate) async fn reply_card(
     ctx: &Ctx<'_>,
     s: &BenchState,
@@ -403,7 +405,7 @@ pub(crate) async fn reply_card(
     let ch = super::channels::card_channel(s, item);
     let ch = uuid::Uuid::parse_str(&ch).map_err(|e| e.to_string())?;
     let thread = super::publish::thread_of(Some(card), item.reply_to.as_deref())?;
-    let ev = events::build_message(
+    let ev = events::build_message_with_client_tags(
         ch,
         text,
         thread.as_ref(),
@@ -414,6 +416,7 @@ pub(crate) async fn reply_card(
         &[],
         None,
         &ctx.base,
+        &[vec!["client".to_string(), "bench:why".to_string()]],
     )?
     .custom_created_at(nostr::Timestamp::from(now))
     .sign_with_keys(&ctx.owner)
