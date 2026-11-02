@@ -254,8 +254,7 @@ fn writer_keys() -> Result<nostr::Keys, String> {
     Ok(keys)
 }
 
-/// A fresh NIP-OA tag for one request: minted per use, never persisted,
-/// never inside an event.
+/// A fresh NIP-OA tag for one request: minted per use, never stored or in an event.
 fn owner_tag(
     owner: &nostr::Keys,
     writer_pk: &nostr::PublicKey,
