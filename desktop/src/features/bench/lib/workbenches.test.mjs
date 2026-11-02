@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { readFileSync } from "node:fs";
+
 import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
+import { benchCardPlace } from "./benchCardLayout.ts";
 import {
-  WORKBENCHES,
+  BUILT_IN_WORKBENCHES,
+  adoptBenchProjects,
+  benchTabs,
   cardWorkbench,
   slugWorkbench,
   workbenchColor,
   workbenchCounts,
   workbenchSnapshot,
+  workbenches,
 } from "./workbenches.ts";
 
 function card(id, overrides = {}) {
@@ -122,7 +128,7 @@ function project(dtag, name, color, overrides = {}) {
 }
 
 test("a workbench tab takes its project's color, announced projects first", () => {
-  const [reset, dreamforge] = WORKBENCHES;
+  const [reset, dreamforge] = BUILT_IN_WORKBENCHES;
   const projects = [
     project("reset-notes", "reset-notes", undefined, { legacy: true }),
     project("garden", "Garden", "sky"),
@@ -145,7 +151,7 @@ test("a workbench tab takes its project's color, announced projects first", () =
 });
 
 test("a newer or someone else's matching project never recolors a workbench", () => {
-  const [reset] = WORKBENCHES;
+  const [reset] = BUILT_IN_WORKBENCHES;
   const program = project("28-day-reset", "28 Day Reset", "lime");
   const cohort = project("reset-q4-cohort", "Reset Q4 cohort", "sky");
   const theirs = project("28-day-reset", "28 Day Reset", "red", {
@@ -170,7 +176,7 @@ test("a newer or someone else's matching project never recolors a workbench", ()
 });
 
 test("the viewer's agent's project colors a workbench the viewer has none for", () => {
-  const [reset] = WORKBENCHES;
+  const [reset] = BUILT_IN_WORKBENCHES;
   const AGENT = "c".repeat(64);
   const agents = new Set([AGENT]);
   const agentReset = project("28-day-reset", "28 Day Reset", "orange", {
@@ -198,4 +204,65 @@ test("the viewer's agent's project colors a workbench the viewer has none for", 
     workbenchColor(reset, [agentReset, own], VIEWER, agents).id,
     "lime",
   );
+});
+
+// The kit's seed and where its cards land (tests/projects.rs pins the
+// same cards' headers on the Bench).
+const VECTORS = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../src-tauri/src/bench/projects_vectors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
+const SEEDED = { enabled: true, projects: VECTORS.registry.projects };
+
+test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(
+    benchTabs().map((tab) => [tab.id, tab.label, tab.parent]),
+    [
+      ["all", "All", undefined],
+      ["dreamforge", "Dreamforge", undefined],
+      ["talos", "Talos", "dreamforge"],
+      ["reset", "28 Day Reset", undefined],
+      ["other", "Other", undefined],
+    ],
+  );
+  for (const [project, area, writer, tab, header] of VECTORS.cards) {
+    assert.equal(cardWorkbench({ project, area, writer }), tab, area);
+    assert.deepEqual(benchCardPlace({ project, area }), header, area);
+  }
+  // The built-in writers stay with their slug; a new project has none.
+  assert.deepEqual(workbenches()[0].writers, BUILT_IN_WORKBENCHES[1].writers);
+  assert.deepEqual(workbenches()[1].writers, []);
+  // Unchanged, the same tabs; none, the built-in ones.
+  const tabs = workbenches();
+  adoptBenchProjects({ ...SEEDED, items: [] });
+  assert.equal(workbenches(), tabs);
+  adoptBenchProjects({ ...SEEDED, projects: null });
+  assert.equal(workbenches(), BUILT_IN_WORKBENCHES);
+  assert.equal(
+    cardWorkbench({ project: null, area: "dreamforge-talos", writer: "x" }),
+    "dreamforge",
+  );
+});
+
+test("the registry recolors no built-in tab, and a dropped alias stays dropped", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  const reset = () => workbenches().find((w) => w.id === "reset");
+  const before = workbenchColor(reset(), [], VIEWER).id;
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(reset().slugs, ["28-day-reset", "reset"]);
+  assert.equal(workbenchColor(reset(), [], VIEWER).id, before);
+  adoptBenchProjects({
+    ...SEEDED,
+    projects: SEEDED.projects.map((p) =>
+      p.slug === "reset" ? { ...p, aliases: [] } : p,
+    ),
+  });
+  assert.deepEqual(reset().slugs, ["reset"]);
 });

@@ -476,6 +476,7 @@ fn answer_vectors() {
             created_at: 1,
             hash: item.hash.clone(),
             seeded: 2,
+            place: None,
         });
         if item.scoped() {
             let answerers = case["to"].as_array().unwrap().iter().map(|t| Answerer {
@@ -559,6 +560,7 @@ fn each_thread_reply_counts_for_one_card() {
             created_at: at,
             hash: card_hash(&i),
             seeded: 2,
+            place: None,
         });
         i
     };
