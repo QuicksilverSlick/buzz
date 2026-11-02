@@ -4,7 +4,7 @@
 //! paths, state.json, writer key custody, the monotonic clock, recovery from
 //! the writer's own events, the reaction poll and the outbox, inbox intake,
 //! the pinned relay helpers and the 2 s loop. `publish` posts a tick's cards
-//! and board; `channels` covers project channels bound in roles.json.
+//! and board; `channels` the channels bound in roles.json; `replaced` old posts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,10 +21,12 @@ use crate::secret_store::SecretStore;
 mod channels;
 pub(crate) mod commands;
 mod item;
+mod outbox;
 mod pick;
 mod plain;
 mod projects;
 mod publish;
+mod replaced;
 mod roles;
 mod route;
 
@@ -107,7 +109,7 @@ pub(crate) struct Posted {
     /// Option seeds landed so far.
     #[serde(default)]
     pub seeded: usize,
-    /// A card: its header's place when posted, for the kit's rebuild (bench-card.mjs).
+    /// A card: its header's place when posted. Edits keep it, the kit rebuilds from it.
     pub place: Option<String>,
 }
 
@@ -146,6 +148,9 @@ pub(crate) struct BenchState {
     /// Each kept card posted in a thread, as (its root, its created_at): it
     /// still ends the root-reply window of an older card there.
     kept_at: Vec<(String, u64)>,
+    /// Old posts owed an edit or a reply or watched for a tap; since when their read fails.
+    replaced: Vec<replaced::Replaced>,
+    replaced_unread: Option<u64>,
     /// Live cards whose owner's page was cut this tick, or every item while
     /// roles.json does not read: their answers are unread, so nothing
     /// expires, restamps, routes, retires or replaces them.
@@ -335,8 +340,8 @@ pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt 
                     r.cards.insert(id.to_string(), p);
                 }
             }
-            // Answer notices: thread replies the Bench never edits or retires.
-            Some((target, _)) if target.starts_with("route:") => {}
+            // Thread replies the Bench never edits or retires.
+            Some((t, _)) if t.starts_with("route:") || t.starts_with("replaced:") => {}
             _ => r.stray_ids.push(e.id.to_hex()),
         }
     }
@@ -383,7 +388,7 @@ fn scan_inbox(
 /// What a new Drop keeps of the item it replaces. A close-out (a decision or
 /// status) of a carded request keeps the card, which becomes its receipt; a
 /// new question after an answer, a scoped card's reply or the owner's word
-/// leaves the old card on the relay as it is and gets a card of its own with
+/// leaves the old card on the relay (`replaced`) and gets a card of its own with
 /// nothing told yet, which comes back to whoever answered (`item::Previous`);
 /// anything else (a reply on a card that is not scoped asked nothing of its
 /// own) keeps the card for publish to refresh or close. Each keeps the
@@ -449,6 +454,7 @@ fn intake(
     s: &mut BenchState,
     root: &Path,
     now_iso: &str,
+    now: u64,
     roles: Option<&roles::Roles>,
     roles_bad: bool,
 ) -> bool {
@@ -471,8 +477,10 @@ fn intake(
                     // The hash-change re-drop is the writer's ack: the
                     // rebuilt item carries no answer, so the file goes too,
                     // whether or not state still remembers the answer.
-                    let _ = std::fs::remove_file(outbox_path(root, &item.id));
+                    let _ = std::fs::remove_file(outbox::answer_path(root, &item.id));
+                    outbox::remove_reply(root, &item.id);
                     let item = carry_card(old, item, &mut s.kept, &mut s.kept_at);
+                    replaced::left_behind(s, &item, now);
                     s.items.insert(item.id.clone(), item);
                     changed = true;
                 }
@@ -890,7 +898,10 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
                     .card
                     .as_ref()
                     .is_some_and(|c| c.event_id == posted.event_id) => {}
-            Some(item) => item.card = Some(posted),
+            Some(item) => {
+                outbox::remove_reply(&ctx.root, &id);
+                item.card = Some(posted);
+            }
             None => {
                 s.orphan_cards.insert(id, posted);
             }
@@ -909,11 +920,6 @@ async fn recover(ctx: &Ctx<'_>, s: &mut BenchState, now: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// `outbox/<writer>/<id>.json`: the item id is `<writer>/<id>`, valid_names: no traversal.
-fn outbox_path(root: &Path, item_id: &str) -> PathBuf {
-    root.join("outbox").join(format!("{item_id}.json"))
-}
-
 /// Whether a card shows the item's current Drop, in any card format.
 fn same_drop(c: &Posted, i: &item::Item) -> bool {
     c.hash.split('.').next() == Some(i.hash.as_str())
@@ -925,18 +931,6 @@ fn same_drop(c: &Posted, i: &item::Item) -> bool {
 /// (b) retires it, and it must never re-supply the answer just cleared.
 fn live_card(i: &item::Item) -> Option<&Posted> {
     i.card.as_ref().filter(|c| same_drop(c, i))
-}
-
-/// Forget a card that is gone from the relay. It keeps its place (`repost`);
-/// one of the same Drop, whose owner was pinged, reposts quietly.
-fn forget_card(s: &mut BenchState, id: &str) {
-    let i = s.items.get_mut(id).expect("carded id");
-    let same = i.card.as_ref().is_some_and(|c| same_drop(c, i));
-    i.quiet_repost |= same;
-    i.repost |= i.card.is_some();
-    i.card = None;
-    i.recorded = None;
-    s.board_dirty = true;
 }
 
 /// A stamped answerer's roster name and role; None for the owner's own keys.
@@ -964,8 +958,9 @@ fn named(
 /// double-applied. The outbox file lands before state records the answer: a
 /// failed write is retried next tick instead of being lost. Ok(Some) says
 /// a page was cut: the cards it covers keep their answers, they are read
-/// again next tick, the tick goes on, and it is lastError. A card the
-/// owner's cut page covers is also `held` for the rest of the tick.
+/// again next tick, the tick goes on, and it is lastError, as is a reply file
+/// that would not write. A card the owner's cut page covers is also `held`
+/// for the rest of the tick.
 // ponytail: one /query per 2 s tick, two once a live card has answerers,
 // twice that while a card takes its thread root's replies (up to 120/min of
 // the 300/min budget); swap for the live #h tail via
@@ -1068,7 +1063,7 @@ async fn poll_answers(
         full.iter()
             .any(|&(o, t)| o == owners && (!t || rooted.contains(id)))
     };
-    let why = if full.iter().any(|f| f.0) {
+    let mut why = if full.iter().any(|f| f.0) {
         Some(format!(
             "answers truncated (>= {RECOVER_LIMIT} events from your keys on live cards); \
              those cards' answers stand"
@@ -1159,7 +1154,7 @@ async fn poll_answers(
                 .filter(|r| theirs(&r.by) && item::eligible(item, &r.by, owner_set)),
             None => None,
         };
-        let path = outbox_path(&ctx.root, &id);
+        let path = outbox::answer_path(&ctx.root, &id);
         let picked = (!unread)
             .then(|| item::pick_answer(item, &events, owner_set, &writer_hex, until))
             .flatten();
@@ -1226,6 +1221,15 @@ async fn poll_answers(
                     item.changed_at = now;
                 }
             }
+        }
+        // The owner's own reply, beside the answer and never one. With that key
+        // as the only owner's, nobody else's reply counts once it replied.
+        let owner = std::slice::from_ref(&s.owner_pubkey);
+        let mine = item::pick_reply(item, &events, owner, &writer_hex, until, routed)
+            .filter(|e| e.pubkey.to_hex() == s.owner_pubkey);
+        // The tap is recorded; lastError pauses the kit's approvals until this writes.
+        if let Err(e) = outbox::sync_reply(&ctx.root, &id, mine) {
+            why.get_or_insert(e);
         }
     }
     for t in refused {
@@ -1371,16 +1375,10 @@ pub(crate) async fn tick(
     } else {
         poll_answers(ctx, s, now, &owner_set, &routes).await?
     };
-    intake(s, &ctx.root, now_iso, roles.as_ref(), roles_err.is_some());
+    let roles_bad = roles_err.is_some();
+    intake(s, &ctx.root, now_iso, now, roles.as_ref(), roles_bad);
     expire(s, now);
-    restamp(
-        ctx,
-        s,
-        roles.as_ref(),
-        roles_err.is_some(),
-        &owner_set,
-        &routes,
-    );
+    restamp(ctx, s, roles.as_ref(), roles_bad, &owner_set, &routes);
     let mut failed = Vec::new();
     publish::publish(
         ctx,
@@ -1393,6 +1391,7 @@ pub(crate) async fn tick(
         &mut failed,
     )
     .await?;
+    replaced::tick(ctx, s, &mut budget, now, hhmm, &owner_set).await;
     let failed = (!failed.is_empty()).then(|| failed.join("; "));
     done.and(cut.map_or(Ok(()), Err))
         .and(failed.map_or(Ok(()), Err))
