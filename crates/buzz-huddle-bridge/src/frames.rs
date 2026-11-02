@@ -9,6 +9,9 @@
 //! frames, and unknown fields are refused. `frames-v1/schema.json` and one fixture per frame in
 //! `frames-v1/fixtures/` are the contract Talos copies.
 //!
+//! The socket's NIP-98 `u` is the URL as the PC dialed it, `wss://...`, whatever scheme a Worker
+//! reads. `opened` means the voice is live: the PC sends audio from then until `quiet`.
+//!
 //! Clocks:
 //! - `t_ms`, `start_ms` and `end_ms` are session audio ms: ms of PCM the PC has sent on this
 //!   socket, live and replayed alike, so both sides count the same samples.

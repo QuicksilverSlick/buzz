@@ -30,7 +30,10 @@ mod scope;
 mod setup_mode;
 mod usage;
 mod voice_profile;
-// Huddle voices' typed tools; the voice module (slice 8a) is its first caller.
+// One voice's run in the room; slice 8a part 2 is its first caller.
+#[cfg_attr(not(test), allow(dead_code))]
+mod voice_session;
+// Huddle voices' typed tools; slice 8c connects them to the voice module.
 #[cfg_attr(not(test), allow(dead_code))]
 mod voice_tools;
 
