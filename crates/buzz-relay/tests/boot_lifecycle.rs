@@ -821,6 +821,12 @@ mod postgres_tests {
     /// last, after the cache already serves the report: observing it proves the
     /// whole cycle ran, with no window where the counters have landed but the
     /// timestamp has not.
+    ///
+    /// The scrape that first shows the gauge can't be asserted on: the exporter
+    /// renders counters, then gauges, then histograms, so a render overlapping
+    /// that first sample holds the gauge without the counters. A render that
+    /// starts after the gauge was seen holds everything `sample` wrote before
+    /// it, so the assertions read a second scrape.
     #[test]
     #[ignore = "requires PostgreSQL"]
     fn startup_owns_the_dependency_sampler() {
@@ -842,11 +848,9 @@ mod postgres_tests {
             ("REDIS_URL", &redis_url),
             ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
         ]);
-        let scrape = wait_for_scraped_metric(
-            &mut process,
-            metrics_port,
-            "buzz_readiness_dependency_sample_completed_timestamp_seconds",
-        );
+        let completed = "buzz_readiness_dependency_sample_completed_timestamp_seconds";
+        wait_for_scraped_metric(&mut process, metrics_port, completed);
+        let scrape = wait_for_scraped_metric(&mut process, metrics_port, completed);
         let output = process.terminate();
         let logs = format!(
             "{}{}",
