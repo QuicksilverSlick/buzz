@@ -17,6 +17,7 @@ pub(super) fn carded(mut item: Item) -> Item {
         created_at: 0,
         hash: item.hash.clone(),
         seeded: 0,
+        place: None,
     });
     item
 }

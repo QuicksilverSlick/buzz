@@ -359,6 +359,7 @@ fn render_board_orders_links_and_folds() {
         created_at: 1,
         hash: crit.hash.clone(),
         seeded: 0,
+        place: None,
     });
     let att = check(&[
         ("id", json!("att")),
@@ -705,6 +706,7 @@ fn intake_takes_good_drops_and_rejects_the_rest_in_place() {
         created_at: 1,
         hash: good_hash,
         seeded: 2,
+        place: None,
     };
     s.items.get_mut("orchestrator/good").unwrap().card = Some(card.clone());
     std::fs::write(inbox.join("good.json"), drop_json(&[])).unwrap();
@@ -918,7 +920,8 @@ struct Bench {
 impl Bench {
     async fn new(gate: Gate, force_dup: &[u64]) -> Bench {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
+        // One level down, so a tick's registry (beside the root) is this test's.
+        let root = dir.path().join("bench");
         std::fs::create_dir_all(root.join("inbox")).unwrap();
         let owner = Keys::generate();
         let writer = Keys::generate();
@@ -1254,6 +1257,7 @@ async fn recover_from_query_rebuilds_cards_and_deletes_nothing() {
         created_at: now - 35,
         hash: card_hash(&y),
         seeded: 1,
+        place: None,
     };
     b.s.items.insert(
         y.id.clone(),
@@ -1472,6 +1476,7 @@ mod desktop_cards;
 mod one_tap;
 mod owner_signed;
 mod owner_word;
+mod projects;
 mod receipts;
 mod replaced;
 mod routes;

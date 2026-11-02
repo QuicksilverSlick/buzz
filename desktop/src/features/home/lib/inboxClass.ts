@@ -14,13 +14,13 @@ import {
 } from "@/features/bench/lib/benchCards";
 import { benchPostCard } from "@/features/bench/lib/benchCardLayout";
 import {
-  WORKBENCHES,
   type Workbench,
   cardWorkbench,
   compareProjectIds,
   projectWorkbench,
   slugWorkbench,
   workbenchColor,
+  workbenches,
 } from "@/features/bench/lib/workbenches";
 import type { InboxItem } from "@/features/home/lib/inbox";
 import { getProjectInboxReference } from "@/features/home/lib/projectInbox";
@@ -85,10 +85,12 @@ export function inboxProjects(
   projects: ReadonlyArray<ChipProject>,
   viewerPubkey: string | undefined,
   viewerAgentPubkeys?: ReadonlySet<string>,
+  /** The Bench's tabs, for a memo that follows the registry. */
+  benches: readonly Workbench[] = workbenches(),
 ): InboxProjects {
   const viewer = viewerPubkey?.toLowerCase();
-  const workbenches = Object.fromEntries(
-    WORKBENCHES.map((w) => [
+  const chipsByBench = Object.fromEntries(
+    benches.map((w) => [
       w.id,
       {
         label: w.label,
@@ -104,7 +106,7 @@ export function inboxProjects(
   )) {
     const workbench = projectWorkbench(project);
     const chip = workbench
-      ? workbenches[workbench.id]
+      ? chipsByBench[workbench.id]
       : { label: project.name, color: projectColorOf(project) };
     const repositories = project.repositories.filter(
       (repository) =>
@@ -119,7 +121,7 @@ export function inboxProjects(
     ];
     for (const key of keys) if (!chips.has(key)) chips.set(key, chip);
   }
-  return { chips, workbenches };
+  return { chips, workbenches: chipsByBench };
 }
 
 /** The repository address of a Buzz Git row ("30617:<owner>:<d-tag>"). */

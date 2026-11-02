@@ -413,6 +413,7 @@ pub(super) async fn publish(
     owner_set: &[String],
     failed: &mut Vec<String>,
 ) -> Result<(), String> {
+    super::projects::refresh(&ctx.root);
     // (a) The live cards: the open ones (`open`), in `item::rank` order.
     // MAX_CARDS gates new posts only: an open card with a place (`placed`:
     // posted, or retired for a refresh and coming back) keeps it, so (b)
@@ -769,6 +770,7 @@ pub(super) async fn publish(
         let hash = item::card_hash(&item);
         let marker = format!("bench:card:{}@{hash}", item.id);
         let text = item::render_card(&item, hhmm);
+        let place = super::plain::place(item.project.as_deref(), &item.area);
         let pings = item::card_pings(&item, &s.owner_pubkey, owner_set);
         let pinged: Vec<&str> = pings.iter().map(String::as_str).collect();
         let thread = item
@@ -809,6 +811,7 @@ pub(super) async fn publish(
                     created_at,
                     hash,
                     seeded: 0,
+                    place: Some(place),
                 });
                 i.routed_seen |= seen;
                 i.quiet_repost = false;
@@ -893,6 +896,7 @@ pub(super) async fn publish(
                     created_at: s.last_created_at,
                     hash,
                     seeded: 0,
+                    place: None,
                 });
                 s.board_dirty = false;
                 if let Some(old) = old {

@@ -133,6 +133,68 @@ async fn answered_then_replaced() -> (Bench, Posted, nostr::Event) {
     (b, old, answer)
 }
 
+/// The registry beside the root, renaming the seeded card's project.
+fn rename(b: &Bench, label: &str) {
+    let registry = json!({"projects": [{"slug": "dreamforge", "label": label}]});
+    let file = b.root.parent().unwrap().join("projects.json");
+    std::fs::write(file, registry.to_string()).unwrap();
+}
+
+/// A rename never reaches a posted card. The kit rebuilds a tap's card from its
+/// record (bench-card.mjs), and its edits (Recorded, old post, receipt) and its
+/// recovery from the relay all show the header it was posted with.
+#[tokio::test]
+async fn a_cards_header_stays_as_posted_through_a_rename() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let first = b.card(ITEM);
+    let head = "🔴 · Dreamforge · orchestrator\n";
+    assert_eq!(first.place.as_deref(), Some("Dreamforge"));
+    rename(&b, "Forge");
+
+    let answer = tap(&b.ctx.owner, &first.event_id, OPTION_EMOJI[1], b.now);
+    reply(&b, &[&answer]);
+    b.tick().await.unwrap();
+    let recorded = last_edit(&b, &first.event_id);
+    assert!(content(&recorded).starts_with(head), "{recorded}");
+    assert!(
+        content(&recorded).contains("\nRecorded: 2. Move"),
+        "{recorded}"
+    );
+
+    // Asked again: the old post keeps its header, the new card has the new name.
+    redrop(&b, "Relay choice, reworded");
+    b.settle(3).await;
+    assert_eq!(b.s.replaced[0].card.place, first.place);
+    let old = last_edit(&b, &first.event_id);
+    let replaced = format!("{REPLACED}\n{head}");
+    assert!(content(&old).starts_with(&replaced), "{old}");
+    let second = b.card(ITEM);
+    assert_ne!(second.event_id, first.event_id);
+    assert_eq!(second.place.as_deref(), Some("Forge"));
+    // The name the kit reads in state.json.
+    assert_eq!(serde_json::to_value(&second).unwrap()["place"], "Forge");
+
+    // Lost from state and recovered: its post's header, not today's registry.
+    let post = posted(&b, &second.event_id);
+    let back = "Back to you\n🔴 · Forge · orchestrator\n";
+    assert!(post.content.starts_with(back), "{}", post.content);
+    rename(&b, "Forge Two");
+    *b.relay.query_reply.lock().unwrap() = vec![serde_json::to_value(&post).unwrap()];
+    b.s.items.get_mut(ITEM).unwrap().card = None;
+    b.s.needs_rebuild = true;
+    b.tick().await.unwrap();
+    assert_eq!(b.card(ITEM).event_id, second.event_id);
+    assert_eq!(b.card(ITEM).place, second.place);
+
+    // Closed out, the receipt (whose request has no card of its own) keeps it too.
+    close_out(&b, "Moved the relay");
+    b.tick().await.unwrap();
+    let receipt = last_edit(&b, &second.event_id);
+    let closed_head = "🔴 · Forge · orchestrator\n";
+    assert!(content(&receipt).starts_with(closed_head), "{receipt}");
+    assert!(content(&receipt).contains("Moved the relay"), "{receipt}");
+}
+
 #[tokio::test]
 async fn a_re_ask_edits_the_old_post_first_line_and_takes_its_seeds_off() {
     let mut b = seeded_bench(Gate::Open, &[]).await;

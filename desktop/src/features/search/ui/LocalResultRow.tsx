@@ -10,10 +10,10 @@ import {
 } from "@/features/bench/lib/benchCards";
 import { benchCardTier, benchNeedsYou } from "@/features/bench/lib/benchFind";
 import {
-  WORKBENCHES,
   cardWorkbench,
   workbenchColor,
   workbenchLabel,
+  workbenches,
 } from "@/features/bench/lib/workbenches";
 import type { InboxItemType } from "@/features/home/lib/inboxClass";
 import { INBOX_TYPE_META } from "@/features/home/ui/InboxItemPreview";
@@ -49,7 +49,7 @@ export function BenchResultRow({
   const severity = benchSeverityChip(card.severity);
   const state = card.kind === "status" ? benchStateLabel(card.state) : null;
   const where = cardWorkbench(card);
-  const workbench = WORKBENCHES.find((w) => w.id === where);
+  const workbench = workbenches().find((w) => w.id === where);
   const dot = workbench
     ? workbenchColor(workbench, projects, viewer, viewerAgents).dot
     : null;

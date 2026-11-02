@@ -24,6 +24,7 @@ mod item;
 mod outbox;
 mod pick;
 mod plain;
+mod projects;
 mod publish;
 mod replaced;
 mod roles;
@@ -103,12 +104,13 @@ pub(crate) fn is_bench_channel(owner_hex: &str, scope_value: &str) -> bool {
 pub(crate) struct Posted {
     pub event_id: String,
     pub created_at: u64,
-    /// A card: the `item::card_hash` its text shows (posted or last edited).
-    /// The board: `item::board_hash`.
+    /// A card: the `item::card_hash` its text shows. The board: `item::board_hash`.
     pub hash: String,
     /// Option seeds landed so far.
     #[serde(default)]
     pub seeded: usize,
+    /// A card: its header's place when posted. Edits keep it, the kit rebuilds from it.
+    pub place: Option<String>,
 }
 
 /// How the relay admitted the writer key: learned from its first request.
@@ -257,8 +259,7 @@ fn writer_keys() -> Result<nostr::Keys, String> {
     Ok(keys)
 }
 
-/// A fresh NIP-OA tag for one request: minted per use, never persisted,
-/// never inside an event.
+/// A fresh NIP-OA tag for one request: minted per use, never stored or in an event.
 fn owner_tag(
     owner: &nostr::Keys,
     writer_pk: &nostr::PublicKey,
@@ -305,8 +306,7 @@ fn newest(slot: Option<&mut Posted>, new: Posted, strays: &mut Vec<String>) -> O
 
 /// Recover cards and board from the writer's own kind-9 events by their
 /// `client` marker. Everything else the writer left in #bench is a stray:
-/// listed, never deleted. Recovered cards are assumed seeded (a repeated seed
-/// is a duplicate, which counts as success anyway).
+/// listed, never deleted. Recovered cards count as seeded (a repeat is a success).
 pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt {
     let mut r = Rebuilt {
         cards: BTreeMap::new(),
@@ -326,6 +326,7 @@ pub(crate) fn rebuild_map(events: &[nostr::Event], writer_hex: &str) -> Rebuilt 
             created_at: e.created_at.as_secs(),
             hash: hash.to_string(),
             seeded: usize::MAX,
+            place: plain::shown_place(&e.content),
         };
         match marker.and_then(|m| m.rsplit_once('@')) {
             Some(("board", hash)) => {

@@ -357,6 +357,8 @@ async fn bench_cards_snapshot() {
             "lastTick",
             "maxCards",
             "ownerPubkey",
+            "projects",
+            "projectsNotice",
             "writerPubkey"
         ]
     );

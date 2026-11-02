@@ -149,6 +149,18 @@ export type BenchSnapshot = {
   /** How many open cards the Bench keeps on the relay at once. */
   maxCards?: number;
   items: BenchCard[];
+  /** The project registry (bench/projects.rs); null: the built-in tabs. */
+  projects?: BenchProject[] | null;
+  /** Why the built-in tabs show: the registry is missing or invalid. */
+  projectsNotice?: string | null;
+};
+
+/** One registry entry, as the Bench validated it. */
+export type BenchProject = {
+  slug: string;
+  label: string;
+  parent: string | null;
+  aliases: string[];
 };
 
 export type BenchCards = { enabled: false } | BenchSnapshot;
