@@ -24,11 +24,13 @@ use crate::{
 const TALOS_PUBKEY: &str = "";
 const TALOS_URL: &str = "";
 
-/// Talos refuses a snapshot over 8 KB. The newest text is kept and the cut is
-/// marked, so Talos knows it has only the end.
+/// Talos refuses a snapshot over 8 KB, measured after NFKC, so the page normalizes
+/// before this cap sees it. The newest text is kept and the cut is marked, so Talos
+/// knows it has only the end.
 const SNAPSHOT_MAX_BYTES: usize = 8 * 1024;
 const SNAPSHOT_CUT_MARK: &str = "[earlier text cut at 8 KB]\n";
 const TALK_TIMEOUT: Duration = Duration::from_secs(15);
+const TRY_AGAIN: &str = "Try again in a minute. If it keeps failing, check that Talos is deployed.";
 
 /// What was on screen at the click. Talos treats `snapshot` as untrusted data.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -55,14 +57,21 @@ fn pinned(env_name: &str, built_in: &str) -> String {
         .unwrap_or_else(|| built_in.to_string())
 }
 
-#[tauri::command]
-pub fn get_talos_pubkey() -> Option<String> {
-    if pinned("BUZZ_TALOS_URL", TALOS_URL).is_empty() {
+/// Both values or neither: the button never shows with nowhere to send a click.
+fn parse_pin(url: &str, pubkey: &str) -> Option<String> {
+    if url.is_empty() {
         return None;
     }
-    let pin = pinned("BUZZ_TALOS_PUBKEY", TALOS_PUBKEY);
-    let key = nostr::PublicKey::from_hex(pin.trim()).ok()?;
+    let key = nostr::PublicKey::from_hex(pubkey.trim()).ok()?;
     Some(key.to_hex())
+}
+
+#[tauri::command]
+pub fn get_talos_pubkey() -> Option<String> {
+    parse_pin(
+        &pinned("BUZZ_TALOS_URL", TALOS_URL),
+        &pinned("BUZZ_TALOS_PUBKEY", TALOS_PUBKEY),
+    )
 }
 
 fn cap_snapshot(text: String) -> String {
@@ -82,9 +91,12 @@ fn refusal_sentence(status: StatusCode, body: &str) -> String {
     match serde_json::from_str::<Refusal>(body) {
         Ok(refusal) => refusal.message.chars().take(300).collect(),
         Err(_) if status == StatusCode::NOT_FOUND => {
-            "Talos can't take this yet: its /df/talk isn't live. Nothing was started.".to_string()
+            format!("Talos can't take this yet: its /df/talk isn't live. Nothing was started. {TRY_AGAIN}")
         }
-        Err(_) => format!("Talos answered with an error ({status}). Nothing was started."),
+        Err(_) => format!(
+            "Talos answered with an error ({}). Nothing was started. {TRY_AGAIN}",
+            status.as_u16()
+        ),
     }
 }
 
@@ -97,9 +109,7 @@ async fn post_talk(
     // header and the snapshot off the pinned host.
     let client = ADMIN_CLIENT.get().ok_or("The HTTP client isn't ready.")?;
     context.snapshot = context.snapshot.map(cap_snapshot);
-    let mut body = serde_json::to_value(&context).map_err(|error| error.to_string())?;
-    body["nonce"] = Uuid::new_v4().to_string().into();
-    let body = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+    let body = serde_json::to_vec(&context).map_err(|error| error.to_string())?;
 
     let url = format!("{base_url}/df/talk");
     let auth_header = build_nip98_auth_header(&Method::POST, &url, &body, state)?;
@@ -111,7 +121,7 @@ async fn post_talk(
         .body(body)
         .send()
         .await
-        .map_err(|_| "Talos didn't answer. Nothing was started.".to_string())?;
+        .map_err(|_| format!("Talos didn't answer. Nothing was started. {TRY_AGAIN}"))?;
     let status = response.status();
     if status.is_success() {
         return Ok(());
@@ -134,7 +144,10 @@ async fn add_to_huddle(pubkey: &str, state: &AppState) -> Result<(), String> {
     // the parent as a `bot`, permanently, and a `bot` member turns speech-to-text
     // on. The roster poll picks Talos up within 15 s.
     let add = events::build_add_member(channel, pubkey, Some("member"))?;
-    submit_event(add, state).await.map(|_| ())
+    submit_event(add, state)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Talos couldn't be added to this huddle: {error}"))
 }
 
 #[tauri::command]
@@ -237,7 +250,6 @@ mod tests {
         assert_eq!(json["route"], "channels");
         assert_eq!(json["card_id"], serde_json::Value::Null);
         assert_eq!(json["snapshot"], "the card");
-        assert!(json["nonce"].is_string());
     }
 
     #[tokio::test]
@@ -245,8 +257,9 @@ mod tests {
         let state = test_state();
         for (status, reply, expected) in [
             (404, "Not found", "isn't live"),
-            (500, "", "(500 Internal Server Error)"),
-            (307, "", "(307 Temporary Redirect)"),
+            (500, "", "(500)"),
+            (307, "", "(307)"),
+            (522, "", "(522)"),
             (
                 503,
                 r#"{"error":"off","message":"Switched off."}"#,
@@ -257,11 +270,24 @@ mod tests {
             let error = post_talk(&base, context(), &state).await.unwrap_err();
             assert!(error.contains(expected), "{status}: {error}");
             assert_eq!(seen.lock().unwrap().len(), 1, "{status}");
+            if !reply.contains("message") {
+                assert!(error.contains(TRY_AGAIN), "{status}: {error}");
+            }
         }
         let error = post_talk("http://127.0.0.1:9", context(), &state)
             .await
             .unwrap_err();
         assert!(error.contains("didn't answer"), "{error}");
+    }
+
+    #[test]
+    fn the_pin_needs_both_values_and_a_real_key() {
+        let key = Keys::generate().public_key().to_hex();
+        let url = "https://talos.test";
+        assert_eq!(parse_pin(url, &key).as_deref(), Some(key.as_str()));
+        assert_eq!(parse_pin("", &key), None);
+        assert_eq!(parse_pin(url, ""), None);
+        assert_eq!(parse_pin(url, "not-hex"), None);
     }
 
     #[test]
@@ -300,5 +326,17 @@ mod tests {
         assert_eq!(tag(&event, "h"), ephemeral.to_string());
         assert_eq!(tag(&event, "p"), talos);
         assert_eq!(tag(&event, "role"), "member");
+    }
+
+    #[tokio::test]
+    async fn a_failed_add_names_what_failed() {
+        let (base, _seen) = fake_server(500, "nope").await;
+        let state = test_state();
+        *state.relay_url_override.lock().unwrap() = Some(base.replacen("http", "ws", 1));
+        state.huddle().unwrap().ephemeral_channel_id = Some(Uuid::new_v4().to_string());
+        state.huddle().unwrap().phase = HuddlePhase::Active;
+
+        let error = add_to_huddle(&"ab".repeat(32), &state).await.unwrap_err();
+        assert!(error.starts_with("Talos couldn't be added"), "{error}");
     }
 }

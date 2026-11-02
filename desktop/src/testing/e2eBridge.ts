@@ -12423,7 +12423,10 @@ export function maybeInstallE2eTauriMocks() {
       case "add_talos_to_huddle": {
         const pubkey = activeConfig?.mock?.talosPubkey;
         if (!mockHuddle || !pubkey) throw new Error("No active huddle.");
-        mockHuddle.members.push({ pubkey, role: "member" });
+        // Idempotent, as the relay treats a same-role re-add.
+        if (!mockHuddle.members.some((member) => member.pubkey === pubkey)) {
+          mockHuddle.members.push({ pubkey, role: "member" });
+        }
         refreshMockHuddleMembership(activeConfig);
         persistMockHuddle();
         await emitMockHuddleState();

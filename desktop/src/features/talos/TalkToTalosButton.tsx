@@ -3,7 +3,7 @@ import { AudioLines, LoaderCircle } from "lucide-react";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
-import { useTalkToTalos } from "./useTalkToTalos";
+import { STILL_ASKING, useTalkToTalos } from "./useTalkToTalos";
 
 // The same fixed 28px row as TOP_CHROME_ICON_BUTTON_CLASS in AppTopChrome.
 const CHROME_CLASS =
@@ -27,14 +27,9 @@ export function TalkToTalosButton({
       aria-busy={pending}
       className={cn(!room && CHROME_CLASS, className)}
       data-testid={room ? "talos-quick-add" : "talk-to-talos"}
-      disabled={pending}
       onClick={talk}
       size="sm"
-      title={
-        pending
-          ? "Waiting for Talos. This stops by itself if Talos doesn't answer within 15 seconds."
-          : undefined
-      }
+      title={pending ? STILL_ASKING : undefined}
       variant={room ? "outline" : "ghost"}
     >
       {pending ? <LoaderCircle className="animate-spin" /> : <AudioLines />}

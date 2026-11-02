@@ -15,8 +15,13 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 const TALK_MUTATION_KEY = ["talkToTalos"] as const;
 
 const NOT_SET_UP = "Talk to Talos isn't set up yet:";
+const CLEARS = "It appears once the owner finishes setup.";
+export const STILL_ASKING =
+  "Still asking Talos and connecting. This clears when that's done; if a mic prompt is open, answer it first.";
+// Sonner's 4 s default is too short to read these sentences.
+const LONG_TOAST = { duration: 10_000 };
 
-/** Hidden until the pinned key is a community member (setup step S4). */
+/** Hidden until the pinned key is a community member. */
 function useTalosState() {
   const pin = useQuery({
     queryKey: ["talosPubkey"],
@@ -29,9 +34,9 @@ function useTalosState() {
     (member) => normalizePubkey(member.pubkey) === pubkey,
   );
   if (isMember) return { pubkey, why: "", recheck: () => {} };
-  let why = `${NOT_SET_UP} Talos's key isn't a member of this community (setup step S4).`;
+  let why = `${NOT_SET_UP} Talos isn't a member of this community. ${CLEARS}`;
   if (pin.isSuccess && !pubkey) {
-    why = `${NOT_SET_UP} this build has no Talos key (setup step S4).`;
+    why = `${NOT_SET_UP} this build has no Talos key. ${CLEARS}`;
   } else if (!members.data) {
     why =
       "Still checking whether Talos is in this community. Try again in a moment.";
@@ -75,7 +80,12 @@ function talkContext(pathname: string, search: Record<string, unknown>) {
     thread_root: shortId(search.threadRootId ?? search.thread),
     card_id: shortId(surface?.dataset.benchItem),
     project_id: view === "projects" ? shortId(id) : null,
-    snapshot: surface?.innerText.trim() || null,
+    // Talos measures its 8 KB after these two steps, so the cap must see this text.
+    snapshot:
+      surface?.innerText
+        .normalize("NFKC")
+        .replace(/\p{Cf}/gu, "")
+        .trim() || null,
   };
 }
 
@@ -88,10 +98,9 @@ export function useTalkToTalos() {
   const { mutate } = useMutation({
     mutationKey: TALK_MUTATION_KEY,
     mutationFn: async (pubkey: string) => {
-      const huddle = await invokeTauri<{
-        phase: string;
-        participants: string[];
-      } | null>("get_huddle_state");
+      const huddle = await invokeTauri<{ phase: string } | null>(
+        "get_huddle_state",
+      );
       const phase = huddle?.phase ?? "idle";
       const live = phase === "connected" || phase === "active";
       if (!live && phase !== "idle") {
@@ -99,32 +108,30 @@ export function useTalkToTalos() {
           "A huddle is starting or ending. Try again when it's done.",
         );
       }
-      if (
-        live &&
-        huddle?.participants.some((p) => normalizePubkey(p) === pubkey)
-      ) {
-        toast("Talos is already in this huddle.");
-        return;
-      }
-      await invokeTauri("talk_to_talos", {
-        context: talkContext(
-          location.pathname,
-          location.search as Record<string, unknown>,
-        ),
-      });
+      const context = talkContext(
+        location.pathname,
+        location.search as Record<string, unknown>,
+      );
+      await invokeTauri("talk_to_talos", { context });
       if (live) {
+        // A re-click is the way to retry: a same-role add is idempotent on the
+        // relay, and the huddle's member list says nothing about who joined.
         await invokeTauri("add_talos_to_huddle");
       } else {
         // In the Talos DM, never the channel on screen: nobody else is rung.
         const dm = await openDm({ pubkeys: [pubkey] });
         await startHuddle(dm.id, []);
       }
+      const asked = context.snapshot
+        ? "Talos got the text on this screen and was asked to join."
+        : "Talos was asked to join.";
       toast(
-        "Talos was asked to join. It should be here in a few seconds. If it isn't, it may be offline; your huddle stays open.",
+        `${asked} It should be here in a few seconds. If it isn't, it may be offline; your huddle stays open.`,
+        LONG_TOAST,
       );
     },
     onError: (error) => {
-      toast.error(formatHuddleActionError(error, "start"));
+      toast.error(formatHuddleActionError(error, "start"), LONG_TOAST);
     },
   });
 
@@ -132,7 +139,9 @@ export function useTalkToTalos() {
     if (!talos.pubkey) {
       toast(talos.why);
       talos.recheck();
-    } else if (!pending) {
+    } else if (pending) {
+      toast(STILL_ASKING, { id: "talk-to-talos-pending" });
+    } else {
       mutate(talos.pubkey);
     }
   };
@@ -146,6 +155,10 @@ export function TalkToTalosTriggers() {
     function handleKeyDown(event: KeyboardEvent) {
       if (!hasPrimaryShortcutModifier(event) || !event.shiftKey) return;
       if (event.altKey || event.repeat || event.code !== "KeyT") return;
+      // In the terminal this chord is the shell's ^T.
+      if (document.activeElement?.closest('[data-terminal-owner="terminal"]')) {
+        return;
+      }
       event.preventDefault();
       talk();
     }

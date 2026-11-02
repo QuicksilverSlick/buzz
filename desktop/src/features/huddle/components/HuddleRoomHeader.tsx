@@ -114,7 +114,7 @@ export function HuddleRoomHeader() {
   if (!state || !isVisible(state)) return null;
 
   return (
-    <header className="relative flex min-h-24 shrink-0 items-center justify-center border-b border-border/60 bg-background/85 px-6 py-3 backdrop-blur-sm">
+    <header className="flex min-h-24 shrink-0 items-center justify-center border-b border-border/60 bg-background/85 px-6 py-3 backdrop-blur-sm">
       <HuddleParticipantsControl
         activeSpeakers={activeSpeakers}
         speakerLevels={participantSpeakerLevels}
@@ -139,7 +139,7 @@ export function HuddleRoomHeader() {
         }}
       />
       <TalkToTalosButton
-        className="absolute right-6 top-1/2 -translate-y-1/2"
+        className="ml-3 shrink-0"
         participants={lifecycleParticipants}
       />
     </header>
