@@ -28,6 +28,7 @@ use tauri::{
 const TRAY_ID: &str = "buzz-tray";
 const OPEN_BUZZ_ID: &str = "tray-open-buzz";
 const NEW_CHANNEL_ID: &str = "tray-new-channel";
+const TALK_TO_TALOS_ID: &str = "tray-talk-to-talos";
 const QUIT_ID: &str = "tray-quit";
 const OPEN_CHANNEL_PREFIX: &str = "tray-open-channel:";
 const OPEN_CHANNEL_ACTIVITY_SEPARATOR: char = '|';
@@ -212,6 +213,7 @@ struct TrayMenuState<R: Runtime> {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum TrayAction {
     NewChannel,
+    TalkToTalos,
     OpenChannel {
         #[serde(rename = "channelId")]
         channel_id: String,
@@ -332,6 +334,17 @@ fn build_menu<R: Runtime>(
         true,
         None::<&str>,
     )?)?;
+    // Absent until a key is pinned. Once pinned, a click before the key is admitted
+    // opens the app, which says why it can't work yet.
+    if crate::talos::get_talos_pubkey().is_some() {
+        menu.append(&MenuItem::with_id(
+            app,
+            TALK_TO_TALOS_ID,
+            "Talk to Talos",
+            true,
+            None::<&str>,
+        )?)?;
+    }
     append_separator(app, &menu)?;
     menu.append(&MenuItem::with_id(
         app,
@@ -451,6 +464,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             show_main_window(app);
             queue_tray_action(app, TrayAction::NewChannel);
         }
+        TALK_TO_TALOS_ID => {
+            show_main_window(app);
+            queue_tray_action(app, TrayAction::TalkToTalos);
+        }
         QUIT_ID => app.exit(0),
         _ => {
             let Some(channel_id) = id.strip_prefix(OPEN_CHANNEL_PREFIX) else {
@@ -512,7 +529,7 @@ pub fn take_tray_actions<R: Runtime>(app: AppHandle<R>) -> Result<Vec<TrayAction
 
 fn requeue_actions(queue: &mut TrayActionQueue, mut actions: Vec<TrayAction>) {
     actions.retain(|action| match action {
-        TrayAction::NewChannel => true,
+        TrayAction::NewChannel | TrayAction::TalkToTalos => true,
         TrayAction::OpenChannel {
             community_generation,
             ..
@@ -615,6 +632,12 @@ pub fn update_tray_agent_activity<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{requeue_actions, TrayAction, TrayActionQueue};
+
+    #[test]
+    fn talk_to_talos_action_serializes_with_the_frontend_kind() {
+        let value = serde_json::to_value(TrayAction::TalkToTalos).expect("serializes");
+        assert_eq!(value, serde_json::json!({ "kind": "talkToTalos" }));
+    }
 
     #[test]
     fn open_channel_action_serializes_with_frontend_field_names() {
