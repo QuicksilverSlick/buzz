@@ -20,9 +20,9 @@ const SILENT: &str = "silent";
 /// A `refuse` for the fake relay that means it takes the socket and never answers.
 const HANG: &str = "hang";
 /// For the tests of the owner's grace; the rest get 30 s, so a slow join can't end them.
-const GRACE: Duration = Duration::from_secs(2);
+pub(crate) const GRACE: Duration = Duration::from_secs(2);
 
-fn say(frame: Value) -> Message {
+pub(crate) fn say(frame: Value) -> Message {
     Message::Text(frame.to_string().into())
 }
 
@@ -50,8 +50,8 @@ impl Logs {
 
 /// What the fakes hold and saw. `log` keeps each thing the sockets did, the first time, in order.
 #[derive(Clone, Default)]
-struct Seen {
-    log: Arc<Mutex<Vec<String>>>,
+pub(crate) struct Seen {
+    pub(crate) log: Arc<Mutex<Vec<String>>>,
     talos_auth: Arc<Mutex<String>>,
     open: Arc<Mutex<Value>>,
     audio_auth: Arc<Mutex<Value>>,
@@ -68,7 +68,7 @@ impl Seen {
         }
     }
 
-    fn saw(&self, what: &str) -> bool {
+    pub(crate) fn saw(&self, what: &str) -> bool {
         self.log.lock().unwrap().iter().any(|seen| seen == what)
     }
 
@@ -77,7 +77,7 @@ impl Seen {
     }
 }
 
-async fn listen() -> (TcpListener, String) {
+pub(crate) async fn listen() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     (listener, address)
@@ -99,7 +99,7 @@ async fn fake_rest(seen: Seen) -> String {
 /// Challenge, the agent's auth, `joined` with the owner in the room or the `refuse` error, then
 /// what the voice plays, and the frames tests queue in `room`, where `"drop"` ends it. One socket
 /// only: any rejoin fails.
-async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> String {
+pub(crate) async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> String {
     let (listener, address) = listen().await;
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -139,6 +139,9 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
                         if frame == "drop" {
                             return;
                         }
+                        if frame == "stall" {
+                            std::future::pending::<()>().await;
+                        }
                         ws.send(say(frame)).await.unwrap();
                     }
                 }
@@ -151,7 +154,7 @@ async fn fake_audio(seen: Seen, owner: String, refuse: Option<&'static str>) -> 
 /// Answers `open` with `refusal`, or `opened`. Once a roster shows audio is joined it sends the
 /// floor, a burst of voice, a bad frame, a ping, a tool and a reseed; after the answers it sends
 /// `end`, drops the socket if that's `"drop"`, or sends a frame over the cap if it's `"huge"`.
-async fn fake_talos(
+pub(crate) async fn fake_talos(
     seen: Seen,
     agent: String,
     refusal: Option<&'static str>,
@@ -305,7 +308,7 @@ impl Run {
     }
 }
 
-async fn until(what: &str, done: impl Fn() -> bool) {
+pub(crate) async fn until(what: &str, done: impl Fn() -> bool) {
     let wait = async {
         while !done() {
             sleep(Duration::from_millis(5)).await;
@@ -400,6 +403,28 @@ async fn a_run_ending_before_opened_still_closes_the_socket() {
     assert!(matches!(left(run).await, Left::NoLease(_)));
     until("Talos's Close", || r.seen.saw("talos:close")).await;
     assert!(!r.seen.saw("audio:join"));
+}
+
+/// Talos's Close ends the bill, so a relay that has stopped reading can't hold it up.
+#[tokio::test]
+async fn a_relay_slow_to_close_doesnt_hold_up_talos_close() {
+    let r = Run::new(None, None, Value::Null).await;
+    let (stop, run) = r.start();
+    until("joined", || r.seen.saw("talos:roster")).await;
+    r.seen.room_sends(json!("stall"));
+    sleep(Duration::from_millis(50)).await;
+    let at = Instant::now();
+    stop.send(()).unwrap();
+    until("Talos's Close", || r.seen.saw("talos:close")).await;
+    assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
+    assert_eq!(left(run).await, Left::Done("stopped".into()));
+}
+
+#[tokio::test]
+async fn a_bridge_that_panicked_is_a_lost_run_not_a_clean_end() {
+    let panicked: Result<End, JoinError> = tokio::spawn(async { panic!("in the bridge") }).await;
+    let room_ended = Left::Done("the audio room ended".into());
+    assert_eq!(how_it_ended(Some(panicked), room_ended), Left::Lost);
 }
 
 #[tokio::test]

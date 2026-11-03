@@ -1,9 +1,9 @@
-//! One huddle voice's run in the room (design 2026-10-29 §3.3-§3.5; slice 8a, part 1 of 2):
-//! `open` on `/df/voice` with NIP-98, audio joined through the bridge only after `opened`, the
-//! frame client between the two, and a clean Close on the way out.
+//! One huddle voice's run in the room (design 2026-10-29 §3.3-§3.5; slice 8a): `open` on
+//! `/df/voice` with NIP-98, audio joined through the bridge only after `opened`, the frame client
+//! between the two, and a clean Close on the way out.
 //!
-//! Part 2 decides when to run one: the 44100 actor gate, the owner-present rule, the decline line
-//! and kind 9, behind slice 9's switch. Nothing calls this until then.
+//! The `voice` module decides when to run one: the 44100 actor gate, the owner-present rule, the
+//! decline line and kind 9, behind slice 9's switch. `session` does no check on `added`.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -22,6 +22,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use tokio::time::{sleep_until, timeout, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -72,14 +73,14 @@ pub(crate) enum Left {
     /// `stop` fired, Talos closed the voice (its reason), the huddle ended, or the bridge couldn't
     /// take a command.
     Done(String),
-    /// The Talos socket dropped, or sent a frame over `frames::MAX_FRAME`. 8e resumes within the
-    /// lease's 20 s.
+    /// The Talos socket dropped or sent a frame over `frames::MAX_FRAME`, which 8e resumes within
+    /// the lease's 20 s, or the bridge panicked.
     Lost,
     /// The relay refused the audio join for good, in its words.
     Refused(String),
 }
 
-fn text(error: impl std::fmt::Display) -> String {
+pub(crate) fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
@@ -187,11 +188,24 @@ pub(crate) async fn session(
     let left = pump(me, huddle, &mut talos, &cmd, &mut from_room, &mut stop).await;
     // A full queue must not hold up the Close.
     drop(from_room);
-    let _ = cmd.send(Cmd::Leave).await;
-    let end = timeout(LEAVE_WAIT, bridge).await;
-    let _ = timeout(LEAVE_WAIT, talos.close(None)).await;
-    match end {
-        Ok(Ok(End::Refused(why))) if !why.contains("huddle has ended") => Left::Refused(why),
+    let leave = async {
+        let _ = cmd.send(Cmd::Leave).await;
+        bridge.await
+    };
+    // Both at once: a relay slow to close must not keep Talos billing the lease.
+    let (end, _) = tokio::join!(
+        timeout(LEAVE_WAIT, leave),
+        timeout(LEAVE_WAIT, talos.close(None))
+    );
+    how_it_ended(end.ok(), left)
+}
+
+/// How a run ended, now the bridge has had its say.
+fn how_it_ended(bridge: Option<Result<End, JoinError>>, left: Left) -> Left {
+    match bridge {
+        Some(Ok(End::Refused(why))) if !why.contains("huddle has ended") => Left::Refused(why),
+        // It panicked: the room is gone, but the pump's "room ended" would read as a clean end.
+        Some(Err(_)) => Left::Lost,
         _ => left,
     }
 }
@@ -304,7 +318,7 @@ fn on_frame(frame: ToPc, me: &Voicing, cmd: &mpsc::Sender<Cmd>) -> Result<Option
     })
 }
 
-/// The bridge for one run; it rejoins on its own. Until part 2's peer policy, only the owner is
+/// The bridge for one run; it rejoins on its own. Until the peer policy lands, only the owner is
 /// heard: every other peer is outside `admitted`.
 async fn room(
     me: Arc<Voicing>,
@@ -344,4 +358,4 @@ async fn room(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
