@@ -386,6 +386,8 @@ type E2eConfig = {
     /** Reject successive mock `join_channel` calls, then resume. */
     joinChannelErrors?: string[];
     channelsReadDelayMs?: number;
+    /** Hold the boot `get_channels` read until the E2E release seam is invoked. */
+    deferFirstChannelsRead?: boolean;
     /** Return not-modified for this many reads before resuming full payloads. */
     channelsNotModifiedResponses?: number;
     /** When true, a matching knownHash returns a not-modified channel payload. */
@@ -11911,7 +11913,9 @@ export function maybeInstallE2eTauriMocks() {
     for (const release of held) release();
     return held.length;
   };
-  deferNextChannelsRead = false;
+  // Armed from config because the boot read fires before a spec can call the
+  // defer seam below.
+  deferNextChannelsRead = config.mock?.deferFirstChannelsRead ?? false;
   deferredChannelsReadResolve = null;
   window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
   window.__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__ = () => {
