@@ -5,6 +5,7 @@ import * as React from "react";
 import { useProfileQuery, useSelfProfileCache } from "@/features/profile/hooks";
 import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { TalkToTalosButton } from "@/features/talos/TalkToTalosButton";
 import { useHuddle, useHuddleLevels } from "../HuddleContext";
 import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
@@ -136,6 +137,10 @@ export function HuddleRoomHeader() {
             null,
           pubkey: currentPubkey,
         }}
+      />
+      <TalkToTalosButton
+        className="ml-3 shrink-0"
+        participants={lifecycleParticipants}
       />
     </header>
   );

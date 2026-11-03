@@ -8,6 +8,7 @@ import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
 import { cn } from "@/shared/lib/cn";
 import { topChromeBackdrop } from "@/shared/layout/chromeLayout";
 import { useOptionalSidebar } from "@/shared/ui/sidebar";
+import { TalkToTalosButton } from "@/features/talos/TalkToTalosButton";
 
 type AppTopChromeProps = {
   canGoBack: boolean;
@@ -160,6 +161,7 @@ export function AppTopChrome({
         data-tauri-drag-region
         id="app-top-chrome-content"
       />
+      <TalkToTalosButton className={cn("ml-2", navRowAlignmentClass)} />
     </div>
   );
 }
