@@ -414,7 +414,7 @@ impl RestClient {
     }
 
     /// Build the full `Authorization` header value: `Nostr <base64>`.
-    fn nip98_header(
+    pub(crate) fn nip98_header(
         &self,
         method: &str,
         url: &str,

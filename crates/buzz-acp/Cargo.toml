@@ -20,6 +20,9 @@ path = "src/main.rs"
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
+# Huddle voice bridge. A path dependency makes it a workspace member without a root
+# manifest edit. It builds Opus, so building this crate needs cmake.
+buzz-huddle-bridge = { path = "../buzz-huddle-bridge" }
 
 # Git multicall helpers and ephemeral key ownership
 git-credential-nostr = { path = "../git-credential-nostr" }
@@ -86,9 +89,6 @@ evalexpr = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
 
 [dev-dependencies]
-# Huddle voice bridge. A path dependency makes it a workspace member without a root
-# manifest edit; slice 8a moves it to [dependencies] when the voice module uses it.
-buzz-huddle-bridge = { path = "../buzz-huddle-bridge" }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
