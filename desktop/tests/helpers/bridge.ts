@@ -288,6 +288,8 @@ type MockBridgeOptions = {
   /** Reject successive mock `join_channel` calls, then resume. */
   joinChannelErrors?: string[];
   channelsReadDelayMs?: number;
+  /** Hold the boot `get_channels` read until `releaseChannelsRead` runs. */
+  deferFirstChannelsRead?: boolean;
   /** Return not-modified for this many reads before resuming full payloads. */
   channelsNotModifiedResponses?: number;
   /** When true, a matching knownHash returns a not-modified channel payload. */
@@ -1062,6 +1064,18 @@ export async function installRelayBridge(
     relayWsUrl: DEFAULT_RELAY_WS_URL,
     seedPreviewFeatures: options?.seedPreviewFeatures,
   });
+}
+
+/** Number of `get_channels` reads currently held. */
+export async function pendingChannelsRead(page: Page): Promise<number> {
+  return page.evaluate(() => window.__BUZZ_E2E_CHANNELS_READ_PENDING__ ?? 0);
+}
+
+/** Release the `get_channels` read held by the mock bridge, if any. */
+export async function releaseChannelsRead(page: Page): Promise<number> {
+  return page.evaluate(
+    () => window.__BUZZ_E2E_RELEASE_CHANNELS_READ__?.() ?? 0,
+  );
 }
 
 /** Release every `get_channel_members` read held by `deferChannelMembersReads`. */
