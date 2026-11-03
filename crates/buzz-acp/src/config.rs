@@ -629,6 +629,16 @@ pub struct CliArgs {
     /// output route. Set alongside `--voice-profile`.
     #[arg(long, env = "BUZZ_ACP_AUDIO_ROUTE_FILE")]
     pub audio_route_file: Option<PathBuf>,
+
+    /// Talos for huddle voices, pinned here: the host never comes from a frame.
+    /// Only read while the voice switch is on. Any host but the harness's pinned
+    /// one keeps voice off, with an error in the log.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_VOICE_TALOS_URL",
+        default_value = crate::voice::TALOS_URL
+    )]
+    pub voice_talos_url: String,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -727,11 +737,12 @@ pub struct Config {
     /// triggering message. Clamped where consumed — see
     /// `startup_watermark_with_floor`.
     pub replay_floor_unix: Option<u64>,
-    /// Huddle voice profile, present only while switched on. Read-only until
-    /// the voice module (slice 8a).
+    /// Huddle voice profile, present only while switched on.
     pub voice_profile: Option<crate::voice_profile::VoiceProfile>,
     /// The desktop's huddle output route file (see `--audio-route-file`).
     pub audio_route_file: Option<PathBuf>,
+    /// Talos for huddle voices (see `--voice-talos-url`).
+    pub voice_talos_url: String,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1465,6 +1476,7 @@ impl Config {
             replay_floor_unix: args.replay_floor,
             voice_profile: args.voice_profile.filter(|profile| profile.enabled),
             audio_route_file: args.audio_route_file,
+            voice_talos_url: args.voice_talos_url,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1876,6 +1888,7 @@ mod tests {
             replay_floor_unix: None,
             voice_profile: None,
             audio_route_file: None,
+            voice_talos_url: String::new(),
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

@@ -29,9 +29,8 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod usage;
+mod voice;
 mod voice_profile;
-// One voice's run in the room; slice 8a part 2 is its first caller.
-#[cfg_attr(not(test), allow(dead_code))]
 mod voice_session;
 // Huddle voices' typed tools; slice 8c connects them to the voice module.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -626,6 +625,18 @@ mod inbound_author_gate {
             RespondTo::Allowlist if allowlist.contains(author) => Some(true),
             RespondTo::Allowlist => owner_or_sibling(author, owner_cache, rest_client).await,
         }
+    }
+
+    /// The policy for a key the relay vouches for, not an event's signer: the
+    /// actor in a relay-signed 44100, for the huddle voice module. No listener
+    /// may call this: it skips workflow attribution, as `author_allowed` says.
+    pub(crate) async fn voice_admits(
+        policy: (&RespondTo, &HashSet<String>),
+        pubkey: &str,
+        owners: &OwnerCache,
+        rest: &relay::RestClient,
+    ) -> Option<bool> {
+        author_allowed(policy.0, policy.1, pubkey, false, owners, rest).await
     }
 
     #[cfg(test)]
@@ -3160,6 +3171,7 @@ async fn run_harness(
         .filter(|s| !s.is_empty())
         .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
+    let voice_auth_tag = relay_auth_tag.clone();
     let mut relay =
         HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
             .await
@@ -3215,6 +3227,15 @@ async fn run_harness(
         }
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
+    // `None` unless the definition's voice switch is on; then nothing changes.
+    let mut voice = voice::Voice::start(
+        config,
+        startup_owner.as_deref(),
+        voice_auth_tag,
+        relay.rest_client(),
+        shutdown_rx.clone(),
+    )
+    .await;
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -3882,6 +3903,9 @@ async fn run_harness(
                                     }
                                 }
                                 membership_newest_ts.insert(ch, ts);
+                                if let Some(voice) = voice.as_mut() {
+                                    voice.on_membership(&buzz_event.event);
+                                }
 
                                 if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
                                     // Clear removal tracking so sessions are not
@@ -4172,6 +4196,15 @@ async fn run_harness(
                                     continue; // consume event — do NOT push to queue
                                 }
                                 // Not from owner — fall through to normal prompt handling.
+                            }
+
+                            // A voiced huddle takes nothing, typed or spoken, after the owner's
+                            // control commands above.
+                            if voice.as_ref().is_some_and(|voice| {
+                                voice.ignores(&buzz_event.event, ch, &config.catch_up)
+                            }) {
+                                tracing::debug!(channel_id = %ch, kind = kind_u32, "voiced huddle: ignoring");
+                                continue;
                             }
 
                             // Coarse security policy: drop events from disallowed
@@ -5012,6 +5045,10 @@ async fn run_harness(
 
     if let Some(handle) = relay_observer_publisher_task.take() {
         handle.abort();
+    }
+
+    if let Some(voice) = voice.as_mut() {
+        voice.drain().await;
     }
 
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
@@ -11965,6 +12002,7 @@ mod build_mcp_servers_tests {
             replay_floor_unix: None,
             voice_profile: None,
             audio_route_file: None,
+            voice_talos_url: String::new(),
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -13199,6 +13237,7 @@ mod error_outcome_emission_tests {
             replay_floor_unix: None,
             voice_profile: None,
             audio_route_file: None,
+            voice_talos_url: String::new(),
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
