@@ -223,32 +223,47 @@ pub(crate) fn body(summary: &str) -> String {
     out
 }
 
-/// The workbenches the desktop's Bench tabs name (WORKBENCHES in
-/// desktop/src/features/bench/lib/workbenches.ts; keep the two in step).
-const WORKBENCHES: [(&str, &[&str]); 2] = [
-    ("28 Day Reset", &["28-day-reset", "reset"]),
-    ("Dreamforge", &["dreamforge", "buzz"]),
-];
-
-/// Where a card's header says it is: its project (else area) by name when
-/// the slug is a workbench's or starts with one and a "-", else as it is;
-/// then the area when it says more: "28 Day Reset · reset-billing", never
-/// "28 Day Reset · 28-day-reset" (benchCardPlace on the desktop).
+/// Where a card's header says it is, by the registry the service read this
+/// tick (`projects::with_current`).
 pub(crate) fn place(project: Option<&str>, area: &str) -> String {
+    super::projects::with_current(|projects| place_in(projects, project, area))
+}
+
+/// Its project (else area) by name when the slug is a project's slug or
+/// alias, or starts with one and a "-" (the longest wins, so
+/// "dreamforge-talos" is Talos), else as it is; then the area when it says
+/// more: "28 Day Reset · reset-billing", never "28 Day Reset · 28-day-reset"
+/// (benchCardPlace on the desktop; projects_vectors.json pins both).
+pub(crate) fn place_in(
+    projects: &[super::projects::Project],
+    project: Option<&str>,
+    area: &str,
+) -> String {
     let slug = project.unwrap_or(area);
-    let claims = |known: &&str| {
-        slug.strip_prefix(*known)
+    let claims = |known: &str| {
+        slug.strip_prefix(known)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
     };
-    let workbench = WORKBENCHES
+    let owner = projects
         .iter()
-        .find(|(_, slugs)| slugs.iter().any(claims));
-    let name = workbench.map_or(slug, |(name, _)| name);
-    if area == name || workbench.is_some_and(|(_, slugs)| slugs.contains(&area)) {
+        .filter_map(|p| Some((p.keys().filter(|k| claims(k)).map(str::len).max()?, p)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, p)| p);
+    let name = owner.map_or(slug, |p| p.label.as_str());
+    if area == name || owner.is_some_and(|p| p.keys().any(|k| k == area)) {
         name.to_string()
     } else {
         format!("{name}{RISK_JOIN}{area}")
     }
+}
+
+/// The place a posted card's header shows ("<marker> · <place> · <writer>",
+/// after any "Back to you" line), for a card recovered from the relay.
+pub(crate) fn shown_place(content: &str) -> Option<String> {
+    content.lines().take(2).find_map(|line| {
+        let (_, rest) = line.split_once(RISK_JOIN)?;
+        Some(rest.rsplit_once(RISK_JOIN)?.0.to_string())
+    })
 }
 
 /// The plain details, after the recommendation as the desktop shows them,

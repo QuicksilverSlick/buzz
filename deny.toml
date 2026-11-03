@@ -39,6 +39,12 @@ ignore = [
     # Keep the exact NetEQ pin and the wrapper ban below together. Re-audit or
     # remove this exception when NetEQ removes/updates the unused dependency.
     { id = "RUSTSEC-2026-0293", reason = "unused dependency of audited, exactly pinned neteq 0.8.3; no Rust references to ringbuf; other consumers forbidden by bans.deny" },
+    # zip < 9: ZipArchive::extract aborts the process on a symlink entry with a large declared size. Fixed only in 9.0.0.
+    # Same copies and reasoning as 0367-0369 below. 8.6.0 via mesh-llm v0.76.2 (root via buzz-mesh-smoke; desktop via the
+    # mesh-llm feature, off in Dreamforge releases): its readers never call extract(). 4.6.1 via tauri-plugin-updater (Windows):
+    # extract() only sees bytes that passed the signature check in download(), and we ship .exe updates, not zips.
+    # Our own use is zip 9. Remove when a tagged mesh-llm is on zip 9 and the updater is >= 2.14.1.
+    { id = "RUSTSEC-2026-0429", reason = "zip 8.6.0 via mesh-llm v0.76.2 never calls extract(); zip 4.6.1 via tauri-plugin-updater extracts only signature-checked bytes, and we ship .exe updates" },
     # zip < 9 (0367 SUID bits kept, 0368 symlinks escaping the destination, 0369 permissions
     # applied through symlinks): all three are in ZipArchive::extract / ZipStreamReader::extract.
     # The desktop's own reader (managed_node.rs) is on zip 9 since upstream #8412. zip 8.6.0 stays

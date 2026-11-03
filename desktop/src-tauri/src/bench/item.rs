@@ -978,7 +978,7 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     } else {
         String::new()
     };
-    out.push_str(&card_head(item));
+    out.push_str(&card_head(item, item.card.as_ref()));
     let pending = item.kind == ItemKind::Pending;
     let scoped = pending && item.scoped();
     let tap = TAP;
@@ -1033,7 +1033,7 @@ pub(crate) fn render_closed(posted: &str) -> String {
 /// A closed card: the request as it was asked, what was answered, then the
 /// close-out drop as its Outcome, appended so the question is never lost.
 fn render_receipt(request: &Item, outcome: &Item, hhmm: &str) -> String {
-    let mut out = card_head(request);
+    let mut out = card_head(request, outcome.card.as_ref());
     // An answer recorded before step 1 has no time of its own.
     let by = |name: Option<&str>, at: &str| {
         let mut s = String::new();
@@ -1153,8 +1153,11 @@ pub(crate) fn answerer_text(
 /// the options as a numbered list, the validated deadline and links so the
 /// phone can open them.
 /// Everything but the summary and the url goes through plain_text.
-fn card_head(item: &Item) -> String {
-    let place = super::plain::place(item.project.as_deref(), &item.area);
+/// A posted card keeps the place it recorded, so no edit of it renames it.
+fn card_head(item: &Item, posted: Option<&super::Posted>) -> String {
+    let recorded = posted.and_then(|c| c.place.clone());
+    let place =
+        recorded.unwrap_or_else(|| super::plain::place(item.project.as_deref(), &item.area));
     let mut out = format!("{} \u{b7} {place} \u{b7} {}", marker(item), item.writer);
     let title = plain_text(&item.title, usize::MAX);
     // An empty one would print `****`, a rule on both apps.

@@ -13,6 +13,7 @@ import {
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { useNow } from "@/shared/lib/useNow";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
+import { TALK_TO_TALOS_EVENT } from "@/shared/lib/keyboard-shortcuts";
 import type { Channel } from "@/shared/api/types";
 
 type TrayAgentActivity = {
@@ -25,6 +26,7 @@ type TrayAgentActivity = {
 
 type TrayAction =
   | { kind: "newChannel" }
+  | { kind: "talkToTalos" }
   | { kind: "openChannel"; channelId: string };
 
 const MAX_RECENT_TRAY_ACTIVITIES = 5;
@@ -134,6 +136,8 @@ export function useTrayMenu({
       for (const action of actions) {
         if (action.kind === "newChannel") {
           openCreateChannel();
+        } else if (action.kind === "talkToTalos") {
+          window.dispatchEvent(new Event(TALK_TO_TALOS_EVENT));
         } else {
           void goChannel(action.channelId);
         }

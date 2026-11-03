@@ -35,6 +35,9 @@ struct Snapshot {
     /// `MAX_CARDS`: new cards post only while fewer slots are in use.
     max_cards: usize,
     items: Vec<Card>,
+    /// The project tabs, read beside the Bench root on every call.
+    #[serde(flatten)]
+    registry: super::projects::Registry,
 }
 
 #[derive(Serialize)]
@@ -242,6 +245,7 @@ pub(crate) fn cards(root: &Path) -> BenchCards {
             last_tick: s.last_tick,
             max_cards: super::MAX_CARDS,
             items,
+            registry: super::projects::load(root),
         }),
     }
 }

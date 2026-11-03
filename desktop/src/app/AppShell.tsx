@@ -99,6 +99,8 @@ import { useWebviewScrollBoundaryLock } from "@/shared/hooks/useWebviewScrollBou
 import { joinChannel } from "@/shared/api/tauri";
 import type { Channel, ChannelVisibility, SearchHit } from "@/shared/api/types";
 import { ChannelNavigationProvider } from "@/shared/context/ChannelNavigationContext";
+import { topChromeBackdrop } from "@/shared/layout/chromeLayout";
+import { cn } from "@/shared/lib/cn";
 import { useAppDeepLinks } from "@/shared/useAppDeepLinks";
 import { SidebarProvider } from "@/shared/ui/sidebar";
 import { RelayConnectionOverlay } from "@/app/RelayConnectionOverlay";
@@ -107,6 +109,8 @@ import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
 import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
 import { AppWorkflowEditorOverlayProvider } from "@/app/AppWorkflowEditorOverlayProvider";
 import { LazySettingsScreen } from "@/app/LazySettingsScreen";
+import { TalkToTalosButton } from "@/features/talos/TalkToTalosButton";
+import { TalkToTalosTriggers } from "@/features/talos/useTalkToTalos";
 const EMPTY_CHANNELS: Channel[] = [];
 export function AppShell() {
   useWebviewZoomShortcuts();
@@ -763,6 +767,7 @@ export function AppShell() {
             onViewHuddleChannel={viewHuddleChannel}
             onVisibilityChange={handleHuddleVisibilityChange}
           >
+            <TalkToTalosTriggers />
             {hasCommunityRail && !isHuddleRoom ? (
               <CommunityRail
                 activeCommunityId={communitiesHook.activeCommunity?.id ?? null}
@@ -789,7 +794,15 @@ export function AppShell() {
                     />
                   ) : null}
                   {settingsOpen ? (
-                    <div className="flex min-h-0 flex-1 overflow-hidden">
+                    <div className="relative flex min-h-0 flex-1 overflow-hidden">
+                      <div
+                        className={cn(
+                          "absolute right-3 top-0 z-20 flex items-center",
+                          topChromeBackdrop.height,
+                        )}
+                      >
+                        <TalkToTalosButton />
+                      </div>
                       <React.Suspense fallback={null}>
                         <LazySettingsScreen
                           currentPubkey={identityQuery.data?.pubkey}

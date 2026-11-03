@@ -1,7 +1,7 @@
 import type { Project } from "@/features/projects/projectModels";
 
 /**
- * The eight project colors. A project saves one as its `color` tag; one
+ * The ten project colors. A project saves one as its `color` tag; one
  * without a known id gets a fixed color from its d-tag. Text is the 800 in
  * light and the 300 in dark, 4.5:1 on the default themes (pinned by the
  * test); the stripe and the dot are the 600 in light and the 400 in dark.
@@ -21,7 +21,10 @@ export const PROJECT_COLOR_TAG = "color";
 /**
  * Palette order is the auto-pick order. None is an Inbox type's hue (amber,
  * violet, blue, emerald, fuchsia), and each stripe is at least 0.1 OKLab
- * from every type stripe on the default themes.
+ * from every type stripe on the default themes. Sized for 10 projects: past
+ * that, colors repeat (`nextProjectColor`). Tailwind has no more that read as
+ * another color: green and purple sit on a type's stripe, rose is 0.03 from
+ * red on the dark themes, and the other grays are about 0.01 from slate.
  */
 export const PROJECT_COLORS: readonly ProjectColor[] = [
   {
@@ -80,7 +83,27 @@ export const PROJECT_COLORS: readonly ProjectColor[] = [
     stripe: "border-l-yellow-600 dark:border-l-yellow-400",
     dot: "bg-yellow-600 dark:bg-yellow-400",
   },
+  {
+    id: "cyan",
+    label: "Cyan",
+    text: "text-cyan-800 dark:text-cyan-300",
+    stripe: "border-l-cyan-600 dark:border-l-cyan-400",
+    dot: "bg-cyan-600 dark:bg-cyan-400",
+  },
+  {
+    id: "slate",
+    label: "Slate",
+    text: "text-slate-800 dark:text-slate-300",
+    stripe: "border-l-slate-600 dark:border-l-slate-400",
+    dot: "bg-slate-600 dark:bg-slate-400",
+  },
 ];
+
+/**
+ * The first eight only: a larger palette must not recolor a project that has
+ * no saved color (and every older device hashes over these eight too).
+ */
+const FALLBACK_COLORS = PROJECT_COLORS.slice(0, 8);
 
 export function projectColorById(
   id: string | null | undefined,
@@ -94,7 +117,7 @@ export function fallbackProjectColor(dtag: string): ProjectColor {
   for (let index = 0; index < dtag.length; index += 1) {
     hash = Math.imul(hash ^ dtag.charCodeAt(index), 0x01000193);
   }
-  return PROJECT_COLORS[(hash >>> 0) % PROJECT_COLORS.length];
+  return FALLBACK_COLORS[(hash >>> 0) % FALLBACK_COLORS.length];
 }
 
 export function projectColorOf(

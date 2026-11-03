@@ -45,6 +45,7 @@ mod relay_admission;
 mod reset;
 mod secret_store;
 mod shutdown;
+mod talos;
 mod team_catalog;
 mod templates;
 mod terminal_runtime;
@@ -829,6 +830,9 @@ pub fn run() {
             speak_agent_message,
             interrupt_huddle_speech,
             add_agent_to_huddle,
+            talos::add_talos_to_huddle,
+            talos::get_talos_pubkey,
+            talos::talk_to_talos,
             remove_agent_from_huddle,
             huddle::agents::sync_agents_to_active_huddle,
             check_pipeline_hotstart,

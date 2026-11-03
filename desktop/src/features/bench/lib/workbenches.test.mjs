@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { readFileSync } from "node:fs";
+
 import { fallbackProjectColor } from "@/features/projects/lib/projectColors.ts";
+import { benchCardPlace } from "./benchCardLayout.ts";
 import {
-  WORKBENCHES,
+  BUILT_IN_WORKBENCHES,
+  INLINE_PROJECT_TABS,
+  adoptBenchProjects,
+  benchTabs,
   cardWorkbench,
+  otherReason,
   slugWorkbench,
+  splitBenchTabs,
   workbenchColor,
   workbenchCounts,
   workbenchSnapshot,
+  workbenches,
 } from "./workbenches.ts";
 
 function card(id, overrides = {}) {
@@ -122,7 +131,7 @@ function project(dtag, name, color, overrides = {}) {
 }
 
 test("a workbench tab takes its project's color, announced projects first", () => {
-  const [reset, dreamforge] = WORKBENCHES;
+  const [reset, dreamforge] = BUILT_IN_WORKBENCHES;
   const projects = [
     project("reset-notes", "reset-notes", undefined, { legacy: true }),
     project("garden", "Garden", "sky"),
@@ -145,7 +154,7 @@ test("a workbench tab takes its project's color, announced projects first", () =
 });
 
 test("a newer or someone else's matching project never recolors a workbench", () => {
-  const [reset] = WORKBENCHES;
+  const [reset] = BUILT_IN_WORKBENCHES;
   const program = project("28-day-reset", "28 Day Reset", "lime");
   const cohort = project("reset-q4-cohort", "Reset Q4 cohort", "sky");
   const theirs = project("28-day-reset", "28 Day Reset", "red", {
@@ -170,7 +179,7 @@ test("a newer or someone else's matching project never recolors a workbench", ()
 });
 
 test("the viewer's agent's project colors a workbench the viewer has none for", () => {
-  const [reset] = WORKBENCHES;
+  const [reset] = BUILT_IN_WORKBENCHES;
   const AGENT = "c".repeat(64);
   const agents = new Set([AGENT]);
   const agentReset = project("28-day-reset", "28 Day Reset", "orange", {
@@ -198,4 +207,120 @@ test("the viewer's agent's project colors a workbench the viewer has none for", 
     workbenchColor(reset, [agentReset, own], VIEWER, agents).id,
     "lime",
   );
+});
+
+// The kit's seed and where its cards land (tests/projects.rs pins the
+// same cards' headers on the Bench).
+const VECTORS = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../src-tauri/src/bench/projects_vectors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
+const SEEDED = { enabled: true, projects: VECTORS.registry.projects };
+
+test("the kit's seed: Talos gets its own tab beside Dreamforge, old areas follow", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(
+    benchTabs().map((tab) => [tab.id, tab.label, tab.parent]),
+    [
+      ["all", "All", undefined],
+      ["dreamforge", "Dreamforge", undefined],
+      ["talos", "Talos", "dreamforge"],
+      ["reset", "28 Day Reset", undefined],
+      ["other", "Other", undefined],
+    ],
+  );
+  for (const [project, area, writer, tab, header] of VECTORS.cards) {
+    assert.equal(cardWorkbench({ project, area, writer }), tab, area);
+    assert.deepEqual(benchCardPlace({ project, area }), header, area);
+  }
+  // The built-in writers stay with their slug; a new project has none.
+  assert.deepEqual(workbenches()[0].writers, BUILT_IN_WORKBENCHES[1].writers);
+  assert.deepEqual(workbenches()[1].writers, []);
+  // Unchanged, the same tabs; none, the built-in ones.
+  const tabs = workbenches();
+  adoptBenchProjects({ ...SEEDED, items: [] });
+  assert.equal(workbenches(), tabs);
+  adoptBenchProjects({ ...SEEDED, projects: null });
+  assert.equal(workbenches(), BUILT_IN_WORKBENCHES);
+  assert.equal(
+    cardWorkbench({ project: null, area: "dreamforge-talos", writer: "x" }),
+    "dreamforge",
+  );
+});
+
+test("Other says why its cards are there, each name once, largest first", () => {
+  const other = (area, project = null, validity = "current") => ({
+    area,
+    project,
+    validity,
+  });
+  assert.equal(otherReason([other("gone", null, "stale")]), null);
+  assert.match(
+    otherReason([other("factory")]),
+    /^1 card names no project: factory \(1\)\. /,
+  );
+  assert.match(
+    otherReason([other("your-desktop"), other("fathom"), other("x", "fathom")]),
+    /^3 cards name no project: fathom \(2\), your-desktop \(1\)\. /,
+  );
+});
+
+test("past six project tabs the rest wait in More, those needing the owner first", () => {
+  const ids = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+  const tabs = [
+    { id: "all", label: "All" },
+    ...ids.map((id) => ({ id, label: id })),
+    { id: "other", label: "Other" },
+  ];
+  const counts = { g: { needsYou: 0 }, h: { needsYou: 0 }, i: { needsYou: 2 } };
+  const shown = (open) => {
+    const { inline, more } = splitBenchTabs(tabs, open, counts);
+    return [inline.map((t) => t.id).join(""), more.map((t) => t.id).join("")];
+  };
+  assert.equal(INLINE_PROJECT_TABS, 6);
+  assert.deepEqual(shown("all"), ["allabcdefother", "igh"]);
+  // The open tab shows beside the six; an open tab among them adds none.
+  assert.deepEqual(shown("h"), ["allabcdefhother", "ig"]);
+  assert.deepEqual(shown("a"), ["allabcdefother", "igh"]);
+  // Six or fewer: no More.
+  assert.equal(splitBenchTabs(tabs.slice(0, 7), "all", null).more.length, 0);
+});
+
+test("a tab with no project of its own never borrows another tab's color", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  adoptBenchProjects(SEEDED);
+  const [dreamforge, talos, reset] = workbenches();
+  // Talos's own slug color is lime, which Reset already shows.
+  assert.equal(fallbackProjectColor("talos").id, "lime");
+  const projects = [project("28-day-reset", "28 Day Reset", "lime")];
+  assert.equal(workbenchColor(reset, projects, VIEWER).id, "lime");
+  assert.equal(
+    workbenchColor(dreamforge, projects, VIEWER),
+    fallbackProjectColor("dreamforge"),
+  );
+  assert.equal(workbenchColor(talos, projects, VIEWER).id, "sky");
+  // Without the clash, its own slug's color.
+  assert.equal(workbenchColor(talos, [], VIEWER).id, "lime");
+});
+
+test("the registry recolors no built-in tab, and a dropped alias stays dropped", (t) => {
+  t.after(() => adoptBenchProjects(null));
+  const reset = () => workbenches().find((w) => w.id === "reset");
+  const before = workbenchColor(reset(), [], VIEWER).id;
+  adoptBenchProjects(SEEDED);
+  assert.deepEqual(reset().slugs, ["28-day-reset", "reset"]);
+  assert.equal(workbenchColor(reset(), [], VIEWER).id, before);
+  adoptBenchProjects({
+    ...SEEDED,
+    projects: SEEDED.projects.map((p) =>
+      p.slug === "reset" ? { ...p, aliases: [] } : p,
+    ),
+  });
+  assert.deepEqual(reset().slugs, ["reset"]);
 });
