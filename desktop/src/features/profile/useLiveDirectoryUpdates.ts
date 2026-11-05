@@ -8,6 +8,7 @@ import {
 import {
   myRelayMembershipLookupQueryKey,
   myRelayMembershipQueryKey,
+  relayMemberAddedDatesQueryKey,
   relayMembersQueryKey,
 } from "@/features/community-members/hooks";
 import { updateCachedChannelMemberDisplayNames } from "@/features/channels/channelMemberProfileCache";
@@ -85,6 +86,7 @@ export function startLiveDirectoryUpdates(
   let timer: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let viewerRoleChanged = false;
+  let rosterChanged = false;
   let newestMembershipAt = 0;
   // pubkey → the roster name its latest kind:0 carries.
   const changedProfiles = new Map<string, string | null>();
@@ -128,6 +130,14 @@ export function startLiveDirectoryUpdates(
         },
       );
     }
+    // A snapshot carries no Added dates. Refetched here, not per snapshot: at
+    // most one request per window, and only while the Members panel is open.
+    if (rosterChanged) {
+      rosterChanged = false;
+      void queryClient.invalidateQueries({
+        queryKey: relayMemberAddedDatesQueryKey,
+      });
+    }
     if (viewerRoleChanged) {
       viewerRoleChanged = false;
       void queryClient.invalidateQueries({
@@ -148,6 +158,7 @@ export function startLiveDirectoryUpdates(
       // Same parser `listRelayMembers` feeds the query with, so the roster is
       // written directly instead of costing a request per snapshot.
       queryClient.setQueryData<RelayMember[]>(relayMembersQueryKey, roster);
+      rosterChanged = true;
       // A join changes no one's directory entry (that waits for their kind:0),
       // so only a change to the viewer's own role is worth a refetch.
       const role = roster.find((m) => m.pubkey === viewer)?.role ?? null;
@@ -158,13 +169,12 @@ export function startLiveDirectoryUpdates(
         )?.membership,
       ];
       if (
-        !shown.some(
+        shown.some(
           (member) => member !== undefined && (member?.role ?? null) !== role,
         )
       ) {
-        return;
+        viewerRoleChanged = true;
       }
-      viewerRoleChanged = true;
     } else if (event.kind === KIND_PROFILE) {
       changedProfiles.set(
         normalizePubkey(event.pubkey),

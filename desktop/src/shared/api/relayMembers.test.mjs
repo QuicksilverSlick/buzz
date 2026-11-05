@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   canManageCommunityMembers,
+  listRelayMemberAddedDates,
   loadRelayMembershipLookup,
   relayMemberActions,
+  relayMembersFromEvent,
   shouldShowCommunityMembersSettings,
   shouldWarnMissingMembershipSnapshot,
 } from "./relayMembers.ts";
@@ -183,4 +185,58 @@ test("row actions need a known owner or admin viewer", () => {
   });
   assert.deepEqual(relayMemberActions("owner", "owner", true), none);
   assert.deepEqual(relayMemberActions("admin", "member", true), none);
+});
+
+test("added dates come from each member's newest announcement", async () => {
+  const alice = "a".repeat(64);
+  const bob = "b".repeat(64);
+  const filters = [];
+  const dates = await listRelayMemberAddedDates(async (filter) => {
+    filters.push(filter);
+    return [
+      // Removed and re-added: the later add is the current membership.
+      { created_at: 3_000, tags: [["p", alice]] },
+      { created_at: 1_000, tags: [["p", alice]] },
+      { created_at: 2_000, tags: [["-"], ["p", bob.toUpperCase()]] },
+      { created_at: 4_000, tags: [["-"]] },
+    ];
+  });
+
+  assert.deepEqual(filters, [{ kinds: [8000], limit: 1_000 }]);
+  assert.deepEqual(dates, {
+    [alice]: new Date(3_000_000).toISOString(),
+    [bob]: new Date(2_000_000).toISOString(),
+  });
+});
+
+test("a full page of announcements warns that older dates are missing", async () => {
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (message) => warnings.push(message);
+  try {
+    await listRelayMemberAddedDates(async () =>
+      Array.from({ length: 999 }, () => ({ created_at: 1, tags: [] })),
+    );
+    assert.equal(warnings.length, 0);
+
+    await listRelayMemberAddedDates(async () =>
+      Array.from({ length: 1_000 }, () => ({ created_at: 1, tags: [] })),
+    );
+    assert.match(warnings[0], /older members show no Added date/);
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("the roster carries no date, since the snapshot's time isn't anyone's", () => {
+  const [member] = relayMembersFromEvent({
+    created_at: 5_000,
+    tags: [["member", "a".repeat(64), "member"]],
+  });
+
+  assert.deepEqual(member, {
+    pubkey: "a".repeat(64),
+    role: "member",
+    addedBy: null,
+  });
 });

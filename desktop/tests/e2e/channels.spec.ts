@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { nip19 } from "nostr-tools";
 import { GENERAL_ALICE_EVENT_ID } from "@/testing/e2eSeedIds";
 
 import {
@@ -26,6 +27,10 @@ const CACHED_PROFILE_LABELS_TAG = "@cached-profile-labels";
 // view-activity gate (memberIsBot && viewerIsOwner) opens for it.
 const OWNED_RELAY_AGENT_PUBKEY =
   "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+const PASTED_HEX =
+  "ea9b4d7a7a78a3e3729e5568b14d764d4962be0e1f20f749bcf8d9dbbf9a9328";
+const PASTED_NPUB =
+  "npub1a2d567n60z37xu57245tzntkf4yk90swrus0wjdulrvah0u6jv5qusyp60";
 const DM_RELAY_AGENT_PUBKEY =
   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 // Unnamed roster fixtures whose two plausible orders disagree (the e2e twin
@@ -4644,6 +4649,144 @@ test("members sidebar can invite and remove managed agents", async ({
   await expectMembersTriggerCount(page, initialMemberCount);
 });
 
+test("members sidebar adds someone with no profile from a pasted npub", async ({
+  page,
+}) => {
+  await installMockBridge(page, { extraRelayMemberPubkeys: [PASTED_HEX] });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+  const initialMemberCount = await readMembersTriggerCount(page);
+
+  await page.getByTestId("channel-management-search-users").fill(PASTED_NPUB);
+  const result = page.getByTestId(`channel-user-search-result-${PASTED_HEX}`);
+  await expect(result).toContainText("npub1a2d…yp60");
+  await result.getByRole("button", { name: "Add", exact: true }).click();
+
+  // Same paste now finds them as a member, with nothing left to add.
+  await expect(page.getByTestId(`sidebar-member-${PASTED_HEX}`)).toBeVisible();
+  await expect(result).toHaveCount(0);
+  await expectMembersTriggerCount(page, initialMemberCount + 1);
+});
+
+test("members sidebar takes a pasted hex key, and Enter adds it", async ({
+  page,
+}) => {
+  await installMockBridge(page, { extraRelayMemberPubkeys: [PASTED_HEX] });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  const search = page.getByTestId("channel-management-search-users");
+  await search.fill(PASTED_HEX.toUpperCase());
+  await expect(
+    page.getByTestId(`channel-user-search-result-${PASTED_HEX}`),
+  ).toBeVisible();
+  await search.press("Enter");
+
+  await expect(page.getByTestId(`sidebar-member-${PASTED_HEX}`)).toBeVisible();
+});
+
+test("members sidebar says why a pasted key outside the community can't be added", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill(PASTED_NPUB);
+
+  await expect(
+    page.getByText("That key isn’t a member of this community yet."),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(`channel-user-search-result-${PASTED_HEX}`),
+  ).toHaveCount(0);
+});
+
+test("members sidebar offers a pasted key when the relay has no member list", async ({
+  page,
+}) => {
+  await installMockBridge(page, { relayMembershipSnapshot: false });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill(PASTED_NPUB);
+
+  await expect(
+    page.getByTestId(`channel-user-search-result-${PASTED_HEX}`),
+  ).toBeVisible();
+});
+
+test("members sidebar names a pasted key that has a profile", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [{ pubkey: PASTED_HEX, displayName: "Priya" }],
+  });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill(PASTED_NPUB);
+
+  await expect(
+    page.getByTestId(`channel-user-search-result-${PASTED_HEX}`),
+  ).toContainText("Priya");
+});
+
+test("members sidebar keeps a pasted agent key under the agent rules", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: PASTED_HEX,
+        displayName: "Scout",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+  });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill(PASTED_NPUB);
+
+  // Someone else's agent, not shared with this viewer: pasting its key is no way around that.
+  await expect(page.getByText("No matching people or agents.")).toBeVisible();
+  await expect(
+    page.getByTestId(`channel-user-search-result-${PASTED_HEX}`),
+  ).toHaveCount(0);
+});
+
+test("members sidebar finds a current member by pasted npub without offering to add", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page
+    .getByTestId("channel-management-search-users")
+    .fill(nip19.npubEncode(TEST_IDENTITIES.alice.pubkey));
+
+  await expect(
+    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.alice.pubkey}`),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(
+      `channel-user-search-result-${TEST_IDENTITIES.alice.pubkey}`,
+    ),
+  ).toHaveCount(0);
+});
+
+test("members sidebar offers nothing for a malformed key", async ({ page }) => {
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page
+    .getByTestId("channel-management-search-users")
+    .fill(`${PASTED_NPUB.slice(0, -1)}q`);
+
+  await expect(page.getByText("No matching people or agents.")).toBeVisible();
+});
+
 test("members sidebar pages add-member search beyond the first 50 people", async ({
   page,
 }) => {
@@ -4802,7 +4945,10 @@ test("members modal does not show direct pubkey entry", async ({ page }) => {
   ).toHaveCount(0);
   await expect(
     page.getByTestId("channel-management-search-users"),
-  ).toHaveAttribute("placeholder", "Add people and agents");
+  ).toHaveAttribute(
+    "placeholder",
+    "Add people and agents, or paste a public key",
+  );
 });
 
 test("channel header omits the add agent action", async ({ page }) => {
@@ -4960,7 +5106,10 @@ test("private-channel members can add people and managed agents without admin", 
   await expect(page.getByTestId("members-sidebar-add-denied")).toHaveCount(0);
   await expect(
     page.getByTestId("channel-management-search-users"),
-  ).toHaveAttribute("placeholder", "Add people and agents");
+  ).toHaveAttribute(
+    "placeholder",
+    "Add people and agents, or paste a public key",
+  );
 
   await page.getByTestId("channel-management-search-users").fill("char");
   await page

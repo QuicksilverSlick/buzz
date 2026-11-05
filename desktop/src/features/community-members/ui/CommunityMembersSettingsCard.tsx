@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import {
   useChangeRelayMemberRoleMutation,
   useMyRelayMembershipLookupQuery,
+  useRelayMemberAddedDatesQuery,
   useRelayMembersQuery,
 } from "@/features/community-members/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
@@ -64,7 +65,9 @@ function formatDisplayName(member: RelayMember, displayName?: string | null) {
   ) {
     return trimmedDisplayName;
   }
-  return member.role === "owner" ? "Community owner" : "Unnamed member";
+  return member.role === "owner"
+    ? "Community owner"
+    : truncateNpub(member.pubkey);
 }
 
 function npubFromPubkey(pubkey: string): string | null {
@@ -110,12 +113,15 @@ function HoverMemberIdentity({
 }
 
 function RelayMemberRow({
+  addedAt,
   currentRole,
   currentPubkey,
   onRemove,
   profile,
   member,
 }: {
+  /** Undefined when the relay holds no announcement of this member being added. */
+  addedAt?: string;
   /** Null when the role is unknown: the row then offers no actions. */
   currentRole: RelayMemberRole | null;
   currentPubkey?: string;
@@ -187,10 +193,14 @@ function RelayMemberRow({
           data-settings-subcopy
         >
           <span className="shrink-0 capitalize">{member.role}</span>
-          <span aria-hidden="true" className="shrink-0">
-            ·
-          </span>
-          <span className="shrink-0">Added {formatDate(member.createdAt)}</span>
+          {addedAt ? (
+            <>
+              <span aria-hidden="true" className="shrink-0">
+                ·
+              </span>
+              <span className="shrink-0">Added {formatDate(addedAt)}</span>
+            </>
+          ) : null}
           {isSelf ? (
             <>
               <span aria-hidden="true" className="shrink-0">
@@ -287,6 +297,7 @@ export function CommunityMembersSettingsCard({
       ? "This relay didn’t return its member list."
       : null;
   const membersQuery = useRelayMembersQuery(canManage);
+  const addedDatesQuery = useRelayMemberAddedDatesQuery(canManage);
   const isRetrying = myMembershipQuery.isFetching || membersQuery.isFetching;
   const members = React.useMemo(
     () =>
@@ -453,6 +464,9 @@ export function CommunityMembersSettingsCard({
               items={filteredMembers}
               renderItem={(member) => (
                 <RelayMemberRow
+                  addedAt={
+                    addedDatesQuery.data?.[normalizePubkey(member.pubkey)]
+                  }
                   currentPubkey={currentPubkey}
                   currentRole={currentRole}
                   member={member}

@@ -427,6 +427,8 @@ type MockBridgeOptions = {
   relayMembershipEoseDelayMs?: number;
   /** False: answer kind:13534 REQs with EOSE only, as a relay with no snapshot does. */
   relayMembershipSnapshot?: boolean;
+  /** More community members, on the roster with no profile. */
+  extraRelayMemberPubkeys?: string[];
   talosPubkey?: string;
   talkToTalosError?: string;
   /**
