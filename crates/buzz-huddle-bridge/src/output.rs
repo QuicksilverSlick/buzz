@@ -6,9 +6,10 @@
 //! the queue goes, and the rest of that response is dropped as it arrives, until the voice has
 //! sent no speech for `release_ms` or Talos gives the floor again with a newer token.
 //!
-//! GPT-Live streams PCM all session, silence between answers included, so only frames at speech
-//! level ([`Barge::speech_dbov`]) count as the voice playing, for barge-in, the half-duplex
-//! window and a cut's release. Silence still goes to the room, where Opus DTX makes it tiny.
+//! GPT-Live streams PCM all session, silence between answers included, so only frames at the
+//! voice's speech level ([`Barge::voice_dbov`]) count as the voice playing, for barge-in, the
+//! half-duplex window and a cut's release. Silence still goes to the room, where Opus DTX makes it
+//! tiny, except that a backlog drains through it: a stream that never stops never runs dry.
 //!
 //! The caller owns the socket and the clock, as for [`crate::input::Input`]: it calls
 //! [`Output::hear`] every 10 ms and [`Output::tick`] every 20 ms.
@@ -19,21 +20,27 @@ use buzz_audio_client::wire::audio_level_dbov;
 use std::collections::{HashMap, VecDeque};
 
 /// 16 frames, 320 ms: the most a barge-in ever has to cut. Talos paces its PCM to real time
-/// (frames v1); a burst past this is dropped, with one warning per response.
+/// (frames v1); a burst past this is dropped, with one warning until the backlog clears.
 pub const QUEUE_FRAMES: usize = 16;
+/// With this many frames queued, silence after silence is dropped, so a backlog drains.
+const BACKLOG_FRAMES: usize = 2;
 const FRAME_MS: u64 = 20;
 const TICK_MS: u64 = 10;
 
 /// Barge-in knobs; probe P measures the real values.
 #[derive(Clone, Debug)]
 pub struct Barge {
-    /// Decoded level (dBov) at or above which a human's 10 ms counts as energy, and a 20 ms frame
-    /// of the voice as speech. Keep it equal to [`crate::input::Tuning::speech_dbov`], so a cut
-    /// and Input's onset agree. GPT-Live's silence sits far below it; a human's room noise can sit
-    /// on it (5 Nov: 10 of 26 speech starts read -44 or -45), which only matters while the voice
-    /// speaks.
+    /// Decoded level (dBov) at or above which a human's 10 ms counts as energy. Keep it equal to
+    /// [`crate::input::Tuning::speech_dbov`], so a cut and Input's onset agree. A human's room
+    /// noise can sit on it (5 Nov: 19 of 59 speech starts read -44 or -45), which only matters
+    /// while the voice speaks.
     pub speech_dbov: i8,
-    /// Energy that cuts the voice from the owner's isolated desktop.
+    /// Level (dBov) at or above which a 20 ms frame of the voice is speech, kept apart from the
+    /// people's line so either can move alone. ponytail: GPT-Live's silence level isn't measured
+    /// (the tests assume about -57), and a voice softer than this line can't be cut.
+    pub voice_dbov: i8,
+    /// Energy that cuts the voice from the owner's isolated desktop. As long as on speakers, so a
+    /// cough or a chair doesn't cut a real answer (the 1:1 runs); GPT-Live hears a real one.
     pub isolated_ms: u64,
     /// Energy above the echo threshold that cuts it from any other peer.
     pub sustained_ms: u64,
@@ -46,9 +53,11 @@ pub struct Barge {
     pub echo_margin_db: i8,
     /// How long a frame's echo may still come back, so how long its level counts.
     pub echo_ms: u64,
-    /// After a cut, how long the voice must send no speech (the cut response is over) before it
-    /// may play again. A pause inside the cut answer shorter than this keeps it cut; the next
-    /// answer starts 0.5 to 0.7 s after a person stops (5 Nov), so it isn't swallowed.
+    /// A pause in the voice's speech shorter than this is inside one answer: barge-in still
+    /// counts the voice as playing, and a cut holds. After a cut, the voice must send no speech
+    /// this long before it may play again. ponytail: a cut answer that pauses this long plays on
+    /// after the pause, but the next answer starts 0.5 to 0.7 s after a person stops (5 Nov), so
+    /// a longer wait would swallow it. Upgrade: a frames v1 response boundary from Talos.
     pub release_ms: u64,
 }
 
@@ -56,7 +65,8 @@ impl Default for Barge {
     fn default() -> Self {
         Self {
             speech_dbov: -45,
-            isolated_ms: 200,
+            voice_dbov: -45,
+            isolated_ms: 320,
             sustained_ms: 320,
             gap_ms: 80,
             echo_margin_db: 6,
@@ -76,7 +86,7 @@ pub struct Output {
     prev: f32,
     /// The partial frame waited one tick for more PCM and goes out at the next.
     tail_due: bool,
-    /// A frame was dropped past the cap since the queue last ran empty.
+    /// A frame was dropped past the cap since the backlog last cleared.
     overflow: bool,
     token: u64,
     floor: bool,
@@ -145,11 +155,17 @@ impl Output {
             if self.partial.len() == FRAME_SAMPLES {
                 let frame = std::mem::take(&mut self.partial);
                 let level = audio_level_dbov(&frame);
+                let voice = self.barge.voice_dbov;
+                let silent_after_silence = level < voice
+                    && self.queue.len() >= BACKLOG_FRAMES
+                    && self.queue.back().is_some_and(|(_, l)| *l < voice);
                 if let Some(quiet) = &mut self.cut {
                     // Only speech holds a cut, not the silence a live model streams after it.
-                    if level >= self.barge.speech_dbov {
+                    if level >= voice {
                         *quiet = 0;
                     }
+                } else if silent_after_silence {
+                    // A backlog drains here; a lone quiet frame inside speech is kept.
                 } else if self.queue.len() < QUEUE_FRAMES {
                     self.queue.push_back((frame, level));
                 } else if !std::mem::replace(&mut self.overflow, true) {
@@ -179,6 +195,8 @@ impl Output {
             let level = audio_level_dbov(&frame);
             (frame, level)
         };
+        // The backlog is down to a frame: the next overflow warns again.
+        self.overflow &= self.queue.len() > 1;
         let payload = self
             .encoder
             .encode(&frame)
@@ -186,7 +204,7 @@ impl Output {
             .ok()?;
         self.sent.push_back((now_ms, level));
         self.last_end_ms = now_ms + FRAME_MS;
-        if level >= self.barge.speech_dbov {
+        if level >= self.barge.voice_dbov {
             self.spoke_end_ms = self.last_end_ms;
         }
         Some(payload)
@@ -195,7 +213,7 @@ impl Output {
     /// When the voice's speech ends, queued speech included, for the half-duplex window and
     /// barge-in. Silence after it, sent or queued, doesn't count.
     pub fn until(&self) -> u64 {
-        let speech = self.barge.speech_dbov;
+        let speech = self.barge.voice_dbov;
         let tail = self.cut.is_none()
             && !self.partial.is_empty()
             && audio_level_dbov(&self.partial) >= speech;
@@ -239,7 +257,8 @@ impl Output {
         }
         let recent = self.sent.iter().map(|(_, l)| *l).max().unwrap_or(-127);
         let echo = recent.saturating_add(b.echo_margin_db).max(b.speech_dbov);
-        let playing = now_ms < self.until();
+        // Through a pause inside an answer, so a run carries across the voice's phrases.
+        let playing = now_ms < self.until() + b.release_ms;
         let mut barged = None;
         let runs = levels
             .into_iter()
@@ -375,10 +394,11 @@ mod tests {
         // 1 s in 50 ms chunks: 50 frames, no padded tail between chunks.
         let quiet = |_| level(2, false, -127);
         assert_eq!(play(&mut o, &mut now, 1_200, talos(50, 1_000), quiet).0, 50);
-        // The queue holds under a frame now and then; a talker on speakers still cuts at 320 ms.
+        // The queue holds under a frame now and then; a talker on speakers still cuts after
+        // 320 ms, the first 10 counted at once as the voice spoke 200 ms ago, inside a pause.
         let loud = |_| level(2, false, -10);
         let (_, cut) = play(&mut o, &mut now, 1_000, talos(50, 1_000), loud);
-        assert_eq!(cut, Some(320));
+        assert_eq!(cut, Some(310));
     }
 
     #[test]
@@ -397,14 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn barge_in_takes_200_ms_isolated_or_320_ms_over_the_echo_and_outlasts_dips() {
+    fn barge_in_takes_320_ms_isolated_or_over_the_echo_and_outlasts_dips() {
         // Speech with a 20 ms dip every 200 ms; the voice plays from the first tick.
         let dipping = |index, isolated, dbov| {
             move |t: u64| level(index, isolated, if t % 200 >= 180 { -60 } else { dbov })
         };
         // On headphones the voice's level doesn't matter; on speakers it plays at about
         // -23 dBov, so its echo threshold is about -17 dBov.
-        for (human, cut) in [(dipping(1, true, -40), 220), (dipping(2, false, -10), 340)] {
+        for (human, cut) in [(dipping(1, true, -40), 340), (dipping(2, false, -10), 340)] {
             let mut o = output();
             let mut now = T0;
             let (_, at) = play(&mut o, &mut now, 1_000, talos(20, 1_000), human);
@@ -427,7 +447,7 @@ mod tests {
         let mut now = T0;
         let owner = |_| level(1, true, -30);
         let voice = || talos(20, u64::MAX);
-        assert_eq!(play(&mut o, &mut now, 400, voice(), owner).1, Some(200));
+        assert_eq!(play(&mut o, &mut now, 400, voice(), owner).1, Some(320));
         // The response goes on, the room is quiet or noisy: none of it plays.
         let noise = |_| level(2, false, -44);
         assert_eq!(play(&mut o, &mut now, 3_000, voice(), noise).0, 0);
@@ -447,10 +467,15 @@ mod tests {
         assert!(o.cut.is_none());
     }
 
-    /// GPT-Live's stream: 20 ms chunks all session, silence (about -57 dBov) except speech at
-    /// about -23 dBov while `speaking(t)`.
+    /// A stream all session in `chunk` ms deltas at `amp(t)`: 0.1 is about -23 dBov, 0.015
+    /// about -40 and 0.002 (silence) about -57.
+    fn stream(chunk: u64, amp: impl Fn(u64) -> f32) -> impl Fn(u64) -> Option<Vec<u8>> {
+        move |t| (t % chunk == 0).then(|| pcm(chunk as usize, amp(t)))
+    }
+
+    /// GPT-Live's stream: 20 ms chunks all session, silence except speech while `speaking(t)`.
     fn live(speaking: impl Fn(u64) -> bool) -> impl Fn(u64) -> Option<Vec<u8>> {
-        move |t| (t % FRAME_MS == 0).then(|| pcm(20, if speaking(t) { 0.1 } else { 0.002 }))
+        stream(FRAME_MS, move |t| if speaking(t) { 0.1 } else { 0.002 })
     }
 
     /// The 5 Nov field failure: a person's first words cut GPT-Live's silence 200 ms in, the
@@ -484,10 +509,10 @@ mod tests {
             play(&mut o, &mut now, 400, live(|_| true), quiet),
             (20, None)
         );
-        // 200 ms of energy, the first counted at once since the answer is already playing.
+        // 320 ms of energy, the first counted at once since the answer is already playing.
         assert_eq!(
             play(&mut o, &mut now, 400, live(|_| true), owner).1,
-            Some(190)
+            Some(310)
         );
         assert_eq!(play(&mut o, &mut now, 2_000, live(|_| true), quiet).0, 0);
     }
@@ -500,7 +525,7 @@ mod tests {
         let quiet = |_| level(1, true, -127);
         assert_eq!(
             play(&mut o, &mut now, 400, live(|_| true), owner).1,
-            Some(200)
+            Some(320)
         );
         // A pause in speech shorter than `release_ms` holds the cut; a longer one ends it.
         play(&mut o, &mut now, 200, live(|_| false), quiet);
@@ -508,6 +533,71 @@ mod tests {
         play(&mut o, &mut now, 200, live(|_| false), quiet);
         assert!(o.cut.is_none(), "the silence held the cut");
         assert_eq!(play(&mut o, &mut now, 1_000, live(|_| true), quiet).0, 50);
+    }
+
+    #[test]
+    fn a_talker_cuts_an_answer_that_pauses_between_phrases() {
+        // Phrases of 250 ms with 150 ms pauses: the run carries across them, on either route.
+        for human in [level(1, true, -35), level(2, false, -10)] {
+            let mut o = output();
+            let mut now = T0;
+            let phrases = live(|t| t % 400 < 250);
+            let (_, cut) = play(&mut o, &mut now, 2_000, phrases, move |_| human);
+            assert_eq!(cut, Some(320), "{human:?}");
+        }
+    }
+
+    /// Soft speech between the two lines, unaligned deltas, and a cut answer's scrap under a frame.
+    #[test]
+    fn a_soft_answer_plays_and_cuts_and_a_cut_leaves_no_scrap() {
+        let mut o = output();
+        let mut now = T0;
+        let owner = |_| level(1, true, -35);
+        let quiet = |_| level(1, true, -127);
+        // 30 ms deltas of silence leave a scrap between them, which isn't speech either.
+        let silence = stream(30, |_| 0.002);
+        assert_eq!(play(&mut o, &mut now, 1_000, silence, owner).1, None);
+        assert!(o.until() <= now, "silence holds the echo window open");
+        let soft = || stream(FRAME_MS, |_| 0.015);
+        assert_eq!(play(&mut o, &mut now, 400, soft(), quiet), (20, None));
+        // Cut on the same tick as a loud answer; a scrap that comes after holds nothing open.
+        assert_eq!(play(&mut o, &mut now, 320, soft(), owner).1, Some(310));
+        o.on_pcm(&pcm(10, 0.015));
+        assert!(
+            o.until() <= now,
+            "the cut answer holds the echo window open"
+        );
+        // Talos stops: the scrap never plays, during the cut, after it, or after a newer token.
+        assert_eq!(play(&mut o, &mut now, 600, |_| None, quiet).0, 0);
+        assert!(o.cut.is_none());
+        assert!(play(&mut o, &mut now, 400, soft(), owner).1.is_some());
+        o.on_pcm(&pcm(10, 0.015));
+        o.set_floor(Some(ME), 2);
+        assert_eq!(play(&mut o, &mut now, 100, |_| None, quiet).0, 0);
+    }
+
+    /// A stream that never stops never runs dry, so a burst's backlog drains through silence,
+    /// and the next overflow warns again.
+    #[test]
+    fn a_backlog_drains_through_the_streamed_silence() {
+        let mut o = output();
+        let mut now = T0;
+        o.on_pcm(&pcm(100, 0.002));
+        o.on_pcm(&pcm(400, 0.1));
+        assert!(o.overflow && o.queue.len() == QUEUE_FRAMES);
+        let quiet = |_| level(1, true, -127);
+        assert_eq!(play(&mut o, &mut now, 1_000, live(|_| false), quiet).0, 50);
+        assert!(
+            o.queue.len() < BACKLOG_FRAMES && !o.overflow,
+            "{}",
+            o.queue.len()
+        );
+        // A quiet frame alone inside speech still plays.
+        let before = o.queue.len();
+        o.on_pcm(&pcm(60, 0.1));
+        o.on_pcm(&pcm(20, 0.002));
+        o.on_pcm(&pcm(20, 0.1));
+        assert_eq!(o.queue.len(), before + 5);
     }
 
     /// Input and Output together in link.rs's step order, with a decoded talker: `loud(t)` says
