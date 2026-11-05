@@ -5,12 +5,15 @@ import {
   changeRelayMemberRole,
   getMyRelayMembership,
   getMyRelayMembershipLookup,
+  listRelayMemberAddedDates,
   listRelayMembers,
   removeRelayMember,
 } from "@/shared/api/relayMembers";
 import type { RelayMember } from "@/shared/api/types";
 
 export const relayMembersQueryKey = ["relayMembers"] as const;
+// Kept apart from relayMembersQueryKey: live snapshots overwrite that cache.
+export const relayMemberAddedDatesQueryKey = ["relayMemberAddedDates"] as const;
 export const myRelayMembershipQueryKey = ["myRelayMembership"] as const;
 export const myRelayMembershipLookupQueryKey = [
   "myRelayMembershipLookup",
@@ -21,6 +24,15 @@ export function useRelayMembersQuery(enabled = true) {
     enabled,
     queryKey: relayMembersQueryKey,
     queryFn: listRelayMembers,
+    staleTime: 30_000,
+  });
+}
+
+export function useRelayMemberAddedDatesQuery(enabled = true) {
+  return useQuery({
+    enabled,
+    queryKey: relayMemberAddedDatesQueryKey,
+    queryFn: () => listRelayMemberAddedDates(),
     staleTime: 30_000,
   });
 }
@@ -59,7 +71,6 @@ export function useAddRelayMemberMutation() {
           pubkey,
           role: role as RelayMember["role"],
           addedBy: null,
-          createdAt: new Date().toISOString(),
         },
       ]);
 

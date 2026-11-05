@@ -49,6 +49,7 @@ test("relay invalidation includes relay-backed channel and profile queries", () 
     ["user-status", "alice"],
     ["relay-agents"],
     ["relayMembers"],
+    ["relayMemberAddedDates"],
     ["myRelayMembershipLookup"],
     ["archivedIdentities"],
     ["oaOwner", "alice"],

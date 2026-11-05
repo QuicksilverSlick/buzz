@@ -532,6 +532,8 @@ type E2eConfig = {
     relayMembershipEoseDelayMs?: number;
     /** False: answer kind:13534 REQs with EOSE only, as a relay with no snapshot does. */
     relayMembershipSnapshot?: boolean;
+    /** More community members, on the roster with no profile. */
+    extraRelayMemberPubkeys?: string[];
     relayRole?: "owner" | "admin" | "member" | null;
     // Descriptors returned by the mocked `pick_and_upload_media` /
     // `upload_media_bytes` commands. Lets a spec drive the attachment flow
@@ -2086,7 +2088,8 @@ function resetMockRelayMembers(config: E2eConfig | undefined) {
       pubkey: ALICE_PUBKEY,
       role: "admin",
       added_by: pubkey,
-      created_at: isoMinutesAgo(90),
+      // Fixed and old, so a date taken from the snapshot (always now) can't pass.
+      created_at: "2026-03-14T12:00:00.000Z",
     },
     {
       pubkey: BOB_PUBKEY,
@@ -2094,6 +2097,12 @@ function resetMockRelayMembers(config: E2eConfig | undefined) {
       added_by: pubkey,
       created_at: isoMinutesAgo(60),
     },
+    ...(config?.mock?.extraRelayMemberPubkeys ?? []).map((extraPubkey) => ({
+      pubkey: extraPubkey,
+      role: "member" as const,
+      added_by: pubkey,
+      created_at: isoMinutesAgo(30),
+    })),
   ];
 }
 
@@ -11054,6 +11063,26 @@ function sendToMockSocket(args: {
     }
 
     const filter = rest[1] as MockFilter;
+    if (filter.kinds?.includes(8000)) {
+      // As on a real relay, the bootstrap owner (added_by null) is never announced.
+      for (const member of mockRelayMembers) {
+        if (member.added_by === null) continue;
+        sendWsText(socket.handler, [
+          "EVENT",
+          subId,
+          createMockEvent(
+            8000,
+            "",
+            [["p", member.pubkey]],
+            "f".repeat(64),
+            Math.floor(Date.parse(member.created_at) / 1000),
+          ),
+        ]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
     if (filter.kinds?.includes(13534)) {
       if (getConfig()?.mock?.relayMembershipSnapshot === false) {
         sendWsText(socket.handler, ["EOSE", subId]);
