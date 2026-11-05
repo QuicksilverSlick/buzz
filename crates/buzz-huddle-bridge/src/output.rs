@@ -3,8 +3,12 @@
 //! 48 kHz and cut into 20 ms frames, at most [`QUEUE_FRAMES`] queued, and one frame is encoded
 //! per 20 ms tick. It plays only while this voice holds the floor (the speak token), and a
 //! human who talks over it cuts it (barge-in). The cut takes the place of the desktop's epoch:
-//! the queue goes, and the rest of that response is dropped as it arrives, until Talos has sent
-//! nothing for `release_ms` or gives the floor again with a newer token.
+//! the queue goes, and the rest of that response is dropped as it arrives, until the voice has
+//! sent no speech for `release_ms` or Talos gives the floor again with a newer token.
+//!
+//! GPT-Live streams PCM all session, silence between answers included, so only frames at speech
+//! level ([`Barge::speech_dbov`]) count as the voice playing, for barge-in, the half-duplex
+//! window and a cut's release. Silence still goes to the room, where Opus DTX makes it tiny.
 //!
 //! The caller owns the socket and the clock, as for [`crate::input::Input`]: it calls
 //! [`Output::hear`] every 10 ms and [`Output::tick`] every 20 ms.
@@ -23,8 +27,11 @@ const TICK_MS: u64 = 10;
 /// Barge-in knobs; probe P measures the real values.
 #[derive(Clone, Debug)]
 pub struct Barge {
-    /// Decoded level (dBov) at or above which a human's 10 ms counts as energy. Keep it equal to
-    /// [`crate::input::Tuning::speech_dbov`], so a cut and Input's onset agree.
+    /// Decoded level (dBov) at or above which a human's 10 ms counts as energy, and a 20 ms frame
+    /// of the voice as speech. Keep it equal to [`crate::input::Tuning::speech_dbov`], so a cut
+    /// and Input's onset agree. GPT-Live's silence sits far below it; a human's room noise can sit
+    /// on it (5 Nov: 10 of 26 speech starts read -44 or -45), which only matters while the voice
+    /// speaks.
     pub speech_dbov: i8,
     /// Energy that cuts the voice from the owner's isolated desktop.
     pub isolated_ms: u64,
@@ -39,8 +46,9 @@ pub struct Barge {
     pub echo_margin_db: i8,
     /// How long a frame's echo may still come back, so how long its level counts.
     pub echo_ms: u64,
-    /// After a cut, how long Talos must send nothing (the cut response is over) before the
-    /// voice may play again.
+    /// After a cut, how long the voice must send no speech (the cut response is over) before it
+    /// may play again. A pause inside the cut answer shorter than this keeps it cut; the next
+    /// answer starts 0.5 to 0.7 s after a person stops (5 Nov), so it isn't swallowed.
     pub release_ms: u64,
 }
 
@@ -62,7 +70,8 @@ pub struct Output {
     me: String,
     barge: Barge,
     encoder: AudioEncoder,
-    queue: VecDeque<Vec<f32>>,
+    /// Each frame with its level.
+    queue: VecDeque<(Vec<f32>, i8)>,
     partial: Vec<f32>,
     prev: f32,
     /// The partial frame waited one tick for more PCM and goes out at the next.
@@ -73,11 +82,12 @@ pub struct Output {
     floor: bool,
     /// Unix ms and level of each frame sent within `echo_ms`.
     sent: VecDeque<(u64, i8)>,
-    /// When the last frame sent ends.
+    /// When the last frame sent ends, and the last one with speech.
     last_end_ms: u64,
+    spoke_end_ms: u64,
     /// Each peer's ms of energy while the voice plays, and the ms since its last energy.
     runs: HashMap<u8, (u64, u64)>,
-    /// Ms since Talos last sent PCM, while cut; `None` when not cut.
+    /// Ms since the voice last sent speech, while cut; `None` when not cut.
     cut: Option<u64>,
 }
 
@@ -97,6 +107,7 @@ impl Output {
             floor: false,
             sent: VecDeque::new(),
             last_end_ms: 0,
+            spoke_end_ms: 0,
             runs: HashMap::new(),
             cut: None,
         })
@@ -109,8 +120,8 @@ impl Output {
         if token < self.token {
             return;
         }
-        if token > self.token {
-            self.cut = None;
+        if token > self.token && self.cut.take().is_some() {
+            self.flush();
         }
         self.token = token;
         self.floor = holder == Some(self.me.as_str());
@@ -125,10 +136,6 @@ impl Output {
         if !self.floor {
             return;
         }
-        if let Some(quiet) = &mut self.cut {
-            *quiet = 0;
-            return;
-        }
         self.tail_due = false;
         for s in pcm.as_chunks::<2>().0 {
             let s = f32::from(i16::from_le_bytes(*s)) / 32_768.0;
@@ -137,8 +144,14 @@ impl Output {
             self.prev = s;
             if self.partial.len() == FRAME_SAMPLES {
                 let frame = std::mem::take(&mut self.partial);
-                if self.queue.len() < QUEUE_FRAMES {
-                    self.queue.push_back(frame);
+                let level = audio_level_dbov(&frame);
+                if let Some(quiet) = &mut self.cut {
+                    // Only speech holds a cut, not the silence a live model streams after it.
+                    if level >= self.barge.speech_dbov {
+                        *quiet = 0;
+                    }
+                } else if self.queue.len() < QUEUE_FRAMES {
+                    self.queue.push_back((frame, level));
                 } else if !std::mem::replace(&mut self.overflow, true) {
                     tracing::warn!(
                         "huddle bridge: voice PCM ahead of real time, dropped past 320 ms"
@@ -152,28 +165,49 @@ impl Output {
     /// waits one tick for the PCM that may finish it, so a chunk just in time pads no silence
     /// into speech, then goes out padded by the encoder.
     pub fn tick(&mut self, now_ms: u64) -> Option<Vec<u8>> {
-        let frame = if let Some(frame) = self.queue.pop_front() {
-            frame
-        } else if self.partial.is_empty() || !std::mem::replace(&mut self.tail_due, true) {
+        let (frame, level) = if let Some(queued) = self.queue.pop_front() {
+            queued
+        } else if self.cut.is_some()
+            || self.partial.is_empty()
+            || !std::mem::replace(&mut self.tail_due, true)
+        {
+            // A cut keeps resampling to hear when the voice stops, but sends none of it.
             self.overflow = false;
             return None;
         } else {
-            std::mem::take(&mut self.partial)
+            let frame = std::mem::take(&mut self.partial);
+            let level = audio_level_dbov(&frame);
+            (frame, level)
         };
         let payload = self
             .encoder
             .encode(&frame)
             .inspect_err(|e| tracing::warn!(error = %e, "huddle bridge: voice encode"))
             .ok()?;
-        self.sent.push_back((now_ms, audio_level_dbov(&frame)));
+        self.sent.push_back((now_ms, level));
         self.last_end_ms = now_ms + FRAME_MS;
+        if level >= self.barge.speech_dbov {
+            self.spoke_end_ms = self.last_end_ms;
+        }
         Some(payload)
     }
 
-    /// When the voice's output ends, queued audio included, for the half-duplex window.
+    /// When the voice's speech ends, queued speech included, for the half-duplex window and
+    /// barge-in. Silence after it, sent or queued, doesn't count.
     pub fn until(&self) -> u64 {
-        let frames = self.queue.len() + usize::from(!self.partial.is_empty());
-        self.last_end_ms + FRAME_MS * frames as u64
+        let speech = self.barge.speech_dbov;
+        let tail = self.cut.is_none()
+            && !self.partial.is_empty()
+            && audio_level_dbov(&self.partial) >= speech;
+        let queued = self.queue.iter().rposition(|(_, level)| *level >= speech);
+        let frames = if tail {
+            Some(self.queue.len() + 1)
+        } else {
+            queued.map(|i| i + 1)
+        };
+        frames.map_or(self.spoke_end_ms, |n| {
+            self.last_end_ms + FRAME_MS * n as u64
+        })
     }
 
     /// Barge-in, every 10 ms, with each admitted human's level. While the voice plays, a human
@@ -198,6 +232,8 @@ impl Output {
             self.cut = (quiet < b.release_ms).then_some(quiet);
             if self.cut.is_none() {
                 tracing::info!("huddle bridge: the cut response is over");
+                // Under a frame of the cut response, resampled but never sent.
+                self.flush();
             }
             return false;
         }
@@ -316,7 +352,7 @@ mod tests {
         o.on_pcm(&pcm(7, 0.3));
         o.on_pcm(&pcm(13, 0.3));
         assert_eq!((o.queue.len(), o.partial.len()), (1, 0));
-        assert!(o.queue[0].len() == FRAME_SAMPLES);
+        assert!(o.queue[0].0.len() == FRAME_SAMPLES);
         o.on_pcm(&pcm(1_000, 0.3));
         assert_eq!(o.queue.len(), QUEUE_FRAMES, "320 ms, the rest dropped");
         let mut sent = 0;
@@ -409,6 +445,69 @@ mod tests {
         assert!(o.cut.is_some(), "the same token");
         o.set_floor(Some(ME), 2);
         assert!(o.cut.is_none());
+    }
+
+    /// GPT-Live's stream: 20 ms chunks all session, silence (about -57 dBov) except speech at
+    /// about -23 dBov while `speaking(t)`.
+    fn live(speaking: impl Fn(u64) -> bool) -> impl Fn(u64) -> Option<Vec<u8>> {
+        move |t| (t % FRAME_MS == 0).then(|| pcm(20, if speaking(t) { 0.1 } else { 0.002 }))
+    }
+
+    /// The 5 Nov field failure: a person's first words cut GPT-Live's silence 200 ms in, the
+    /// silence that kept coming held the cut, and no answer ever reached the room.
+    #[test]
+    fn a_live_models_silence_is_not_the_voice_playing() {
+        for human in [level(1, true, -40), level(2, false, -40)] {
+            let mut o = output();
+            let mut now = T0;
+            let quiet = move |_| level(human.index, human.isolated, -127);
+            play(&mut o, &mut now, 500, live(|_| false), quiet);
+            assert!(o.until() <= T0, "silence holds the echo window open");
+            let (_, cut) = play(&mut o, &mut now, 1_500, live(|_| false), |_| human);
+            assert_eq!(cut, None, "{human:?}: the question cut the silence");
+            let (sent, cut) = play(&mut o, &mut now, 1_000, live(|_| true), quiet);
+            assert_eq!((sent, cut), (50, None), "{human:?}: the whole answer");
+        }
+    }
+
+    #[test]
+    fn talking_over_a_live_answer_still_cuts_it_and_drops_the_rest() {
+        let mut o = output();
+        let mut now = T0;
+        let owner = |_| level(1, true, -35);
+        let quiet = |_| level(1, true, -127);
+        assert_eq!(
+            play(&mut o, &mut now, 1_000, live(|_| false), owner).1,
+            None
+        );
+        assert_eq!(
+            play(&mut o, &mut now, 400, live(|_| true), quiet),
+            (20, None)
+        );
+        // 200 ms of energy, the first counted at once since the answer is already playing.
+        assert_eq!(
+            play(&mut o, &mut now, 400, live(|_| true), owner).1,
+            Some(190)
+        );
+        assert_eq!(play(&mut o, &mut now, 2_000, live(|_| true), quiet).0, 0);
+    }
+
+    #[test]
+    fn after_a_cut_the_streamed_silence_ends_it_and_the_next_answer_plays() {
+        let mut o = output();
+        let mut now = T0;
+        let owner = |_| level(1, true, -35);
+        let quiet = |_| level(1, true, -127);
+        assert_eq!(
+            play(&mut o, &mut now, 400, live(|_| true), owner).1,
+            Some(200)
+        );
+        // A pause in speech shorter than `release_ms` holds the cut; a longer one ends it.
+        play(&mut o, &mut now, 200, live(|_| false), quiet);
+        assert!(o.cut.is_some());
+        play(&mut o, &mut now, 200, live(|_| false), quiet);
+        assert!(o.cut.is_none(), "the silence held the cut");
+        assert_eq!(play(&mut o, &mut now, 1_000, live(|_| true), quiet).0, 50);
     }
 
     /// Input and Output together in link.rs's step order, with a decoded talker: `loud(t)` says
