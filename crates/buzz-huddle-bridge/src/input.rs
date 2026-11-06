@@ -55,10 +55,11 @@ pub struct Tuning {
     pub onset_ms: u64,
     /// Silence before the forwarded human releases the floor.
     pub hangover_ms: u64,
-    /// Echo tail after the voice's output, for the owner's desktop. ponytail: both tails are
-    /// guesses until probe P measures them from `output_until`, the desktop's and the phone's.
+    /// Echo tail after the voice's speech, for the owner's desktop on speakers, at its end and at
+    /// every pause in it. Probe step 6 (5 Nov) heard the voice come back 361-508 ms after it
+    /// played, which leaked past 300 ms.
     pub desktop_tail_ms: u64,
-    /// Echo tail for every other peer.
+    /// Echo tail for every other peer. ponytail: a guess; the phone sent back none of 5 clips.
     pub remote_tail_ms: u64,
     /// Widening on both sides of each `secret` window, for clock skew with Talos.
     pub secret_skew_ms: u64,
@@ -73,7 +74,7 @@ impl Default for Tuning {
             speech_dbov: -45,
             onset_ms: 100,
             hangover_ms: 300,
-            desktop_tail_ms: 300,
+            desktop_tail_ms: 600,
             remote_tail_ms: 600,
             secret_skew_ms: 1_000,
             floor_cap_ms: 30_000,
@@ -929,13 +930,15 @@ mod tests {
     #[test]
     fn half_duplex_unless_the_desktop_here_is_isolated() {
         let mut now = T0;
-        for (here, echo) in [(false, true), (true, false)] {
+        // The phone, the desktop on speakers, the desktop on headphones.
+        for (here, isolated, echo) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
             let mut input = input();
             input.set_awake(true);
-            input.set_route(Route {
-                here,
-                isolated: true,
-            });
+            input.set_route(Route { here, isolated });
             input.set_output_until(now + 1_000);
             let mut owner = [talker(1, 0.3, None)];
             let start = now;
@@ -950,7 +953,8 @@ mod tests {
             assert_eq!(voiced(&during), !echo, "here: {here}");
             let after = run(&mut input, &mut now, 1_200, &mut owner);
             assert!(voiced(&after) && input.who_said(0, u64::MAX).all(|s| s.echo == echo));
-            // Echo lasts to start + 1.6 s (1 s of output, 600 ms tail) and never enters the ring.
+            // Echo lasts to start + 1.6 s (1 s of output, a 600 ms tail on either speakers) and
+            // never enters the ring.
             let kept = if echo { 20 } else { 180 };
             assert_eq!(ring(&input, start, now, now), kept);
         }

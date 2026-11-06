@@ -413,8 +413,8 @@ const DESKTOP: Route = Route {
 
 /// How long the voice's audio takes from the relay back into the owner's mic on `route`: never on
 /// headphones, 40 ms from the desktop, 200 ms from the owner's phone. A tail covers this plus the
-/// bridge's own NetEQ delay, here at its 200 ms cap, so echo leaks from 65 ms on the desktop (its
-/// 300 ms tail) and 380 ms on the phone (600 ms). Probe P measures the real path.
+/// bridge's own NetEQ delay, here at its 200 ms cap, so a 600 ms tail lets echo leak from about
+/// 380 ms. Probe step 6 (5 Nov) heard the desktop's echo come back 361-508 ms after it played.
 fn bleed(route: Route) -> Option<Duration> {
     (!route.isolated).then(|| ms(if route.here { 40 } else { 200 }))
 }
@@ -549,16 +549,17 @@ async fn the_voice_hears_the_owner_and_says_it_back_paced_without_hearing_its_ow
     }
 }
 
-/// The owner talking over the voice cuts it: after 200 ms of energy on the isolated desktop, or
-/// 320 ms over the echo on speakers. The rest of that response never plays, and the owner is heard:
-/// at once on headphones, else once the echo tail after the cut (desktop 300 ms, phone 600) passes.
+/// The owner talking over the voice cuts it: after 320 ms of energy on the isolated desktop, or
+/// over the echo on speakers. The rest of that response never plays, and the owner is heard: at
+/// once on headphones, else once the 600 ms echo tail after the cut passes.
 #[tokio::test(start_paused = true)]
-async fn talking_over_the_voice_cuts_it_after_200_ms_on_headphones_or_320_ms_on_speakers() {
+async fn talking_over_the_voice_cuts_it_after_320_ms_on_headphones_or_speakers() {
     let headphones = Route {
         here: true,
         isolated: true,
     };
-    for (route, need) in [(headphones, 200), (DESKTOP, 320), (Route::default(), 320)] {
+    let need = 320;
+    for route in [headphones, DESKTOP, Route::default()] {
         let (relay, talos) = (&Relay::with(&[(1, OWNER, 0.0)]), &Talos::default());
         relay.bleed.set(bleed(route));
         talos.repeat.set(4);
@@ -580,11 +581,11 @@ async fn talking_over_the_voice_cuts_it_after_200_ms_on_headphones_or_320_ms_on_
             assert!(lag >= ms(need), "{route:?}: cut {lag:?} after the barge");
             let onset = first(talos, true, OWNER, barged).expect("the owner is heard");
             if route.isolated {
-                // Heard at once: 100 ms to the onset, 200 ms to the cut.
+                // Heard at once: 100 ms to the onset, 320 ms to the cut.
                 let after = cut - onset;
-                assert!((ms(80)..ms(130)).contains(&after), "cut {after:?} after");
+                assert!((ms(200)..ms(250)).contains(&after), "cut {after:?} after");
             } else {
-                let (after, tail) = (onset - cut, ms(if route.here { 300 } else { 600 }));
+                let (after, tail) = (onset - cut, ms(600));
                 let heard = (tail..tail + ms(40)).contains(&after);
                 assert!(heard, "{route:?}: heard {after:?} after the cut");
                 assert!(lag < ms(need + 300), "cut {lag:?} after the barge");

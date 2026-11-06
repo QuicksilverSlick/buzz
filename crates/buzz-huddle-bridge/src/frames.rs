@@ -2,9 +2,11 @@
 //!
 //! JSON text frames carry `"v": 1` and a `type`; audio is binary PCM16 LE, mono, 24 kHz.
 //!
-//! Talos sends a response's PCM paced to real time, and none between responses. The PC queues
-//! at most 320 ms and drops the rest; after a barge-in it drops PCM until none has come for
-//! 300 ms, or a newer `floor` token arrives. A huddle's `floor` token never goes down.
+//! Talos sends the voice's PCM paced to real time. GPT-Live streams it all session, silence
+//! between responses included, so the PC counts only PCM at speech level as the voice speaking.
+//! The PC queues at most 320 ms and drops the rest; after a barge-in it drops PCM until none at
+//! speech level has come for 300 ms, or a newer `floor` token arrives. A huddle's `floor` token
+//! never goes down.
 //! [`ToTalos`] and [`ToPc`] are the two directions: each side parses only the other side's
 //! frames, and unknown fields are refused. `frames-v1/schema.json` and one fixture per frame in
 //! `frames-v1/fixtures/` are the contract Talos copies.
