@@ -409,6 +409,39 @@ async fn an_old_post_never_brings_a_repost() {
     assert_eq!(b.posts().len(), before, "no repost, no delete");
 }
 
+/// State lost, then the same Drop again: a post edited closed says a tap
+/// doesn't count, so a new card goes up. One with its Recorded edit is the card.
+#[tokio::test]
+async fn lost_state_never_adopts_a_post_edited_closed() {
+    for closed in [true, false] {
+        let mut b = seeded_bench(Gate::Open, &[]).await;
+        let first = b.card(ITEM).event_id;
+        let post = posted(&b, &first);
+        if closed {
+            reply(&b, &[&post]);
+            let gone = drop_json(&[("validity", json!("superseded"))]);
+            b.drop_file("orchestrator", "relay-choice", &gone);
+        } else {
+            let owner_tap = tap(&b.ctx.owner, &first, OPTION_EMOJI[0], b.now);
+            reply(&b, &[&post, &owner_tap]);
+        }
+        b.settle(4).await;
+        let edit = last_edit(&b, &first);
+        assert_eq!(content(&edit).starts_with(NOT_ASKED), closed);
+        reply(&b, &[&post, &serde_json::from_value(edit).unwrap()]);
+        b.s.items.clear();
+        b.s.kept.clear();
+        b.s.replaced.clear();
+        b.s.needs_rebuild = true;
+        b.settle(1).await;
+        assert!(b.s.orphan_cards.contains_key(ITEM));
+        b.drop_file("orchestrator", "relay-choice", &drop_json(&[]));
+        b.settle(3).await;
+        assert_eq!(b.card(ITEM).event_id == first, !closed);
+        assert_eq!(b.s.kept.contains(&first), closed);
+    }
+}
+
 #[tokio::test]
 async fn a_tap_on_an_old_post_gets_one_reply_and_counts_for_nothing() {
     let (mut b, old, answer) = answered_then_replaced().await;

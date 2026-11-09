@@ -702,19 +702,22 @@ pub(super) async fn publish(
         forget_card(ctx, s, &id);
     }
 
-    // (c) Post missing cards, adopting a recovered orphan when its hash matches.
+    // (c) Post missing cards, adopting a recovered orphan when its hash matches
+    // and it was not edited closed: that post says a tap there doesn't count.
     for id in &wanted {
         if s.items[id].card.is_some() {
             continue;
         }
         let ch = card_channel(s, &s.items[id]);
         if let Some(orphan) = s.orphan_cards.get(id).cloned() {
-            if orphan.hash == item::card_hash(&s.items[id]) {
+            let on = on_post(ctx, s, &ch, &orphan.event_id, now).await?;
+            let closed = on.iter().any(super::replaced::closes);
+            if orphan.hash == item::card_hash(&s.items[id]) && !closed {
                 s.items.get_mut(id).expect("wanted id").card = s.orphan_cards.remove(id);
                 continue;
             }
             // An answered, replied or receipt card stays on the relay for good.
-            if !on_post(ctx, s, &ch, &orphan.event_id, now).await?.is_empty() {
+            if !on.is_empty() {
                 s.kept.push(orphan.event_id.clone());
             } else {
                 if !spend(budget, 1) {
