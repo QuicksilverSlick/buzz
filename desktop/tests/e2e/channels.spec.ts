@@ -4787,6 +4787,26 @@ test("members sidebar offers nothing for a malformed key", async ({ page }) => {
   await expect(page.getByText("No matching people or agents.")).toBeVisible();
 });
 
+test("members sidebar keeps the outsider notice to pasted keys once the roster is cached", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  const search = page.getByTestId("channel-management-search-users");
+  const outsiderNotice = page.getByText(
+    "That key isn’t a member of this community yet.",
+  );
+  await search.fill(PASTED_NPUB);
+  await expect(outsiderNotice).toBeVisible();
+
+  await search.clear();
+  await search.fill("zzzz-matches-nobody");
+
+  await expect(page.getByText("No matching people or agents.")).toBeVisible();
+  await expect(outsiderNotice).toHaveCount(0);
+});
+
 test("members sidebar pages add-member search beyond the first 50 people", async ({
   page,
 }) => {
