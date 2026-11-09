@@ -564,6 +564,18 @@ pub(crate) struct Account {
     /// timed limit: no clock lifts a lost sign-in, so only a passing
     /// sign-in check or a real answer on this login clears it.
     pub signed_out: bool,
+    /// A `dpapi:` login the server refused: its file's modified time then.
+    /// `claude auth status` never asks the server, so a check cannot lift
+    /// that; a new file or a real answer can.
+    refused: Option<std::time::SystemTime>,
+}
+
+impl Account {
+    /// When this login's token file last changed; `None` for any other login.
+    fn file_stamp(&self) -> Option<std::time::SystemTime> {
+        let file = self.dir.as_deref()?.strip_prefix(DPAPI_ENTRY)?.trim();
+        std::fs::metadata(file).and_then(|m| m.modified()).ok()
+    }
 }
 
 /// A limit one login of the pool hit.
@@ -742,6 +754,7 @@ impl Factory {
                     label,
                     limited: None,
                     signed_out: false,
+                    refused: None,
                 }
             })
             .collect();
@@ -901,6 +914,7 @@ impl Factory {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Plan {
+        self.note_refusal(self.on(slot), failure);
         let (wait, free) = self.begin_limit(self.on(slot), failure, now);
         if let Some(next) = free {
             let label = self.accounts[next].label.clone();
@@ -940,7 +954,17 @@ impl Factory {
     /// while the pool is idle left the dot green and #factory silent until
     /// some real request happened along and failed (spec 2.2, 4.2).
     pub(crate) fn record_limit(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
+        self.note_refusal(self.on(slot), failure);
         self.record_limit_on(self.on(slot), failure, now);
+    }
+
+    /// A real turn lost its sign-in on login `on`: see [`Account::refused`].
+    fn note_refusal(&mut self, on: usize, failure: &Failure) {
+        if failure.class == Class::SignIn {
+            if let Some(account) = self.accounts.get_mut(on) {
+                account.refused = account.file_stamp();
+            }
+        }
     }
 
     /// [`record_limit`](Self::record_limit) for a login named directly
@@ -1094,6 +1118,7 @@ impl Factory {
         {
             account.limited = None;
             account.signed_out = false;
+            account.refused = None;
         }
         let settled = if self.preferred(now).is_some_and(|p| p > 0) {
             Health::Degraded

@@ -218,7 +218,15 @@ impl Factory {
     /// already due.
     fn signin_restored(&mut self, index: usize, now: DateTime<Utc>) -> bool {
         let cleared = match self.accounts.get_mut(index) {
-            Some(account) => std::mem::take(&mut account.signed_out),
+            Some(account)
+                if account.refused.is_some() && account.refused == account.file_stamp() =>
+            {
+                return false;
+            }
+            Some(account) => {
+                account.refused = None;
+                std::mem::take(&mut account.signed_out)
+            }
             None => false,
         };
         let over = matches!(self.health, Health::Down | Health::Degraded)

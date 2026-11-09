@@ -76,7 +76,9 @@ fn decrypt(_file: &str) -> Result<String, Unread> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::factory::{Factory, OAUTH_TOKEN_ENV};
+    use crate::acp::AcpError;
+    use crate::factory::{classify, Factory, OAUTH_TOKEN_ENV};
+    use crate::scope::SessionScope;
     use chrono::Utc;
 
     const TOKEN: &str = "fake-token-for-tests";
@@ -86,7 +88,7 @@ mod tests {
     /// Stands in for DPAPI: no test here reaches PowerShell.
     fn fake(file: &str) -> Result<String, Unread> {
         match file {
-            "good" => Ok(TOKEN.to_string()),
+            good if good.ends_with("good") => Ok(TOKEN.to_string()),
             "blank" => Ok("  ".to_string()),
             "hung" => Err(SILENT),
             _ => Err(DEAD),
@@ -144,6 +146,69 @@ mod tests {
         assert_eq!(targets[1].1, Err(DEAD));
         assert_eq!(targets[2].1, Err(SILENT));
         assert_eq!(targets[3].1, Ok(pair(OAUTH_TOKEN_ENV, TOKEN)));
+    }
+
+    fn refuse(f: &mut Factory, now: chrono::DateTime<Utc>) {
+        let channel_id = uuid::Uuid::from_u128(7);
+        let scope = SessionScope::Conversation { channel_id };
+        let error = AcpError::agent_error(-32603, "API Error: 401 expired");
+        f.plan(0, &scope, &classify(&error, now), now);
+    }
+
+    /// A server's 401 is about the token, and `claude auth status` never asks
+    /// the server, so its yes cannot bring the login back. A new file can.
+    #[test]
+    fn a_refused_token_stays_out_until_its_file_changes() {
+        let now = Utc::now();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("good");
+        std::fs::write(&file, "cipher").unwrap();
+        let mut f = pool(&format!("primary=dpapi:{};fallback=C:/f", file.display()));
+        f.launch_env(0, now);
+        refuse(&mut f, now);
+        f.launch_env(0, now);
+        f.take_alerts();
+        assert!(!f.signin_checked(0, SignIn::Valid, now), "nothing changed");
+        assert!(f.accounts()[0].signed_out);
+        assert!(!f.wants_restart(0, now), "the work stays off it");
+        assert!(f.take_alerts().is_empty(), "no all-clear to take back");
+
+        let replaced = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle.set_modified(replaced).unwrap();
+        assert!(f.signin_checked(0, SignIn::Valid, now), "the new file");
+        assert!(!f.accounts()[0].signed_out);
+        assert!(f.wants_restart(0, now), "back to the first login");
+    }
+
+    /// Only a refusal waits for a new file: a real answer ends it, and a file
+    /// that could not be read says nothing about its token.
+    #[test]
+    fn a_real_answer_ends_a_refusal_and_a_good_read_clears_an_unread_file() {
+        let now = Utc::now();
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["good", "missing"] {
+            std::fs::write(dir.path().join(name), "cipher").unwrap();
+        }
+        let good = dir.path().join("good");
+        let mut f = pool(&format!("primary=dpapi:{}", good.display()));
+        f.launch_env(0, now);
+        refuse(&mut f, now);
+        f.launch_env(0, now);
+        f.on_success(0, now);
+        f.signin_checked(0, SignIn::SignedOut, now);
+        f.signin_checked(0, SignIn::Valid, now);
+        assert!(!f.accounts()[0].signed_out, "the refusal is over");
+
+        let missing = dir.path().join("missing");
+        let mut f = pool(&format!(
+            "primary=dpapi:{};fallback=C:/f",
+            missing.display()
+        ));
+        f.launch_env(0, now);
+        assert!(f.accounts()[0].signed_out);
+        f.signin_checked(0, SignIn::Valid, now);
+        assert!(!f.accounts()[0].signed_out, "a good read clears it");
     }
 
     #[cfg(not(windows))]
