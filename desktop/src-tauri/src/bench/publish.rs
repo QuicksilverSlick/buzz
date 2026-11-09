@@ -370,10 +370,10 @@ fn bad_thread(e: &str) -> bool {
 }
 
 /// Cards, seeds, then the board, at most `budget` posts. A card is posted
-/// once per Drop and card format; it is edited to record an answer, once closed
-/// out to become a receipt and once stale to become an old post (`replaced`), so
-/// only a recovered orphan nobody touched is ever deleted. Every post made once
-/// a card's own id is known links its thread.
+/// once per Drop and card format; it is edited to record an answer and, once
+/// stale or closed out, to become an old post (`replaced`), so only a recovered
+/// orphan nobody touched is ever deleted. Every post made once a card's own id
+/// is known links its thread.
 /// An owner's notice that fails to go again lands in `failed`, for
 /// lastError, and the rest goes on.
 #[allow(clippy::too_many_arguments)]
@@ -471,8 +471,9 @@ pub(super) async fn publish(
         }
     }
 
-    // (a2b) A close-out keeps the card: edited to the receipt, with the
-    // answer and this drop as its Outcome. A later close-out edits it again.
+    // (a2b) A close-out keeps the card, owed its edit to the receipt
+    // (`replaced`), with the answer and this drop as its Outcome. A later
+    // close-out edits it again.
     for id in s.items.keys().cloned().collect::<Vec<_>>() {
         let item = &s.items[&id];
         let (Some(_), Some(card)) = (&item.request, &item.card) else {
@@ -482,19 +483,9 @@ pub(super) async fn publish(
         if card.hash == hash {
             continue;
         }
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        let (event_id, ch) = (card.event_id.clone(), card_channel(s, item));
-        let text = item::render_card(item, hhmm) + &item::thread_line(&ch, &event_id);
-        match edit(ctx, s, &ch, &event_id, &text, now).await {
-            Ok(_) => {
-                let i = s.items.get_mut(&id).expect("receipt id");
-                i.card.as_mut().expect("receipt card").hash = hash;
-            }
-            Err(e) if e.contains("not found") => forget_card(ctx, s, &id),
-            Err(e) => return Err(e),
-        }
+        super::replaced::receipt(s, &id, now);
+        let i = s.items.get_mut(&id).expect("receipt id");
+        i.card.as_mut().expect("receipt card").hash = hash;
     }
 
     // (a3) Tell the writer's route target of a settled answer change, and of
