@@ -141,8 +141,8 @@ pub(super) fn left_behind(s: &mut BenchState, new: &item::Item, now: u64) {
 }
 
 /// A close-out (publish (a2b)): its card stays the item's, and the post becomes
-/// the receipt. A later one, while the post is still here, only changes what it
-/// shows.
+/// the receipt. A later one, while the post is still here, changes what it shows
+/// and starts its 24 h again.
 pub(super) fn receipt(s: &mut BenchState, id: &str, now: u64) {
     let Some((i, card)) = s.items.get(id).and_then(|i| Some((i, i.card.as_ref()?))) else {
         return;
@@ -150,7 +150,7 @@ pub(super) fn receipt(s: &mut BenchState, id: &str, now: u64) {
     let r = showing(s, i, card, now);
     let same = |o: &&mut Replaced| o.card.event_id == r.card.event_id;
     match s.replaced.iter_mut().find(same) {
-        Some(o) => o.shown = r.shown,
+        Some(o) => (o.shown, o.at) = (r.shown, r.at),
         None => add(s, r),
     }
 }

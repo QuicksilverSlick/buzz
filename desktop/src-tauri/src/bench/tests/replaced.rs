@@ -738,6 +738,34 @@ async fn a_close_out_in_a_channel_not_ready_keeps_its_edit() {
     assert!(content(&receipt).contains("Done in X"), "{receipt}");
 }
 
+/// A later close-out's edit, failing once near the end of the first one's
+/// 24 h, still gets its retry.
+#[tokio::test]
+async fn a_later_close_out_gets_its_own_window() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    close_out(&b, "First report");
+    b.settle(3).await;
+    assert!(b.s.replaced[0].shown.is_none() && b.s.replaced[0].watch);
+    b.now = b.s.replaced[0].at + 86_400 - 6;
+    *b.relay.post_down.lock().unwrap() = Some(card.clone());
+    close_out(&b, "Second report");
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert!(b.s.replaced[0].retry_at > 0, "one failed try");
+    *b.relay.post_down.lock().unwrap() = None;
+    b.now += 60;
+    b.settle(4).await;
+    assert_eq!(b.s.last_error, None);
+    // The fake relay logs a refused write too, so two is the retry.
+    let second = b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(&card))
+        .filter(|(e, _)| content(e).contains("Second report"))
+        .count();
+    assert_eq!(second, 2);
+}
+
 /// Close-out receipts are the largest group of dead pills: the first line, the
 /// seeds off, the answer it closed with no new tap, its card still the item's
 /// (the kit's `findCard` matches `item.card`).
