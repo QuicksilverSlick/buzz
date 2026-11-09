@@ -702,7 +702,6 @@ function fromRawRelayMember(raw: RawRelayMember): RelayMember {
     pubkey: raw.pubkey,
     role: raw.role as RelayMemberRole,
     addedBy: raw.added_by,
-    createdAt: raw.created_at,
   };
 }
 

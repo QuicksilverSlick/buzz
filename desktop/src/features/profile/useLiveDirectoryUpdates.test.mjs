@@ -249,6 +249,24 @@ describe("startLiveDirectoryUpdates", () => {
     assert.ok(invalidated(client, ["myRelayMembershipLookup"]));
   });
 
+  it("refreshes member Added dates once per burst of rosters", () => {
+    client.setQueryData(["relayMemberAddedDates"], {});
+
+    relay.onEvent(event(0, NEW_MEMBER));
+    mock.timers.tick(windowMs);
+    assert.equal(invalidated(client, ["relayMemberAddedDates"]), false);
+
+    relay.onEvent(
+      snapshot(200, [
+        [VIEWER, "member"],
+        [NEW_MEMBER, "member"],
+      ]),
+    );
+    assert.equal(invalidated(client, ["relayMemberAddedDates"]), false);
+    mock.timers.tick(windowMs);
+    assert.ok(invalidated(client, ["relayMemberAddedDates"]));
+  });
+
   it("ignores a roster older than the one already applied", () => {
     relay.onEvent(
       snapshot(200, [
