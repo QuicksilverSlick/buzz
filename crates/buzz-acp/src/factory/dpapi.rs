@@ -52,8 +52,9 @@ fn powershell(file: &str) -> tokio::process::Command {
 }
 
 /// ponytail: blocks the caller and the factory lock for one PowerShell start
-/// (about a second, 15 s at worst) at each launch and each 15-minute check.
-/// Move it off the lock if launches ever become frequent.
+/// (about a second, 15 s at worst) per `dpapi:` entry, at each launch and each
+/// 15-minute check, on the main loop. Move it off the lock if launches ever
+/// become frequent.
 #[cfg(windows)]
 fn decrypt(file: &str) -> Result<String, Unread> {
     use std::io::Read;
@@ -139,6 +140,7 @@ mod tests {
     use crate::acp::AcpError;
     use crate::factory::{classify, signin_ask as ask, OAUTH_TOKEN_ENV};
     use crate::scope::SessionScope;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TOKEN: &str = "fake-token-for-tests";
     const DEAD: Unread = (SignIn::SignedOut, "it did not decrypt");
@@ -351,6 +353,20 @@ mod tests {
             "{texts:?}"
         );
         assert!(!f.signin_found(1, Err(DEAD), now), "said once");
+    }
+
+    /// One launch reads each file once: it can hold the factory lock for 15 s.
+    #[test]
+    fn one_launch_reads_each_file_once() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(_: &str) -> Result<String, Unread> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Err(SILENT)
+        }
+        let mut f = Factory::new(Some("a=dpapi:x;b=dpapi:y"), "claude-agent-acp");
+        f.decrypt = Some(counted);
+        assert!(f.login_env(0, Utc::now()).is_err());
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(not(windows))]

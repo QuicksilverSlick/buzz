@@ -814,27 +814,26 @@ impl Factory {
         slot: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<(String, String)>, String> {
-        let mut dead = String::new();
+        let mut dead = None;
+        let mut tried = HashSet::new();
         // ponytail: `pick` still offers a login when all are out, so a dead
         // file ranked first then fails the launch without trying the others,
         // which are out too. The slot refill tries again.
-        for _ in 0..=self.accounts.len() {
-            let Some(i) = self.pick(now) else {
-                return Ok(Vec::new());
-            };
+        while let Some(i) = self.pick(now).filter(|&i| tried.insert(i)) {
             match self.account_env(i) {
                 Ok(env) => {
                     self.started_on.insert(slot, i);
                     return Ok(env);
                 }
                 Err(unread) => {
-                    dead = format!("login {}: {}", self.at(i), unread.1);
-                    tracing::warn!("{dead}; trying the next login");
+                    let why = format!("login {}: {}", self.at(i), unread.1);
+                    tracing::warn!("{why}; trying the next login");
                     self.token_file_failed(i, unread, now);
+                    dead = Some(why);
                 }
             }
         }
-        Err(dead)
+        dead.map_or(Ok(Vec::new()), Err)
     }
 
     /// [`login_env`](Self::login_env) for tests with a login left.

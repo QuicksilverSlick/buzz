@@ -3606,7 +3606,8 @@ async fn run_harness(
 
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
-            // loop so it never blocks event processing.
+            // loop so it never blocks event processing; choosing the login
+            // does not, and reading a `dpapi:` file can take 15 s.
             for (idx, slot) in crash_history.iter_mut().enumerate() {
                 if pool.slot_alive(idx) || slot.respawn_in_flight {
                     continue;
@@ -6236,8 +6237,10 @@ async fn deliver_factory_state(
 /// Ask each login of the pool whether its sign-in is still good, and act on
 /// what comes back exactly as a failed turn would (spec M2 item 3).
 ///
-/// Runs off the main loop: every probe spawns a short-lived process. It costs
-/// no model usage, and only a definite "not signed in" changes anything.
+/// Runs off the main loop: every probe spawns a short-lived process. Only
+/// collecting the targets does not, and reading a `dpapi:` file can take 15 s.
+/// It costs no model usage, and only a definite "not signed in" changes
+/// anything.
 fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
     let factory = config.factory.clone();
     let targets = factory.lock().signin_check_targets();
