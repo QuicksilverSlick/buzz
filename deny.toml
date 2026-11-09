@@ -39,6 +39,23 @@ ignore = [
     # Keep the exact NetEQ pin and the wrapper ban below together. Re-audit or
     # remove this exception when NetEQ removes/updates the unused dependency.
     { id = "RUSTSEC-2026-0293", reason = "unused dependency of audited, exactly pinned neteq 0.8.3; no Rust references to ringbuf; other consumers forbidden by bans.deny" },
+    # rmcp < 3.9.0: the Streamable HTTP clients read non-streaming response bodies into memory with no size limit, so a
+    # malicious or compromised MCP server can exhaust the client's memory. The only patched range is >= 3.9.0; rmcp 1.x
+    # has no fix. rmcp 1.8.0 reaches us only via buzz-agent, which compiles just its client and transport-child-process
+    # features. The code the advisory names sits behind transport-streamable-http-client* and __reqwest, which are off,
+    # so the HTTP transport is not built. This id-level ignore would also hide a 3.x copy, so rmcp 3.x must stay at
+    # >= 3.9.0. Remove when buzz-agent moves to rmcp >= 3.9.
+    { id = "RUSTSEC-2026-0462", reason = "rmcp 1.8.0 via buzz-agent compiles only client and transport-child-process, so the affected HTTP client is not built; no 1.x fix; rmcp 3.x must stay >= 3.9.0" },
+    # libsqlite3-sys < 0.39 bundles SQLite < 3.54.0, which can return uninitialized page-cache memory when it opens a
+    # database with a sibling -wal file of a different page size (CVE-2026-119375): a crafted pair makes ordinary queries
+    # return stale bytes from the process's memory. No tagged upgrade resolves: the fix needs libsqlite3-sys >= 0.39 (rusqlite
+    # >= 0.41), mesh-llm-log-store requires rusqlite ^0.40 through mesh-llm v0.78.1, libsqlite3-sys's links = "sqlite3"
+    # allows one copy, and the patched sqlx-sqlite caps it below 0.39. The risk is accepted, not absent: the desktop opens
+    # archive/archive.db inside the nest at every start, and the nest is the working directory of spawned agents, so a
+    # sandboxed agent able to write there could plant the db and -wal pair. The app's other databases are outside the
+    # nest. Remove when libsqlite3-sys >= 0.39 resolves: that needs a tagged mesh-llm allowing rusqlite >= 0.41, the
+    # desktop's own rusqlite moving with it, and a sqlx-sqlite pin allowing libsqlite3-sys >= 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "risk accepted, not absent: no upgrade until a tagged mesh-llm allows rusqlite >= 0.41, and the desktop opens archive.db inside the nest, where a sandboxed agent could plant a crafted db and -wal pair" },
     # zip < 9: ZipArchive::extract aborts the process on a symlink entry with a large declared size. Fixed only in 9.0.0.
     # Same copies and reasoning as 0367-0369 below. 8.6.0 via mesh-llm v0.76.2 (root via buzz-mesh-smoke; desktop via the
     # mesh-llm feature, off in Dreamforge releases): its readers never call extract(). 4.6.1 via tauri-plugin-updater (Windows):
