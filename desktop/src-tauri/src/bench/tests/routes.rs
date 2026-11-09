@@ -778,8 +778,8 @@ async fn a_reword_closes_a_routed_card_with_only_a_reply() {
     let reworded = drop_json(&[("options", json!(["Stay", "Move away"]))]);
     b.drop_file("orchestrator", "relay-choice", &reworded);
     b.settle(3).await;
-    assert_eq!(b.kinds()[before..], [40003, 9, 7, 7, 9, 5]);
-    let closed = &b.posts()[before].0;
+    assert_eq!(b.kinds()[before..], [9, 7, 7, 40003, 9, 5]);
+    let closed = &b.posts()[before + 3].0;
     assert_eq!(tag_value(closed, "e").unwrap(), old_card.event_id);
     assert!(content(closed).contains("\n\nClosed: a tap or reply here is no longer read."));
     assert_eq!(b.s.kept, [old_card.event_id]);

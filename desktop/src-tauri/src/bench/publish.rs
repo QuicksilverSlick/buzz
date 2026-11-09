@@ -8,9 +8,8 @@ use std::sync::{Mutex, PoisonError};
 
 use super::channels::{card_channel, channel_ready, joined, reads_replies};
 use super::{
-    item, live_card, local_hhmm, next_ts, outbox, post_as_writer, query, query_writer, same_drop,
-    save_both, spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS,
-    RECOVER_LIMIT,
+    item, live_card, local_hhmm, next_ts, outbox, post_as_writer, query, same_drop, save_both,
+    spend, submit, BenchState, Ctx, Outcome, Posted, BOARD_MAX_AGE_SECS, MAX_CARDS, RECOVER_LIMIT,
 };
 use crate::events;
 
@@ -337,7 +336,7 @@ fn df_answer(parts: [&str; 3]) -> Result<nostr::Tag, String> {
     nostr::Tag::parse(["df-answer", n, by, id]).map_err(|e| e.to_string())
 }
 
-/// Whether a recovered card has anything on it but the writer's own seeds:
+/// Whether a recovered orphan has anything on it but the writer's own seeds:
 /// a tap, a reply, a route notice, or a Recorded or receipt edit. A cut page
 /// holds more than the four seeds, so it counts too.
 async fn touched(
@@ -360,34 +359,6 @@ async fn touched(
     }))
 }
 
-/// A stale card kept for what is on it (`touched`), for good: edited closed
-/// from its own text as posted (`replaced::old_post`), its thread root (its
-/// parent) ending older cards' root-reply windows there, and watched for a tap
-/// (`replaced`). One gone from the relay is only kept.
-async fn close(
-    ctx: &Ctx<'_>,
-    s: &mut BenchState,
-    id: &str,
-    ch: &str,
-    card: &Posted,
-    now: u64,
-) -> Result<(), String> {
-    let filter = serde_json::json!({ "ids": [card.event_id], "kinds": [9], "#h": [ch] });
-    if let Some(e) = query_writer(ctx, s, filter, now).await?.first() {
-        let text = super::replaced::old_post(s, id, &e.content);
-        let text = text + &item::thread_line(ch, &card.event_id);
-        match edit(ctx, s, ch, &card.event_id, &text, now).await {
-            Err(err) if !err.contains("not found") => return Err(err),
-            _ => {}
-        }
-        let root = item::parent(e).map(|r| (r.to_string(), card.created_at));
-        s.kept_at.extend(root);
-        super::replaced::closed(s, id, ch, card, item::parent(e), now);
-    }
-    s.kept.push(card.event_id.clone());
-    Ok(())
-}
-
 /// A thread the relay will not take: its root is gone, in another channel or
 /// not a thread root.
 fn bad_thread(e: &str) -> bool {
@@ -397,9 +368,10 @@ fn bad_thread(e: &str) -> bool {
 }
 
 /// Cards, seeds, then the board, at most `budget` posts. A card is posted
-/// once per Drop and card format; it is edited to record an answer and, once
-/// closed out, to become a receipt. Only a card nobody engaged with is ever
-/// deleted. Every post made once a card's own id is known links its thread.
+/// once per Drop and card format; it is edited to record an answer, once closed
+/// out to become a receipt and once stale to become an old post (`replaced`), so
+/// only a recovered orphan nobody touched is ever deleted. Every post made once
+/// a card's own id is known links its thread.
 /// An owner's notice that fails to go again lands in `failed`, for
 /// lastError, and the rest goes on.
 #[allow(clippy::too_many_arguments)]
@@ -704,12 +676,13 @@ pub(super) async fn publish(
         s.items.get_mut(&id).expect("routed id").routed_reply = Some(r.event_id.clone());
     }
 
-    // (b) Delete cards that are stale (another Drop, card format or stamp) or
+    // (b) Retire cards that are stale (another Drop, card format or stamp) or
     // no longer asked (superseded, expired, no longer pending), never for
     // MAX_CARDS, unless someone answered or replied on them or they are a
-    // receipt: those stay on the relay for good, and so, closed, does one
-    // with anything else on it but its seeds. A card in a channel that is
-    // not ready, or `held`, waits: its taps are read once it is again.
+    // receipt: those keep their place. A retired card stays on the relay for
+    // good, kept from recover and owed its edit closed (`replaced`), so no
+    // failure here fails the tick. A card in a channel that is not ready, or
+    // `held`, waits: its taps are read once it is again.
     let stale: Vec<(String, String, Posted)> = s
         .items
         .values()
@@ -722,20 +695,8 @@ pub(super) async fn publish(
         })
         .collect();
     for (id, ch, card) in stale {
-        // One post per card, its lookups riding on it: the delete, or the edit
-        // that closes it.
-        if !spend(budget, 1) {
-            return Ok(());
-        }
-        // A reply or tap the item never read or no longer holds (free text on
-        // an unscoped card with no route, or one asked again) still makes the
-        // card a record: it stays, as `carry_card` keeps one, but closed,
-        // since nothing reads it any more.
-        if touched(ctx, s, &ch, &card.event_id, now).await? {
-            close(ctx, s, &id, &ch, &card, now).await?;
-        } else {
-            delete(ctx, s, &ch, &card.event_id, now).await?;
-        }
+        super::replaced::retired(s, &id, &ch, &card, now);
+        s.kept.push(card.event_id);
         forget_card(ctx, s, &id);
     }
 

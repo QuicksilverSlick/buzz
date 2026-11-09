@@ -776,6 +776,8 @@ struct Relay {
     clock: Mutex<Option<u64>>,
     /// A /query naming this id in its `#e` fails with a 500.
     e_down: Mutex<Option<String>>,
+    /// A write on this id, or a /query for it by `ids`, fails with a 500.
+    post_down: Mutex<Option<String>>,
 }
 
 fn tag_value(ev: &Value, name: &str) -> Option<String> {
@@ -823,6 +825,9 @@ async fn fake_events(
         return (StatusCode::OK, Json(reply));
     }
     let target = tag_value(&ev, "e").unwrap_or_default();
+    if r.post_down.lock().unwrap().as_ref() == Some(&target) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})));
+    }
     if matches!(kind, 5 | 9 | 40003) && r.gone.lock().unwrap().contains(&target) {
         let message = match kind {
             5 => "target event not found",
@@ -863,6 +868,10 @@ async fn fake_query(
     }
     let down = r.e_down.lock().unwrap().clone().map(|id| json!(id));
     if down.is_some_and(|id| q[0]["#e"].as_array().is_some_and(|e| e.contains(&id))) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let down = r.post_down.lock().unwrap().clone().map(|id| json!(id));
+    if down.is_some_and(|id| q[0]["ids"].as_array().is_some_and(|e| e.contains(&id))) {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     let mut evs = r.query_reply.lock().unwrap().clone();
@@ -938,6 +947,7 @@ impl Bench {
             admins_down: Mutex::new(false),
             clock: Mutex::new(None),
             e_down: Mutex::new(None),
+            post_down: Mutex::new(None),
         });
         let base = fake_relay(relay.clone()).await;
         let state: &'static AppState = Box::leak(Box::new(crate::app_state::build_app_state()));
@@ -1108,9 +1118,11 @@ async fn resync_is_idempotent() {
 }
 
 #[tokio::test]
-async fn pending_reword_deletes_and_reposts_never_edits() {
+async fn pending_reword_reposts_and_edits_the_old_card_closed() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let old_card = b.card("orchestrator/relay-choice");
+    let old_post = answers::posted(&b, &old_card.event_id);
+    answers::reply(&b, &[&old_post]);
     let old_board = b.s.board.clone().unwrap();
     let before = b.posts().len();
     b.drop_file(
@@ -1124,16 +1136,15 @@ async fn pending_reword_deletes_and_reposts_never_edits() {
         .iter()
         .map(|(e, _)| e["kind"].as_u64().unwrap())
         .collect();
-    assert_eq!(kinds, [5, 9, 7, 7, 9, 5]);
-    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old_card.event_id);
+    assert_eq!(kinds, [9, 7, 7, 40003, 9, 5]);
     let new_card = b.card("orchestrator/relay-choice");
     assert_ne!(new_card.hash, old_card.hash);
     assert_eq!(
-        tag_value(&posts[1].0, "client").unwrap(),
+        tag_value(&posts[0].0, "client").unwrap(),
         format!("bench:card:orchestrator/relay-choice@{}", new_card.hash)
     );
+    assert_eq!(tag_value(&posts[3].0, "e").unwrap(), old_card.event_id);
     assert_eq!(tag_value(&posts[5].0, "e").unwrap(), old_board.event_id);
-    assert!(!b.kinds().contains(&40003));
 }
 
 #[tokio::test]
@@ -1331,7 +1342,7 @@ async fn vanished_targets_are_dropped_not_retried() {
     b.settle(2).await;
     assert_eq!(b.kinds()[before..], [40003, 9]);
     assert_ne!(b.s.board.as_ref().unwrap().event_id, old_board.event_id);
-    // A hard-purged card: the retiring kind 5 is refused, the repost goes on.
+    // A hard-purged card: nothing is left to edit, the repost goes on.
     let old_card = b.card("orchestrator/relay-choice");
     b.relay
         .gone
@@ -1345,7 +1356,7 @@ async fn vanished_targets_are_dropped_not_retried() {
         &drop_json(&[("options", json!(["Stay", "Go"]))]),
     );
     b.settle(3).await;
-    assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
+    assert_eq!(b.kinds()[before..], [9, 7, 7, 9, 5]);
     assert_ne!(
         b.card("orchestrator/relay-choice").event_id,
         old_card.event_id
@@ -1382,8 +1393,8 @@ async fn a_tick_never_exceeds_the_post_budget() {
         b.tick().await.unwrap();
         assert!(b.posts().len() - n <= MAX_POSTS_PER_TICK);
     }
-    // Delete, card, seed; then the board and its predecessor's delete as a pair.
-    assert_eq!(b.kinds()[before..], [5, 9, 7, 9, 5]);
+    // Card, seed; then the board and its predecessor's delete as a pair.
+    assert_eq!(b.kinds()[before..], [9, 7, 9, 5]);
 }
 
 #[tokio::test]

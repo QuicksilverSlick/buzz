@@ -7,9 +7,10 @@ use super::channels::X;
 use super::receipts::close_out;
 use super::*;
 use crate::bench::channels::ChannelCheck;
-use crate::bench::replaced::{closed, tick as old_posts_tick, WATCH_MAX};
+use crate::bench::replaced::{retired, tick as old_posts_tick, Replaced, WATCH_MAX};
 
 const REPLACED: &str = "Replaced by a newer card. A tap here doesn't count.";
+const NOT_ASKED: &str = "No longer asked. A tap here doesn't count.";
 
 fn content(ev: &Value) -> &str {
     ev["content"].as_str().unwrap()
@@ -89,6 +90,13 @@ async fn old_tick(b: &mut Bench, mut budget: usize) -> usize {
     let owners = [b.owner_hex()];
     old_posts_tick(&b.ctx, &mut b.s, &mut budget, b.now, "14:05", &owners).await;
     budget
+}
+
+/// An old post already edited closed.
+fn closed(s: &mut BenchState, id: &str, ch: &str, card: &Posted, root: Option<&str>, now: u64) {
+    retired(s, id, ch, card, now);
+    let r = s.replaced.last_mut().unwrap();
+    (r.from_post, r.root) = (false, root.map(str::to_string));
 }
 
 /// An old post with no history, its id made from `n`, in `ch`.
@@ -243,10 +251,7 @@ async fn a_re_ask_edits_the_old_post_first_line_and_takes_its_seeds_off() {
 async fn a_touched_stale_card_says_so_first_too() {
     for (drop, first) in [
         (vec![("options", json!(["Stay", "Move away"]))], REPLACED),
-        (
-            vec![("validity", json!("superseded"))],
-            "No longer asked. A tap here doesn't count.",
-        ),
+        (vec![("validity", json!("superseded"))], NOT_ASKED),
     ] {
         let mut b = seeded_bench(Gate::Open, &[]).await;
         let old = b.card(ITEM);
@@ -290,17 +295,118 @@ async fn an_old_receipt_keeps_its_outcome_time() {
     assert!(!text.contains("23:59"), "{text}");
 }
 
-/// `pending_reword_deletes_and_reposts_never_edits` pins the post; a deleted
-/// card has nothing left to say so on, and the relay refuses a tap on it.
+/// An untouched card stays as any other: a phone that lost its socket across a
+/// delete would keep showing it, and the relay would refuse a tap there with
+/// nothing said. It says so from its own text, its seeds come off and a tap on
+/// it is told, once.
 #[tokio::test]
-async fn an_untouched_stale_card_is_only_deleted() {
+async fn an_untouched_stale_card_is_edited_not_deleted() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let old = b.card(ITEM).event_id;
+    let on_card = seeds(&b, &old);
+    let post = posted(&b, &old);
+    let mut relay: Vec<&nostr::Event> = on_card.iter().collect();
+    relay.push(&post);
+    reply(&b, &relay);
     redrop(&b, "Relay choice, reworded");
+    b.settle(4).await;
+
+    let edited = last_edit(&b, &old);
+    let text = content(&edited);
+    assert!(text.starts_with(&format!("{REPLACED}\n🔴 · ")), "{text}");
+    assert!(text.contains("**Relay choice**"), "as asked: {text}");
+    assert!(!text.contains("reworded"), "{text}");
+    assert!(text.ends_with(&thread_line(&b.channel(), &old)), "{text}");
+    let off = removed(&b);
+    assert!(!off.contains(&old), "deleted: {off:?}");
+    for seed in &on_card {
+        assert!(off.contains(&seed.id.to_hex()), "{off:?}");
+    }
+    assert_eq!(b.s.kept, [old.as_str()]);
+
+    let stray = tap(&b.ctx.owner, &old, OPTION_EMOJI[0], b.now + 1);
+    reply(&b, &[&stray]);
     b.settle(3).await;
-    assert!(removed(&b).contains(&old));
-    assert!(b.s.replaced.is_empty());
-    assert!(b.s.kept.is_empty());
+    assert_eq!(replies(&b).len(), 1);
+    assert!(content(&replies(&b)[0]).contains("The live card is the one that counts:"));
+}
+
+/// lastError stops the kit's approvals: a lookup that fails, an edit refused or
+/// a post gone from the relay is the board's and the retry's, never the tick's.
+#[tokio::test]
+async fn a_stale_card_that_will_not_update_fails_no_tick() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old = b.card(ITEM).event_id;
+    let post = posted(&b, &old);
+    reply(&b, &[&post]);
+    *b.relay.post_down.lock().unwrap() = Some(old.clone());
+    redrop(&b, "Relay choice, reworded");
+    b.tick().await.unwrap();
+    assert!(b.s.replaced[0].from_post);
+    // Saved by a build before this one, the key is absent and state still loads.
+    let mut saved = serde_json::to_value(&b.s.replaced[0]).unwrap();
+    saved.as_object_mut().unwrap().remove("fromPost");
+    assert!(!serde_json::from_value::<Replaced>(saved).unwrap().from_post);
+    let retry = b.s.replaced[0].retry_at;
+    assert_eq!(retry, b.now + 60);
+    b.settle(2).await;
+    assert!(
+        board(&b).contains("\n\nOld cards\nWould not update: 1."),
+        "{}",
+        board(&b)
+    );
+    assert!(b.s.replaced[0].from_post, "not before its retry");
+    *b.relay.post_down.lock().unwrap() = None;
+    b.now = retry;
+    b.settle(4).await;
+    assert!(content(&last_edit(&b, &old)).starts_with(REPLACED));
+    assert!(!board(&b).contains("Old cards"), "{}", board(&b));
+
+    // One gone from the relay is let go, with nothing to edit.
+    let gone = b.card(ITEM).event_id;
+    reply(&b, &[]);
+    let before = b.posts().len();
+    redrop(&b, "Relay choice, reworded again");
+    b.settle(3).await;
+    assert!(!b.s.replaced.iter().any(|r| r.card.event_id == gone));
+    let edited = |e: &Value| e["kind"] == 40003 && tag_value(e, "e") == Some(gone.clone());
+    assert!(!b.posts()[before..].iter().any(|(e, _)| edited(e)));
+    assert!(b.s.kept.contains(&gone));
+}
+
+/// Nothing an old post does brings a new card back: edited, kept and read again
+/// through a relaunch, the item keeps the one newer card it was given.
+#[tokio::test]
+async fn an_old_post_never_brings_a_repost() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let old = b.card(ITEM).event_id;
+    let post = posted(&b, &old);
+    reply(&b, &[&post]);
+    redrop(&b, "Relay choice, reworded");
+    b.settle(6).await;
+    let new = b.card(ITEM).event_id;
+    assert_ne!(new, old);
+    let board_id = b.s.board.as_ref().unwrap().event_id.clone();
+    let (new_post, board_post) = (posted(&b, &new), posted(&b, &board_id));
+    let before = b.posts().len();
+    b.settle(10).await;
+    assert_eq!(b.posts().len(), before, "quiet once it is done");
+
+    // A relaunch reads both posts: the old one is kept, so never adopted.
+    reply(&b, &[&post, &new_post, &board_post]);
+    b.s.needs_rebuild = true;
+    b.settle(10).await;
+    assert_eq!(b.card(ITEM).event_id, new);
+    assert!(b.s.orphan_cards.is_empty() && b.s.strays.is_empty());
+    assert_eq!(b.posts().len(), before, "no repost, no delete");
+
+    // State lost: the newest post is the card, the old one only listed.
+    b.s.kept.clear();
+    b.s.needs_rebuild = true;
+    b.settle(10).await;
+    assert_eq!(b.card(ITEM).event_id, new);
+    assert_eq!(b.s.strays, [old]);
+    assert_eq!(b.posts().len(), before, "no repost, no delete");
 }
 
 #[tokio::test]
@@ -623,6 +729,56 @@ async fn removals_and_replies_stop_at_the_post_budget() {
     assert!(b.s.replaced[1].tapped.is_some());
 }
 
+/// One lookup a tick and a minute's retry: with more posts failing than a
+/// minute's lookups, every tick runs out. They still go at the end of their
+/// window.
+#[tokio::test]
+async fn posts_failing_past_the_lookups_still_go_at_their_window() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    let seeds: Vec<_> = (1..=40)
+        .map(|n| {
+            let old = old_card(&mut b, n, &ch);
+            tap(&b.ctx.writer, &old.event_id, OPTION_EMOJI[0], b.now)
+        })
+        .collect();
+    reply(&b, &seeds.iter().collect::<Vec<_>>());
+    let end = b.now + 86_400;
+    *b.relay.clock.lock().unwrap() = Some(b.now + 10_000);
+    for _ in 0..120 {
+        b.now += 2;
+        old_tick(&mut b, 4).await;
+    }
+    assert_eq!(b.s.replaced.len(), 40);
+    b.now = end;
+    // The 30 tried go at once; the 10 waiting behind them go a tick each.
+    for _ in 0..10 {
+        b.now += 2;
+        old_tick(&mut b, 4).await;
+    }
+    assert!(b.s.replaced.is_empty());
+}
+
+/// Out of lookups, a post past its window that hasn't failed waits for its try:
+/// a Bench off for a day still closes what it owed.
+#[tokio::test]
+async fn past_its_window_a_post_still_gets_its_try_when_lookups_run_out() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let ch = b.channel();
+    let seeds = [1, 2].map(|n| {
+        let old = old_card(&mut b, n, &ch);
+        tap(&b.ctx.writer, &old.event_id, OPTION_EMOJI[0], b.now)
+    });
+    reply(&b, &[&seeds[0], &seeds[1]]);
+    b.now += 86_400;
+    old_tick(&mut b, 4).await;
+    assert_eq!(removed(&b).len(), 1);
+    assert_eq!(b.s.replaced.len(), 2);
+    old_tick(&mut b, 4).await;
+    assert_eq!(removed(&b).len(), 2);
+    assert!(b.s.replaced.is_empty());
+}
+
 /// With no post left to spend, the lookups before a removal or a reply wait too.
 #[tokio::test]
 async fn no_budget_no_lookup() {
@@ -662,6 +818,17 @@ async fn lookups_are_capped_per_tick() {
     let from = b.relay.queries.lock().unwrap().len();
     old_tick(&mut b, 4).await;
     assert_eq!(lookups(&b, from), 1);
+}
+
+/// Its lookup is a lookup and its edit a post, like any other.
+#[tokio::test]
+async fn an_edit_from_its_post_spends_a_post() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let (ch, card) = (b.channel(), b.card(ITEM));
+    let post = posted(&b, &card.event_id);
+    reply(&b, &[&post]);
+    retired(&mut b.s, "orchestrator/old", &ch, &card, b.now);
+    assert_eq!(old_tick(&mut b, 4).await, 3);
 }
 
 /// A read that keeps failing fails no tick (lastError stops the kit's approvals).

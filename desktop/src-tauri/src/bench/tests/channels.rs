@@ -628,10 +628,10 @@ async fn closed_card_keeps_its_own_thread_root() {
     b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(r2))]));
     b.settle(3).await;
     assert_eq!(b.s.kept, [old.event_id.as_str()]);
-    assert_eq!(b.s.kept_at, [(r1, old.created_at)]);
-    let closed = &b.posts()[before].0;
-    assert_eq!(closed["kind"], 40003);
-    assert_eq!(tag_value(closed, "e").unwrap(), old.event_id);
+    assert_eq!(b.s.kept_at, [(r1.clone(), old.created_at)]);
+    assert_eq!(b.s.replaced[0].root, Some(r1), "where its one reply goes");
+    let on_old = |e: &Value| e["kind"] == 40003 && tag_value(e, "e") == Some(old.event_id.clone());
+    assert!(b.posts()[before..].iter().any(|(e, _)| on_old(e)));
     let new = b.card(ASK);
     assert_ne!(new.event_id, old.event_id);
     assert_eq!(parent(&posted(&b, &new.event_id)), Some(r2.as_str()));

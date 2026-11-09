@@ -501,9 +501,9 @@ async fn an_unanswered_card_asked_again_is_replaced_as_today() {
         b.drop_file("orchestrator", "relay-choice", &drop);
     };
     let replaced = |b: &Bench, before: usize, old: &str| {
-        assert_eq!(b.kinds()[before..], [5, 9, 7, 7, 9, 5]);
-        assert_eq!(tag_value(&b.posts()[before].0, "e").as_deref(), Some(old));
-        content(&b.posts()[before + 1].0).to_string()
+        assert_eq!(b.kinds()[before..], [9, 7, 7, 9, 5]);
+        assert!(b.s.kept.iter().any(|k| k == old));
+        content(&b.posts()[before].0).to_string()
     };
     let old = b.card(ITEM).event_id;
     let before = b.posts().len();

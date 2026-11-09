@@ -318,7 +318,7 @@ pub(crate) struct Item {
     /// next one posts without the p tag. A new Drop starts false.
     #[serde(default)]
     pub quiet_repost: bool,
-    /// Its card left the relay (retired for a refresh, deleted by hand) and
+    /// Its card is gone (retired for a refresh, deleted by hand) and
     /// has not posted again: it keeps its `MAX_CARDS` place till it does.
     #[serde(default)]
     pub repost: bool,
@@ -1013,8 +1013,8 @@ pub(crate) fn render_card(item: &Item, hhmm: &str) -> String {
     out
 }
 
-/// A stale card kept for what is on it (publish (b)), from its text as
-/// posted: closed, it no longer says how to answer, and says where to now.
+/// An old post (`replaced`), from what it shows: closed, it no longer says how
+/// to answer, and says where to now.
 pub(crate) fn render_closed(posted: &str) -> String {
     let open = [
         format!(" {TAP}"),
