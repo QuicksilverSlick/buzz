@@ -762,6 +762,8 @@ impl AcpClient {
         // over the harness-owned agent identity in native shells.
         cmd.env_remove("GIT_CONFIG_PARAMETERS");
         cmd.env_remove("NOSTR_PRIVATE_KEY");
+        // It says where the primary's token file is: not for the agent's shell.
+        cmd.env_remove(crate::factory::ACCOUNT_POOL_ENV);
         if extra_env.iter().any(|(name, _)| name == "GIT_CONFIG_COUNT") {
             // Native shells inherit these overrides, while buzz-agent clears
             // them for MCP. Let both paths use the harness's agent identity.
@@ -5992,27 +5994,68 @@ mod tests {
         );
     }
 
-    /// A folder login's child has no token, even one the persona (or the PC)
-    /// would hand it. The child says only set or unset, so a failure cannot
-    /// print a value.
-    #[tokio::test]
-    async fn the_real_spawn_removes_a_folder_logins_token() {
-        const CMD: &str = "if defined CLAUDE_CODE_OAUTH_TOKEN (echo set) else (echo unset)";
-        const SH: &str = "[ \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" ] && echo set || echo unset";
+    /// The launch `login` gives a real child, as the child sees `var`. It says
+    /// only set or unset, so a failure cannot print a value.
+    async fn child_sees(
+        var: &str,
+        persona: &[(String, String)],
+        login: Result<Vec<(String, String)>, String>,
+    ) -> String {
         let (shell, flag, show) = if cfg!(windows) {
-            ("cmd", "/c", CMD)
+            let cmd = format!("if defined {var} (echo set) else (echo unset)");
+            ("cmd", "/c", cmd)
         } else {
-            ("sh", "-c", SH)
+            let sh = format!("[ \"${{{var}+x}}\" ] && echo set || echo unset");
+            ("sh", "-c", sh)
         };
-        let args = [flag.to_string(), show.to_string()];
-        let persona = [("CLAUDE_CODE_OAUTH_TOKEN".into(), "from-persona".into())];
-        let folder = Ok(vec![("CLAUDE_CONFIG_DIR".into(), "/logins/one".into())]);
-        let mut client = AcpClient::spawn_with_env(shell, &args, &persona, false, &folder)
+        let args = [flag.to_string(), show];
+        let mut client = AcpClient::spawn_with_env(shell, &args, persona, false, &login)
             .await
             .expect("spawn");
         let seen = client.reader.next().await.expect("a line").expect("read");
         client.shutdown().await;
-        assert_eq!(seen.trim(), "unset");
+        seen.trim().to_string()
+    }
+
+    /// A folder login's child has no token, even one the persona (or the PC)
+    /// would hand it. The agent's own token and a `dpapi:` login keep theirs.
+    #[tokio::test]
+    async fn the_real_spawn_gives_each_kind_of_login_its_token() {
+        const TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+        let persona = [(TOKEN.to_string(), "from-persona".to_string())];
+        let own = Ok(Vec::new());
+        assert_eq!(child_sees(TOKEN, &persona, own).await, "set", "env entry");
+        let file = Ok(vec![(TOKEN.to_string(), "from-file".to_string())]);
+        assert_eq!(child_sees(TOKEN, &[], file).await, "set", "dpapi entry");
+        let folder = Ok(vec![("CLAUDE_CONFIG_DIR".into(), "/logins/one".into())]);
+        assert_eq!(child_sees(TOKEN, &persona, folder).await, "unset", "folder");
+    }
+
+    /// The pool string says where the primary's token file is, so the agent's
+    /// tool shell is not handed it.
+    #[tokio::test]
+    async fn the_real_spawn_keeps_the_pool_string_from_the_agent() {
+        let var = crate::factory::ACCOUNT_POOL_ENV;
+        let persona = [(var.to_string(), "primary=dpapi:C:/x".to_string())];
+        assert_eq!(child_sees(var, &persona, Ok(Vec::new())).await, "unset");
+    }
+
+    /// With no login left nothing starts, not even on the agent's own
+    /// environment, which is what a loose refusal would fall through to.
+    #[tokio::test]
+    async fn no_login_left_starts_nothing() {
+        let (shell, flag, show) = if cfg!(windows) {
+            ("cmd", "/c", "echo started")
+        } else {
+            ("sh", "-c", "echo started")
+        };
+        let args = [flag.to_string(), show.to_string()];
+        let dead = Err("login primary: dead".to_string());
+        let refused = AcpClient::spawn_with_env(shell, &args, &[], false, &dead).await;
+        assert!(
+            matches!(&refused, Err(AcpError::Protocol(why)) if why.contains("login primary: dead")),
+            "nothing may start with no login left"
+        );
     }
 
     #[tokio::test]
