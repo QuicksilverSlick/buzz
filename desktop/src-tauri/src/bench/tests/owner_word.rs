@@ -199,6 +199,40 @@ async fn a_cut_owner_page_retires_nothing() {
     assert!(!deleted(&b));
 }
 
+/// `held` is all that keeps a card from retiring when only its card format
+/// moved: nothing asked again waits in the inbox, and the tap is still unread.
+#[tokio::test]
+async fn a_cut_owner_page_leaves_a_stale_format_card_up() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let root = "ab".repeat(32);
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(root))]));
+    b.settle(6).await;
+    let i = b.s.items.get_mut(ASK).unwrap();
+    i.card.as_mut().unwrap().hash = format!("{}.3", i.hash);
+    let card = b.card(ASK);
+    let two = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now);
+    let chat = owners_chat(&b, &root, card.created_at);
+    let mut evs = vec![&list, &two];
+    evs.extend(&chat);
+    reply(&b, &evs);
+    let before = b.posts().len();
+    for _ in 0..3 {
+        let _ = b.tick().await;
+    }
+    assert_eq!(b.s.held, [ASK]);
+    assert_eq!(b.card(ASK), card);
+    assert!(b.s.replaced.is_empty());
+    let edited = |e: &Value| e["kind"] == 40003 && tag_value(e, "e") == Some(card.event_id.clone());
+    assert!(!b.posts()[before..].iter().any(|(e, _)| edited(e)));
+    // Read in full, the tap counts on the card it was made on.
+    reply(&b, &[&list, &two]);
+    b.tick().await.unwrap();
+    assert_eq!(b.s.items[ASK].answer.as_ref().map(|a| a.option), Some(1));
+}
+
 #[tokio::test]
 async fn a_re_asked_card_still_ends_an_older_cards_window() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
