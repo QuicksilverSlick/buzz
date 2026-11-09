@@ -31,7 +31,11 @@ import {
   useUsersBatchQuery,
 } from "@/features/profile/hooks";
 import { formatOwnerLabel } from "@/features/profile/lib/identity";
-import { rankUserCandidatesBySearch } from "@/features/profile/lib/userCandidateSearch";
+import {
+  getKeyboardSearchSelection,
+  rankUserCandidatesBySearch,
+} from "@/features/profile/lib/userCandidateSearch";
+import { useRelayMembersQuery } from "@/features/community-members/hooks";
 import { useAgentAvailabilityLookup } from "@/features/agents/lib/useAgentAvailability";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -52,6 +56,7 @@ import {
 } from "@/shared/ui/dialog";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
+import { parsePubkeyInput } from "@/shared/lib/nostrUtils";
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import {
   MODAL_SEARCH_INPUT_CLASS,
@@ -202,9 +207,14 @@ export function MembersSidebar({
   const memberProfilesQuery = useUsersBatchQuery(allMemberPubkeys, {
     enabled: open && rawMembers.length > 0,
   });
-  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  // A pasted npub or hex key searches as its hex form, which matches existing
+  // members and ranks the pasted candidate below.
+  const normalizedSearchQuery =
+    parsePubkeyInput(searchQuery) ?? searchQuery.trim().toLowerCase();
   const deferredSearchQuery = React.useDeferredValue(searchQuery.trim());
-  const normalizedDeferredSearchQuery = deferredSearchQuery.toLowerCase();
+  const pastedPubkey = parsePubkeyInput(deferredSearchQuery);
+  const normalizedDeferredSearchQuery =
+    pastedPubkey ?? deferredSearchQuery.toLowerCase();
   const filteredActiveMembers = React.useMemo(() => {
     if (!normalizedSearchQuery) {
       return activeMembers;
@@ -252,13 +262,43 @@ export function MembersSidebar({
     channel?.visibility !== "open";
   const userSearchQuery = useInfiniteUserSearchQuery(deferredSearchQuery, {
     allowEmpty: false,
+    // User search matches profile text, never keys. A pasted key is looked up
+    // directly instead, so it needs no search round trip.
     enabled:
       open &&
       canAddMembers &&
+      pastedPubkey === null &&
       deferredSearchQuery.length >= MEMBER_SEARCH_MIN_QUERY_LENGTH,
     limit: MEMBER_ADD_RESULT_LIMIT,
   });
   const userSearchResults = useFlattenedUserSearchResults(userSearchQuery.data);
+  const pastedProfileQuery = useUsersBatchQuery(
+    pastedPubkey ? [pastedPubkey] : [],
+    { enabled: open && canAddMembers },
+  );
+  const rosterQuery = useRelayMembersQuery(
+    open && canAddMembers && pastedPubkey !== null,
+  );
+  const pastedProfile = pastedPubkey
+    ? pastedProfileQuery.data?.profiles[pastedPubkey]
+    : undefined;
+  const pastedKeyResolved =
+    pastedProfileQuery.isSuccess &&
+    !pastedProfileQuery.isFetching &&
+    !rosterQuery.isLoading;
+  // The relay checks channel policy only, so it would seat any key: a typo, an
+  // event id, someone not let into the community. An empty roster means no
+  // member list to check against, as on an open relay.
+  const pastedKeyIsOutsider =
+    pastedKeyResolved &&
+    !pastedProfile &&
+    (rosterQuery.data?.length ?? 0) > 0 &&
+    !rosterQuery.data?.some((member) => member.pubkey === pastedPubkey);
+  const pastedKeyNotice = pastedKeyIsOutsider
+    ? "That key isn’t a member of this community yet. An owner or admin can add them in Settings > Members."
+    : pastedPubkey && pastedProfileQuery.isError
+      ? "Couldn’t look up that key. Check your connection and try again."
+      : null;
   const isArchivedDiscovery = useIsArchivedPredicate();
   const addSearchResults = React.useMemo(() => {
     if (!canAddMembers || normalizedDeferredSearchQuery.length === 0) {
@@ -348,6 +388,20 @@ export function MembersSidebar({
       });
     }
 
+    // Someone with no kind:0 profile is invisible to user search, so a pasted
+    // key is the only way to reach them. Waits for the lookup so an agent's key
+    // is treated as an agent, not added as a person.
+    if (pastedPubkey && pastedKeyResolved && !pastedKeyIsOutsider) {
+      addCandidate({
+        pubkey: pastedPubkey,
+        displayName: pastedProfile?.displayName ?? null,
+        avatarUrl: pastedProfile?.avatarUrl ?? null,
+        nip05Handle: pastedProfile?.nip05Handle ?? null,
+        ownerPubkey: pastedProfile?.ownerPubkey ?? null,
+        isAgent: pastedProfile?.isAgent === true,
+      });
+    }
+
     const coalescedCandidates = coalesceAgentAutocompleteCandidates(
       [...candidatesByPubkey.values()],
       {
@@ -371,11 +425,17 @@ export function MembersSidebar({
     managedAgentsQuery.data,
     memberPubkeys,
     normalizedDeferredSearchQuery,
+    pastedKeyIsOutsider,
+    pastedKeyResolved,
+    pastedProfile,
+    pastedPubkey,
     relayAgentsQuery.data,
     userSearchResults,
   ]);
   const isAddSearchLoading =
     userSearchQuery.isLoading ||
+    pastedProfileQuery.isFetching ||
+    rosterQuery.isLoading ||
     managedAgentsQuery.isLoading ||
     relayAgentsQuery.isLoading ||
     channelsQuery.isLoading;
@@ -727,16 +787,23 @@ export function MembersSidebar({
                   setSearchQuery(event.target.value);
                 }}
                 onKeyDown={(event) => {
-                  if (event.key !== "Enter" || addSearchResults.length === 0) {
+                  // Null until the results match what's in the box, so Enter
+                  // right after a paste can't add the previous search's top row.
+                  const selection = getKeyboardSearchSelection({
+                    currentQuery: normalizedSearchQuery,
+                    rankedQuery: normalizedDeferredSearchQuery,
+                    results: addSearchResults,
+                  });
+                  if (event.key !== "Enter" || !selection) {
                     return;
                   }
 
                   event.preventDefault();
-                  void handleAddSearchResult(addSearchResults[0]);
+                  void handleAddSearchResult(selection);
                 }}
                 placeholder={
                   canAddMembers
-                    ? "Add people and agents"
+                    ? "Add people and agents, or paste a public key"
                     : "Search people and agents"
                 }
                 ref={searchInputRef}
@@ -807,7 +874,7 @@ export function MembersSidebar({
                     addSearchResults.length === 0 &&
                     !isAddSearchLoading ? (
                       <p className="px-4 py-3 text-sm text-muted-foreground">
-                        No matching people or agents.
+                        {pastedKeyNotice ?? "No matching people or agents."}
                       </p>
                     ) : null}
                   </div>

@@ -253,7 +253,6 @@ export type RelayMember = {
   pubkey: string;
   role: RelayMemberRole;
   addedBy: string | null;
-  createdAt: string;
 };
 export type RelayAgent = {
   pubkey: string;

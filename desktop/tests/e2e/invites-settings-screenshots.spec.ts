@@ -249,9 +249,29 @@ test("owner adds a member by npub from Add member", async ({ page }) => {
   await dialog.getByTestId("confirm-add-member").click();
 
   await expect(dialog).toHaveCount(0);
+  const row = page.getByTestId(`relay-member-row-${DIRECT_ADD_HEX}`);
+  await expect(row).toBeVisible();
+  // No profile: the row names them by short npub, so two can be told apart.
   await expect(
-    page.getByTestId(`relay-member-row-${DIRECT_ADD_HEX}`),
+    page.getByTestId(`relay-member-name-${DIRECT_ADD_HEX}`),
+  ).toHaveText("npub1a2d…yp60");
+  await expect(
+    page.getByRole("button", { name: "Actions for npub1a2d…yp60" }),
   ).toBeVisible();
+});
+
+test("member rows show when each was added, not when the list last changed", async ({
+  page,
+}) => {
+  await expect(
+    page.getByTestId(`relay-member-row-${TEST_IDENTITIES.alice.pubkey}`),
+  ).toContainText("Added Mar 14, 2026");
+  // The relay never announced the bootstrap owner, so there is no date to show.
+  await expect(
+    page
+      .locator('[data-testid^="relay-member-row-"]')
+      .filter({ hasText: "You" }),
+  ).not.toContainText("Added");
 });
 
 test("owner removes a member via the ... menu with confirm", async ({
