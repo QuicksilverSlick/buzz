@@ -661,19 +661,25 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
-        Self::spawn_with_env(command, args, extra_env, has_generated_codex_config, &[]).await
+        let none = Ok(Vec::new());
+        Self::spawn_with_env(command, args, extra_env, has_generated_codex_config, &none).await
     }
 
     /// Spawn with authoritative launch environment overrides. Unlike persona
     /// defaults, these values take precedence over the inherited environment.
+    /// An `Err` is a pool with no login left to start on: nothing is spawned.
     pub(crate) async fn spawn_with_env(
         command: &str,
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
-        launch_env: &[(String, String)],
+        launch_env: &Result<Vec<(String, String)>, String>,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
+
+        let launch_env = launch_env
+            .as_ref()
+            .map_err(|why| AcpError::Protocol(format!("no login to start on: {why}")))?;
 
         // A launch prefix may change the CLI or environment the adapter sees,
         // so the version check below could inspect the wrong binary.
@@ -787,7 +793,7 @@ impl AcpClient {
                 "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
                 _ => None,
             };
-        cmd.envs(launch_env.iter().cloned());
+        crate::factory::apply_launch_env(&mut cmd, launch_env);
         cmd.env_remove(launch::PREFIX_ENV);
         let claude_thinking_summaries = standard_adapter == Some(StandardAdapterKind::Claude)
             && !launch_prefixed
@@ -5986,6 +5992,29 @@ mod tests {
         );
     }
 
+    /// A folder login's child has no token, even one the persona (or the PC)
+    /// would hand it. The child says only set or unset, so a failure cannot
+    /// print a value.
+    #[tokio::test]
+    async fn the_real_spawn_removes_a_folder_logins_token() {
+        const CMD: &str = "if defined CLAUDE_CODE_OAUTH_TOKEN (echo set) else (echo unset)";
+        const SH: &str = "[ \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" ] && echo set || echo unset";
+        let (shell, flag, show) = if cfg!(windows) {
+            ("cmd", "/c", CMD)
+        } else {
+            ("sh", "-c", SH)
+        };
+        let args = [flag.to_string(), show.to_string()];
+        let persona = [("CLAUDE_CODE_OAUTH_TOKEN".into(), "from-persona".into())];
+        let folder = Ok(vec![("CLAUDE_CONFIG_DIR".into(), "/logins/one".into())]);
+        let mut client = AcpClient::spawn_with_env(shell, &args, &persona, false, &folder)
+            .await
+            .expect("spawn");
+        let seen = client.reader.next().await.expect("a line").expect("read");
+        client.shutdown().await;
+        assert_eq!(seen.trim(), "unset");
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script("sleep 10").await;
@@ -6661,10 +6690,10 @@ sleep 1"#,
             &[],
             &[],
             false,
-            &[(
+            &Ok(vec![(
                 "CLAUDE_CODE_EXECUTABLE".into(),
                 cli.to_str().expect("utf8 path").into(),
-            )],
+            )]),
         )
         .await
         .expect("spawn fake claude adapter");

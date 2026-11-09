@@ -3619,7 +3619,7 @@ async fn run_harness(
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
-                let launch_env = config.factory.lock().launch_env(idx, chrono::Utc::now());
+                let launch_env = config.factory.lock().login_env(idx, chrono::Utc::now());
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -6239,7 +6239,13 @@ fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
     tokio::spawn(async move {
         let mut changed = false;
         for (login, env) in targets {
-            let found = factory::signin_probe(&env).await;
+            let found = match env {
+                Ok(env) => factory::signin_probe(&env).await,
+                Err((found, why)) => {
+                    tracing::warn!(login, "sign-in check: its token file: {why}");
+                    found
+                }
+            };
             tracing::debug!(login, "sign-in check: {found:?}");
             changed |= factory
                 .lock()
@@ -6960,7 +6966,7 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
-    let launch_env = config.factory.lock().launch_env(i, chrono::Utc::now());
+    let launch_env = config.factory.lock().login_env(i, chrono::Utc::now());
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -7251,7 +7257,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let launch_env = config.factory.lock().launch_env(index, chrono::Utc::now());
+    let launch_env = config.factory.lock().login_env(index, chrono::Utc::now());
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -7310,7 +7316,7 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let launch_env = startup.factory.lock().launch_env(i, chrono::Utc::now());
+        let launch_env = startup.factory.lock().login_env(i, chrono::Utc::now());
         let spawn_result = AcpClient::spawn_with_env(
             &startup.command,
             &startup.args,
@@ -7419,7 +7425,7 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
-    launch_env: &[(String, String)],
+    launch_env: &std::result::Result<Vec<(String, String)>, String>,
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,

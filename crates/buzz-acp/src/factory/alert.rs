@@ -236,9 +236,8 @@ mod tests {
     const TWO_FOLDERS: &str = r"primary=C:\logins\one;spare=C:\logins\two";
 
     /// Everything a pool login is allowed to put in the agent's environment:
-    /// its own config folder, and a blanked token so a PC-wide one cannot
-    /// win over the folder's login. Nothing else, and nothing of the
-    /// harness's own.
+    /// its own config folder, or a `dpapi:` entry's token. Nothing else, and
+    /// nothing of the harness's own.
     const ALLOWED_AGENT_ENV_KEYS: [&str; 2] =
         ["CLAUDE_CONFIG_DIR", crate::factory::OAUTH_TOKEN_ENV];
 
@@ -544,7 +543,7 @@ mod tests {
             let mut factory = Factory::new(pool, "claude-agent-acp");
             let mut envs = vec![factory.launch_env(0, now)];
             for i in 0..=factory.accounts().len() {
-                envs.push(factory.account_env(i));
+                envs.push(factory.account_env(i).unwrap());
             }
             for env in envs {
                 for (key, value) in env {
