@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use super::channels::{card_channel, channel_ready, ready};
 use super::publish::{edit, forget_card, on_post, post_message, thread_of};
 use super::{
-    item, post_as_writer, query, query_writer, spend, BenchState, Ctx, Posted, RECOVER_LIMIT,
+    item, post_as_writer, query, query_writer, same_drop, spend, BenchState, Ctx, Posted,
+    RECOVER_LIMIT,
 };
 use crate::events;
 
@@ -142,16 +143,19 @@ pub(super) fn left_behind(s: &mut BenchState, new: &item::Item, now: u64) {
 
 /// A close-out (publish (a2b)): its card stays the item's, and the post becomes
 /// the receipt. A later one, while the post is still here, changes what it shows
-/// and starts its 24 h again.
+/// and starts its 24 h again. A new card format or stamp is no close-out, so it
+/// is edited again unwatched, as `backfill` does: most closed out days ago.
 pub(super) fn receipt(s: &mut BenchState, id: &str, now: u64) {
     let Some((i, card)) = s.items.get(id).and_then(|i| Some((i, i.card.as_ref()?))) else {
         return;
     };
     let r = showing(s, i, card, now);
+    let closed_out = !same_drop(card, i);
     let same = |o: &&mut Replaced| o.card.event_id == r.card.event_id;
     match s.replaced.iter_mut().find(same) {
         Some(o) => (o.shown, o.at) = (r.shown, r.at),
-        None => add(s, r),
+        None if closed_out => add(s, r),
+        None => s.replaced.push(Replaced { watch: false, ..r }),
     }
 }
 
