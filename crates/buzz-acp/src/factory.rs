@@ -1480,16 +1480,28 @@ pub(crate) const PRIMARY_LABEL: &str = "primary";
 /// means the agent's own environment, unchanged, so its own long-lived token
 /// is the login. The label is still the owner's own word, which is how a
 /// token-based login gets a name that is neither a token nor a path.
+///
+/// A `dpapi:` entry that does not parse is kept as one with no file, which
+/// fails plainly when it is launched. It must not become a folder login.
 fn parse_entry(entry: &str) -> (String, Option<String>) {
     match entry.split_once('=') {
         Some((label, value)) if is_plain_label(label) && value.trim() == ENV_ENTRY => {
             (slug(label.trim()), None)
         }
-        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
+        Some((label, dir))
+            if is_plain_label(label) && !dir.trim().is_empty() && !garbled_dpapi(dir) =>
+        {
             (slug(label.trim()), Some(dir.trim().to_string()))
         }
+        _ if garbled_dpapi(entry) => (account_label(entry), Some(DPAPI_ENTRY.to_string())),
         _ => (account_label(entry), Some(entry.to_string())),
     }
+}
+
+/// Whether `value` reaches for a `dpapi:` file without being one.
+fn garbled_dpapi(value: &str) -> bool {
+    let value = value.trim();
+    !value.starts_with(DPAPI_ENTRY) && value.to_ascii_lowercase().contains(DPAPI_ENTRY)
 }
 
 /// Whether `s` is a label the owner wrote rather than the head of a path: at

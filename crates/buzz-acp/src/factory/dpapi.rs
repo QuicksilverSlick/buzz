@@ -22,6 +22,12 @@ pub(super) type Decrypt = fn(&str) -> Result<String, Unread>;
 /// The token in `file`. Blank is a failure: a failed decrypt prints nothing,
 /// and the Claude CLI reads a blank token as signed out.
 pub(super) fn token(file: &str, read: Option<Decrypt>) -> Result<String, Unread> {
+    if file.is_empty() {
+        return Err((
+            SignIn::SignedOut,
+            "its pool entry is not written label=dpapi:<path>; correct it in the agent's settings",
+        ));
+    }
     match read.unwrap_or(decrypt)(file) {
         Ok(token) if token.trim().is_empty() => Err((
             SignIn::SignedOut,
@@ -367,6 +373,29 @@ mod tests {
         f.decrypt = Some(counted);
         assert!(f.login_env(0, Utc::now()).is_err());
         assert_eq!(READS.load(Ordering::SeqCst), 2);
+    }
+
+    /// A typo in a `dpapi:` entry fails that entry and says so. It never
+    /// becomes a folder login named after the typo.
+    #[test]
+    fn a_garbled_dpapi_entry_is_dead_and_never_a_folder() {
+        let now = Utc::now();
+        let long = format!("{}=dpapi:C:/x/p.dpapi", "a".repeat(33));
+        for entry in [
+            "primary=DPAPI:C:/x/p.dpapi",
+            "my.login=dpapi:C:/x/p.dpapi",
+            "primary login=dpapi:C:/x/p.dpapi",
+            "primary=dpapi:",
+            long.as_str(),
+        ] {
+            let mut f = pool(&format!("{entry};fallback=C:/f"));
+            f.decrypt = Some(|_| panic!("a garbled entry has no file to read"));
+            let env = f.launch_env(0, now);
+            assert_eq!(env, pair("CLAUDE_CONFIG_DIR", "C:/f"), "{entry}");
+            assert_eq!(f.label(0), "fallback", "{entry}");
+            let texts = f.take_alerts();
+            assert!(texts[0].contains("label=dpapi:"), "{entry}: {texts:?}");
+        }
     }
 
     #[cfg(not(windows))]
