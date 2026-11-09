@@ -480,7 +480,9 @@ pub(super) async fn publish(
             continue;
         };
         let hash = item::card_hash(item);
-        if card.hash == hash {
+        // A channel not ready takes no edit (`replaced`): the hash stays behind,
+        // so the close-out is picked up once it is ready.
+        if card.hash == hash || !channel_ready(s, item) {
             continue;
         }
         super::replaced::receipt(s, &id, now);

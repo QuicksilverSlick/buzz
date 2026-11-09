@@ -3,7 +3,7 @@
 //! harness are in scope.
 
 use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
-use super::channels::{admins, ask, bind, ASK, X};
+use super::channels::{admins, ask, bind, bound_bench, hex, ASK, X};
 use super::receipts::close_out;
 use super::*;
 use crate::bench::channels::ChannelCheck;
@@ -704,6 +704,38 @@ async fn a_tap_on_a_receipt_in_a_thread_is_told_under_its_root() {
     };
     assert_eq!(named("root"), root);
     assert_eq!(named("reply"), card);
+}
+
+/// A close-out in a channel that stays refused for more than a day: its edit
+/// waits with the channel, unowed, and goes out once the channel is ready.
+#[tokio::test]
+async fn a_close_out_in_a_channel_not_ready_keeps_its_edit() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let bad = admins(&b, &b.relay.keys.clone(), &[&hex(&p.craig)]);
+    reply(&b, &[&bad]);
+    b.now += 601;
+    b.settle(2).await;
+    assert!(b.s.channels[X].refused.is_some());
+    b.drop_file("reset-worker", "welcome", &done_in_x());
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(b.s.items[ASK].request.is_some());
+    b.now += 86_400;
+    b.settle(2).await;
+    let edited = |b: &Bench| {
+        let on_card = |e: &Value| e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(&card);
+        b.posts()[before..].iter().any(|(e, _)| on_card(e))
+    };
+    assert!(!edited(&b), "not while the channel is refused");
+    reply(&b, &[&list]);
+    b.now += 61;
+    b.settle(4).await;
+    assert_eq!(b.s.channels[X].refused, None);
+    assert!(edited(&b), "the close-out's edit never went out");
+    let receipt = last_edit(&b, &card);
+    assert!(content(&receipt).starts_with(NOT_ASKED), "{receipt}");
+    assert!(content(&receipt).contains("Done in X"), "{receipt}");
 }
 
 /// Close-out receipts are the largest group of dead pills: the first line, the
