@@ -24,6 +24,7 @@ const RELAY_QUERY_ROOTS = new Set<string>([
   "pulse-reactions",
   "pulse-timeline",
   "relay-agents",
+  "relayMemberAddedDates",
   "relayMembers",
   "reminders",
   "run-approvals",

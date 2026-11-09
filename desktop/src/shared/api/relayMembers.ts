@@ -1,4 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
+import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import { invokeTauri, signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import type {
@@ -8,6 +9,8 @@ import type {
 } from "@/shared/api/types";
 
 const KIND_NIP43_MEMBERSHIP_LIST = 13534;
+const KIND_NIP43_MEMBER_ADDED = 8000;
+const MEMBER_ADDED_LIMIT = 1_000;
 const KIND_RELAY_ADMIN_ADD_MEMBER = 9030;
 const KIND_RELAY_ADMIN_REMOVE_MEMBER = 9031;
 const KIND_RELAY_ADMIN_CHANGE_ROLE = 9032;
@@ -90,7 +93,6 @@ export function shouldShowCommunityMembersSettings(
 export function relayMembersFromEvent(event: RelayEvent): RelayMember[] {
   const seen = new Set<string>();
   const members: RelayMember[] = [];
-  const createdAt = eventCreatedAtIso(event);
 
   for (const tag of event.tags) {
     const [name, rawPubkey, maybeRoleOrRelay, maybePTagRole] = tag;
@@ -108,7 +110,6 @@ export function relayMembersFromEvent(event: RelayEvent): RelayMember[] {
       pubkey,
       role,
       addedBy: null,
-      createdAt,
     });
   }
 
@@ -161,6 +162,43 @@ export async function loadRelayMembershipLookup(
 export async function listRelayMembers(): Promise<RelayMember[]> {
   const event = await fetchMembershipListEvent();
   return event ? relayMembersFromEvent(event) : [];
+}
+
+/**
+ * When each member was added (ISO time by hex pubkey), from the relay's
+ * kind:8000 announcements.
+ *
+ * The kind:13534 snapshot can't say: it is one replaceable event whose
+ * `created_at` moves on every roster change, and its tags hold no per-member
+ * time. Someone removed and re-added has several announcements, and the newest
+ * is their current membership. A member the relay never announced (the
+ * bootstrap owner, an allowlist backfill) gets no entry, so their row shows no
+ * date rather than a wrong one.
+ */
+export async function listRelayMemberAddedDates(
+  fetchEvents: (filter: RelaySubscriptionFilter) => Promise<RelayEvent[]> = (
+    filter,
+  ) => relayClient.fetchEvents(filter),
+): Promise<Record<string, string>> {
+  const events = await fetchEvents({
+    kinds: [KIND_NIP43_MEMBER_ADDED],
+    limit: MEMBER_ADDED_LIMIT,
+  });
+  // ponytail: one page, the relay's max. Past 1,000 adds the oldest members
+  // lose their date; page with until + before_id (fetchHuddleLifecycleHistory)
+  // if a community gets there.
+  if (events.length >= MEMBER_ADDED_LIMIT) {
+    console.warn(
+      `Read only the newest ${MEMBER_ADDED_LIMIT} member additions: older members show no Added date.`,
+    );
+  }
+
+  const addedAt: Record<string, string> = {};
+  for (const event of [...events].sort((a, b) => a.created_at - b.created_at)) {
+    const pubkey = event.tags.find(([name]) => name === "p")?.[1];
+    if (pubkey) addedAt[normalizePubkey(pubkey)] = eventCreatedAtIso(event);
+  }
+  return addedAt;
 }
 
 export async function relayRequiresMembership(
