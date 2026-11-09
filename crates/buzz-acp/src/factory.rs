@@ -26,7 +26,7 @@ use park_budget::{Budget, Parks};
 
 pub(crate) use alert::{send as send_alert, ALERT_CMD_ENV, ALERT_SMS_TO_ENV};
 pub(crate) use signin_check::{
-    probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
+    ask as signin_ask, probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
     CHECK_SECS_ENV as SIGNIN_CHECK_SECS_ENV,
 };
 
@@ -827,10 +827,10 @@ impl Factory {
                     self.started_on.insert(slot, i);
                     return Ok(env);
                 }
-                Err((_, why)) => {
-                    dead = format!("login {}: {why}", self.at(i));
+                Err(unread) => {
+                    dead = format!("login {}: {}", self.at(i), unread.1);
                     tracing::warn!("{dead}; trying the next login");
-                    self.signin_checked(i, signin_check::SignIn::SignedOut, now);
+                    self.token_file_failed(i, unread, now);
                 }
             }
         }
@@ -1194,7 +1194,7 @@ impl Factory {
             record.push_str(&format!(" incident={incident}"));
         }
         if let Some(f) = failure {
-            record.push_str(&format!("\n{} said: \"{}\"", self.provider_name(), f.text));
+            record.push_str(&format!("\n{} said: \"{}\"", self.speaker(f), f.text));
         }
         record.push_str(&format!("\nPlain words: {}", self.plain_words(now)));
         if !stopped {
@@ -1219,6 +1219,27 @@ impl Factory {
         }
     }
 
+    /// Whose words `failure` carries: a token file's are Buzz's own.
+    fn speaker(&self, failure: &Failure) -> String {
+        if failure.slug == dpapi::UNREAD_SLUG {
+            "Buzz".to_string()
+        } else {
+            self.provider_name()
+        }
+    }
+
+    /// What brings back the login the current incident is about.
+    fn sign_in_remedy(&self) -> &'static str {
+        let on_file = self.accounts.iter().any(|a| {
+            a.label == self.account && a.dir.as_deref().is_some_and(|d| d.starts_with(DPAPI_ENTRY))
+        });
+        if on_file {
+            "its token file is replaced with set-account.ps1"
+        } else {
+            "it is signed in again"
+        }
+    }
+
     fn who(&self) -> &str {
         match self.reporting.agent.as_str() {
             "" => "This agent",
@@ -1239,8 +1260,8 @@ impl Factory {
                  recovered."
             ),
             (Health::Down, ..) => format!(
-                "{who} lost its sign-in. Its work is paused until it is signed in again; it \
-                 keeps checking. {saved}"
+                "{who} lost its sign-in. Its work is paused until {}; it keeps checking. {saved}",
+                self.sign_in_remedy()
             ),
             (Health::Blocked, Some(Class::SpendCap), _) => format!(
                 "{who}'s work is paused until the spending cap is raised; it checks every 30 \
@@ -1303,13 +1324,13 @@ impl Factory {
             (
                 "sign-in",
                 format!("{who} lost its {provider} sign-in"),
-                "it is signed in again",
+                self.sign_in_remedy(),
             )
         };
         // The time is in the text so a later incident is a new card, not
         // the same Drop the Bench already holds.
         let since = chicago_label(self.since.unwrap_or_else(Utc::now));
-        let quote = card_quote(&provider, &failure.text);
+        let quote = card_quote(&self.speaker(failure), &failure.text);
         let where_now = match moved_to {
             Some(next) => format!("It is now running on login {next}."),
             None => "Its requests are parked, not dropped.".to_string(),

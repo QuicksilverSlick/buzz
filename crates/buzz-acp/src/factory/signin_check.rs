@@ -118,8 +118,25 @@ impl Factory {
         match found {
             SignIn::Unknown => false,
             SignIn::Valid => self.signin_restored(index, now),
-            SignIn::SignedOut => self.signin_lost(index, now),
+            SignIn::SignedOut => self.signin_lost(index, &check_failure(), now),
         }
+    }
+
+    /// [`signin_checked`](Self::signin_checked), for a check whose login's
+    /// file may have given it nothing to ask about. No answer from PowerShell
+    /// concludes nothing, the same as no answer from the CLI.
+    pub(crate) fn signin_found(
+        &mut self,
+        index: usize,
+        found: Result<SignIn, dpapi::Unread>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let (found, why) = match found {
+            Ok(found) => return self.signin_checked(index, found, now),
+            Err(unread) => unread,
+        };
+        tracing::warn!(login = index, "sign-in check: its token file: {why}");
+        found != SignIn::Unknown && self.token_file_failed(index, (found, why), now)
     }
 
     /// The check says login `index` is not signed in, and no request was in
@@ -138,7 +155,12 @@ impl Factory {
     ///
     /// A login already known to be out changes nothing either way: the check
     /// runs every 15 minutes and must not card or text on every one of them.
-    fn signin_lost(&mut self, index: usize, now: DateTime<Utc>) -> bool {
+    pub(super) fn signin_lost(
+        &mut self,
+        index: usize,
+        failure: &Failure,
+        now: DateTime<Utc>,
+    ) -> bool {
         let known = match self.accounts.get(index) {
             Some(account) => account.signed_out,
             // No pool: the single login's state is the harness's own.
@@ -148,12 +170,12 @@ impl Factory {
             return false;
         }
         if !self.accounts.is_empty() && !self.work_runs_on(index, now) {
-            return self.spare_signin_lost(index);
+            return self.spare_signin_lost(index, failure);
         }
         if self.health == Health::Blocked {
             return self.signin_lost_while_parked(index);
         }
-        self.record_limit_on(index, &check_failure(), now);
+        self.record_limit_on(index, failure, now);
         true
     }
 
@@ -195,12 +217,16 @@ impl Factory {
     /// and no all-clear owed afterwards for an outage that never happened.
     /// The owner still hears once, because a pool quietly down to its last
     /// working login is how the next outage becomes a surprise.
-    fn spare_signin_lost(&mut self, index: usize) -> bool {
+    fn spare_signin_lost(&mut self, index: usize, failure: &Failure) -> bool {
         self.accounts[index].signed_out = true;
-        let line = format!(
-            "{}'s backup sign-in needs signing in again; the agent is unaffected.",
-            self.who()
-        );
+        let line = if failure.slug == dpapi::UNREAD_SLUG {
+            format!("{} {}. The agent is unaffected.", self.who(), failure.text)
+        } else {
+            format!(
+                "{}'s backup sign-in needs signing in again; the agent is unaffected.",
+                self.who()
+            )
+        };
         tracing::warn!("{line}");
         self.alert_aside(&line);
         true
@@ -242,6 +268,18 @@ impl Factory {
         }
         cleared || over
     }
+}
+
+/// What `probe` says about a login, unless its file gave no token. Then the
+/// CLI is not asked: it would judge the agent's own environment instead.
+pub(crate) async fn ask<F>(
+    env: dpapi::LoginEnv,
+    probe: impl FnOnce(Vec<(String, String)>) -> F,
+) -> Result<SignIn, dpapi::Unread>
+where
+    F: std::future::Future<Output = SignIn>,
+{
+    Ok(probe(env?).await)
 }
 
 /// Ask the Claude CLI whether `env` is signed in, spending no usage.

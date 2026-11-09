@@ -6239,17 +6239,12 @@ fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
     tokio::spawn(async move {
         let mut changed = false;
         for (login, env) in targets {
-            let found = match env {
-                Ok(env) => factory::signin_probe(&env).await,
-                Err((found, why)) => {
-                    tracing::warn!(login, "sign-in check: its token file: {why}");
-                    found
-                }
-            };
+            let probe = |env: Vec<_>| async move { factory::signin_probe(&env).await };
+            let found = factory::signin_ask(env, probe).await;
             tracing::debug!(login, "sign-in check: {found:?}");
             changed |= factory
                 .lock()
-                .signin_checked(login, found, chrono::Utc::now());
+                .signin_found(login, found, chrono::Utc::now());
         }
         if !changed {
             return;

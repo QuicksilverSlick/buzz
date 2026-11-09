@@ -1,7 +1,13 @@
 //! A login's token from a DPAPI file (`label=dpapi:<path>`): kept nowhere
 //! here, and handed to the child only in its environment.
 
+use chrono::{DateTime, Utc};
+
 use super::signin_check::SignIn;
+use super::{Class, Factory, Failure};
+
+/// The STATE record's class for a file that gave no token.
+pub(super) const UNREAD_SLUG: &str = "token_file";
 
 /// Why a file gave no token: a sign-in check's verdict and fixed words, so
 /// neither a value nor anything PowerShell printed can reach a log.
@@ -19,7 +25,8 @@ pub(super) fn token(file: &str, read: Option<Decrypt>) -> Result<String, Unread>
     match read.unwrap_or(decrypt)(file) {
         Ok(token) if token.trim().is_empty() => Err((
             SignIn::SignedOut,
-            "the file is missing or did not decrypt for this Windows user",
+            "the file is missing or did not decrypt for this Windows user; \
+             run set-account.ps1 to replace it",
         )),
         read => read,
     }
@@ -51,8 +58,19 @@ fn powershell(file: &str) -> tokio::process::Command {
 fn decrypt(file: &str) -> Result<String, Unread> {
     use std::io::Read;
     use std::time::{Duration, Instant};
-    let no_answer = (SignIn::Unknown, "PowerShell did not answer");
-    let mut child = powershell(file).into_std().spawn().map_err(|_| no_answer)?;
+    let no_answer = (
+        SignIn::Unknown,
+        "PowerShell did not answer in 15 s; it tries again in 30 minutes, and set-account.ps1 \
+         replaces the file if it keeps failing",
+    );
+    let wont_start = (
+        SignIn::Unknown,
+        "PowerShell would not start; it tries again in 30 minutes",
+    );
+    let mut child = powershell(file)
+        .into_std()
+        .spawn()
+        .map_err(|_| wont_start)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     while !matches!(child.try_wait(), Ok(Some(_))) {
         if Instant::now() >= deadline {
@@ -73,13 +91,54 @@ fn decrypt(_file: &str) -> Result<String, Unread> {
     Err((SignIn::SignedOut, "a dpapi: login only works on Windows"))
 }
 
+impl Factory {
+    /// Login `i`'s file gave no token. Claude was never asked, so the owner
+    /// is told about the file, in words of its own.
+    ///
+    /// A file that is dead takes the path a lost sign-in takes. PowerShell
+    /// not answering says nothing about the token, so that login is set
+    /// aside as a limit with no reset time: tried again in 30 minutes
+    /// ([`PROBE_EVERY`](super::PROBE_EVERY)), and no sign-in incident. A
+    /// login already inside a limit keeps it, and what the record says of it.
+    pub(super) fn token_file_failed(
+        &mut self,
+        i: usize,
+        (found, why): Unread,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let text = format!(
+            "could not read the token file for login {}: {why}",
+            self.at(i)
+        );
+        let mut failure = Failure {
+            class: Class::SignIn,
+            slug: UNREAD_SLUG,
+            text,
+            resets_at: None,
+        };
+        if found != SignIn::Unknown {
+            return self.signin_lost(i, &failure, now);
+        }
+        if self.accounts[i]
+            .limited
+            .as_ref()
+            .is_some_and(|l| l.until > now)
+        {
+            return false;
+        }
+        failure.class = Class::UsageLimit;
+        self.alert_aside(&format!("{} {}.", self.who(), failure.text));
+        self.record_limit_on(i, &failure, now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp::AcpError;
-    use crate::factory::{classify, Factory, OAUTH_TOKEN_ENV};
+    use crate::factory::{classify, signin_ask as ask, OAUTH_TOKEN_ENV};
     use crate::scope::SessionScope;
-    use chrono::Utc;
 
     const TOKEN: &str = "fake-token-for-tests";
     const DEAD: Unread = (SignIn::SignedOut, "it did not decrypt");
@@ -120,13 +179,13 @@ mod tests {
         assert_eq!(f.label(0), "fallback");
     }
 
-    /// Missing, blank or silent, a file fails its own entry and the pool
+    /// Missing or blank, a file fails its own entry and the pool
     /// moves on. With nothing left the launch fails plainly, naming the
     /// entry: never a blank token, never the agent's own environment.
     #[test]
     fn a_dead_file_moves_on_and_a_pool_of_only_dead_files_refuses() {
         let now = Utc::now();
-        for file in ["missing", "blank", "hung"] {
+        for file in ["missing", "blank"] {
             let mut f = pool(&format!("primary=dpapi:{file};fallback=C:/f"));
             let env = f.launch_env(0, now);
             assert_eq!(env, pair("CLAUDE_CONFIG_DIR", "C:/f"), "{file}");
@@ -209,6 +268,89 @@ mod tests {
         assert!(f.accounts()[0].signed_out);
         f.signin_checked(0, SignIn::Valid, now);
         assert!(!f.accounts()[0].signed_out, "a good read clears it");
+    }
+
+    /// PowerShell not answering says nothing about the sign-in, so the login
+    /// is set aside for a while and comes back by itself.
+    #[test]
+    fn a_silent_file_is_set_aside_and_no_one_says_claude_refused() {
+        let now = Utc::now();
+        let mut f = pool("primary=dpapi:hung;fallback=C:/f");
+        assert_eq!(f.launch_env(0, now), pair("CLAUDE_CONFIG_DIR", "C:/f"));
+        assert!(!f.accounts()[0].signed_out, "Claude was never asked");
+        let texts = f.take_alerts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("login primary"), "{texts:?}");
+        assert!(texts[0].contains("no answer"), "{texts:?}");
+        let record = f.take_report(now).expect("a STATE record");
+        assert!(record.contains("class=token_file"), "{record}");
+        assert!(!record.contains("Claude said"), "{record}");
+        assert!(!f.wants_restart(0, now), "off it for now");
+        let until = f.accounts()[0].limited.as_ref().map(|l| l.until);
+        assert!(!f.token_file_failed(0, SILENT, now), "already set aside");
+        assert_eq!(f.accounts()[0].limited.as_ref().map(|l| l.until), until);
+        let later = now + chrono::Duration::minutes(31);
+        assert!(f.wants_restart(0, later), "and it tries it again");
+    }
+
+    /// A dead file's words name the file and the fix, on the text, the record
+    /// and the card. Claude never said anything.
+    #[test]
+    fn a_dead_files_words_name_the_file_and_the_fix() {
+        let now = Utc::now();
+        let bench = tempfile::tempdir().unwrap();
+        let mut f = pool("primary=dpapi:blank;fallback=C:/f");
+        f.reporting.bench = Some(bench.path().to_path_buf());
+        f.reporting.short = "abcd1234".to_string();
+        f.launch_env(0, now);
+        assert!(f.accounts()[0].signed_out);
+        let texts = f.take_alerts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        let record = f.take_report(now).expect("a STATE record");
+        let card = bench.path().join("inbox/factory/abcd1234-sign-in.json");
+        let card = std::fs::read_to_string(card).expect("a card");
+        for words in [&texts[0], &record, &card] {
+            assert!(words.contains("login primary"), "{words}");
+            assert!(words.contains("set-account.ps1"), "{words}");
+            assert!(!words.contains("Claude said"), "{words}");
+        }
+        assert!(record.contains("class=token_file"), "{record}");
+        assert!(card.contains("replaced with set-account.ps1"), "{card}");
+    }
+
+    /// A file that gave no token is its own answer: asking the CLI anyway
+    /// would judge the agent's own environment and read as signed in.
+    #[tokio::test]
+    async fn a_dead_file_is_not_asked_about() {
+        let dead = ask(Err(DEAD), |_| async { panic!("the CLI was asked") }).await;
+        assert_eq!(dead, Err(DEAD));
+        let good = ask(Ok(pair(OAUTH_TOKEN_ENV, TOKEN)), |env| async move {
+            assert_eq!(env, pair(OAUTH_TOKEN_ENV, TOKEN));
+            SignIn::Valid
+        })
+        .await;
+        assert_eq!(good, Ok(SignIn::Valid));
+    }
+
+    /// The check marks a dead file once, in the file's own words, and a
+    /// silent PowerShell concludes nothing.
+    #[test]
+    fn the_check_marks_a_dead_file_and_leaves_a_silent_one() {
+        let now = Utc::now();
+        let mut f = pool("token=env;primary=dpapi:missing");
+        f.launch_env(0, now);
+        assert!(!f.signin_found(1, Err(SILENT), now), "concludes nothing");
+        assert!(!f.accounts()[1].signed_out);
+        assert!(f.take_alerts().is_empty());
+        assert!(f.signin_found(1, Err(DEAD), now));
+        assert!(f.accounts()[1].signed_out);
+        let texts = f.take_alerts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].contains("token file for login primary"),
+            "{texts:?}"
+        );
+        assert!(!f.signin_found(1, Err(DEAD), now), "said once");
     }
 
     #[cfg(not(windows))]
