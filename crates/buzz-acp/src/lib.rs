@@ -3659,6 +3659,8 @@ async fn run_harness(
                     spawn_signin_check(config, &ctx.rest_client);
                 }
             }
+
+            report_queued_alerts(config, &ctx.rest_client);
         }
 
         // Move an idle agent off a login the pool has given up on, before a
@@ -6163,6 +6165,15 @@ fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
             .factory
             .lock()
             .dropped(batch.channel_id, &last.event.id.to_hex(), why);
+    }
+}
+
+/// Send the owner's texts a launch queued: boot, a slot refill and an idle
+/// move have no turn ending to carry them out. Only when one is waiting, so a
+/// STATE record that merely fell due keeps its own carrier.
+fn report_queued_alerts(config: &Config, rest: &relay::RestClient) {
+    if config.factory.lock().alerts_waiting() {
+        report_factory_state(config, rest);
     }
 }
 
@@ -15218,6 +15229,39 @@ mod error_outcome_emission_tests {
                 "{message}: one STATE record"
             );
         }
+    }
+
+    /// A login lost at a launch queues the owner's text with no turn ending
+    /// to carry it, so the maintenance beat sends it, and takes nothing else.
+    #[tokio::test]
+    async fn the_maintenance_beat_sends_a_launchs_text_and_nothing_else() {
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://localhost:0".into(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        let now = chrono::Utc::now();
+        let lost = |login| {
+            config
+                .factory
+                .lock()
+                .signin_checked(login, factory::SignIn::SignedOut, now)
+        };
+        assert!(lost(0));
+        assert_eq!(config.factory.lock().take_alerts().len(), 1);
+        report_queued_alerts(&config, &rest);
+        let due = config.factory.lock().take_report(now);
+        assert!(due.is_some(), "no text waiting: the record is left alone");
+
+        assert!(lost(1));
+        report_queued_alerts(&config, &rest);
+        assert!(config.factory.lock().take_alerts().is_empty(), "sent");
     }
 
     /// With an account pool, a weekly limit on the primary re-runs the same

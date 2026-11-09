@@ -113,6 +113,11 @@ impl Factory {
     pub(crate) fn take_alerts(&mut self) -> Vec<String> {
         std::mem::take(&mut self.alerts)
     }
+
+    /// Whether a text is waiting for something to send it.
+    pub(crate) fn alerts_waiting(&self) -> bool {
+        !self.alerts.is_empty()
+    }
 }
 
 /// Run the owner's alert command with `text` as its last argument.
