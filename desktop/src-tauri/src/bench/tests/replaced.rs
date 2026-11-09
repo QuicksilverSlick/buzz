@@ -3,7 +3,7 @@
 //! harness are in scope.
 
 use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
-use super::channels::X;
+use super::channels::{admins, ask, bind, bound_bench, hex, ASK, X};
 use super::receipts::close_out;
 use super::*;
 use crate::bench::channels::ChannelCheck;
@@ -90,6 +90,18 @@ async fn old_tick(b: &mut Bench, mut budget: usize) -> usize {
     let owners = [b.owner_hex()];
     old_posts_tick(&b.ctx, &mut b.s, &mut budget, b.now, "14:05", &owners).await;
     budget
+}
+
+/// The scoped card ASK closes out.
+fn done_in_x() -> String {
+    drop_json(&[
+        ("project", json!("reset")),
+        ("kind", json!("status")),
+        ("state", json!("done")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+        ("title", json!("Done in X")),
+    ])
 }
 
 /// An old post already edited closed.
@@ -198,8 +210,8 @@ async fn a_cards_header_stays_as_posted_through_a_rename() {
     close_out(&b, "Moved the relay");
     b.tick().await.unwrap();
     let receipt = last_edit(&b, &second.event_id);
-    let closed_head = "🔴 · Forge · orchestrator\n";
-    assert!(content(&receipt).starts_with(closed_head), "{receipt}");
+    let closed_head = format!("{NOT_ASKED}\n🔴 · Forge · orchestrator\n");
+    assert!(content(&receipt).starts_with(&closed_head), "{receipt}");
     assert!(content(&receipt).contains("Moved the relay"), "{receipt}");
 }
 
@@ -648,10 +660,11 @@ async fn a_recorded_answer_from_a_clock_ahead_is_no_new_tap() {
 /// A tap after the item closed out: nothing is asked, so no live card is named.
 #[tokio::test]
 async fn a_tap_after_a_close_out_is_told_nothing_is_asked() {
-    let (mut b, old, answer) = answered_then_replaced().await;
+    let (mut b, _old, answer) = answered_then_replaced().await;
+    let receipt = b.card(ITEM).event_id;
     close_out(&b, "Moved the relay");
     b.settle(2).await;
-    let stray = tap(&b.ctx.owner, &old.event_id, OPTION_EMOJI[0], b.now);
+    let stray = tap(&b.ctx.owner, &receipt, OPTION_EMOJI[0], b.now);
     reply(&b, &[&answer, &stray]);
     b.settle(2).await;
     let told = replies(&b);
@@ -659,6 +672,278 @@ async fn a_tap_after_a_close_out_is_told_nothing_is_asked() {
     let text = content(&told[0]);
     assert!(text.ends_with("This is no longer asked."), "{text}");
     assert!(!text.contains("live card"), "{text}");
+}
+
+/// Close-out receipts are the largest group of dead pills: the first line, the
+/// seeds off, the answer it closed with no new tap, its card still the item's
+/// (the kit's `findCard` matches `item.card`).
+/// The relay refuses a reply whose root is not its thread's, so a tap on a
+/// receipt posted in a thread is told under that thread's root.
+#[tokio::test]
+async fn a_tap_on_a_receipt_in_a_thread_is_told_under_its_root() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let root = "ab".repeat(32);
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(root))]));
+    b.settle(6).await;
+    let card = b.card(ASK).event_id;
+    b.drop_file("reset-worker", "welcome", &done_in_x());
+    b.settle(3).await;
+    assert!(b.s.items[ASK].request.is_some());
+    let stray = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now + 5);
+    reply(&b, &[&list, &stray]);
+    b.settle(3).await;
+    let told = replies(&b);
+    assert_eq!(told.len(), 1);
+    let named = |marker: &str| {
+        let tags = told[0]["tags"].as_array().unwrap();
+        let tag = tags.iter().find(|t| t[0] == "e" && t[3] == marker).unwrap();
+        tag[1].as_str().unwrap().to_string()
+    };
+    assert_eq!(named("root"), root);
+    assert_eq!(named("reply"), card);
+}
+
+/// A close-out in a channel that stays refused for more than a day: its edit
+/// waits with the channel, unowed, and goes out once the channel is ready.
+#[tokio::test]
+async fn a_close_out_in_a_channel_not_ready_keeps_its_edit() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let bad = admins(&b, &b.relay.keys.clone(), &[&hex(&p.craig)]);
+    reply(&b, &[&bad]);
+    b.now += 601;
+    b.settle(2).await;
+    assert!(b.s.channels[X].refused.is_some());
+    b.drop_file("reset-worker", "welcome", &done_in_x());
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(b.s.items[ASK].request.is_some());
+    b.now += 86_400;
+    b.settle(2).await;
+    let edited = |b: &Bench| {
+        let on_card = |e: &Value| e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(&card);
+        b.posts()[before..].iter().any(|(e, _)| on_card(e))
+    };
+    assert!(!edited(&b), "not while the channel is refused");
+    reply(&b, &[&list]);
+    b.now += 61;
+    b.settle(4).await;
+    assert_eq!(b.s.channels[X].refused, None);
+    assert!(edited(&b), "the close-out's edit never went out");
+    let receipt = last_edit(&b, &card);
+    assert!(content(&receipt).starts_with(NOT_ASKED), "{receipt}");
+    assert!(content(&receipt).contains("Done in X"), "{receipt}");
+}
+
+/// A later close-out's edit, failing once near the end of the first one's
+/// 24 h, still gets its retry.
+#[tokio::test]
+async fn a_later_close_out_gets_its_own_window() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    close_out(&b, "First report");
+    b.settle(3).await;
+    assert!(b.s.replaced[0].shown.is_none() && b.s.replaced[0].watch);
+    b.now = b.s.replaced[0].at + 86_400 - 6;
+    *b.relay.post_down.lock().unwrap() = Some(card.clone());
+    close_out(&b, "Second report");
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert!(b.s.replaced[0].retry_at > 0, "one failed try");
+    *b.relay.post_down.lock().unwrap() = None;
+    b.now += 60;
+    b.settle(4).await;
+    assert_eq!(b.s.last_error, None);
+    // The fake relay logs a refused write too, so two is the retry.
+    let second = b.posts()[before..]
+        .iter()
+        .filter(|(e, _)| e["kind"] == 40003 && tag_value(e, "e").as_deref() == Some(&card))
+        .filter(|(e, _)| content(e).contains("Second report"))
+        .count();
+    assert_eq!(second, 2);
+}
+
+/// A new card format is no close-out: receipts closed days ago are edited
+/// again, unwatched, and leave the cap to posts a tap could still come to.
+#[tokio::test]
+async fn a_format_bump_watches_no_old_receipt() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    close_out(&b, "Moved the relay");
+    b.settle(3).await;
+    let receipt = b.s.items[ITEM].clone();
+    b.s.replaced.clear();
+    b.s.receipts_todo = Some(Vec::new());
+    for n in 0..=WATCH_MAX {
+        let mut i = receipt.clone();
+        i.id = format!("orchestrator/r{n}");
+        let c = i.card.as_mut().unwrap();
+        c.event_id = format!("{n:064x}");
+        c.hash = format!("{}.3", i.hash);
+        b.s.items.insert(i.id.clone(), i);
+    }
+    b.tick().await.unwrap();
+    assert_eq!(b.s.replaced.len(), WATCH_MAX + 1);
+    assert!(b.s.replaced.iter().all(|r| !r.watch));
+    b.tick().await.unwrap();
+    assert!(!board(&b).contains("Watched for a tap"), "{}", board(&b));
+}
+
+#[tokio::test]
+async fn a_receipt_says_so_and_loses_its_seeds() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM);
+    let on_card = seeds(&b, &card.event_id);
+    assert_eq!(on_card.len(), 2);
+    // Its clock is ahead, so only `seen` keeps it from counting as new.
+    let answer = tap(&b.ctx.owner, &card.event_id, OPTION_EMOJI[1], b.now + 500);
+    let mut relay: Vec<&nostr::Event> = on_card.iter().collect();
+    relay.push(&answer);
+    reply(&b, &relay);
+    b.tick().await.unwrap();
+    close_out(&b, "Moved the relay");
+    b.settle(4).await;
+
+    let edited = last_edit(&b, &card.event_id);
+    let text = content(&edited);
+    assert!(text.starts_with(&format!("{NOT_ASKED}\n🔴 · ")), "{text}");
+    assert!(text.contains("\nAnswered: 2. Move"), "{text}");
+    assert!(text.contains("**Moved the relay**"), "{text}");
+    let off = removed(&b);
+    for seed in &on_card {
+        assert!(off.contains(&seed.id.to_hex()), "{off:?}");
+    }
+    assert!(!off.contains(&answer.id.to_hex()) && !off.contains(&card.event_id));
+    assert!(replies(&b).is_empty(), "the answer it closed with");
+    assert!(b.s.kept.is_empty());
+    assert_eq!(b.card(ITEM).event_id, card.event_id);
+}
+
+/// Its edit failing used to fail the tick, and lastError stops the kit.
+#[tokio::test]
+async fn a_receipt_that_will_not_update_fails_no_tick_and_one_gone_is_forgotten() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    close_out(&b, "Moved the relay");
+    *b.relay.post_down.lock().unwrap() = Some(card.clone());
+    b.tick().await.unwrap();
+    assert!(b.s.replaced[0].shown.is_some() && b.s.replaced[0].retry_at > 0);
+    // A second close-out while it is owed: one post, one edit, the last words.
+    close_out(&b, "Moved after all");
+    b.tick().await.unwrap();
+    assert_eq!(b.s.replaced.len(), 1);
+    *b.relay.post_down.lock().unwrap() = None;
+    b.now = b.s.replaced[0].retry_at;
+    b.settle(2).await;
+    let text = last_edit(&b, &card);
+    assert!(content(&text).contains("**Moved after all**"), "{text}");
+
+    // A later close-out on a receipt deleted by hand: the item lets it go.
+    b.relay.gone.lock().unwrap().insert(card);
+    close_out(&b, "Moved again");
+    b.settle(3).await;
+    assert!(b.s.items[ITEM].card.is_none());
+}
+
+/// Receipts from before this build: one at a time and unwatched, each with its
+/// first line and without its seeds; then never again.
+#[tokio::test]
+async fn old_receipts_are_edited_one_at_a_time_then_never_again() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    b.drop_file(
+        "orchestrator",
+        "other",
+        &drop_json(&[("title", json!("Other"))]),
+    );
+    b.settle(4).await;
+    let (a, z) = (b.card(ITEM).event_id, b.card("orchestrator/other").event_id);
+    let on_card = [seeds(&b, &a), seeds(&b, &z)].concat();
+    let done = drop_json(&[
+        ("kind", json!("status")),
+        ("state", json!("done")),
+        ("severity", Value::Null),
+        ("options", Value::Null),
+    ]);
+    b.drop_file("orchestrator", "relay-choice", &done);
+    b.drop_file("orchestrator", "other", &done);
+    b.settle(6).await;
+    // As a build before this left them: nothing owed, not listed.
+    b.s.replaced.clear();
+    b.s.receipts_todo = None;
+    reply(&b, &on_card.iter().collect::<Vec<_>>());
+    let before = b.posts().len();
+    b.tick().await.unwrap();
+    assert_eq!(
+        b.posts().len(),
+        before,
+        "listed this tick, edited from the next"
+    );
+    assert_eq!(b.s.receipts_todo.as_ref().unwrap().len(), 1);
+    assert!(b.s.replaced.len() == 1 && !b.s.replaced[0].watch);
+    b.settle(10).await;
+    assert_eq!(b.s.receipts_todo.as_deref(), Some(&[][..]));
+    assert!(b.s.replaced.is_empty(), "let go once done");
+    for card in [&a, &z] {
+        let text = last_edit(&b, card);
+        assert!(content(&text).starts_with(NOT_ASKED), "{text}");
+    }
+    let off = removed(&b);
+    for seed in &on_card {
+        let n = off.iter().filter(|id| **id == seed.id.to_hex()).count();
+        assert_eq!(n, 1, "{off:?}");
+    }
+    let before = b.posts().len();
+    b.settle(5).await;
+    assert_eq!(b.posts().len(), before, "never again");
+}
+
+/// One that can't be told yet stays listed; one asked again since has a live card,
+/// which is never edited as an old post.
+#[tokio::test]
+async fn an_old_receipt_waits_for_its_channel_and_one_asked_again_is_skipped() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    close_out(&b, "Moved the relay");
+    b.settle(3).await;
+    b.s.replaced.clear();
+    b.s.receipts_todo = Some(vec![ITEM.to_string()]);
+    let in_x = |b: &mut Bench, ch: Option<String>| {
+        b.s.items
+            .get_mut(ITEM)
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .channel = ch;
+    };
+    in_x(&mut b, Some(X.to_string()));
+    b.settle(2).await;
+    assert!(b.s.replaced.is_empty());
+    assert_eq!(b.s.receipts_todo.as_ref().unwrap().len(), 1);
+    in_x(&mut b, None);
+    redrop(&b, "Relay choice, asked again");
+    b.settle(6).await;
+    assert_eq!(b.s.receipts_todo.as_deref(), Some(&[][..]));
+    let live = b.card(ITEM).event_id;
+    let on_live = |e: &Value| e["kind"] == 40003 && tag_value(e, "e").as_ref() == Some(&live);
+    assert!(!b.posts().iter().any(|(e, _)| on_live(e)));
+}
+
+/// A relay refusing them holds one on the board, not all of them in state.
+#[tokio::test]
+async fn an_old_receipt_that_will_not_update_holds_the_rest() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    let card = b.card(ITEM).event_id;
+    close_out(&b, "Moved the relay");
+    b.settle(3).await;
+    b.s.replaced.clear();
+    b.s.receipts_todo = Some(vec![ITEM.to_string(), ITEM.to_string()]);
+    *b.relay.post_down.lock().unwrap() = Some(card);
+    b.settle(4).await;
+    assert_eq!(b.s.replaced.len(), 1);
+    assert_eq!(b.s.receipts_todo.as_ref().unwrap().len(), 1);
+    assert!(board(&b).contains("Would not update: 1."), "{}", board(&b));
 }
 
 /// A channel that isn't ready: nothing there is read, edited or counted against

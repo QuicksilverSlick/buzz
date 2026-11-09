@@ -1,6 +1,6 @@
 //! Receipts: a close-out keeps the card and edits it to add the answer and
-//! the outcome. Child of tests.rs so the fake relay and Bench harness are in
-//! scope.
+//! the outcome, as an old post (replaced.rs). Child of tests.rs so the fake
+//! relay and Bench harness are in scope.
 
 use super::answers::{last_query, reply, tap, ITEM};
 use super::*;
@@ -43,51 +43,65 @@ async fn close_out_edits_the_card_into_a_receipt() {
     let before = b.posts().len();
     close_out(&b, "Moved the relay");
     b.tick().await.unwrap();
-    // The card's edit, then the board's: nothing is deleted or reposted.
+    // The board's edit, then the card's: nothing is deleted or reposted.
     let posts = b.posts()[before..].to_vec();
     assert_eq!(b.kinds()[before..], [40003, 40003]);
-    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card.event_id);
-    assert_eq!(tag_value(&posts[0].0, "h").unwrap(), b.channel());
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), card.event_id);
+    assert_eq!(tag_value(&posts[1].0, "h").unwrap(), b.channel());
     let item = &b.s.items[ITEM];
-    let receipt = content(&posts[0].0);
+    let receipt = content(&posts[1].0);
     let link = format!(
         "buzz://message?channel={}&id={}",
         b.channel(),
         card.event_id
     );
+    // The time the close-out came in, not the tick's.
+    let came_in = chrono::DateTime::parse_from_rfc3339(NOW).unwrap();
+    let came_in = local_hhmm(came_in.timestamp() as u64);
     // The edit knows the card's id, so the receipt links its thread.
     assert_eq!(
         receipt,
-        render_card(item, "14:05") + &format!("\nOpen thread: {link}")
+        format!(
+            "No longer asked. A tap here doesn't count.\n{}\n\nClosed: a tap or reply here is \
+             no longer read. If this is still asked, answer on the newer card.\n\
+             Open thread: {link}",
+            render_card(item, &came_in)
+        )
     );
     let request = item.request.as_ref().unwrap();
     let at = &request.answer.as_ref().unwrap().hhmm;
     assert!(
-        receipt.starts_with("🔴 · Dreamforge · orchestrator\n**Relay choice**\n"),
+        receipt.starts_with(
+            "No longer asked. A tap here doesn't count.\n\
+             🔴 · Dreamforge · orchestrator\n**Relay choice**\n"
+        ),
         "{receipt}"
     );
     assert!(
-        receipt.ends_with(&format!(
-            "1. Stay\n2. Move\n\nAnswered: 2. Move · {at}\n\nOutcome · 14:05\n\
+        receipt.contains(&format!(
+            "1. Stay\n2. Move\n\nAnswered: 2. Move · {at}\n\nOutcome · {came_in}\n\
              **Moved the relay**\n\nMoved the community to the new relay.\n\n\
-             PR: https://github.com/x/y/pull/1\nOpen thread: {link}"
+             PR: https://github.com/x/y/pull/1\n"
         )),
         "{receipt}"
     );
     assert_eq!(item.card.as_ref().unwrap().event_id, card.event_id);
     assert_eq!(item.card.as_ref().unwrap().hash, card_hash(item));
     // The board links the decision to its receipt.
-    let board = content(&posts[1].0);
+    let board = content(&posts[0].0);
     assert!(
         board.contains(&format!(
             "- 🧭 Moved the relay (dreamforge) (claude) · {link}"
         )),
         "{board}"
     );
-    // The poll reads the open card only, and nothing more is posted.
+    // The poll reads the open card, the old posts' read the receipt, and
+    // nothing more is posted.
     let before = b.posts().len();
     b.settle(2).await;
-    assert_eq!(last_query(&b)[0]["#e"], json!([other]));
+    let queries = b.relay.queries.lock().unwrap().clone();
+    assert_eq!(queries[queries.len() - 2][0]["#e"], json!([other]));
+    assert_eq!(last_query(&b)[0]["#e"], json!([card.event_id]));
     assert_eq!(b.posts().len(), before);
     // A relaunch keeps the receipt: no delete, no repost.
     let relay: Vec<nostr::Event> = b
@@ -113,13 +127,12 @@ async fn unanswered_close_out_is_kept_and_a_second_one_re_edits() {
     b.tick().await.unwrap();
     let posts = b.posts()[before..].to_vec();
     assert_eq!(b.kinds()[before..], [40003, 40003]);
-    let receipt = content(&posts[0].0);
+    let receipt = content(&posts[1].0);
     assert!(
-        receipt.contains(
-            "\nAnswered: no answer recorded\n\nOutcome · 14:05\n**Not needed after all**"
-        ),
+        receipt.contains("\nAnswered: no answer recorded\n\nOutcome · "),
         "{receipt}"
     );
+    assert!(receipt.contains("\n**Not needed after all**"), "{receipt}");
     // Later ticks neither retire nor re-edit it.
     let before = b.posts().len();
     b.settle(3).await;
@@ -129,8 +142,8 @@ async fn unanswered_close_out_is_kept_and_a_second_one_re_edits() {
     b.tick().await.unwrap();
     let posts = b.posts()[before..].to_vec();
     assert_eq!(b.kinds()[before..], [40003, 40003]);
-    assert_eq!(tag_value(&posts[0].0, "e").unwrap(), card);
-    let receipt = content(&posts[0].0);
+    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), card);
+    let receipt = content(&posts[1].0);
     assert!(
         receipt.contains("**Relay choice**") && receipt.contains("**Moved after all**"),
         "{receipt}"

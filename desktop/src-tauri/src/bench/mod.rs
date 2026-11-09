@@ -151,6 +151,8 @@ pub(crate) struct BenchState {
     /// Old posts owed an edit or a reply or watched for a tap; since when their read fails.
     replaced: Vec<replaced::Replaced>,
     replaced_unread: Option<u64>,
+    /// Receipts still to become old posts (`replaced::backfill`); None: unread.
+    receipts_todo: Option<Vec<String>>,
     /// Live cards whose owner's page was cut this tick, or every item while
     /// roles.json does not read: their answers are unread, so nothing
     /// expires, restamps, routes, retires or replaces them.
