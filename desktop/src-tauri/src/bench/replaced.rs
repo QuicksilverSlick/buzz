@@ -7,6 +7,10 @@
 //! card that was shown, so it never answers, never reaches the outbox and
 //! never moves to the new card.
 //!
+//! None is deleted. A phone that lost its socket across the delete keeps
+//! showing the post, the relay refuses a tap on it and the phone's code ignores
+//! the refusal, so that tap would vanish with nothing said.
+//!
 //! Nothing here fails a tick: lastError stops the steward kit's approvals, and
 //! the live cards are fine. What keeps failing is on the board (`alarm`).
 
@@ -15,7 +19,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::channels::{card_channel, ready};
-use super::publish::{edit, post_message, thread_of};
+use super::publish::{edit, on_post, post_message, thread_of};
 use super::{
     item, post_as_writer, query, query_writer, spend, BenchState, Ctx, Posted, RECOVER_LIMIT,
 };
@@ -30,10 +34,11 @@ const NOT_ASKED: &str = "No longer asked. A tap here doesn't count.";
 const WATCH_SECS: u64 = 86_400;
 /// Old posts read for taps at once, newest first. One batched /query per tick
 /// while any is watched, however many: +30/min of the relay's 300/min (about
-/// 5/s), beside `poll_answers`' up to 120. Sized for ten times the churn at 1
-/// Nov 2026 (28 drops in a day, 7 cards kept in all, most re-drops deleted as
-/// untouched). A cut page keeps its newest events, the ones looked for. Past
-/// this the oldest go unread and the board says so (`alarm`).
+/// 5/s), beside `poll_answers`' up to 120. Sized for three times the busiest day
+/// at 1 Nov 2026, 28 drops if each left an old post; ten times that outgrows it.
+/// A cut page keeps its newest events, the ones looked for. Past this the oldest
+/// go unread and the board says so (`alarm`); raising it only lengthens the one
+/// query's `#e`.
 pub(super) const WATCH_MAX: usize = 100;
 /// An old post that would not update is tried again this soon.
 const RETRY_SECS: u64 = 60;
@@ -60,6 +65,11 @@ pub(crate) struct Replaced {
     pub at: u64,
     /// The item as the post shows it, until the post is edited.
     pub shown: Option<Box<item::Item>>,
+    /// Owed its edit, before its seeds, from its own text on the relay: its
+    /// item already holds the newer Drop (`retired`). With a `root`, edited:
+    /// what is on it is still to read, for `kept_at`.
+    #[serde(default)]
+    pub from_post: bool,
     pub seeds_off: bool,
     /// Read for a tap: the newest old post of its item, not told yet.
     pub watch: bool,
@@ -83,6 +93,7 @@ impl Replaced {
             root: root.map(str::to_string),
             at: now,
             shown: None,
+            from_post: false,
             seeds_off: false,
             watch: true,
             seen: Vec::new(),
@@ -107,8 +118,8 @@ fn add(s: &mut BenchState, r: Replaced) {
 }
 
 /// A new Drop left the card of the item it replaces behind (`carry_card`): it
-/// has no card, the item still in state does. publish edits it from what it
-/// shows, its Recorded line or receipt included.
+/// has no card, the item still in state does. Edited from what it shows, its
+/// Recorded line or receipt included.
 pub(super) fn left_behind(s: &mut BenchState, new: &item::Item, now: u64) {
     let Some(old) = s.items.get(&new.id).filter(|_| new.card.is_none()) else {
         return;
@@ -124,16 +135,20 @@ pub(super) fn left_behind(s: &mut BenchState, new: &item::Item, now: u64) {
     add(s, r);
 }
 
-/// A stale card publish (b) just edited closed (`old_post`).
-pub(super) fn closed(
-    s: &mut BenchState,
-    id: &str,
-    ch: &str,
-    card: &Posted,
-    root: Option<&str>,
-    now: u64,
-) {
-    add(s, Replaced::new(id, ch, card, root, now));
+/// A stale card publish (b) just retired: its item holds the newer Drop, so it
+/// is edited from its own text as posted.
+pub(super) fn retired(s: &mut BenchState, id: &str, ch: &str, card: &Posted, now: u64) {
+    let r = Replaced {
+        from_post: true,
+        ..Replaced::new(id, ch, card, None, now)
+    };
+    add(s, r);
+}
+
+/// Whether `e` is an edit that made a post an old post.
+pub(super) fn closes(e: &nostr::Event) -> bool {
+    let first = e.content.lines().next().unwrap_or_default();
+    e.kind.as_u16() == 40003 && (first == REPLACED || first == NOT_ASKED)
 }
 
 fn asked(i: &item::Item) -> bool {
@@ -273,7 +288,7 @@ async fn read(ctx: &Ctx<'_>, s: &mut BenchState, now: u64, owner_set: &[String])
 /// never comes back from /query, so this resumes), its one reply. Ok(false):
 /// the tick's budget or lookups ran out first. The relay is asked before the
 /// reply goes, so a crash after it landed and before state saved never sends
-/// it twice.
+/// it twice. A post no longer there is an Err saying "not found" (`tick`).
 async fn finish(
     ctx: &Ctx<'_>,
     s: &mut BenchState,
@@ -285,6 +300,32 @@ async fn finish(
 ) -> Result<bool, String> {
     let r = s.replaced[i].clone();
     let (ch, card) = (&r.channel, &r.card.event_id);
+    if r.from_post {
+        if *budget == 0 || !spend(lookups, 1) {
+            return Ok(false);
+        }
+        // Edited, in a thread: with anything else on it, it ends older cards'
+        // root-reply windows there, as a kept card does. With nothing, a reply
+        // naming only the root is still theirs.
+        if let Some(root) = &r.root {
+            let on = on_post(ctx, s, ch, card, now).await?;
+            if on.iter().any(|e| !closes(e)) {
+                s.kept_at.push((root.clone(), r.card.created_at));
+            }
+            s.replaced[i].from_post = false;
+            return Ok(true);
+        }
+        let filter = serde_json::json!({ "ids": [card], "kinds": [9], "#h": [ch] });
+        let posted = query_writer(ctx, s, filter, now).await?;
+        let e = posted.first().ok_or("not found: no such post")?;
+        let text = old_post(s, &r.item, &e.content) + &item::thread_line(ch, card);
+        spend(budget, 1);
+        edit(ctx, s, ch, card, &text, now).await?;
+        let root = item::parent(e).map(str::to_string);
+        let r = &mut s.replaced[i];
+        (r.from_post, r.root) = (root.is_some(), root);
+        return Ok(true);
+    }
     if let Some(shown) = &r.shown {
         if !spend(budget, 1) {
             return Ok(false);
@@ -366,6 +407,10 @@ pub(super) async fn tick(
     hhmm: &str,
     owner_set: &[String],
 ) {
+    // Past 30 failing the loop runs out of lookups every tick and never reaches
+    // the retain below, so one that has failed goes at its window here.
+    s.replaced
+        .retain(|r| r.retry_at == 0 || now < r.at + WATCH_SECS);
     read(ctx, s, now, owner_set).await;
     let mut lookups = LOOKUPS_PER_TICK;
     for i in 0..s.replaced.len() {
@@ -374,6 +419,7 @@ pub(super) async fn tick(
             continue;
         }
         match finish(ctx, s, i, budget, &mut lookups, now, hhmm).await {
+            // Not `break`: the retain would drop what is past its window untried.
             Ok(false) => return,
             Ok(true) => s.replaced[i].retry_at = 0,
             // Gone from the relay: nothing is left to edit or to reply under.

@@ -202,8 +202,8 @@ async fn a_card_retired_for_a_refresh_keeps_its_place() {
     b.drop_file("orchestrator", "a-first", &attention);
     b.settle(2).await;
     assert_eq!(queued(&b), ["a-first", "hold-36", "hold-37", "hold-38"]);
-    // Four cards change format at once: (b) spends the tick retiring them,
-    // and they come back before the newcomer, which still waits.
+    // Four cards change format at once: (b) retires them, and they come back
+    // before the newcomer, which still waits.
     let refreshed = ["hold-32", "hold-33", "hold-34", "hold-35"];
     for id in refreshed {
         let i = b.s.items.get_mut(&format!("orchestrator/{id}")).unwrap();
@@ -211,7 +211,7 @@ async fn a_card_retired_for_a_refresh_keeps_its_place() {
         i.card.as_mut().unwrap().hash = format!("{hash}.old-format");
     }
     b.tick().await.unwrap();
-    assert!(b.s.items["orchestrator/hold-32"].card.is_none());
+    assert_eq!(b.s.kept.len(), refreshed.len());
     b.settle(4).await;
     for id in refreshed {
         let i = &b.s.items[&format!("orchestrator/{id}")];

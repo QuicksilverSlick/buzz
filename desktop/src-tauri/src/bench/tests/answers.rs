@@ -457,16 +457,15 @@ async fn pending_reword_closes_a_card_someone_replied_or_reacted_on() {
             &drop_json(&[("options", json!(["Stay", "Move away"]))]),
         );
         b.settle(3).await;
-        // No delete: the old card is closed, then a new one, its seeds, the
-        // board.
+        // No delete: a new card and its seeds, the old one closed, the board.
         let posts = b.posts()[before..].to_vec();
         assert_eq!(
             b.kinds()[before..],
-            [40003, 9, 7, 7, 9, 5],
+            [9, 7, 7, 40003, 9, 5],
             "heart: {heart}"
         );
-        assert_eq!(tag_value(&posts[0].0, "e").unwrap(), old_card.event_id);
-        let closed = text(&posts[0].0);
+        assert_eq!(tag_value(&posts[3].0, "e").unwrap(), old_card.event_id);
+        let closed = text(&posts[3].0);
         assert!(closed.contains("**Relay choice**\n\nStay or move?\n\n1. Stay\n2. Move\n\nas of"));
         assert!(!closed.contains("Tap one number"), "{closed}");
         assert!(closed.contains("\n\nClosed: a tap or reply here is no longer read."));
@@ -479,30 +478,52 @@ async fn pending_reword_closes_a_card_someone_replied_or_reacted_on() {
     }
 }
 
+/// The worst case at once: every card asked again in one tick. New cards go
+/// first, each tick stays inside the post budget and one lookup, each old post
+/// is edited once and none deleted.
 #[tokio::test]
-async fn stale_cards_are_looked_up_within_the_post_budget() {
+async fn cards_asked_again_at_once_stay_inside_the_budgets() {
     let mut b = seeded_bench(Gate::Open, &[]).await;
     let ids = ["a", "b", "c", "d", "relay-choice"];
     for id in &ids[..4] {
         b.drop_file("orchestrator", id, &drop_json(&[("title", json!(id))]));
     }
     b.settle(10).await;
-    assert!(ids
+    let cards: Vec<String> = ids
         .iter()
-        .all(|id| b.s.items[&format!("orchestrator/{id}")].card.is_some()));
+        .map(|id| b.card(&format!("orchestrator/{id}")).event_id)
+        .collect();
+    let old: Vec<nostr::Event> = cards.iter().map(|c| posted(&b, c)).collect();
+    reply(&b, &old.iter().collect::<Vec<_>>());
     // All five asked again at once, against four posts a tick.
     for id in ids {
         let title = json!(format!("{id}, reworded"));
         b.drop_file("orchestrator", id, &drop_json(&[("title", title)]));
     }
-    let (posts, queries) = (b.posts().len(), b.relay.queries.lock().unwrap().len());
-    b.tick().await.unwrap();
-    assert_eq!(b.kinds()[posts..], [5, 5, 5, 5]);
-    let lookups = b.relay.queries.lock().unwrap()[queries..]
-        .iter()
-        .filter(|q| q[0]["kinds"] == json!([7, 9, 40003]))
-        .count();
-    assert_eq!(lookups, 4);
+    let start = b.posts().len();
+    let writer = json!([b.writer_hex()]);
+    for tick in 0..24 {
+        let (posts, queries) = (b.posts().len(), b.relay.queries.lock().unwrap().len());
+        b.tick().await.unwrap();
+        assert!(b.posts().len() - posts <= MAX_POSTS_PER_TICK);
+        let q = b.relay.queries.lock().unwrap()[queries..].to_vec();
+        let lookup = |q: &&Value| q[0]["authors"] == writer || q[0]["ids"].is_array();
+        assert!(q.iter().filter(lookup).count() <= 1);
+        if tick == 0 {
+            assert_eq!(b.kinds()[posts..], [9, 9, 9, 9]);
+        }
+    }
+    let posts = b.posts()[start..].to_vec();
+    for card in &cards {
+        let on = |e: &&(Value, Option<String>)| tag_value(&e.0, "e").as_ref() == Some(card);
+        let kinds: Vec<u64> = posts
+            .iter()
+            .filter(on)
+            .map(|(e, _)| e["kind"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kinds, [40003], "{card}");
+    }
+    assert_eq!(b.s.kept, cards);
 }
 
 #[tokio::test]
@@ -740,19 +761,20 @@ async fn older_card_format_case(older: &str) {
     let answer = b.s.items[ITEM].answer.clone();
     assert!(answer.is_some());
     // The tapped card takes the new text by its Recorded edit; only the
-    // unanswered one is refreshed: delete, quiet repost, seeds, board pair.
+    // unanswered one is refreshed: quiet repost, seeds, board pair. No post of
+    // the old one is on this fake relay to edit.
     let posts = b.posts()[before..].to_vec();
-    assert_eq!(b.kinds()[before..], [40003, 5, 9, 7, 7, 9, 5]);
+    assert_eq!(b.kinds()[before..], [40003, 9, 7, 7, 9, 5]);
     assert_eq!(tag_value(&posts[0].0, "e").unwrap(), kept);
-    assert_eq!(tag_value(&posts[1].0, "e").unwrap(), old);
+    assert_eq!(b.s.kept, [old]);
     let new_card = b.card(OTHER);
     assert_eq!(
-        tag_value(&posts[2].0, "client").unwrap(),
+        tag_value(&posts[1].0, "client").unwrap(),
         format!("bench:card:{OTHER}@{}", card_hash(&b.s.items[OTHER]))
     );
     assert!(text(&posts[0].0).contains("\n**Relay choice**\n"));
-    assert!(text(&posts[2].0).contains("\n**Other**\n") && text(&posts[2].0).contains(HINT));
-    assert_eq!(tag_value(&posts[2].0, "p"), None);
+    assert!(text(&posts[1].0).contains("\n**Other**\n") && text(&posts[1].0).contains(HINT));
+    assert_eq!(tag_value(&posts[1].0, "p"), None);
     assert!(!b.s.items[OTHER].quiet_repost);
     // The answered card, its answer and its outbox file stay.
     assert_eq!(b.card(ITEM).event_id, kept);
