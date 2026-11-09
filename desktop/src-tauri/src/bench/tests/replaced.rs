@@ -22,7 +22,7 @@ fn redrop(b: &Bench, title: &str) {
 }
 
 /// The post the Bench last edited `card` to.
-fn last_edit(b: &Bench, card: &str) -> Value {
+pub(super) fn last_edit(b: &Bench, card: &str) -> Value {
     b.posts()
         .into_iter()
         .rev()

@@ -5,6 +5,7 @@
 
 use super::super::roles::AgentAccess;
 use super::answers::{posted, reply, tap, ITEM};
+use super::replaced::last_edit;
 use super::*;
 
 pub(super) const X: &str = "105f15cc-1d5a-431a-9826-9402fba1a12b";
@@ -635,6 +636,41 @@ async fn closed_card_keeps_its_own_thread_root() {
     let new = b.card(ASK);
     assert_ne!(new.event_id, old.event_id);
     assert_eq!(parent(&posted(&b, &new.event_id)), Some(r2.as_str()));
+}
+
+/// A newer card nobody touched, withdrawn: with only its seeds and closing edit
+/// on it, a reply naming only the root still reaches the one open card there.
+#[tokio::test]
+async fn a_retired_card_nobody_touched_ends_no_older_cards_window() {
+    let mut b = seeded_bench(Gate::Open, &[]).await;
+    bind(&mut b);
+    let list = admins(&b, &b.relay.keys.clone(), &[]);
+    reply(&b, &[&list]);
+    let root = "ab".repeat(32);
+    b.drop_file("reset-worker", "welcome", &ask(&[("replyTo", json!(root))]));
+    b.settle(6).await;
+    let second = |validity: &str| {
+        ask(&[
+            ("replyTo", json!(root)),
+            ("title", json!("Second")),
+            ("validity", json!(validity)),
+        ])
+    };
+    b.drop_file("reset-worker", "second", &second("current"));
+    b.settle(6).await;
+    let newer = b.card("reset-worker/second").event_id;
+    let post = posted(&b, &newer);
+    reply(&b, &[&list, &post]);
+    b.drop_file("reset-worker", "second", &second("superseded"));
+    b.tick().await.unwrap();
+    let closing = serde_json::from_value(last_edit(&b, &newer)).unwrap();
+    reply(&b, &[&list, &post, &closing]);
+    b.settle(3).await;
+    assert!(b.s.kept_at.is_empty(), "{:?}", b.s.kept_at);
+    let said = thread_reply(&b.ctx.owner, &root, "1", b.s.last_created_at + 5, &[]);
+    reply(&b, &[&list, &said]);
+    b.settle(3).await;
+    assert_eq!(b.s.items[ASK].answer.as_ref().map(|a| a.option), Some(0));
 }
 
 #[tokio::test]

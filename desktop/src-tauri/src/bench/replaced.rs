@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::channels::{card_channel, ready};
-use super::publish::{edit, post_message, thread_of};
+use super::publish::{edit, on_post, post_message, thread_of};
 use super::{
     item, post_as_writer, query, query_writer, spend, BenchState, Ctx, Posted, RECOVER_LIMIT,
 };
@@ -66,7 +66,8 @@ pub(crate) struct Replaced {
     /// The item as the post shows it, until the post is edited.
     pub shown: Option<Box<item::Item>>,
     /// Owed its edit, before its seeds, from its own text on the relay: its
-    /// item already holds the newer Drop (`retired`).
+    /// item already holds the newer Drop (`retired`). With a `root`, edited:
+    /// what is on it is still to read, for `kept_at`.
     #[serde(default)]
     pub from_post: bool,
     pub seeds_off: bool,
@@ -142,6 +143,12 @@ pub(super) fn retired(s: &mut BenchState, id: &str, ch: &str, card: &Posted, now
         ..Replaced::new(id, ch, card, None, now)
     };
     add(s, r);
+}
+
+/// Whether `e` is an edit that made a post an old post.
+pub(super) fn closes(e: &nostr::Event) -> bool {
+    let first = e.content.lines().next().unwrap_or_default();
+    e.kind.as_u16() == 40003 && (first == REPLACED || first == NOT_ASKED)
 }
 
 fn asked(i: &item::Item) -> bool {
@@ -297,18 +304,26 @@ async fn finish(
         if *budget == 0 || !spend(lookups, 1) {
             return Ok(false);
         }
+        // Edited, in a thread: with anything else on it, it ends older cards'
+        // root-reply windows there, as a kept card does. With nothing, a reply
+        // naming only the root is still theirs.
+        if let Some(root) = &r.root {
+            let on = on_post(ctx, s, ch, card, now).await?;
+            if on.iter().any(|e| !closes(e)) {
+                s.kept_at.push((root.clone(), r.card.created_at));
+            }
+            s.replaced[i].from_post = false;
+            return Ok(true);
+        }
         let filter = serde_json::json!({ "ids": [card], "kinds": [9], "#h": [ch] });
         let posted = query_writer(ctx, s, filter, now).await?;
         let e = posted.first().ok_or("not found: no such post")?;
         let text = old_post(s, &r.item, &e.content) + &item::thread_line(ch, card);
         spend(budget, 1);
         edit(ctx, s, ch, card, &text, now).await?;
-        // Its thread root ends older cards' root-reply windows there.
         let root = item::parent(e).map(str::to_string);
-        s.kept_at
-            .extend(root.clone().map(|root| (root, r.card.created_at)));
         let r = &mut s.replaced[i];
-        (r.from_post, r.root) = (false, root);
+        (r.from_post, r.root) = (root.is_some(), root);
         return Ok(true);
     }
     if let Some(shown) = &r.shown {

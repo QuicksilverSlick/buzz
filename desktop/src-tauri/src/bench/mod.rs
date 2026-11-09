@@ -145,8 +145,8 @@ pub(crate) struct BenchState {
     /// retired: on the relay for good, never adopted again by recover (which
     /// would retire them as stale). 64 bytes each, a few a day at 4 Nov 2026.
     kept: Vec<String>,
-    /// Each kept card posted in a thread, as (its root, its created_at): it
-    /// still ends the root-reply window of an older card there.
+    /// Each kept card in a thread with anything on it, as (its root, its
+    /// created_at): it still ends the root-reply window of an older card there.
     kept_at: Vec<(String, u64)>,
     /// Old posts owed an edit or a reply or watched for a tap; since when their read fails.
     replaced: Vec<replaced::Replaced>,

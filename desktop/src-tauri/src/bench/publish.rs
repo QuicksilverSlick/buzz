@@ -336,27 +336,29 @@ fn df_answer(parts: [&str; 3]) -> Result<nostr::Tag, String> {
     nostr::Tag::parse(["df-answer", n, by, id]).map_err(|e| e.to_string())
 }
 
-/// Whether a recovered orphan has anything on it but the writer's own seeds:
-/// a tap, a reply, a route notice, or a Recorded or receipt edit. A cut page
-/// holds more than the four seeds, so it counts too.
-async fn touched(
+/// What a post has on it but the writer's own seeds: a tap, a reply, a route
+/// notice, or a Recorded, receipt or closing edit. A cut page holds more than
+/// the four seeds, so it counts too.
+pub(super) async fn on_post(
     ctx: &Ctx<'_>,
     s: &BenchState,
     ch: &str,
     card: &str,
     now: u64,
-) -> Result<bool, String> {
+) -> Result<Vec<nostr::Event>, String> {
     let filter = serde_json::json!({
         "kinds": [7, 9, 40003], "#h": [ch], "#e": [card], "limit": RECOVER_LIMIT,
     });
     let writer = ctx.writer.public_key();
-    Ok(query(ctx, s, filter, now).await?.iter().any(|e| {
+    let mut on = query(ctx, s, filter, now).await?;
+    on.retain(|e| {
         let on_card = e
             .tags
             .iter()
             .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "e" && v == card));
         on_card && !(e.kind.as_u16() == 7 && e.pubkey == writer)
-    }))
+    });
+    Ok(on)
 }
 
 /// A thread the relay will not take: its root is gone, in another channel or
@@ -712,7 +714,7 @@ pub(super) async fn publish(
                 continue;
             }
             // An answered, replied or receipt card stays on the relay for good.
-            if touched(ctx, s, &ch, &orphan.event_id, now).await? {
+            if !on_post(ctx, s, &ch, &orphan.event_id, now).await?.is_empty() {
                 s.kept.push(orphan.event_id.clone());
             } else {
                 if !spend(budget, 1) {
