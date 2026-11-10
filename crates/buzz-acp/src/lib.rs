@@ -3606,7 +3606,8 @@ async fn run_harness(
 
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
-            // loop so it never blocks event processing.
+            // loop so it never blocks event processing; choosing the login
+            // does not, and reading a `dpapi:` file can take 15 s.
             for (idx, slot) in crash_history.iter_mut().enumerate() {
                 if pool.slot_alive(idx) || slot.respawn_in_flight {
                     continue;
@@ -3619,7 +3620,7 @@ async fn run_harness(
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
-                let launch_env = config.factory.lock().launch_env(idx, chrono::Utc::now());
+                let launch_env = config.factory.lock().login_env(idx, chrono::Utc::now());
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -3659,6 +3660,8 @@ async fn run_harness(
                     spawn_signin_check(config, &ctx.rest_client);
                 }
             }
+
+            report_queued_alerts(config, &ctx.rest_client);
         }
 
         // Move an idle agent off a login the pool has given up on, before a
@@ -6166,6 +6169,15 @@ fn card_dropped(config: &Config, batch: &FlushBatch, why: &str) {
     }
 }
 
+/// Send the owner's texts a launch queued: boot, a slot refill and an idle
+/// move have no turn ending to carry them out. Only when one is waiting, so a
+/// STATE record that merely fell due keeps its own carrier.
+fn report_queued_alerts(config: &Config, rest: &relay::RestClient) {
+    if config.factory.lock().alerts_waiting() {
+        report_factory_state(config, rest);
+    }
+}
+
 /// Log the STATE record when the harness's health changed, post it to
 /// #factory when one is configured (spec 4.2), and text the owner about a
 /// Critical (spec M2 item 4). Never into a work thread.
@@ -6225,8 +6237,10 @@ async fn deliver_factory_state(
 /// Ask each login of the pool whether its sign-in is still good, and act on
 /// what comes back exactly as a failed turn would (spec M2 item 3).
 ///
-/// Runs off the main loop: every probe spawns a short-lived process. It costs
-/// no model usage, and only a definite "not signed in" changes anything.
+/// Runs off the main loop: every probe spawns a short-lived process. Only
+/// collecting the targets does not, and reading a `dpapi:` file can take 15 s.
+/// It costs no model usage, and only a definite "not signed in" changes
+/// anything.
 fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
     let factory = config.factory.clone();
     let targets = factory.lock().signin_check_targets();
@@ -6239,11 +6253,12 @@ fn spawn_signin_check(config: &Config, rest: &relay::RestClient) {
     tokio::spawn(async move {
         let mut changed = false;
         for (login, env) in targets {
-            let found = factory::signin_probe(&env).await;
+            let probe = |env: Vec<_>| async move { factory::signin_probe(&env).await };
+            let found = factory::signin_ask(env, probe).await;
             tracing::debug!(login, "sign-in check: {found:?}");
             changed |= factory
                 .lock()
-                .signin_checked(login, found, chrono::Utc::now());
+                .signin_found(login, found, chrono::Utc::now());
         }
         if !changed {
             return;
@@ -6960,7 +6975,7 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
-    let launch_env = config.factory.lock().launch_env(i, chrono::Utc::now());
+    let launch_env = config.factory.lock().login_env(i, chrono::Utc::now());
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -7251,7 +7266,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let launch_env = config.factory.lock().launch_env(index, chrono::Utc::now());
+    let launch_env = config.factory.lock().login_env(index, chrono::Utc::now());
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -7310,7 +7325,7 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let launch_env = startup.factory.lock().launch_env(i, chrono::Utc::now());
+        let launch_env = startup.factory.lock().login_env(i, chrono::Utc::now());
         let spawn_result = AcpClient::spawn_with_env(
             &startup.command,
             &startup.args,
@@ -7419,7 +7434,7 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
-    launch_env: &[(String, String)],
+    launch_env: &std::result::Result<Vec<(String, String)>, String>,
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
@@ -15217,6 +15232,39 @@ mod error_outcome_emission_tests {
                 "{message}: one STATE record"
             );
         }
+    }
+
+    /// A login lost at a launch queues the owner's text with no turn ending
+    /// to carry it, so the maintenance beat sends it, and takes nothing else.
+    #[tokio::test]
+    async fn the_maintenance_beat_sends_a_launchs_text_and_nothing_else() {
+        let mut config = test_config();
+        config.factory = factory::FactoryHandle::new(factory::Factory::new(
+            Some("/pool/one/claude;/pool/two/claude"),
+            "claude-agent-acp",
+        ));
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://localhost:0".into(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        let now = chrono::Utc::now();
+        let lost = |login| {
+            config
+                .factory
+                .lock()
+                .signin_checked(login, factory::SignIn::SignedOut, now)
+        };
+        assert!(lost(0));
+        assert_eq!(config.factory.lock().take_alerts().len(), 1);
+        report_queued_alerts(&config, &rest);
+        let due = config.factory.lock().take_report(now);
+        assert!(due.is_some(), "no text waiting: the record is left alone");
+
+        assert!(lost(1));
+        report_queued_alerts(&config, &rest);
+        assert!(config.factory.lock().take_alerts().is_empty(), "sent");
     }
 
     /// With an account pool, a weekly limit on the primary re-runs the same

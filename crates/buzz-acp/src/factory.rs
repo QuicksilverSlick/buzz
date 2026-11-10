@@ -17,6 +17,7 @@ use crate::acp::{self, AcpError};
 use crate::scope::SessionScope;
 
 mod alert;
+mod dpapi;
 mod park_budget;
 mod paused_state;
 mod signin_check;
@@ -25,7 +26,7 @@ use park_budget::{Budget, Parks};
 
 pub(crate) use alert::{send as send_alert, ALERT_CMD_ENV, ALERT_SMS_TO_ENV};
 pub(crate) use signin_check::{
-    probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
+    ask as signin_ask, probe as signin_probe, CHECK_SECS_DEFAULT as SIGNIN_CHECK_SECS_DEFAULT,
     CHECK_SECS_ENV as SIGNIN_CHECK_SECS_ENV,
 };
 
@@ -520,10 +521,14 @@ fn card_quote(provider: &str, text: &str) -> String {
 ///
 /// One entry may be written `label=env` ([`ENV_ENTRY`]) instead of a folder,
 /// meaning "this login is the agent's own environment, unchanged": no
-/// `CLAUDE_CONFIG_DIR` override and no blanked token, so the agent's own
+/// `CLAUDE_CONFIG_DIR` override and no removed token, so the agent's own
 /// long-lived `claude setup-token` token signs it in. An agent with its own
 /// token and its folder login as a fallback is written
 /// `token=env;fallback=…\factory\claude`.
+///
+/// An entry may also be `label=dpapi:<path>`: a long-lived token in a file
+/// encrypted for this Windows user (see [`dpapi`]), written
+/// `token=env;primary=dpapi:…\primary.dpapi;fallback=…\factory\claude`.
 pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
 
 /// The value that makes a pool entry the agent's own environment rather than
@@ -531,10 +536,13 @@ pub(crate) const ACCOUNT_POOL_ENV: &str = "BUZZ_ACP_CLAUDE_ACCOUNT_POOL";
 /// still has to be written as a path.
 pub(crate) const ENV_ENTRY: &str = "env";
 
+/// What makes a pool entry's value a token file rather than a folder.
+const DPAPI_ENTRY: &str = "dpapi:";
+
 /// The folder a Claude login's own settings and credential live in.
 const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// A PC-wide token, blanked for a folder entry so it cannot win over that
+/// A PC-wide token, removed for a folder entry so it cannot win over that
 /// folder's own login. Named so the one test that guards what reaches an
 /// agent can name it too.
 pub(super) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -542,7 +550,7 @@ pub(super) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// One login of the pool.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Account {
-    /// The `CLAUDE_CONFIG_DIR` folder, or `None` for a [`ENV_ENTRY`] entry:
+    /// The `CLAUDE_CONFIG_DIR` folder or `dpapi:` file, or `None` for a [`ENV_ENTRY`] entry:
     /// the agent's own environment, left exactly as it is. Never shown
     /// either way, because a folder holds a user path.
     dir: Option<String>,
@@ -556,6 +564,18 @@ pub(crate) struct Account {
     /// timed limit: no clock lifts a lost sign-in, so only a passing
     /// sign-in check or a real answer on this login clears it.
     pub signed_out: bool,
+    /// A `dpapi:` login the server refused: its file's modified time then.
+    /// `claude auth status` never asks the server, so a check cannot lift
+    /// that; a new file or a real answer can.
+    refused: Option<std::time::SystemTime>,
+}
+
+impl Account {
+    /// When this login's token file last changed; `None` for any other login.
+    fn file_stamp(&self) -> Option<std::time::SystemTime> {
+        let file = self.dir.as_deref()?.strip_prefix(DPAPI_ENTRY)?.trim();
+        std::fs::metadata(file).and_then(|m| m.modified()).ok()
+    }
 }
 
 /// A limit one login of the pool hit.
@@ -660,6 +680,8 @@ pub(crate) struct Factory {
     /// The account pool; empty when none is configured, which is exactly the
     /// single-login behaviour.
     accounts: Vec<Account>,
+    /// What reads a `dpapi:` file: `None` is the real one, only tests set it.
+    decrypt: Option<dpapi::Decrypt>,
     /// Which login each agent slot was last started on.
     started_on: HashMap<usize, usize>,
     /// Consecutive rate-limit failures, for the backoff. A real answer clears it.
@@ -732,6 +754,7 @@ impl Factory {
                     label,
                     limited: None,
                     signed_out: false,
+                    refused: None,
                 }
             })
             .collect();
@@ -784,32 +807,61 @@ impl Factory {
     }
 
     /// Env for starting agent `slot` on the login [`pick`](Self::pick)
-    /// chose. Empty without a pool.
-    pub(crate) fn launch_env(&mut self, slot: usize, now: DateTime<Utc>) -> Vec<(String, String)> {
-        let Some(i) = self.pick(now) else {
-            return Vec::new();
-        };
-        self.started_on.insert(slot, i);
-        self.account_env(i)
+    /// chose. Empty without a pool. A `dpapi:` login whose file gives no
+    /// token is marked out and the next tried; `Err` when none is left.
+    pub(crate) fn login_env(
+        &mut self,
+        slot: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut dead = None;
+        let mut tried = HashSet::new();
+        // ponytail: `pick` still offers a login when all are out, so a dead
+        // file ranked first then fails the launch without trying the others,
+        // which are out too. The slot refill tries again.
+        while let Some(i) = self.pick(now).filter(|&i| tried.insert(i)) {
+            match self.account_env(i) {
+                Ok(env) => {
+                    self.started_on.insert(slot, i);
+                    return Ok(env);
+                }
+                Err(unread) => {
+                    let why = format!("login {}: {}", self.at(i), unread.1);
+                    tracing::warn!("{why}; trying the next login");
+                    self.token_file_failed(i, unread, now);
+                    dead = Some(why);
+                }
+            }
+        }
+        dead.map_or(Ok(Vec::new()), Err)
     }
 
-    /// The launch environment for login `i`: its folder, and an empty
-    /// `CLAUDE_CODE_OAUTH_TOKEN` so a PC-wide token cannot win over the
-    /// folder's own login.
+    /// [`login_env`](Self::login_env) for tests with a login left.
+    #[cfg(test)]
+    pub(crate) fn launch_env(&mut self, slot: usize, now: DateTime<Utc>) -> Vec<(String, String)> {
+        self.login_env(slot, now).expect("a login to launch on")
+    }
+
+    /// The launch environment for login `i`: a folder entry's
+    /// `CLAUDE_CONFIG_DIR` (see [`apply_launch_env`] for its token), or a
+    /// `dpapi:` entry's decrypted token.
     ///
     /// Empty for a [`ENV_ENTRY`] entry, which is what makes it the agent's
     /// own environment unchanged — its own `CLAUDE_CONFIG_DIR` for settings
     /// and its own long-lived token for the sign-in. The sign-in check asks
     /// through this same function, so it can never judge a different login
     /// from the one the adapter would run on.
-    pub(super) fn account_env(&self, i: usize) -> Vec<(String, String)> {
-        match self.accounts.get(i).and_then(|a| a.dir.as_deref()) {
-            Some(dir) => vec![
-                (CONFIG_DIR_ENV.into(), dir.to_string()),
-                (OAUTH_TOKEN_ENV.into(), String::new()),
-            ],
-            None => Vec::new(),
-        }
+    pub(super) fn account_env(&self, i: usize) -> dpapi::LoginEnv {
+        let Some(dir) = self.accounts.get(i).and_then(|a| a.dir.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![match dir.strip_prefix(DPAPI_ENTRY) {
+            Some(file) => (
+                OAUTH_TOKEN_ENV.into(),
+                dpapi::token(file.trim(), self.decrypt)?,
+            ),
+            None => (CONFIG_DIR_ENV.into(), dir.to_string()),
+        }])
     }
 
     /// Which login agent `slot` was last started on.
@@ -861,6 +913,7 @@ impl Factory {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Plan {
+        self.note_refusal(self.on(slot), failure);
         let (wait, free) = self.begin_limit(self.on(slot), failure, now);
         if let Some(next) = free {
             let label = self.accounts[next].label.clone();
@@ -900,7 +953,17 @@ impl Factory {
     /// while the pool is idle left the dot green and #factory silent until
     /// some real request happened along and failed (spec 2.2, 4.2).
     pub(crate) fn record_limit(&mut self, slot: usize, failure: &Failure, now: DateTime<Utc>) {
+        self.note_refusal(self.on(slot), failure);
         self.record_limit_on(self.on(slot), failure, now);
+    }
+
+    /// A real turn lost its sign-in on login `on`: see [`Account::refused`].
+    fn note_refusal(&mut self, on: usize, failure: &Failure) {
+        if failure.class == Class::SignIn {
+            if let Some(account) = self.accounts.get_mut(on) {
+                account.refused = account.file_stamp();
+            }
+        }
     }
 
     /// [`record_limit`](Self::record_limit) for a login named directly
@@ -1054,6 +1117,7 @@ impl Factory {
         {
             account.limited = None;
             account.signed_out = false;
+            account.refused = None;
         }
         let settled = if self.preferred(now).is_some_and(|p| p > 0) {
             Health::Degraded
@@ -1129,7 +1193,7 @@ impl Factory {
             record.push_str(&format!(" incident={incident}"));
         }
         if let Some(f) = failure {
-            record.push_str(&format!("\n{} said: \"{}\"", self.provider_name(), f.text));
+            record.push_str(&format!("\n{} said: \"{}\"", self.speaker(f), f.text));
         }
         record.push_str(&format!("\nPlain words: {}", self.plain_words(now)));
         if !stopped {
@@ -1154,6 +1218,27 @@ impl Factory {
         }
     }
 
+    /// Whose words `failure` carries: a token file's are Buzz's own.
+    fn speaker(&self, failure: &Failure) -> String {
+        if failure.slug == dpapi::UNREAD_SLUG {
+            "Buzz".to_string()
+        } else {
+            self.provider_name()
+        }
+    }
+
+    /// What brings back the login the current incident is about.
+    fn sign_in_remedy(&self) -> &'static str {
+        let on_file = self.accounts.iter().any(|a| {
+            a.label == self.account && a.dir.as_deref().is_some_and(|d| d.starts_with(DPAPI_ENTRY))
+        });
+        if on_file {
+            "its token file is replaced with set-account.ps1"
+        } else {
+            "it is signed in again"
+        }
+    }
+
     fn who(&self) -> &str {
         match self.reporting.agent.as_str() {
             "" => "This agent",
@@ -1174,8 +1259,8 @@ impl Factory {
                  recovered."
             ),
             (Health::Down, ..) => format!(
-                "{who} lost its sign-in. Its work is paused until it is signed in again; it \
-                 keeps checking. {saved}"
+                "{who} lost its sign-in. Its work is paused until {}; it keeps checking. {saved}",
+                self.sign_in_remedy()
             ),
             (Health::Blocked, Some(Class::SpendCap), _) => format!(
                 "{who}'s work is paused until the spending cap is raised; it checks every 30 \
@@ -1238,13 +1323,13 @@ impl Factory {
             (
                 "sign-in",
                 format!("{who} lost its {provider} sign-in"),
-                "it is signed in again",
+                self.sign_in_remedy(),
             )
         };
         // The time is in the text so a later incident is a new card, not
         // the same Drop the Bench already holds.
         let since = chicago_label(self.since.unwrap_or_else(Utc::now));
-        let quote = card_quote(&provider, &failure.text);
+        let quote = card_quote(&self.speaker(failure), &failure.text);
         let where_now = match moved_to {
             Some(next) => format!("It is now running on login {next}."),
             None => "Its requests are parked, not dropped.".to_string(),
@@ -1374,6 +1459,16 @@ impl Factory {
     }
 }
 
+/// Put a login's launch environment on `cmd`. A folder login has any
+/// inherited token removed, so a PC-wide one cannot win over its own login;
+/// removed and not blanked, because the Claude CLI reads blank as signed out.
+pub(crate) fn apply_launch_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
+    if env.iter().any(|(key, _)| key == CONFIG_DIR_ENV) {
+        cmd.env_remove(OAUTH_TOKEN_ENV);
+    }
+    cmd.envs(env.iter().cloned());
+}
+
 /// The label for a login whose folder name cannot be shown: a home folder is
 /// named after the OS account, and no record may carry that (spec 3.1).
 pub(crate) const PRIMARY_LABEL: &str = "primary";
@@ -1385,16 +1480,28 @@ pub(crate) const PRIMARY_LABEL: &str = "primary";
 /// means the agent's own environment, unchanged, so its own long-lived token
 /// is the login. The label is still the owner's own word, which is how a
 /// token-based login gets a name that is neither a token nor a path.
+///
+/// A `dpapi:` entry that does not parse is kept as one with no file, which
+/// fails plainly when it is launched. It must not become a folder login.
 fn parse_entry(entry: &str) -> (String, Option<String>) {
     match entry.split_once('=') {
         Some((label, value)) if is_plain_label(label) && value.trim() == ENV_ENTRY => {
             (slug(label.trim()), None)
         }
-        Some((label, dir)) if is_plain_label(label) && !dir.trim().is_empty() => {
+        Some((label, dir))
+            if is_plain_label(label) && !dir.trim().is_empty() && !garbled_dpapi(dir) =>
+        {
             (slug(label.trim()), Some(dir.trim().to_string()))
         }
+        _ if garbled_dpapi(entry) => (account_label(entry), Some(DPAPI_ENTRY.to_string())),
         _ => (account_label(entry), Some(entry.to_string())),
     }
+}
+
+/// Whether `value` reaches for a `dpapi:` file without being one.
+fn garbled_dpapi(value: &str) -> bool {
+    let value = value.trim();
+    !value.starts_with(DPAPI_ENTRY) && value.to_ascii_lowercase().contains(DPAPI_ENTRY)
 }
 
 /// Whether `s` is a label the owner wrote rather than the head of a path: at
@@ -1972,10 +2079,7 @@ mod tests {
     }
 
     fn env(dir: &str) -> Vec<(String, String)> {
-        vec![
-            ("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new()),
-        ]
+        vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())]
     }
 
     /// The owner's own pool from 18 Oct: the agent's own long-lived token
@@ -1985,7 +2089,7 @@ mod tests {
     /// A `label=env` entry starts the agent with its environment exactly as
     /// it is: no `CLAUDE_CONFIG_DIR` override to move its settings, and no
     /// blanked token, so the agent's own `claude setup-token` token is what
-    /// signs it in. A folder entry still blanks the token, so a PC-wide one
+    /// signs it in. A folder entry still removes the token, so a PC-wide one
     /// cannot win over that folder's own login.
     #[test]
     fn an_env_entry_keeps_the_agents_own_environment() {
