@@ -283,6 +283,7 @@ export function MembersSidebar({
     ? pastedProfileQuery.data?.profiles[pastedPubkey]
     : undefined;
   const pastedKeyResolved =
+    pastedPubkey !== null &&
     pastedProfileQuery.isSuccess &&
     !pastedProfileQuery.isFetching &&
     !rosterQuery.isLoading;
