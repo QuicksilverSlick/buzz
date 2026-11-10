@@ -413,7 +413,7 @@ pub struct CliArgs {
     ///
     /// One entry may be `label=env` instead of a folder, meaning "this login
     /// is the agent's own environment, unchanged": no `CLAUDE_CONFIG_DIR`
-    /// override, so its settings folder stays as it is, and no blanked
+    /// override, so its settings folder stays as it is, and no removed
     /// `CLAUDE_CODE_OAUTH_TOKEN`, so its own long-lived `claude setup-token`
     /// token is the sign-in. An agent with its own token and its folder
     /// login as the fallback is written:
@@ -421,6 +421,9 @@ pub struct CliArgs {
     /// ```text
     /// token=env;fallback=C:\Users\PC owner\.buzz-agents\factory\claude
     /// ```
+    ///
+    /// An entry may also be `label=dpapi:<path>`: a long-lived token in a
+    /// file encrypted for this Windows user.
     #[arg(long, env = crate::factory::ACCOUNT_POOL_ENV)]
     pub claude_account_pool: Option<String>,
 

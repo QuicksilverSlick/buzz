@@ -10,7 +10,7 @@
 //! So the harness asks first. Every [`CHECK_SECS_DEFAULT`] seconds it runs
 //! `claude auth status --json` for each login of the pool, in exactly the
 //! environment the adapter would be launched with — a folder entry's own
-//! `CLAUDE_CONFIG_DIR` and blanked token, or, for a `label=env` entry, the
+//! `CLAUDE_CONFIG_DIR` and no token, or, for a `label=env` entry, the
 //! agent's own environment and so its own long-lived token.
 //!
 //! ## Why that check
@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::{Class, Factory, Failure, Health};
+use super::{dpapi, Class, Factory, Failure, Health};
 
 /// How often each login's sign-in is checked, in seconds; `0` turns the
 /// check off.
@@ -91,13 +91,14 @@ impl Factory {
     /// environment, unchanged, when there is no pool.
     ///
     /// Empty for an adapter that is not Claude: there is no `claude auth
-    /// status` to ask about a Codex sign-in.
-    pub(crate) fn signin_check_targets(&self) -> Vec<(usize, Vec<(String, String)>)> {
+    /// status` to ask about a Codex sign-in. A `dpapi:` login whose file
+    /// gives no token comes back as `Err`, with nothing for the CLI to judge.
+    pub(crate) fn signin_check_targets(&self) -> Vec<(usize, dpapi::LoginEnv)> {
         if self.provider != "claude" {
             return Vec::new();
         }
         if self.accounts.is_empty() {
-            return vec![(0, Vec::new())];
+            return vec![(0, Ok(Vec::new()))];
         }
         (0..self.accounts.len())
             .map(|i| (i, self.account_env(i)))
@@ -117,8 +118,25 @@ impl Factory {
         match found {
             SignIn::Unknown => false,
             SignIn::Valid => self.signin_restored(index, now),
-            SignIn::SignedOut => self.signin_lost(index, now),
+            SignIn::SignedOut => self.signin_lost(index, &check_failure(), now),
         }
+    }
+
+    /// [`signin_checked`](Self::signin_checked), for a check whose login's
+    /// file may have given it nothing to ask about. No answer from PowerShell
+    /// concludes nothing, the same as no answer from the CLI.
+    pub(crate) fn signin_found(
+        &mut self,
+        index: usize,
+        found: Result<SignIn, dpapi::Unread>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let (found, why) = match found {
+            Ok(found) => return self.signin_checked(index, found, now),
+            Err(unread) => unread,
+        };
+        tracing::warn!(login = index, "sign-in check: its token file: {why}");
+        found != SignIn::Unknown && self.token_file_failed(index, (found, why), now)
     }
 
     /// The check says login `index` is not signed in, and no request was in
@@ -137,7 +155,12 @@ impl Factory {
     ///
     /// A login already known to be out changes nothing either way: the check
     /// runs every 15 minutes and must not card or text on every one of them.
-    fn signin_lost(&mut self, index: usize, now: DateTime<Utc>) -> bool {
+    pub(super) fn signin_lost(
+        &mut self,
+        index: usize,
+        failure: &Failure,
+        now: DateTime<Utc>,
+    ) -> bool {
         let known = match self.accounts.get(index) {
             Some(account) => account.signed_out,
             // No pool: the single login's state is the harness's own.
@@ -147,12 +170,12 @@ impl Factory {
             return false;
         }
         if !self.accounts.is_empty() && !self.work_runs_on(index, now) {
-            return self.spare_signin_lost(index);
+            return self.spare_signin_lost(index, failure);
         }
         if self.health == Health::Blocked {
             return self.signin_lost_while_parked(index);
         }
-        self.record_limit_on(index, &check_failure(), now);
+        self.record_limit_on(index, failure, now);
         true
     }
 
@@ -194,12 +217,16 @@ impl Factory {
     /// and no all-clear owed afterwards for an outage that never happened.
     /// The owner still hears once, because a pool quietly down to its last
     /// working login is how the next outage becomes a surprise.
-    fn spare_signin_lost(&mut self, index: usize) -> bool {
+    fn spare_signin_lost(&mut self, index: usize, failure: &Failure) -> bool {
         self.accounts[index].signed_out = true;
-        let line = format!(
-            "{}'s backup sign-in needs signing in again; the agent is unaffected.",
-            self.who()
-        );
+        let line = if failure.slug == dpapi::UNREAD_SLUG {
+            format!("{} {}. The agent is unaffected.", self.who(), failure.text)
+        } else {
+            format!(
+                "{}'s backup sign-in needs signing in again; the agent is unaffected.",
+                self.who()
+            )
+        };
         tracing::warn!("{line}");
         self.alert_aside(&line);
         true
@@ -217,7 +244,15 @@ impl Factory {
     /// already due.
     fn signin_restored(&mut self, index: usize, now: DateTime<Utc>) -> bool {
         let cleared = match self.accounts.get_mut(index) {
-            Some(account) => std::mem::take(&mut account.signed_out),
+            Some(account)
+                if account.refused.is_some() && account.refused == account.file_stamp() =>
+            {
+                return false;
+            }
+            Some(account) => {
+                account.refused = None;
+                std::mem::take(&mut account.signed_out)
+            }
             None => false,
         };
         let over = matches!(self.health, Health::Down | Health::Degraded)
@@ -235,18 +270,26 @@ impl Factory {
     }
 }
 
+/// What `probe` says about a login, unless its file gave no token. Then the
+/// CLI is not asked: it would judge the agent's own environment instead.
+pub(crate) async fn ask<F>(
+    env: dpapi::LoginEnv,
+    probe: impl FnOnce(Vec<(String, String)>) -> F,
+) -> Result<SignIn, dpapi::Unread>
+where
+    F: std::future::Future<Output = SignIn>,
+{
+    Ok(probe(env?).await)
+}
+
 /// Ask the Claude CLI whether `env` is signed in, spending no usage.
 ///
 /// `env` is a login's launch environment: a folder entry's
-/// `CLAUDE_CONFIG_DIR` and blanked token, or nothing at all for a
+/// `CLAUDE_CONFIG_DIR`, a `dpapi:` entry's token, or nothing at all for a
 /// `label=env` entry, which leaves the agent's own token in place.
 pub(crate) async fn probe(env: &[(String, String)]) -> SignIn {
     let cli = crate::acp::claude_cli(env);
-    let mut cmd = tokio::process::Command::new(&cli);
-    cmd.arg("auth")
-        .arg("status")
-        .arg("--json")
-        .envs(env.iter().cloned());
+    let mut cmd = status_command(&cli, env);
     // Any exit status: the real CLI prints `{"loggedIn": false, …}` and
     // exits 1 when the login is signed out, which is the answer this whole
     // check exists to hear. A spawn that fails, a timeout and output that
@@ -258,6 +301,14 @@ pub(crate) async fn probe(env: &[(String, String)]) -> SignIn {
             SignIn::Unknown
         }
     }
+}
+
+/// `claude auth status --json`, in the login's own environment.
+fn status_command(cli: &std::ffi::OsStr, env: &[(String, String)]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(cli);
+    cmd.arg("auth").arg("status").arg("--json");
+    super::apply_launch_env(&mut cmd, env);
+    cmd
 }
 
 /// Read `claude auth status --json`.
@@ -282,7 +333,7 @@ fn read_status(out: &str) -> SignIn {
 mod tests {
     use super::*;
     use crate::acp::AcpError;
-    use crate::factory::{classify, Plan, Reporting, PROBE_EVERY};
+    use crate::factory::{classify, Plan, Reporting, OAUTH_TOKEN_ENV, PROBE_EVERY};
     use crate::scope::SessionScope;
     use chrono::TimeZone;
 
@@ -319,6 +370,16 @@ mod tests {
             ..Reporting::default()
         };
         f
+    }
+
+    /// A folder login's check asks with the token removed, never blanked.
+    #[test]
+    fn a_folder_login_is_checked_with_the_token_removed() {
+        let env = pool().account_env(1).unwrap();
+        assert!(!env.iter().any(|(key, _)| key == OAUTH_TOKEN_ENV));
+        let cmd = status_command("claude".as_ref(), &env);
+        let mut vars = cmd.as_std().get_envs();
+        assert!(vars.any(|var| var == (OAUTH_TOKEN_ENV.as_ref(), None)));
     }
 
     /// Only `loggedIn: false` is a verdict. Everything else — a missing
@@ -366,7 +427,7 @@ mod tests {
         assert!(!f.accounts()[1].signed_out, "the other login is untouched");
         // Another login can take the work, so the agent keeps moving.
         assert_eq!(f.health, Health::Degraded);
-        assert_eq!(f.launch_env(0, oct18()), f.account_env(1));
+        assert_eq!(f.launch_env(0, oct18()), f.account_env(1).unwrap());
 
         let record = f.take_report(oct18()).expect("a STATE record");
         assert!(record.contains("state=DEGRADED class=sign_in"), "{record}");
@@ -459,7 +520,7 @@ mod tests {
             "no Critical card for a login nothing was running on"
         );
         // The work stays exactly where it was.
-        assert_eq!(f.launch_env(0, oct18()), f.account_env(0));
+        assert_eq!(f.launch_env(0, oct18()), f.account_env(0).unwrap());
         assert!(!f.wants_restart(0, oct18()));
         // One truthful line, to the owner, once.
         assert_eq!(
@@ -623,7 +684,7 @@ mod tests {
         assert_eq!(f.health, Health::Operational);
         assert_eq!(f.presence(), "online");
         assert!(f.wants_restart(0, fixed), "back to the first login");
-        assert_eq!(f.launch_env(0, fixed), f.account_env(0));
+        assert_eq!(f.launch_env(0, fixed), f.account_env(0).unwrap());
         assert_eq!(
             f.take_alerts(),
             ["Buzz: all clear — Reset Worker is working normally again."]
@@ -642,7 +703,7 @@ mod tests {
         f.reporting.agent = "Reset Worker".to_string();
         assert_eq!(
             f.signin_check_targets(),
-            vec![(0, Vec::new())],
+            vec![(0, Ok(Vec::new()))],
             "the agent's own environment, unchanged"
         );
         assert!(f.signin_checked(0, SignIn::SignedOut, oct18()));
