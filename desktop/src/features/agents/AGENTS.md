@@ -185,7 +185,8 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit surfaces pass `agentPubkey`, and the picker then names allowed people
    (never agent entries) who share no unarchived stream or forum with the
    agent (`allowlistWithoutSharedChannel` + `allowlistReachabilityText`, from
-   the owner's `useChannelsQuery` rosters). DMs don't count: a partner can only
+   the owner's `useChannelsQuery` rosters), with the short npub when two chips
+   share a name, and nothing until channels and profiles have loaded. DMs don't count: a partner can only
    mention their own agents in a DM. Create surfaces have no key and no line.
    **The owner-only-access build capability is backend-independent.** When
    `getAgentAccessOwnerOnly()` is true, every managed agent's access control is

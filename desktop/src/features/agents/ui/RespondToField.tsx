@@ -362,19 +362,23 @@ function AllowlistPicker({
   );
 
   // Name allowed people (never agent entries) with nowhere to reach the agent;
-  // nothing while the channel list loads.
+  // nothing while channels or profiles load (cached labels carry no isAgent).
   const channelsQuery = useChannelsQuery({ enabled: agentPubkey != null });
+  const profilesPending =
+    profilesQuery.isLoading || profilesQuery.isPlaceholderData;
   const unreachableText = React.useMemo(() => {
-    if (agentPubkey == null || !channelsQuery.data) return null;
+    if (agentPubkey == null || !channelsQuery.data || profilesPending) {
+      return null;
+    }
     const missing = new Set(
       allowlistWithoutSharedChannel(allowlist, agentPubkey, channelsQuery.data),
     );
     return allowlistReachabilityText(
       chips
         .filter((chip) => !chip.isAgent && missing.has(chip.pubkey))
-        .map((chip) => chip.label),
+        .map((chip) => (chip.ambiguous ? chip.accessibleName : chip.label)),
     );
-  }, [agentPubkey, allowlist, channelsQuery.data, chips]);
+  }, [agentPubkey, allowlist, channelsQuery.data, chips, profilesPending]);
 
   // Detect if the query is a pubkey (npub or hex) not already in the list;
   // direct entry offers the canonical hex for storage.

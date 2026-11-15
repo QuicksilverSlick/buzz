@@ -109,6 +109,16 @@ test("the no-shared-channel line comes from the shared helper and skips agents",
     collapsedSource,
     /\.filter\(\(chip\) => !chip\.isAgent && missing\.has\(chip\.pubkey\)\)/,
   );
+  // Two chips sharing a name: the line names the impostor by its short npub.
+  assert.match(
+    collapsedSource,
+    /\.map\(\(chip\) => \(chip\.ambiguous \? chip\.accessibleName : chip\.label\)\)/,
+  );
+  // Until profiles resolve, a partner's agent would be named as a person.
+  assert.match(
+    collapsedSource,
+    /profilesQuery\.isLoading \|\| profilesQuery\.isPlaceholderData/,
+  );
   assert.match(
     collapsedSource,
     /data-testid="agent-respond-to-unreachable" > \{unreachableText\}/,

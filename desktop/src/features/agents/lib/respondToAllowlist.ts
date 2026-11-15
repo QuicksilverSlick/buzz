@@ -174,6 +174,9 @@ export function allowlistWithoutSharedChannel(
 ): string[] {
   const agent = normalizePubkey(agentPubkey);
   const reachable = new Set<string>();
+  // shortcut: only channels the owner is in (the MemberOnly poll), so an open
+  // stream the owner left counts as unshared. Upgrade: merge the
+  // get_open_channel_directory rosters if owners report false warnings.
   for (const channel of channels) {
     if (channel.channelType === "dm" || channel.archivedAt) continue;
     const members = channel.memberPubkeys.map(normalizePubkey);
