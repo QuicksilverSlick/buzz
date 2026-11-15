@@ -94,6 +94,8 @@ This repository (`block/buzz`) is the OSS source for the relay, mobile, CLI, and
 | [block/buzz](https://github.com/block/buzz) | OSS source — relay, mobile app, CLI, agent harness, deprecated Buzz 0.X desktop app |
 | [block/buzz-app](https://github.com/block/buzz-app) | OSS source — Buzz 1.0 desktop and web app; all new desktop feature work |
 
+> In QuicksilverSlick/buzz, `desktop/` is Dreamforge, not deprecated: see the Fork note under Desktop App.
+
 See [RELEASING.md](RELEASING.md) for the desktop release flow and
 [CONTRIBUTING.md § Ecosystem](CONTRIBUTING.md#ecosystem) for contributor
 access information.
@@ -133,6 +135,7 @@ crates/
   sprig               # All-in-one harness bundling ACP, agent, and dev MCP
 
 desktop/              # Buzz 0.X Tauri desktop app (deprecated: new desktop work goes to block/buzz-app)
+                      # QuicksilverSlick/buzz: desktop/ is Dreamforge (Fork note under Desktop App)
 web/                  # Browser web client (repo browser, served by the relay)
 mobile/               # Flutter mobile app
 migrations/           # SQL migrations (run at relay startup when BUZZ_AUTO_MIGRATE is on: binary default off, Helm default on; deployments at scale apply them out of band — see docs/database.md)
@@ -664,7 +667,8 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
 > block/buzz; in QuicksilverSlick/buzz, desktop feature work is normal. Keep
 > Dreamforge branding on every surface, and keep Block's new-app banner and
 > installer download unmounted (`desktop/src/app/AppShell.tsx`,
-> `desktop/src/main.tsx`). Added 15 Nov 2026 by Claude-Account
+> `desktop/src/main.tsx`), and keep `RelayEntryGate` pointing at the admin,
+> not Block's download. Added 15 Nov 2026 by Claude-Account
 > russelledeming@gmail.com for the upstream catch-up.
 
 The desktop app is Tauri 2 + React 19 + Vite + Tailwind CSS. Features are
