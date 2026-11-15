@@ -6,6 +6,7 @@ import {
   ensureManagedAgentRunning,
 } from "./channelAgents";
 import { channelsQueryKey, useOpenDmMutation } from "@/features/channels/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel, CreateManagedAgentResponse } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -24,6 +25,7 @@ export function useCreatedAgentChannelAttachment() {
   const queryClient = useQueryClient();
   const openDmMutation = useOpenDmMutation();
   const identityQuery = useIdentityQuery();
+  const { activeCommunity } = useCommunities();
 
   function cachedDm(targetChannel: TargetChannel) {
     const channel = queryClient
@@ -57,11 +59,15 @@ export function useCreatedAgentChannelAttachment() {
     );
     if (others.length + 1 > MAX_DM_OTHERS) {
       throw new FullDmError(
-        "A DM holds at most 9 people; add it to a channel instead.",
+        `This DM already has 9 people, the most a DM can hold. Add ${created.agent.name} to a channel instead.`,
       );
     }
+    // The scope is this render's, from before creation: a Try again after a
+    // community switch fails closed instead of opening the DM in the other one.
     await openDmMutation.mutateAsync({
       pubkeys: [...others, created.agent.pubkey],
+      expectedRelayUrl: activeCommunity?.relayUrl,
+      expectedSignerPubkey: identityQuery.data?.pubkey,
     });
     created.agent = (await ensureManagedAgentRunning(created.agent)).agent;
   }

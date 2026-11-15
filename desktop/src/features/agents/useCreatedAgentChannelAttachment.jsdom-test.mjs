@@ -186,6 +186,9 @@ test("an agent made in a DM joins a new DM of the same people and starts", async
       TALOS,
       AGENT,
     ]);
+    // Tenant scope rides along, so a switch mid-flight fails closed.
+    assert.equal(commands("open_dm")[0].args.expectedRelayUrl, RELAY);
+    assert.equal(commands("open_dm")[0].args.expectedSignerPubkey, SELF);
     assert.equal(commands("add_channel_members").length, 0);
     assert.equal(commands("start_managed_agent").length, 1);
     assert.equal(toasts.length, 1);
@@ -262,7 +265,10 @@ test("a full 9-person DM says so and offers no Try again", async () => {
     assert.equal(commands("start_managed_agent").length, 0);
     assert.equal(toasts.length, 1);
     assert.equal(toasts[0].kind, "warning");
-    assert.match(toasts[0].options.description, /at most 9 people/);
+    assert.equal(
+      toasts[0].options.description,
+      "Scout couldn’t be added to a new DM. This DM already has 9 people, the most a DM can hold. Add Scout to a channel instead.",
+    );
     assert.equal(toasts[0].options.action, undefined);
   } finally {
     await unmount();
