@@ -1,6 +1,6 @@
 import { useState, useSyncExternalStore } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { relayClient } from "@/shared/api/relayClient";
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import { Button } from "@/shared/ui/button";
 import {
   Dialog,
@@ -26,7 +26,6 @@ export function RelayEntryGate({
   const entry = relayClient.entryRequirements;
   const state = useSyncExternalStore(entry.subscribe, entry.getSnapshot);
   const [editing, setEditing] = useState(false);
-  const [openError, setOpenError] = useState(false);
   const visible = state.relayUrl === relayUrl && state.verdict === "required";
   return (
     <>
@@ -37,29 +36,16 @@ export function RelayEntryGate({
           onPointerDownOutside={(event) => event.preventDefault()}
           data-testid="relay-entry-guidance"
         >
-          <DialogTitle>Upgrade Buzz to join this community</DialogTitle>
+          {/* Dreamforge: Block's copy sent people to download Block's app. */}
+          <DialogTitle>
+            {PRODUCT_NAME} can't join this community yet
+          </DialogTitle>
           <DialogDescription>
-            This community requires sign-in supported by a newer Buzz app. Your
-            keys and saved communities are still here.
+            This community requires a sign-in method {PRODUCT_NAME} doesn't
+            support yet. Your keys and saved communities are still here.
           </DialogDescription>
           <p className="break-all text-sm text-muted-foreground">{relayUrl}</p>
-          <p className="text-sm">
-            Download the latest Buzz client at buzz.xyz to continue.
-          </p>
-          <Button
-            onClick={() => {
-              setOpenError(false);
-              void openUrl("https://buzz.xyz").catch(() => setOpenError(true));
-            }}
-          >
-            Download latest Buzz
-          </Button>
-          {openError ? (
-            <p role="alert" className="text-sm">
-              Could not open the download page. Open https://buzz.xyz in your
-              browser to download the latest Buzz client.
-            </p>
-          ) : null}
+          <p className="text-sm">Ask your {PRODUCT_NAME} admin, then retry.</p>
           <Button variant="outline" disabled={state.pending} onClick={onRetry}>
             {state.pending ? "Checking community…" : "Retry community check"}
           </Button>

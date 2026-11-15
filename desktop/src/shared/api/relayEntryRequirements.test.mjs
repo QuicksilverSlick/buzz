@@ -85,7 +85,7 @@ test("failed discovery preserves authenticated legacy reconnect and required-hos
   const client = new RelayClient();
   currentClient = client;
   try {
-    await assert.rejects(client.preconnect(), /newer Buzz/);
+    await assert.rejects(client.preconnect(), /doesn't support yet/);
     assert.equal(client.entryRequirements.getSnapshot().verdict, "required");
     assert.equal(client.terminal, true);
     assert.equal(dials, 0);
@@ -171,7 +171,7 @@ test("failed discovery preserves authenticated legacy reconnect and required-hos
     client.disconnect();
     relay = "wss://b.example/";
     policy = { required: true };
-    await assert.rejects(client.preconnect(), /newer Buzz/);
+    await assert.rejects(client.preconnect(), /doesn't support yet/);
     resolveA({ required: false });
     await assert.rejects(stale, /superseded/);
     assert.equal(client.entryRequirements.getSnapshot().relayUrl, relay);

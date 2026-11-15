@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PRODUCT_NAME } from "@/shared/constants/brand";
 import { installMockBridge } from "../helpers/bridge";
 type PolicyWindow = Window & {
   __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
@@ -7,7 +8,6 @@ type PolicyWindow = Window & {
   }>;
   __BUZZ_E2E__: {
     mock: {
-      openerError?: string;
       relayEntryPolicy: {
         required: boolean;
         requiredRelay?: string;
@@ -16,6 +16,9 @@ type PolicyWindow = Window & {
     };
   };
 };
+// Dreamforge: the gate points at the admin, never at Block's download.
+const TITLE = `${PRODUCT_NAME} can't join this community yet`;
+const ASK_ADMIN = `Ask your ${PRODUCT_NAME} admin, then retry.`;
 
 test("saved desktop community: required, retryable failure, recovery and keys survive", async ({
   page,
@@ -23,12 +26,8 @@ test("saved desktop community: required, retryable failure, recovery and keys su
   await installMockBridge(page, { relayEntryPolicy: { required: true } });
   await page.goto("/");
   const card = page.getByTestId("relay-entry-guidance");
-  await expect(
-    card.getByText("Upgrade Buzz to join this community"),
-  ).toBeVisible();
-  await expect(
-    card.getByRole("button", { name: "Download latest Buzz" }),
-  ).toBeVisible();
+  await expect(card.getByText(TITLE)).toBeVisible();
+  await expect(card.getByRole("button", { name: /download/i })).toHaveCount(0);
   await card.screenshot({ path: "test-results/relay-entry-required.png" });
   let storage = await page.evaluate(() => ({ ...localStorage }));
   // Native networking is the external boundary. The session and rendered gate stay real.
@@ -56,33 +55,20 @@ test("saved desktop community: required, retryable failure, recovery and keys su
   // storage within each launch rather than comparing the fixture's timestamps.
   await page.reload();
   storage = await page.evaluate(() => ({ ...localStorage }));
-  await expect(
-    card.getByText("Upgrade Buzz to join this community"),
-  ).toBeVisible();
-  await expect(card).toContainText(
-    "Download the latest Buzz client at buzz.xyz to continue.",
-  );
-  await card.getByRole("button", { name: "Download latest Buzz" }).click();
+  await expect(card.getByText(TITLE)).toBeVisible();
+  await expect(card).toContainText(ASK_ADMIN);
   expect(
     await page.evaluate(() =>
-      (window as PolicyWindow).__BUZZ_E2E_COMMAND_PAYLOADS__
-        ?.filter((call) => call.command === "plugin:opener|open_url")
-        .map((call) => call.payload.url),
+      (window as PolicyWindow).__BUZZ_E2E_COMMAND_PAYLOADS__?.filter(
+        (call) => call.command === "plugin:opener|open_url",
+      ),
     ),
-  ).toEqual(["https://buzz.xyz"]);
-  await page.evaluate(() => {
-    (window as PolicyWindow).__BUZZ_E2E__.mock.openerError =
-      "No browser available";
-  });
-  await card.getByRole("button", { name: "Download latest Buzz" }).click();
-  await expect(card.getByRole("alert")).toContainText("https://buzz.xyz");
+  ).toEqual([]);
   await card.getByRole("button", { name: "Change community address" }).click();
   await expect(card).toBeHidden();
   // Returning from address editing keeps the required verdict.
   await page.keyboard.press("Escape");
-  await expect(
-    card.getByText("Upgrade Buzz to join this community"),
-  ).toBeVisible();
+  await expect(card.getByText(TITLE)).toBeVisible();
   await page.evaluate(() => {
     (window as PolicyWindow).__BUZZ_E2E__.mock.relayEntryPolicy = {
       required: false,
@@ -132,9 +118,7 @@ test("required community can switch to a saved free community and join another r
   });
   await page.goto("/");
   const card = page.getByTestId("relay-entry-guidance");
-  await expect(
-    card.getByText("Upgrade Buzz to join this community"),
-  ).toBeVisible();
+  await expect(card.getByText(TITLE)).toBeVisible();
   await card.getByRole("button", { name: "Open Free", exact: true }).click();
   await expect(card).toBeHidden();
   const activeRail = page
@@ -168,16 +152,10 @@ test("required community can switch to a saved free community and join another r
   await page
     .getByRole("button", { name: "Join community", exact: true })
     .click();
-  await expect(
-    card.getByText("Upgrade Buzz to join this community"),
-  ).toBeVisible();
+  await expect(card.getByText(TITLE)).toBeVisible();
   await expect(card).toContainText("new-required.example");
-  await expect(card).toContainText(
-    "Download the latest Buzz client at buzz.xyz to continue.",
-  );
-  await expect(
-    card.getByRole("button", { name: "Download latest Buzz" }),
-  ).toBeVisible();
+  await expect(card).toContainText(ASK_ADMIN);
+  await expect(card.getByRole("button", { name: /download/i })).toHaveCount(0);
   expect(
     await page.evaluate(
       () => JSON.parse(localStorage.getItem("buzz-communities") ?? "[]").length,

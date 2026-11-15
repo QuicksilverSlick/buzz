@@ -111,7 +111,7 @@ export class RelayEntryRequirements {
     });
     if (result.required)
       throw new UpgradeRequiredError(
-        "This community requires a newer Buzz app",
+        "This community requires a sign-in this app doesn't support yet",
       );
   }
 }
