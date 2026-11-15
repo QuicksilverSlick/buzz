@@ -506,7 +506,7 @@ test("invite shows community artwork and name with a text-only fallback", async 
     );
     await expect(page.locator(".invite-community-icon")).toBeVisible();
     await expect(
-      page.getByRole("link", { name: "Accept invite in Buzz" }),
+      page.getByRole("link", { name: "Accept invite in Dreamforge" }),
     ).toHaveAttribute(
       "href",
       "buzz://join?relay=ws%3A%2F%2F127.0.0.1%3A4173&code=visual-preview",
