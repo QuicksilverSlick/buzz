@@ -1,5 +1,5 @@
 use super::*;
-use buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN;
+use crate::OBSERVER_FRAME_MAX_LEN;
 use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
 
@@ -99,7 +99,7 @@ fn oversized_payloads_are_fitted_before_replay_and_stalled_broadcast() {
     assert_eq!(snapshot.len(), 3);
     for (replay, original_size) in snapshot.into_iter().zip(original_sizes) {
         let event = live.try_recv().unwrap();
-        assert!(bytes(&event) <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(bytes(&event) <= OBSERVER_FRAME_MAX_LEN);
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
             serde_json::to_value(&replay).unwrap()
@@ -144,8 +144,8 @@ fn stalled_subscriber_has_a_bounded_recent_window_and_reports_lag() {
     assert!(received.len() <= 1_024);
     assert!(received
         .iter()
-        .all(|event| bytes(event) <= OBSERVER_MAX_PLAINTEXT_LEN));
-    assert!(received.iter().map(bytes).sum::<usize>() <= 1_024 * OBSERVER_MAX_PLAINTEXT_LEN);
+        .all(|event| bytes(event) <= OBSERVER_FRAME_MAX_LEN));
+    assert!(received.iter().map(bytes).sum::<usize>() <= 1_024 * OBSERVER_FRAME_MAX_LEN);
     assert_eq!(received.last().unwrap().payload["n"], 1_099);
     assert!(received
         .windows(2)
@@ -232,8 +232,8 @@ fn publication_metadata_growth_keeps_live_events_bounded() {
         started_at: None,
         payload: json!({"body":""}),
     };
-    template.payload = json!({"body":"x".repeat(OBSERVER_MAX_PLAINTEXT_LEN - bytes(&template))});
-    assert_eq!(bytes(&template), OBSERVER_MAX_PLAINTEXT_LEN);
+    template.payload = json!({"body":"x".repeat(OBSERVER_FRAME_MAX_LEN - bytes(&template))});
+    assert_eq!(bytes(&template), OBSERVER_FRAME_MAX_LEN);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -259,7 +259,7 @@ fn publication_metadata_growth_keeps_live_events_bounded() {
     assert_eq!((fast.seq, boundary.seq), (9, 10));
     assert_eq!(fast.kind, "fast");
     assert_eq!(boundary.kind, "boundary");
-    assert!(bytes(&boundary) <= OBSERVER_MAX_PLAINTEXT_LEN);
+    assert!(bytes(&boundary) <= OBSERVER_FRAME_MAX_LEN);
     assert_ne!(boundary.payload, template.payload);
     let snapshot = observer.snapshot();
     assert_eq!(

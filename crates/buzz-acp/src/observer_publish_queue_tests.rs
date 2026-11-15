@@ -242,7 +242,7 @@ fn interleaved_channels_drain_at_bytes_per_slot_not_events_per_slot() {
         frames.len()
     );
     for frame in &frames {
-        assert!(serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN);
+        assert!(serialized_len(frame) <= OBSERVER_FRAME_MAX_LEN);
     }
     // Within each channel, FIFO order survives the gather.
     let mut seqs_a = Vec::new();
@@ -283,7 +283,7 @@ fn oversized_backlogs_split_across_publish_slots_under_the_cap() {
     let mut seen = Vec::new();
     for frame in &frames {
         assert!(
-            serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN,
+            serialized_len(frame) <= OBSERVER_FRAME_MAX_LEN,
             "every emitted frame must fit the plaintext cap"
         );
         seen.extend(frame_seqs(frame));
@@ -320,12 +320,12 @@ fn batch_packing_matches_wire_bytes_at_the_exact_limit() {
                     value
                 };
                 let overhead = serde_json::to_vec(&wire_batch(&events)).unwrap().len();
-                let padding = (OBSERVER_MAX_PLAINTEXT_LEN as isize + delta) as usize - overhead;
+                let padding = (OBSERVER_FRAME_MAX_LEN as isize + delta) as usize - overhead;
                 events.last_mut().unwrap().payload["text"] = serde_json::json!("x".repeat(padding));
                 let expected = wire_batch(&events);
                 assert_eq!(
                     serde_json::to_vec(&expected).unwrap().len(),
-                    (OBSERVER_MAX_PLAINTEXT_LEN as isize + delta) as usize
+                    (OBSERVER_FRAME_MAX_LEN as isize + delta) as usize
                 );
                 let mut queue = queue_of(events.clone());
                 let frames = drain_frames(&mut queue);
@@ -335,9 +335,7 @@ fn batch_packing_matches_wire_bytes_at_the_exact_limit() {
                 }
                 let mut delivered = Vec::new();
                 for frame in frames {
-                    assert!(
-                        serde_json::to_vec(&frame).unwrap().len() <= OBSERVER_MAX_PLAINTEXT_LEN
-                    );
+                    assert!(serde_json::to_vec(&frame).unwrap().len() <= OBSERVER_FRAME_MAX_LEN);
                     if let Some(inner) = frame.payload["events"].as_array() {
                         delivered.extend(inner.iter().cloned());
                     } else {

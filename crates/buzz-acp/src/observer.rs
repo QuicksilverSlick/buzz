@@ -147,7 +147,7 @@ impl ObserverHandle {
         // account for the final publication metadata below without a JSON walk.
         let prepared_metadata_bytes = event.seq.to_string().len() + event.timestamp.len();
         let mut bytes = super::fit_observer_event_to_budget(&mut event);
-        let prepared_within_budget = bytes <= super::OBSERVER_MAX_PLAINTEXT_LEN;
+        let prepared_within_budget = bytes <= super::OBSERVER_FRAME_MAX_LEN;
         let mut replay = event.clone();
         let mut buffer = match self.inner.buffer.lock() {
             Ok(buffer) => buffer,
@@ -162,13 +162,13 @@ impl ObserverHandle {
         event.timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, false);
         bytes =
             bytes - prepared_metadata_bytes + event.seq.to_string().len() + event.timestamp.len();
-        if prepared_within_budget && bytes > super::OBSERVER_MAX_PLAINTEXT_LEN {
+        if prepared_within_budget && bytes > super::OBSERVER_FRAME_MAX_LEN {
             // A sequence-width boundary can grow a frame prepared just below
             // the cap. Only an already-bounded frame can need this final fit.
             bytes = super::fit_observer_event_to_budget(&mut event);
             replay = event.clone();
         }
-        if bytes > super::OBSERVER_MAX_PLAINTEXT_LEN {
+        if bytes > super::OBSERVER_FRAME_MAX_LEN {
             tracing::warn!(target: "observer", seq = event.seq, bytes, dropped = 1,
                 "observer envelope exceeds byte budget; dropped event");
             return;

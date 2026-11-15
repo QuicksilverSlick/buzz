@@ -47,7 +47,7 @@ fn publish_queue_drain_probe() {
     assert_eq!(seqs, (1..=count as u64).collect::<Vec<_>>());
     assert!(frames
         .iter()
-        .all(|frame| crate::serialized_len(frame) <= crate::OBSERVER_MAX_PLAINTEXT_LEN));
+        .all(|frame| crate::serialized_len(frame) <= crate::OBSERVER_FRAME_MAX_LEN));
     assert_eq!(queue.pending_bytes, 0);
     println!(
         "{}",
