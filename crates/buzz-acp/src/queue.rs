@@ -1796,6 +1796,16 @@ pub(crate) fn replayed_after_restart(event: &Event, replayed_before: Option<u64>
     })
 }
 
+/// `owner` vs `guest`, decided here because the gate's verdict does not
+/// survive to the prompt. An unknown owner degrades to `guest`: an
+/// unverified author must never be presented to the model as the owner.
+fn authority_label(hex: &str, owner: Option<&str>) -> &'static str {
+    match owner {
+        Some(owner) if owner.eq_ignore_ascii_case(hex) => "owner",
+        _ => "guest",
+    }
+}
+
 /// Format the per-event `[Event]` block for a single [`BatchEvent`].
 ///
 /// Includes: event_id, channel (name + UUID), kind, sender (hex + npub),
@@ -1850,13 +1860,7 @@ pub(crate) fn format_event_block(
         ),
         None => format!("{npub} (hex: {hex})"),
     };
-    // `owner` vs `guest`, decided here because the gate's verdict does not
-    // survive to the prompt. An unknown owner degrades to `guest`: an
-    // unverified author must never be presented to the model as the owner.
-    let authority = match owner_pubkey_hex {
-        Some(owner) if owner.eq_ignore_ascii_case(&hex) => "owner",
-        _ => "guest",
-    };
+    let authority = authority_label(&hex, owner_pubkey_hex);
     let escaped_content = crate::prompt_framing::escape_semantic_text(&be.event.content);
     let mut block = format!(
         "Event ID: {event_id}\n\
@@ -2444,6 +2448,7 @@ fn conversation_context_status(
 fn format_conversation_context(
     ctx: &ConversationContext,
     profile_lookup: Option<&PromptProfileLookup>,
+    owner_pubkey_hex: Option<&str>,
 ) -> String {
     let (tag, messages, total, truncated) = match ctx {
         ConversationContext::Thread {
@@ -2469,10 +2474,11 @@ fn format_conversation_context(
             body.push('\n');
         }
         body.push_str(&format!(
-            "[{}] {} ({}): {}",
+            "[{}] {} ({}, {}): {}",
             i + 1,
             format_prompt_actor(&msg.pubkey, profile_lookup),
             msg.timestamp,
+            authority_label(&msg.pubkey, owner_pubkey_hex),
             crate::prompt_framing::escape_semantic_text(&msg.content),
         ));
     }
@@ -2725,7 +2731,11 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
-        sections.push(format_conversation_context(ctx, args.profile_lookup));
+        sections.push(format_conversation_context(
+            ctx,
+            args.profile_lookup,
+            args.owner_pubkey_hex,
+        ));
     }
 
     // 4. Cancelled + re-prompt framing. When a turn was cancelled to deliver
@@ -5366,6 +5376,44 @@ mod tests {
             "mentions=[Rick (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)]"
         ));
         assert!(prompt.contains("[1] Wes ("));
+    }
+
+    /// Context lines say who is owner and who is guest, so earlier guest words
+    /// never read as the owner's; an unknown owner makes everyone a guest.
+    #[test]
+    fn conversation_context_lines_label_owner_and_guest() {
+        let owner = "a".repeat(64);
+        let message = |pubkey: &str, content: &str| ContextMessage {
+            event_id: String::new(),
+            pubkey: pubkey.into(),
+            timestamp: "2026-11-15T12:00:00Z".into(),
+            content: content.into(),
+        };
+        let ctx = ConversationContext::Dm {
+            messages: vec![
+                message(&owner, "from the owner"),
+                message(&"b".repeat(64), "from a guest"),
+            ],
+            total: 2,
+            truncated: false,
+        };
+
+        let labelled = format_conversation_context(&ctx, None, Some(&owner));
+        assert!(
+            labelled.contains("12:00:00Z, owner): from the owner"),
+            "{labelled}"
+        );
+        assert!(
+            labelled.contains("12:00:00Z, guest): from a guest"),
+            "{labelled}"
+        );
+
+        let unknown = format_conversation_context(&ctx, None, None);
+        assert!(
+            unknown.contains("12:00:00Z, guest): from the owner"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains(", owner):"), "{unknown}");
     }
 
     #[test]

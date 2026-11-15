@@ -5725,6 +5725,23 @@ mod try_native_steer_fallback_log_tests {
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+/// An owner turn must not run in a session a guest's words were written into:
+/// their words would sit in the provider's memory under the owner's trust.
+/// Returns whether the scope was reset.
+fn fresh_session_for_owner_turn(
+    agent: &mut OwnedAgent,
+    scope: &scope::SessionScope,
+    authority: acp::TurnAuthority,
+) -> bool {
+    if authority != acp::TurnAuthority::Owner {
+        return false;
+    }
+    let Some(id) = agent.state.sessions.get(scope).cloned() else {
+        return false;
+    };
+    agent.acp.take_guest_mark(&id) && agent.state.invalidate_scope(scope)
+}
+
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
@@ -5870,6 +5887,20 @@ fn dispatch_pending(
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+
+        // Before record_scope_owner: invalidating after it would make
+        // return_agent discard the new session as stale.
+        if fresh_session_for_owner_turn(
+            &mut agent,
+            &scope,
+            pool::turn_authority_for(Some(&batch), ctx.agent_owner_pubkey.as_ref()),
+        ) {
+            tracing::info!(
+                target: "buzz_acp::authority",
+                scope = %scope.telemetry_label(),
+                "owner turn after a guest's words — starting a fresh session"
+            );
+        }
 
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
@@ -12732,6 +12763,84 @@ mod error_outcome_emission_tests {
     ) {
         let generation = pool.record_scope_owner(scope.clone(), agent.index);
         agent.state.set_scope_owner_generation(scope, generation);
+    }
+
+    /// Run one prompt as `authority` into `session_id`. `cat` echoes it back as a
+    /// request the harness rejects, which ends the prompt at once; only the guest
+    /// mark it leaves behind matters here.
+    async fn prompt_once(agent: &mut OwnedAgent, session_id: &str, authority: acp::TurnAuthority) {
+        let _ = agent
+            .acp
+            .session_prompt_with_idle_timeout(
+                session_id,
+                "hello",
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                authority,
+                None,
+            )
+            .await;
+    }
+
+    /// Only an owner turn reaching a session a guest wrote into starts fresh.
+    #[tokio::test]
+    async fn an_owner_turn_after_guest_words_resets_the_scope() {
+        use acp::TurnAuthority::{Guest, Owner};
+        let scope = scope::SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        // (who last wrote into the session, the next turn's authority, reset?)
+        for (writer, next, reset) in [
+            (Guest, Owner, true),
+            (Guest, Guest, false),
+            (Owner, Owner, false),
+        ] {
+            let mut agent = dummy_agent(0).await;
+            agent.state.sessions.insert(scope.clone(), "old".into());
+            prompt_once(&mut agent, "old", writer).await;
+            assert_eq!(
+                fresh_session_for_owner_turn(&mut agent, &scope, next),
+                reset,
+                "{writer:?} then {next:?}"
+            );
+            assert_eq!(
+                agent.state.sessions.contains_key(&scope),
+                !reset,
+                "{writer:?} then {next:?}"
+            );
+        }
+    }
+
+    /// The reset happens before `record_scope_owner`, so the session the owner's
+    /// turn opens is not discarded as stale when the worker comes back.
+    #[tokio::test]
+    async fn the_fresh_session_survives_return_agent() {
+        let scope = scope::SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut agent = dummy_agent(0).await;
+        bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        agent.state.sessions.insert(scope.clone(), "old".into());
+        prompt_once(&mut agent, "old", acp::TurnAuthority::Guest).await;
+
+        // Dispatch order: reset, record the owner, then the turn opens a session.
+        assert!(fresh_session_for_owner_turn(
+            &mut agent,
+            &scope,
+            acp::TurnAuthority::Owner
+        ));
+        bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        agent.state.sessions.insert(scope.clone(), "new".into());
+        pool.return_agent(agent);
+
+        let back = pool
+            .try_claim(Some(&scope))
+            .expect("the worker is idle again");
+        assert_eq!(
+            back.state.sessions.get(&scope).map(String::as_str),
+            Some("new")
+        );
     }
 
     // Exercise result handling and both production idle decisions with a fake clock.

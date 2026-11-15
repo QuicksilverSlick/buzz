@@ -275,6 +275,13 @@ pub struct AcpClient {
     /// lying on the connection is one careless read away from approving a
     /// later guest's request.
     current_turn_authority: TurnAuthority,
+    /// Sessions a guest's words were written into (prompt or steer). An owner
+    /// turn must not inherit them: dispatch starts a fresh session instead
+    /// (`take_guest_mark`).
+    // shortcut: never pruned for sessions no owner turn follows (a few ids per
+    // process; ~632 sessions a month across all agents, 2 Nov count). Prune on
+    // invalidate if one long-lived agent grows.
+    guest_sessions: std::collections::HashSet<String>,
     /// Permission requests refused during the turn in flight.
     ///
     /// Buffered rather than sent through a channel because the pool is already
@@ -823,6 +830,7 @@ impl AcpClient {
             next_id: 0,
             pending_permissions: Default::default(),
             current_turn_authority: TurnAuthority::Guest,
+            guest_sessions: Default::default(),
             permission_refusals: Vec::new(),
             last_prompt_id: None,
             prompt_error_before_drain: None,
@@ -1088,6 +1096,9 @@ impl AcpClient {
         // prompt before the turn's, so that turn could never park. `None`
         // means no request can wait on a person.
         self.current_turn_authority = authority;
+        if authority == TurnAuthority::Guest {
+            self.guest_sessions.insert(session_id.to_owned());
+        }
         // Cleared per turn: a refusal from a previous turn reported against
         // this one would name the wrong request to the wrong person.
         self.permission_refusals.clear();
@@ -1249,6 +1260,11 @@ impl AcpClient {
     pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
         self.goose_usage.seed_zero_baseline(session_id);
         self.standard_usage.seed_zero_baseline(session_id);
+    }
+
+    /// Whether a guest's words were written into `session_id`, clearing the mark.
+    pub(crate) fn take_guest_mark(&mut self, session_id: &str) -> bool {
+        self.guest_sessions.remove(session_id)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1820,7 +1836,7 @@ impl AcpClient {
         let stale = self.pending_permissions.retire_all_parked();
         if !stale.is_empty() {
             tracing::error!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 count = stale.len(),
                 "parked permission requests outlived their turn; retired unanswered"
             );
@@ -1909,6 +1925,9 @@ impl AcpClient {
                     // written, so no permission request the agent raises in response can be
                     // decided with more trust than its instructions came from. This loop is
                     // single-threaded: nothing can be decided between these two steps.
+                    if req.authority == TurnAuthority::Guest {
+                        self.guest_sessions.insert(session_id.to_owned());
+                    }
                     let lowered = self.current_turn_authority.weaker(req.authority);
                     if lowered != self.current_turn_authority {
                         tracing::info!(
@@ -2493,7 +2512,7 @@ impl AcpClient {
         // request; the answer already owed covers both copies.
         if self.pending_permissions.contains(&id) {
             tracing::warn!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 id = %id,
                 "ignoring a repeated permission request that is still owed an answer"
             );
@@ -2509,7 +2528,7 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
 
         tracing::debug!(
-            target: "acp::permission",
+            target: "buzz_acp::permission",
             "session/request_permission id={id}, {} options",
             options.len()
         );
@@ -2519,7 +2538,7 @@ impl AcpClient {
         match decide_permission(authority, options) {
             PermissionDecision::Approve(option_id) => {
                 tracing::info!(
-                    target: "acp::permission",
+                    target: "buzz_acp::permission",
                     "auto-approving permission id={id} with allow_once optionId={option_id:?}"
                 );
                 self.answer_permission(&id, permission_response_selected(&id, &option_id))
@@ -2611,7 +2630,7 @@ impl AcpClient {
             // The id was recorded unparked just before this call, so this
             // cannot happen. Refused rather than trusted if it ever does.
             tracing::error!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 id = %id,
                 ?rejected,
                 "could not park a permission request"
@@ -2633,7 +2652,7 @@ impl AcpClient {
             // now instead of holding the agent until the ask expires.
             let _ = self.pending_permissions.take_parked(park_id);
             tracing::warn!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 id = %id,
                 tool = %tool,
                 "no approval path: the main loop is not listening"
@@ -2644,7 +2663,7 @@ impl AcpClient {
 
         let expires_in = expires_at.saturating_duration_since(now);
         tracing::info!(
-            target: "acp::permission",
+            target: "buzz_acp::permission",
             id = %id,
             park_id = park_id.0,
             turn_id = %ctx.gate.turn_id(),
@@ -2681,7 +2700,7 @@ impl AcpClient {
         // is invisible in practice, and "the agent just didn't do it"
         // is indistinguishable from a bug.
         tracing::warn!(
-            target: "acp::permission",
+            target: "buzz_acp::permission",
             id = %id,
             tool = %tool,
             authority = ?authority,
@@ -2830,7 +2849,7 @@ impl AcpClient {
             let response = permission_response_selected(&ask.rpc_id, &ask.reject_option_id);
             if let Err(e) = self.answer_permission(&ask.rpc_id, response).await {
                 tracing::warn!(
-                    target: "acp::permission",
+                    target: "buzz_acp::permission",
                     "exit drain stopped at a failed write ({e}); the rest stay owed"
                 );
                 return;
@@ -2861,7 +2880,7 @@ impl AcpClient {
         }
         if let Err(e) = self.answer_owed_cancelled().await {
             tracing::warn!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 "exit drain stopped at a failed write ({e}); the rest stay owed"
             );
         }
@@ -2875,7 +2894,7 @@ impl AcpClient {
     async fn answer_owed_cancelled(&mut self) -> Result<(), AcpError> {
         for ask in self.pending_permissions.retire_all_parked() {
             tracing::info!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 id = %ask.rpc_id,
                 park_id = ask.park_id.0,
                 tool = %ask.tool,
@@ -2886,7 +2905,7 @@ impl AcpClient {
             self.answer_permission(&id, permission_response_cancelled(&id))
                 .await?;
             tracing::debug!(
-                target: "acp::permission",
+                target: "buzz_acp::permission",
                 "responded cancelled to pending permission id={id}"
             );
         }
@@ -2907,7 +2926,7 @@ impl AcpClient {
         match settlement {
             Settlement::Allowed { .. } | Settlement::Denied(_) | Settlement::TurnEnded => {
                 tracing::info!(
-                    target: "acp::permission",
+                    target: "buzz_acp::permission",
                     id = %rpc_id,
                     park_id = park_id.0,
                     tool = %tool,
@@ -2917,7 +2936,7 @@ impl AcpClient {
             }
             Settlement::Expired | Settlement::VerdictChannelClosed => {
                 tracing::warn!(
-                    target: "acp::permission",
+                    target: "buzz_acp::permission",
                     id = %rpc_id,
                     park_id = park_id.0,
                     tool = %tool,
@@ -2930,7 +2949,7 @@ impl AcpClient {
             // verdicts is broken somewhere.
             Settlement::DigestMismatch => {
                 tracing::error!(
-                    target: "acp::permission",
+                    target: "buzz_acp::permission",
                     id = %rpc_id,
                     park_id = park_id.0,
                     tool = %tool,
@@ -3873,9 +3892,9 @@ mod tests {
     }
 
     /// Steer `authority`'s words into a running Owner turn, then have the agent
-    /// ask for permission. Returns the harness's answer and the turn's authority
-    /// afterwards.
-    async fn steer_then_ask(name: &str, authority: TurnAuthority) -> (String, TurnAuthority) {
+    /// ask for permission. Returns the harness's answer, the turn's authority
+    /// afterwards, and whether the session was marked as holding a guest's words.
+    async fn steer_then_ask(name: &str, authority: TurnAuthority) -> (String, TurnAuthority, bool) {
         let capture = probe_capture_path(name);
         // The agent blocks until the steer arrives before it asks, so the order
         // is fixed: steer written, then permission request, then answer.
@@ -3912,7 +3931,11 @@ mod tests {
 
         let answer = captured_answer(&capture);
         let _ = std::fs::remove_file(&capture);
-        (answer, client.current_turn_authority)
+        (
+            answer,
+            client.current_turn_authority,
+            client.take_guest_mark("sess-test"),
+        )
     }
 
     /// The hole this closes. A guest who posted while the owner's turn was
@@ -3920,21 +3943,26 @@ mod tests {
     /// agent's next tool request was approved as though the owner had asked.
     #[tokio::test]
     async fn a_guest_steer_lowers_the_turn_before_the_agent_can_ask() {
-        let (answer, after) = steer_then_ask("guest-steer", TurnAuthority::Guest).await;
+        let (answer, after, marked) = steer_then_ask("guest-steer", TurnAuthority::Guest).await;
         assert_eq!(
             answer, "reject-1",
             "a request raised after a guest's steer must be decided as a guest"
         );
         assert_eq!(after, TurnAuthority::Guest);
+        assert!(
+            marked,
+            "a guest's steer must mark the session for the next owner turn"
+        );
     }
 
     /// The control: steering is not what lowers trust. The owner's own steer
     /// leaves the owner's turn exactly as trusted as it was.
     #[tokio::test]
     async fn an_owner_steer_leaves_an_owner_turn_trusted() {
-        let (answer, after) = steer_then_ask("owner-steer", TurnAuthority::Owner).await;
+        let (answer, after, marked) = steer_then_ask("owner-steer", TurnAuthority::Owner).await;
         assert_eq!(answer, "allow-1");
         assert_eq!(after, TurnAuthority::Owner);
+        assert!(!marked, "the owner's own steer leaves the session unmarked");
     }
 
     /// The second hole. The setup loop (session/new, set_config_option) decided
@@ -4442,6 +4470,35 @@ mod tests {
             TurnAuthority::Guest,
             "an owner turn's trust must not outlive the turn"
         );
+    }
+
+    /// A guest's prompt marks its session, so the next owner turn there starts
+    /// fresh; an owner's prompt leaves it unmarked. The echoed `-32601` ends each
+    /// prompt at once, as above.
+    #[tokio::test]
+    async fn a_guest_prompt_marks_its_session_and_an_owner_prompt_does_not() {
+        for (authority, marked) in [(TurnAuthority::Guest, true), (TurnAuthority::Owner, false)] {
+            let mut client = spawn_inert_client().await;
+            let _ = client
+                .session_prompt_with_idle_timeout(
+                    PARK_SESSION,
+                    "hello",
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(10),
+                    authority,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                client.take_guest_mark(PARK_SESSION),
+                marked,
+                "{authority:?}"
+            );
+            assert!(
+                !client.take_guest_mark(PARK_SESSION),
+                "taking the mark clears it"
+            );
+        }
     }
 
     // ── Around a write that has not finished (cat and sleep, every platform) ──
