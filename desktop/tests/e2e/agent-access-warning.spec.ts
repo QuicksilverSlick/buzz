@@ -173,12 +173,16 @@ test("open agent access explains the available access before save", async ({
   const strangerChip = page.getByTestId(
     `agent-respond-to-chip-${"c".repeat(64)}`,
   );
+  const strangerShortNpub = `${strangerNpub.slice(0, 8)}…${strangerNpub.slice(-4)}`;
   await expect(
-    strangerChip.getByText(
-      `${strangerNpub.slice(0, 8)}…${strangerNpub.slice(-4)}`,
-      { exact: true },
-    ),
+    strangerChip.getByText(strangerShortNpub, { exact: true }),
   ).toBeVisible();
+  // Alice shares #general with the agent; the stranger shares no channel, so
+  // only the stranger is named as having nowhere to reach it.
+  const unreachable = page.getByTestId("agent-respond-to-unreachable");
+  await expect(unreachable).toHaveText(
+    `${strangerShortNpub} isn't in a channel with this agent yet, so there's nowhere for them to reach it. Add them to one of its channels.`,
+  );
   // Search finds an already-selected person by display name.
   await search.fill("alice");
   await expect(aliceChip).toBeVisible();
@@ -190,6 +194,11 @@ test("open agent access explains the available access before save", async ({
   await expect(strangerChip.locator("[data-avatar-shape] > *")).toBeVisible();
   await waitForAnimations(page);
   await picker.screenshot({ path: `${SHOTS}/selected-people-names.png` });
+  // Removing the stranger clears the line at once.
+  await strangerChip
+    .getByRole("button", { name: `Remove ${strangerShortNpub}` })
+    .click();
+  await expect(unreachable).toHaveCount(0);
 
   // Only me shares nothing, so the warning goes away entirely.
   await accessSelect.selectOption("owner-only");

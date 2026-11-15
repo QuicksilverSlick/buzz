@@ -16,6 +16,7 @@ import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
+import type { Channel } from "@/shared/api/types";
 import { parsePubkeyInput as parseCanonicalPubkey } from "@/shared/lib/nostrUtils";
 import {
   canonicalNpub,
@@ -153,4 +154,46 @@ export function allowlistChipMatches(
     (chip.title?.startsWith(needle) ?? false) ||
     chip.pubkey.toLowerCase().startsWith(needle)
   );
+}
+
+/**
+ * Allowed people who share no unarchived stream or forum with the agent, in
+ * input order and spelling: nothing gives them a place to reach it.
+ *
+ * DMs don't count: on Desktop a partner can only @-mention their own agents in
+ * a DM, and the owner can't see a partner's DMs anyway.
+ * Sized for ~1k channels x 100 members (O(channels x members)).
+ */
+export function allowlistWithoutSharedChannel(
+  allowlist: readonly string[],
+  agentPubkey: string,
+  channels: readonly Pick<
+    Channel,
+    "channelType" | "archivedAt" | "memberPubkeys"
+  >[],
+): string[] {
+  const agent = normalizePubkey(agentPubkey);
+  const reachable = new Set<string>();
+  for (const channel of channels) {
+    if (channel.channelType === "dm" || channel.archivedAt) continue;
+    const members = channel.memberPubkeys.map(normalizePubkey);
+    if (!members.includes(agent)) continue;
+    for (const member of members) reachable.add(member);
+  }
+  return allowlist.filter((pubkey) => !reachable.has(normalizePubkey(pubkey)));
+}
+
+/** The line naming allowed people with nowhere to reach the agent; null when there are none. */
+export function allowlistReachabilityText(
+  names: readonly string[],
+): string | null {
+  if (names.length === 0) return null;
+  const who =
+    names.length === 1
+      ? names[0]
+      : names.length <= 3
+        ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`
+        : `${names.slice(0, 2).join(", ")} and ${names.length - 2} others`;
+  const verb = names.length === 1 ? "isn't" : "aren't";
+  return `${who} ${verb} in a channel with this agent yet, so there's nowhere for them to reach it. Add them to one of its channels.`;
 }

@@ -1008,6 +1008,7 @@ export function AgentInstanceEditDialog({
             </div>
             <OwnerOnlyAccessField
               accessLocked={agentAccessOwnerOnly === true}
+              agentPubkey={agent.pubkey}
               allowlist={respondToAllowlist}
               disabled={isSaving}
               mode={respondTo}
@@ -1015,7 +1016,6 @@ export function AgentInstanceEditDialog({
               onModeChange={setRespondTo}
             />
             <RunOnSummarySection backend={agent.backend} />
-
             {/* Provider (runtime) */}
             <div className="space-y-1.5">
               <label

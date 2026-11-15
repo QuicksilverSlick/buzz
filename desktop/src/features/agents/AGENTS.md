@@ -182,6 +182,11 @@ with a TypeScript lookup table or an id comparison in a component.
    self-asserted, so the full npub stays in the chip tooltip, the short npub in
    the remove button's accessible name, and the short npub inline whenever two
    chips share a name. Search matches chips by name or key prefix only.
+   Edit surfaces pass `agentPubkey`, and the picker then names allowed people
+   (never agent entries) who share no unarchived stream or forum with the
+   agent (`allowlistWithoutSharedChannel` + `allowlistReachabilityText`, from
+   the owner's `useChannelsQuery` rosters). DMs don't count: a partner can only
+   mention their own agents in a DM. Create surfaces have no key and no line.
    **The owner-only-access build capability is backend-independent.** When
    `getAgentAccessOwnerOnly()` is true, every managed agent's access control is
    locked to owner-only, including provider-backed agents. A provider backend
@@ -394,8 +399,9 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
 - `ui/respondToFieldContract.test.mjs` — plain-language mode labels, the
   persistent warning contract for shared agent access, its two render
   positions (after the people picker for `allowlist`), and named chips that
-  keep the key in the tooltip and accessible name
-  (`lib/respondToAllowlist.test.mjs` pins the label fallbacks).
+  keep the key in the tooltip and accessible name, and the no-shared-channel
+  line's wiring (`lib/respondToAllowlist.test.mjs` pins the label fallbacks
+  and which channels count as shared).
 - `lib/agentAccessWarning.test.mjs` — every mode × run-location copy variant
   plus both resolvers, including unknown-reads-as-local and
   blank-`runOn`-is-not-a-provider.

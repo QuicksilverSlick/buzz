@@ -79,6 +79,7 @@ export function EditRespondToDialog({
           mode={accessLocked ? "owner-only" : respondTo}
           onAllowlistChange={setRespondToAllowlist}
           onModeChange={setRespondTo}
+          agentPubkey={agent?.pubkey}
           ownerPubkey={currentPubkey}
           runLocation={runLocationForBackend(agent?.backend)}
         />
