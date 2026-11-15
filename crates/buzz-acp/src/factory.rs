@@ -1395,6 +1395,36 @@ impl Factory {
         );
     }
 
+    /// A refusal the sender was never told about: the "not set up to take
+    /// requests" notice could not be posted, even on its retry. `event_id` is
+    /// the refused message's hex id.
+    pub(crate) fn refusal_unseen(&mut self, channel_id: uuid::Uuid, event_id: &str) {
+        let who = card_name(self.who(), &self.reporting.short);
+        let body = format!(
+            "{who} isn't set up to take requests from this person, and its reply saying so could \
+             not be posted, so they are waiting on an answer that won't come. If they should \
+             have access, add them in the agent's access settings and ask them to send it \
+             again. Otherwise let them know."
+        );
+        let id = format!(
+            "{}-refused-{}",
+            self.reporting.short,
+            event_id.get(..12).unwrap_or(event_id)
+        );
+        let link = format!("buzz://message?channel={channel_id}&id={event_id}");
+        let title = format!("{who} turned away a message without telling the sender");
+        self.alert_critical(&format!(
+            "{title}. They are waiting on an answer that won't come."
+        ));
+        self.card(
+            &id,
+            &title,
+            &body,
+            "Nothing happens by itself: the sender is not told.",
+            serde_json::json!([{"label": "Open message", "url": link}]),
+        );
+    }
+
     /// Drop a Critical, needs-you card in the Bench inbox (spec 7.1) in the
     /// Bench's drop format, once per id per incident. Written beside its name
     /// and renamed into place, so the Bench never reads half a file.
@@ -2686,5 +2716,36 @@ mod tests {
         // No Bench on this PC: nothing is written, nothing fails.
         let mut f = Factory::new(None, "claude-agent-acp");
         f.dropped(channel, &event, "boom");
+    }
+
+    #[test]
+    fn refusal_unseen_card_links_the_message_and_never_shows_unsafe_text() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut f = Factory::new(None, "claude-agent-acp");
+        f.reporting = reporting("Chris Orchestrator");
+        f.reporting.bench = Some(bench.path().to_path_buf());
+        let channel = uuid::Uuid::parse_str("335dd4e1-0000-4000-8000-000000000001").unwrap();
+        let event = "ef".repeat(32);
+        f.refusal_unseen(channel, &event);
+        let card = read_card(bench.path(), "ade9d0e2-refused-efefefefefef").expect("card");
+        assert_eq!(
+            card["title"],
+            "Chris Orchestrator turned away a message without telling the sender"
+        );
+        assert_eq!(card["severity"], "critical");
+        assert_eq!(
+            card["links"][0]["url"],
+            format!("buzz://message?channel={channel}&id={event}")
+        );
+        assert_eq!(
+            card["plain"]["ifYouWait"],
+            "Nothing happens by itself: the sender is not told."
+        );
+        let body = card["body"].as_str().unwrap();
+        assert!(card_safe(body), "{body}");
+        // D1 (15 Nov 2026): the owner is texted as well as carded.
+        let texts = f.take_alerts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("turned away a message"), "{texts:?}");
     }
 }
