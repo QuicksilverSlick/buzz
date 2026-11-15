@@ -25,6 +25,8 @@ concurrency:
 jobs:
   tlc:
     name: TLC model check
+    # Block's storage-protocol models; the fork doesn't run them (CI volume).
+    if: github.repository == 'block/buzz'
     runs-on: ubuntu-latest
     # About three minutes on 16 cores; the hosted runner has fewer.
     timeout-minutes: 45
@@ -41,6 +43,8 @@ jobs:
 
   lean:
     name: Lean proof
+    # Block's storage-protocol models; the fork doesn't run them (CI volume).
+    if: github.repository == 'block/buzz'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
