@@ -1098,18 +1098,6 @@ export async function installRelayBridge(
   });
 }
 
-/** Number of `get_channels` reads currently held. */
-export async function pendingChannelsRead(page: Page): Promise<number> {
-  return page.evaluate(() => window.__BUZZ_E2E_CHANNELS_READ_PENDING__ ?? 0);
-}
-
-/** Release the `get_channels` read held by the mock bridge, if any. */
-export async function releaseChannelsRead(page: Page): Promise<number> {
-  return page.evaluate(
-    () => window.__BUZZ_E2E_RELEASE_CHANNELS_READ__?.() ?? 0,
-  );
-}
-
 /** Release every `get_channel_members` read held by `deferChannelMembersReads`. */
 export async function releaseChannelMembersReads(page: Page): Promise<number> {
   return page.evaluate(
