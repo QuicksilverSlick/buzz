@@ -13,6 +13,7 @@ import {
   benchCreatedSeconds,
   enabledBenchSnapshot,
 } from "@/features/bench/lib/benchCards";
+import { SHIP_ALL_CHECK_ID } from "@/features/bench/lib/benchShipAll";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type BenchSections = {
@@ -127,6 +128,8 @@ export function benchSections(
     viewer === undefined ||
     (owner !== null && normalizePubkey(viewer) === normalizePubkey(owner));
   for (const card of snapshot.items) {
+    // Machine lines for Ship all: the digest's bar speaks for it.
+    if (card.id === SHIP_ALL_CHECK_ID) continue;
     if (card.validity !== "current") {
       sections.retiring += 1;
     } else if (card.kind === "pending") {
