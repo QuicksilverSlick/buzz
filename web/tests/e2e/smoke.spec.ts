@@ -69,7 +69,7 @@ test("invite requires age and legal consent before opening Dreamforge", async ({
   await page.goto("/invite/demo-code");
 
   await expect(
-    page.getByRole("link", { name: "Download Buzz" }),
+    page.getByRole("link", { name: "Download Dreamforge" }),
   ).toHaveAttribute(
     "href",
     "https://github.com/block/buzz-app/releases/download/v0.4.9/Buzz_0.4.9_x64_unsigned.exe",
@@ -327,7 +327,7 @@ for (const architecture of ["unknown", "x64"]) {
     });
 
     await page.goto("/invite/demo-code");
-    const download = page.getByRole("link", { name: "Download Buzz" });
+    const download = page.getByRole("link", { name: "Download Dreamforge" });
     await expect(download).toHaveAttribute("aria-haspopup", "dialog");
     await download.click();
 
@@ -343,7 +343,7 @@ for (const architecture of ["unknown", "x64"]) {
     );
     await expect(
       chooser.getByText(
-        "Buzz for Mac requires Apple Silicon. Intel Macs are not supported.",
+        "Dreamforge for Mac requires Apple Silicon. Intel Macs are not supported.",
       ),
     ).toBeVisible();
     await expect(chooser.getByText("About This Mac")).toBeVisible();
@@ -460,7 +460,7 @@ test("invite download links to the appropriate platform destination", async ({
 
     await page.goto("/invite/demo-code");
     await expect(
-      page.getByRole("link", { name: "Download Buzz" }),
+      page.getByRole("link", { name: "Download Dreamforge" }),
       device.name,
     ).toHaveAttribute("href", device.expectedUrl);
     await expect(
@@ -470,7 +470,7 @@ test("invite download links to the appropriate platform destination", async ({
       route.fulfill({ contentType: "text/html", body: "Store destination" }),
     );
     const destination = context.waitForEvent("page");
-    await page.getByRole("link", { name: "Download Buzz" }).click();
+    await page.getByRole("link", { name: "Download Dreamforge" }).click();
     await expect(await destination).toHaveURL(device.expectedUrl);
     await context.close();
   }

@@ -1,11 +1,13 @@
-export const BUZZ_RELEASES_URL = "https://github.com/block/buzz-app/releases";
+// Dreamforge: the fork's own desktop releases (Dreamforge_<v>_x64-setup.exe etc.).
+export const BUZZ_RELEASES_URL =
+  "https://github.com/QuicksilverSlick/buzz/releases";
 /** Official iOS download destination. */
 export const BUZZ_IOS_APP_STORE_URL = "https://apps.apple.com/app/id6779728271";
 /** Official Android download destination. */
 export const BUZZ_ANDROID_PLAY_STORE_URL =
   "https://play.google.com/store/apps/details?id=xyz.block.buzz.mobile";
 const BUZZ_RELEASES_API_URL =
-  "https://api.github.com/repos/block/buzz-app/releases?per_page=10";
+  "https://api.github.com/repos/QuicksilverSlick/buzz/releases?per_page=10";
 const CACHE_KEY = "buzz.latestDownload.v2";
 const CACHE_TTL_MS = 60 * 60 * 1000;
 

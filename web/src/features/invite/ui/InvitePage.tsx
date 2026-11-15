@@ -285,7 +285,7 @@ export function InvitePage({ code }: { code: string }) {
               setShowMacChoice(true);
             }}
           >
-            Download Buzz
+            Download Dreamforge
           </a>
         </p>
       </div>
@@ -307,7 +307,7 @@ export function InvitePage({ code }: { code: string }) {
                   Which Mac do you have?
                 </h2>
                 <p className="mt-2 text-sm text-black/60">
-                  Buzz for Mac requires Apple Silicon. Intel Macs are not
+                  Dreamforge for Mac requires Apple Silicon. Intel Macs are not
                   supported.
                 </p>
               </div>
