@@ -3476,9 +3476,9 @@ async fn run_harness(
     // flooder. Bounded because this process is long-lived and the key space is
     // attacker-controlled — on overflow we clear and allow one more notice per
     // pair rather than growing without limit. A pair is claimed while its
-    // notice posts and kept only once the relay accepted it: a notice that
-    // never landed told nobody, so it must not use up their one notice.
-    let gate_notified: Arc<std::sync::Mutex<HashSet<(Uuid, String)>>> = Arc::default();
+    // notice posts and kept once the relay accepted it; a first failure
+    // releases it once (`settle_refusal_notice`).
+    let gate_notified: Arc<std::sync::Mutex<RefusalMemo>> = Arc::default();
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
@@ -4312,7 +4312,8 @@ async fn run_harness(
                                     && remember_gate_notice(
                                         &mut gate_notified
                                             .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .told,
                                         memo_key.clone(),
                                     )
                                 {
@@ -4328,6 +4329,8 @@ async fn run_harness(
                                     let content = author_gate_notice_text(is_dm);
                                     let rest = ctx.rest_client.clone();
                                     let factory = config.factory.clone();
+                                    let alert_cmd = config.factory_alert_cmd.clone();
+                                    let sms_to = config.factory_alert_sms_to.clone();
                                     let memo = Arc::clone(&gate_notified);
                                     tokio::spawn(async move {
                                         // The relay's membership cache can refuse a post into a DM
@@ -4342,13 +4345,19 @@ async fn run_harness(
                                             &waits,
                                         )
                                         .await;
-                                        settle_refusal_notice(
+                                        let texts = settle_refusal_notice(
                                             posted,
                                             &memo,
                                             &memo_key,
                                             &factory,
                                             &inbound_event_id,
                                         );
+                                        if !texts.is_empty() {
+                                            deliver_factory_state(
+                                                None, None, texts, rest, alert_cmd, sms_to,
+                                            )
+                                            .await;
+                                        }
                                     });
                                 }
                                 continue;
@@ -6033,28 +6042,55 @@ async fn post_refusal_notice(
     false
 }
 
-/// After a refusal notice's last try. The memo means "told", so a claim stays
-/// only once the notice landed. Otherwise it is released, so the sender's next
-/// message tries again, and the owner gets a card and a text (D1, 15 Nov 2026).
+/// The refusal-notice memo, keyed by (channel, author).
+#[derive(Default)]
+struct RefusalMemo {
+    /// Told, or a notice in flight.
+    told: HashSet<(Uuid, String)>,
+    /// A notice already failed once; the owner was told about it.
+    failed: HashSet<(Uuid, String)>,
+}
+
+/// After a refusal notice's last try; returns the owner's texts to send now.
+///
+/// A landed notice keeps its claim. A pair's first failure releases it, so
+/// their next message tries again (the relay's cache may have caught up), and
+/// the owner gets one card and one text (D1, 15 Nov 2026). Any later failure
+/// keeps the claim, so a relay that keeps refusing costs no more posts, cards
+/// or texts. The texts go out from here because the beat that sends queued
+/// texts runs only while the pool is up, and a refusal needs no pool.
 fn settle_refusal_notice(
     posted: bool,
-    memo: &std::sync::Mutex<HashSet<(Uuid, String)>>,
+    memo: &std::sync::Mutex<RefusalMemo>,
     key: &(Uuid, String),
     factory: &factory::FactoryHandle,
     event_id: &str,
-) {
+) -> Vec<String> {
     if posted {
-        return;
+        return Vec::new();
     }
-    memo.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(key);
+    let first = {
+        let mut memo = memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = remember_gate_notice(&mut memo.failed, key.clone());
+        if first {
+            memo.told.remove(key);
+        }
+        first
+    };
     tracing::error!(
         channel_id = %key.0,
         event_id,
-        "refusal notice could not be posted — the sender was not told; raising to the owner"
+        first,
+        "refusal notice could not be posted — the sender was not told"
     );
-    factory.lock().refusal_unseen(key.0, event_id);
+    if !first {
+        return Vec::new();
+    }
+    let mut factory = factory.lock();
+    factory.refusal_unseen(key.0, &key.1, event_id);
+    factory.take_alerts()
 }
 
 /// Whether a gate refusal earns the "not set up to take requests" notice.
@@ -10585,38 +10621,39 @@ mod author_gate_tests {
     }
 
     /// 13 Nov: the failed reply used up Chris's one notice, so his next two
-    /// DMs met silence. A notice that never landed keeps no claim, and the
-    /// owner hears about it instead.
+    /// DMs met silence. A first failure releases the claim once and tells the
+    /// owner; a relay that keeps refusing costs no more posts, cards or texts.
     #[test]
-    fn refusal_memo_keeps_a_claim_only_once_the_notice_landed() {
+    fn refusal_memo_releases_a_failed_claim_once() {
         let bench = tempfile::tempdir().unwrap();
         let mut factory = factory::Factory::new(None, "claude-agent-acp");
         factory.reporting.short = "ade9d0e2".to_string();
         factory.reporting.bench = Some(bench.path().to_path_buf());
         let factory = factory::FactoryHandle::new(factory);
-        let memo = std::sync::Mutex::new(HashSet::new());
-        let key = (Uuid::from_u128(1), "chris".to_string());
-        let card = bench
-            .path()
-            .join("inbox")
-            .join(factory::CARD_WRITER)
-            .join("ade9d0e2-refused-abababababab.json");
+        let memo = std::sync::Mutex::new(RefusalMemo::default());
+        let key = (Uuid::from_u128(1), "cd".repeat(32));
+        let event = "ab".repeat(32);
+        let cards = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let card_count = || std::fs::read_dir(&cards).map_or(0, |d| d.count());
+        let claim = || remember_gate_notice(&mut memo.lock().unwrap().told, key.clone());
 
-        assert!(remember_gate_notice(&mut memo.lock().unwrap(), key.clone()));
-        settle_refusal_notice(true, &memo, &key, &factory, &"ab".repeat(32));
-        assert!(memo.lock().unwrap().contains(&key), "told: stays told");
-        assert!(!card.exists(), "a landed notice needs no card");
+        assert!(claim());
+        assert!(settle_refusal_notice(true, &memo, &key, &factory, &event).is_empty());
+        assert!(!claim(), "told: stays told");
+        assert_eq!(card_count(), 0, "a landed notice needs no card");
+
+        memo.lock().unwrap().told.clear();
+        assert!(claim());
+        let texts = settle_refusal_notice(false, &memo, &key, &factory, &event);
+        assert_eq!(texts.len(), 1, "the owner is texted, now: {texts:?}");
+        assert_eq!(card_count(), 1, "and carded");
+        assert!(claim(), "never told: their next message must try again");
+
+        // The retry fails too: the claim stays, and nothing more is raised.
+        assert!(settle_refusal_notice(false, &memo, &key, &factory, &event).is_empty());
+        assert!(!claim(), "a relay that keeps refusing gets no more posts");
+        assert_eq!(card_count(), 1);
         assert!(factory.lock().take_alerts().is_empty());
-
-        memo.lock().unwrap().clear();
-        assert!(remember_gate_notice(&mut memo.lock().unwrap(), key.clone()));
-        settle_refusal_notice(false, &memo, &key, &factory, &"ab".repeat(32));
-        assert!(
-            remember_gate_notice(&mut memo.lock().unwrap(), key.clone()),
-            "never told: their next message must try again"
-        );
-        assert!(card.exists(), "the owner gets a card");
-        assert_eq!(factory.lock().take_alerts().len(), 1, "and a text");
     }
 
     #[tokio::test]
