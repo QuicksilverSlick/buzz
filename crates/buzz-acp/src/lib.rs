@@ -5727,7 +5727,8 @@ mod try_native_steer_fallback_log_tests {
 
 /// An owner turn must not run in a session a guest's words were written into:
 /// their words would sit in the provider's memory under the owner's trust.
-/// Returns whether the scope was reset.
+/// The new session's first prompt fetches the recent history instead, each
+/// line labelled owner or guest. Returns whether the scope was reset.
 fn fresh_session_for_owner_turn(
     agent: &mut OwnedAgent,
     scope: &scope::SessionScope,
@@ -5739,7 +5740,11 @@ fn fresh_session_for_owner_turn(
     let Some(id) = agent.state.sessions.get(scope).cloned() else {
         return false;
     };
-    agent.acp.take_guest_mark(&id) && agent.state.invalidate_scope(scope)
+    if !(agent.acp.take_guest_mark(&id) && agent.state.invalidate_scope(scope)) {
+        return false;
+    }
+    agent.state.history_after_guest.insert(scope.clone());
+    true
 }
 
 /// Flush queued work to available agents.
@@ -12806,6 +12811,12 @@ mod error_outcome_emission_tests {
             assert_eq!(
                 agent.state.sessions.contains_key(&scope),
                 !reset,
+                "{writer:?} then {next:?}"
+            );
+            // The fresh session's first prompt fetches the history it lost.
+            assert_eq!(
+                agent.state.history_after_guest.contains(&scope),
+                reset,
                 "{writer:?} then {next:?}"
             );
         }
