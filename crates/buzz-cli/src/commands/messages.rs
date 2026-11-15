@@ -2063,7 +2063,11 @@ mod tests {
         };
 
         let (url, _, captured_event) = fake_send_relay(send_palette_response()).await;
-        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let client = BuzzClient::new(
+            url,
+            crate::credentials::Credentials::from_keys(Keys::generate()),
+        )
+        .unwrap();
         super::dispatch(cmd, &client, &crate::OutputFormat::Json)
             .await
             .unwrap();
