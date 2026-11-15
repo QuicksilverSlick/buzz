@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
+import { BenchShipAllDetails } from "@/features/bench/ui/BenchShipAllDetails";
 import { HuddleTranscriptIntro } from "@/features/huddle/components/HuddleTranscriptIntro";
 import {
   buildThreadSummaryFromVisibleEntries,
@@ -597,6 +598,11 @@ export function MessageThreadPanel({
                 )}
               />
             </div>
+            <BenchShipAllDetails
+              channelId={channelId}
+              message={threadHead}
+              viewerPubkey={currentPubkey}
+            />
           </div>
         )}
 

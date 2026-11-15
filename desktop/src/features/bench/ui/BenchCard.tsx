@@ -305,7 +305,8 @@ function BenchQuestionCard({
         </fieldset>
       ) : null}
       <BenchWhyBox card={card} live={interactive && card.kind === "pending"} />
-      {interactive && isStewardDigest(card) ? (
+      {/* The thread head has Give me details' own bar below it instead. */}
+      {interactive && isStewardDigest(card) && onOther ? (
         <BenchShipAllBar button="digest" digest={card} />
       ) : null}
       <div aria-live="polite" className="text-xs">

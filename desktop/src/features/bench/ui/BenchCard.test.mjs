@@ -26,6 +26,7 @@ import { JSDOM } from "jsdom";
 
 import {
   ANSWER,
+  REPLY,
   hold,
   shipAllCheck,
 } from "../lib/benchShipAll.test-support.mjs";
@@ -54,6 +55,7 @@ let createRootRoute;
 let createRouter;
 let router;
 let BenchCard;
+let BenchShipAllDetails;
 let clearBenchWhys;
 let formatBenchCreated;
 let useBenchCardForMessage;
@@ -205,6 +207,7 @@ before(async () => {
     createRouter,
   } = await import("@tanstack/react-router"));
   ({ BenchCard } = await import("./BenchCard.tsx"));
+  ({ BenchShipAllDetails } = await import("./BenchShipAllDetails.tsx"));
   ({ clearBenchWhys } = await import("./BenchWhyBox.tsx"));
   ({ formatBenchCreated } = await import("../lib/benchCards.ts"));
   ({ useBenchCardForMessage } = await import("../useBenchCards.ts"));
@@ -1360,8 +1363,8 @@ test("Why? on a steward card says the reason goes on the PR, and public unless t
   );
 });
 
-// Ship all on the steward's digest (benchShipAll.ts): the bar, the confirm
-// and the taps in the steward's order.
+// Ship all on the steward's digest (benchShipAll.ts): the bar, the confirm,
+// the taps in the steward's order, and Give me details' thread block.
 const DIGEST = card({
   id: "steward/digest-2026-11-15",
   writer: "steward",
@@ -1525,11 +1528,67 @@ test("a conflict the check names keeps Ship all off; other cards have none", asy
     shipAllCheck([], { digest: "not clear", held: [[a, why]] }),
   ]);
   await act(async () => {
-    render(wrap(benchCard({ card: DIGEST })));
+    render(wrap(benchCard({ card: DIGEST, onOther: () => {} })));
     render(wrap(benchCard({ card: a })));
   });
   await waitFor(() => screen.getByTestId("bench-ship-all-reason"));
   const reason = screen.getByTestId("bench-ship-all-reason").textContent;
   assert.ok(reason.startsWith(`${why} It checks again by `), reason);
   assert.equal(screen.getAllByRole("button", { name: /^Ship all/ }).length, 1);
+});
+
+test("Give me details shows every waiting card, read first included, the bar below them, and what is left out", async () => {
+  const a = hold(901);
+  const held = hold(903, { readFirst: true, sha: "c" });
+  const replied = hold(904, { reply: REPLY, sha: "d" });
+  const red = hold(905, { sha: "f" });
+  const listed = [
+    [held, false],
+    [a, true],
+  ];
+  const why = "reset PR 905 has red CI on the commit its card names.";
+  serveBench([
+    DIGEST,
+    a,
+    held,
+    replied,
+    red,
+    shipAllCheck(listed, { held: [[red, why]] }),
+  ]);
+  const message = {
+    id: DIGEST.cardEventId,
+    kind: 9,
+    signerPubkey: WRITER,
+    tags: [],
+  };
+  const props = { channelId: CHANNEL, message, viewerPubkey: OWNER };
+  // The thread head (no Open thread) and the block under it: one Ship all.
+  await act(async () => {
+    render(wrap(benchCard({ card: DIGEST })));
+    render(wrap(createElement(BenchShipAllDetails, props)));
+  });
+  await waitFor(() => screen.getByText("Waiting on your tap (4)"));
+  await waitFor(() => assert.equal(shipAll().disabled, false));
+  assert.equal(shipAll().textContent, "Ship all 2");
+  const block = screen.getByTestId("bench-ship-all-thread");
+  const cards = [...block.querySelectorAll("[data-testid='bench-card']")];
+  const titles = cards.map(
+    (c) => c.querySelector("p.font-semibold").textContent,
+  );
+  assert.deepEqual(titles, [held.title, a.title, red.title, replied.title]);
+  // Below the last card it ships, above what it leaves out.
+  const bar = screen.getByTestId("bench-ship-all-details");
+  const after = (x, y) =>
+    Boolean(
+      x.compareDocumentPosition(y) &
+        dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  assert.ok(after(cards[1], bar) && after(bar, cards[2]));
+  assert.deepEqual(
+    screen
+      .getAllByTestId("bench-ship-all-left-reason")
+      .map((p) => p.textContent),
+    [why, "You wrote on its card: answer it there."],
+  );
+  assert.ok(screen.getByText(/^Typing in this thread ships nothing/));
 });
