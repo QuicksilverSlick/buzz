@@ -3,6 +3,9 @@ import { expect, type Locator, type Page, test } from "@playwright/test";
 import { BUZZ_APP_DOWNLOADS_MANIFEST_URL } from "../../src/app/newAppInstaller";
 import { installMockBridge } from "../helpers/bridge";
 
+// Dreamforge unmounts this banner and its installer host (AppShell.tsx, main.tsx).
+test.skip(true, "Dreamforge does not show Block's new-app banner");
+
 type InstallerFailureReason =
   | "network"
   | "storage"

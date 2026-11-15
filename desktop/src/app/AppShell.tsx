@@ -9,7 +9,6 @@ import { AppShellOverlays, TerminalBootstrap } from "@/app/AppShellOverlays";
 import { AppShellChannelSurface } from "@/app/AppShellChannelSurface";
 import { AppHuddleShell } from "@/app/AppHuddleShell";
 import { AppTopChrome } from "@/app/AppTopChrome";
-import { DeprecationBanner } from "@/app/DeprecationBanner";
 import {
   type TerminalContextOverride,
   TerminalContextOverrideProvider,
@@ -794,7 +793,7 @@ export function AppShell() {
                       onGoForward={goForward}
                     />
                   ) : null}
-                  {!isHuddleRoom ? <DeprecationBanner /> : null}
+                  {/* Dreamforge: Block's "new Buzz app" DeprecationBanner stays unmounted. */}
                   {settingsOpen ? (
                     <div className="relative flex min-h-0 flex-1 overflow-hidden">
                       <div
