@@ -39,6 +39,17 @@ function makeSnapshotChannel(index: number, prefix = "snapshot") {
   };
 }
 
+// Cold-boot tests hold the first channels read (deferFirstChannelsRead) so the
+// loading state is on screen however long boot takes, then release it here.
+async function releaseFirstChannelsRead(page: Page) {
+  await expect
+    .poll(() => page.evaluate(() => window.__BUZZ_E2E_CHANNELS_READ_PENDING__))
+    .toBe(1);
+  expect(
+    await page.evaluate(() => window.__BUZZ_E2E_RELEASE_CHANNELS_READ__?.()),
+  ).toBe(1);
+}
+
 const FULL_SNAPSHOT = Array.from({ length: 14 }, (_, index) =>
   makeSnapshotChannel(index),
 );
@@ -361,10 +372,9 @@ test("first-ever boot without a snapshot sends null and shows loading", async ({
   await installMockBridge(page, { deferFirstChannelsRead: true });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);
@@ -397,10 +407,9 @@ test("a different identity's snapshot is ignored", async ({ page }) => {
   await installMockBridge(page, { deferFirstChannelsRead: true });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);
@@ -459,10 +468,9 @@ test("partial hash/list write fails toward a full fetch", async ({ page }) => {
   });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);

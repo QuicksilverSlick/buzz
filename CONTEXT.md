@@ -1,12 +1,16 @@
 # Buzz domain language
 
-Shared terminology for Buzz product behavior. This glossary currently covers mobile [push suppression](#push-suppression); it is not a complete model of Buzz.
+Shared terminology for Buzz product behavior. This glossary currently covers mobile [push suppression](#push-suppression), the [notification body](#notification-body), [mobile builds](#mobile-builds), [sharing](#sharing) and [quick send](#quick-send); it is not a complete model of Buzz.
 
 ## Notifications
 
 ### Mobile push notification
 
 A notification directed to a user's mobile installation through the platform's push service.
+
+### Notification body
+
+The text a [mobile push notification](#mobile-push-notification) shows for a message: the message's text with its Markdown syntax removed, cut only where the platform would cut it. See [ADR 0002](docs/adr/0002-notification-message-text.md).
 
 ### Push suppression
 
@@ -51,3 +55,45 @@ A [suppression activity signal](#suppression-activity-signal) that extends how l
 ### Inactivity cutoff
 
 The time of the last observed [desktop activity](#desktop-activity) plus the duration specified in the spec, when [desktop inactivity](#desktop-inactivity) begins. New desktop activity moves this cutoff forward.
+
+## Mobile builds
+
+### Internal build
+
+A mobile app an organization distributes only to its own members, for example through device management. It uses only that organization's Builderlab and reaches only that organization's community.
+
+_Avoid_: Dogfood build, enterprise build, org build
+
+### Public build
+
+The mobile app distributed through the App Store and TestFlight. It uses only the public Builderlab and cannot reach any organization's community.
+
+_Avoid_: App Store build, external build
+
+## Sharing
+
+### Share
+
+Bringing content such as a screenshot, screen recording, URL or text from another app into a Buzz conversation through the system share sheet. A share ends in that conversation's composer, where the person adds their own text and sends it.
+
+_Avoid_: Forward, post
+
+### Share target
+
+A conversation offered among the share sheet's suggested destinations: an existing channel or DM, or a new Solo chat. Share targets are learned from top-level messages a person sends in a conversation; thread replies and incoming messages never count.
+
+_Avoid_: Recipient, contact, suggestion
+
+## Agents and conversations
+
+### Bestie
+
+The one agent a person has chosen as their default in a community. A community has at most one Bestie per person.
+
+_Avoid_: Default agent, main agent, assistant
+
+### Quick send
+
+Sending a message to Buzz from outside the app (Siri, Shortcuts, the Action button) without opening Buzz. A quick send to the [Bestie](#bestie) posts the message in the person's DM with the Bestie.
+
+_Avoid_: Siri message, dictation, background send

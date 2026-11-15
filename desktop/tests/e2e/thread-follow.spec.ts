@@ -6,6 +6,7 @@ import {
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { openGeneral, pressRowAction } from "../helpers/channelHeadReady";
 
 const CHANNEL = "general";
 const SELF_PUBKEY = "deadbeef".repeat(8);
@@ -85,8 +86,7 @@ async function openMessageMenu(
     `[data-testid="message-row"][data-message-id="${messageId}"]`,
   );
   await row.evaluate((element) => element.scrollIntoView({ block: "center" }));
-  await row.hover();
-  await row.getByTestId(`more-actions-${messageId}`).click();
+  await pressRowAction(row.getByTestId(`more-actions-${messageId}`));
   await expect(page.getByRole("menu")).toBeVisible();
 }
 
@@ -356,7 +356,7 @@ test("a mention-only root offers follow and explicit follow enables ordinary rep
 }) => {
   await installMockBridge(page);
   await page.goto("/");
-  await page.getByTestId(`channel-${CHANNEL}`).click();
+  await openGeneral(page);
   await waitForMockLiveSubscription(page, CHANNEL);
 
   const root = await emitMessage(page, {

@@ -98,7 +98,9 @@ export type ChannelPaneProps = {
   onChannelManagementDeleted?: () => void;
   onCloseIdleAuxiliaryPanel?: () => void;
   onCloseProfilePanel: () => void;
-  onAddAgent?: (options?: { beforeSend?: () => void }) => void;
+  onAddAgent?: (options?: {
+    beforeSend?: (channelId: string) => () => void;
+  }) => void;
   onAddFiles?: () => void;
   onBrowseChannels?: () => void;
   onCreateChannel?: () => void;

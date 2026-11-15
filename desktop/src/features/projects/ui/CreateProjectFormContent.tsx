@@ -4,6 +4,7 @@ import * as React from "react";
 import { useProjectsQuery } from "@/features/projects/hooks";
 import { nextProjectColor } from "@/features/projects/lib/projectColors";
 import type { CreateProjectInput } from "@/features/projects/useCreateProject";
+import { CREATE_PROJECT_REFOCUS_DELAY_MS } from "@/features/projects/ui/createProjectFormFocus";
 import { CreateProjectFormSettings } from "@/features/projects/ui/CreateProjectFormSettings";
 import { ProjectColorPicker } from "@/features/projects/ui/ProjectColorPicker";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -55,7 +56,7 @@ export function CreateProjectFormContent({
 
     const timerId = globalThis.setTimeout(() => {
       nameInputRef.current?.focus();
-    }, 50);
+    }, CREATE_PROJECT_REFOCUS_DELAY_MS);
     return () => globalThis.clearTimeout(timerId);
   }, [active, initialName]);
 

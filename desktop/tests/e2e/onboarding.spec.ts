@@ -4,6 +4,7 @@ import { nsecEncode, npubEncode } from "nostr-tools/nip19";
 
 import { PRODUCT_NAME } from "@/shared/constants/brand";
 
+import { waitForAnimations } from "../helpers/animations";
 import {
   installMockBridge,
   openChannelBrowser,
@@ -1529,6 +1530,9 @@ test("hosted community address line stays within the card for a long name", asyn
   const longName = "a".repeat(63);
   await communityNameInput.fill(longName);
   await expect(communityNameInput).toHaveValue(longName);
+  // The page slides in for 650 ms after the sign-in dialog closes, and the
+  // three boxes below are read in separate round trips. Measure at rest.
+  await waitForAnimations(page);
 
   const [surfaceBox, inputBox, suffixBox] = await Promise.all([
     createSurface.boundingBox(),
@@ -2421,6 +2425,9 @@ test("connected first-community profile keeps navigation inside the card and bal
   await avatarButton.click();
   const avatarDialog = page.getByRole("dialog", { name: "Edit your avatar" });
   await expect(avatarDialog).toBeVisible();
+  // The dialog zooms in from 95% and animates its height; the layout checks
+  // below read boxes in separate round trips, so take them at rest.
+  await waitForAnimations(page);
   await expect(avatarDialog).toHaveAttribute(
     "data-system-color-scheme",
     "light",
