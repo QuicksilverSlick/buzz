@@ -17,6 +17,9 @@ env:
 jobs:
   flake-select:
     name: Flake check selection
+    # Block's advisory lane; on the fork every lane below skips with this job
+    # (keeps PR CI volume down). Guarded here so ci.yml keeps Block's line.
+    if: github.repository == 'block/buzz'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
