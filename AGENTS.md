@@ -658,6 +658,15 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
 > need to update it. Never use it as an implementation or design reference for
 > the mobile app, which is current.
 
+> **Fork note (QuicksilverSlick/buzz, Dreamforge).** In this repository
+> `desktop/` is Dreamforge, the product we ship, and it is not deprecated here.
+> The rule above ("no new desktop features") is Block's rule for PRs to
+> block/buzz; in QuicksilverSlick/buzz, desktop feature work is normal. Keep
+> Dreamforge branding on every surface, and keep Block's new-app banner and
+> installer download unmounted (`desktop/src/app/AppShell.tsx`,
+> `desktop/src/main.tsx`). Added 15 Nov 2026 by Claude-Account
+> russelledeming@gmail.com for the upstream catch-up.
+
 The desktop app is Tauri 2 + React 19 + Vite + Tailwind CSS. Features are
 organized under `desktop/src/features/`. Biome handles linting and formatting.
 
