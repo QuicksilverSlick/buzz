@@ -113,6 +113,15 @@ export function useBenchAnswer() {
   });
 }
 
+/** A snapshot read now, through the shared cache: Ship all's Recorded wait. */
+export async function readBenchSnapshot(
+  queryClient: QueryClient,
+): Promise<BenchSnapshot | null> {
+  return enabledBenchSnapshot(
+    await queryClient.fetchQuery({ ...benchCardsQueryOptions, staleTime: 0 }),
+  );
+}
+
 export type BenchReplyInput = {
   itemId: string;
   /** The card the owner saw: the Bench refuses a reply on any other. */
