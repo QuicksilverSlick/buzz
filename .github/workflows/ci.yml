@@ -275,7 +275,8 @@ jobs:
   # their own statuses and step summaries carry the result.
   flake-check:
     name: Flake Check
-    if: github.event_name == 'pull_request'
+    # Block's advisory lane; the fork doesn't run it (keeps PR CI volume down).
+    if: github.event_name == 'pull_request' && github.repository == 'block/buzz'
     uses: ./.github/workflows/_ci-flake.yml
 
   security-domain:
