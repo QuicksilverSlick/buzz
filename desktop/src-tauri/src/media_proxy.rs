@@ -11,7 +11,7 @@ use tauri::{http, Manager};
 use tokio::net::TcpListener;
 
 use crate::app_state::AppState;
-use crate::commands::media::mint_media_get_auth;
+use crate::commands::media::{learn_relay_clock, mint_media_get_auth, relay_clock_offset};
 use crate::relay;
 
 /// Defense-in-depth cap: refuse to buffer responses larger than this into RAM.
@@ -59,6 +59,7 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).
+    let signed_with = relay_clock_offset(&base_url);
     if let Some(auth) = mint_media_get_auth(&app_state, &base_url) {
         upstream = upstream.header("authorization", auth);
     }
@@ -80,9 +81,12 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
     // evidence_rejected). Under NIP-FI strict mode a read token expires after
     // 60s, so a long video range-request stream will exhaust its token mid-flight.
     // Single retry; if the fresh token also fails, propagate the error to the caller.
-    let resp = if (resp.status() == reqwest::StatusCode::UNAUTHORIZED
-        || resp.status() == reqwest::StatusCode::FORBIDDEN)
-        && has_range
+    // Any request also retries when the refusal showed this computer's clock is
+    // off from the relay's: the fresh token is then signed on the relay's clock.
+    let refused = resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || resp.status() == reqwest::StatusCode::FORBIDDEN;
+    let resp = if refused
+        && (learn_relay_clock(&base_url, resp.headers(), signed_with) || has_range)
     {
         if let Some(fresh_auth) = mint_media_get_auth(&app_state, &base_url) {
             let mut retry = state
@@ -219,6 +223,7 @@ pub async fn handle_buzz_media(
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).
+    let signed_with = relay_clock_offset(&base);
     if let Some(auth) = mint_media_get_auth(&state, &base) {
         upstream = upstream.header("authorization", auth);
     }
@@ -234,11 +239,13 @@ pub async fn handle_buzz_media(
     // Re-mint and retry once on auth failure (401/403) for range requests.
     // Under NIP-FI strict mode a read token expires after 60s, exhausting
     // mid-stream. Single retry with a fresh token; propagate on second failure.
+    // Any request also retries when the refusal showed this computer's clock is
+    // off from the relay's: the fresh token is then signed on the relay's clock.
     let result = match result {
         Ok(resp)
             if (resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN)
-                && has_range =>
+                && (learn_relay_clock(&base, resp.headers(), signed_with) || has_range) =>
         {
             if let Some(fresh_auth) = mint_media_get_auth(&state, &base) {
                 let mut retry = state
