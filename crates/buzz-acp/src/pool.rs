@@ -980,6 +980,11 @@ pub struct PromptContext {
     /// Owner pubkey (hex), if resolved at startup. When unset, NIP-AE core
     /// injection is skipped entirely (no owner = no `(agent, owner)` pair).
     pub agent_owner_pubkey: Option<nostr::PublicKey>,
+    /// The explicit `respond_to` allowlist (lowercase hex), without the owner
+    /// and siblings the gate also admits: the only signers whose `df-ask`
+    /// notice may publish the agent's unsent final text ([`bench_ask`]).
+    /// Empty outside allowlist mode, which turns that fallback off.
+    pub bench_ask_signers: HashSet<String>,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the per-session core engram fetch is skipped and `core_sections`
     /// remains empty for every channel, so `format_prompt` renders no
@@ -5914,19 +5919,53 @@ fn owner_question<'a>(batch: &'a FlushBatch, agent: &str, owner: &str) -> Option
         .find(|event| crate::owner_dm::is_owner_message(event, agent, owner))
 }
 
+/// The last Bench notice in `batch` that asks this agent for an answer in its
+/// card thread: a chat message (kind 9) tagging the agent and carrying a
+/// `["df-ask", …]` tag, signed by a key in `signers`, the agent's explicit
+/// `respond_to` allowlist (for Bench Assistant, only the Bench writer key).
+/// The owner and same-owner sibling agents pass the inbound gate but are not
+/// in that list, so they cannot opt a message into the fallback; an empty list
+/// (owner-only or anyone mode) means no Bench fallback at all. The desktop
+/// must add that tag only to a #bench notice (`ch == s.channel_id`) for a
+/// question from one of the owner's keys, routed to a question answerer
+/// (Bench Assistant), never to what the Factory Steward gets. This cannot tell
+/// #bench from any other channel and does not check.
+fn bench_ask<'a>(
+    batch: &'a FlushBatch,
+    agent: &str,
+    signers: &HashSet<String>,
+) -> Option<&'a nostr::Event> {
+    batch.events.iter().rev().map(|be| &be.event).find(|event| {
+        u32::from(event.kind.as_u16()) == buzz_core::kind::KIND_STREAM_MESSAGE
+            // Config stores the allowlist lowercased; `to_hex` is lowercase.
+            && signers.contains(&event.pubkey.to_hex())
+            && event.tags.iter().any(|t| matches!(t.as_slice(), [k, ..] if k == "df-ask"))
+            && event.tags.iter().any(|t| {
+                matches!(t.as_slice(), [k, pk, ..] if k == "p" && pk.eq_ignore_ascii_case(agent))
+            })
+    })
+}
+
 /// Post the agent's answer when it ended a turn without sending one.
 ///
 /// An agent replies by running `buzz messages send`. One that writes its
 /// answer as the turn's final text instead ends the turn normally, the typing
 /// indicator stops, and the person who asked gets nothing (Bench Assistant,
 /// 18 Nov 2026 03:12 UTC). So after an `end_turn` on the owner's question in
-/// their one-on-one DM, ask the relay whether the agent posted there since
-/// the turn began; if not, post its last words for it.
+/// their one-on-one DM, or on a Bench notice that asks for an answer in its
+/// card thread ([`bench_ask`]), ask the relay whether the agent posted there
+/// since the turn began; if not, post its last words for it.
 ///
 /// Only there. Elsewhere silence can be the job (the Factory Steward ends a
 /// tick wake or a Bench notice with nothing to say), and a guest could read
 /// final text that was never written for them. In the owner's DM nobody else
 /// reads it, and a question with no answer is never what the owner wants.
+/// The desktop tags only #bench notices, #bench is the owner's private
+/// channel, and there the Bench asked for an answer in that card's thread.
+/// The ask counts only from a signer on the agent's explicit `respond_to`
+/// allowlist ([`PromptContext::bench_ask_signers`]), not from everyone the
+/// inbound gate admits: a sibling agent or the owner tagging `df-ask` could
+/// otherwise make the agent publish final text it never meant to send.
 ///
 /// A turn that ends with no text and no post stays silent: that is an agent
 /// choosing not to answer ("thanks"), which the base prompt allows, and the
@@ -5948,21 +5987,34 @@ async fn post_reply_if_silent(
     if reply_text.is_empty() {
         return;
     }
-    let Some(owner) = ctx.agent_owner_pubkey.map(|pk| pk.to_hex()) else {
-        return;
-    };
     let rest = &ctx.rest_client;
     let agent = rest.keys.public_key();
     let agent_hex = agent.to_hex();
-    let Some(asked) = owner_question(batch, &agent_hex, &owner) else {
+    let owner = ctx.agent_owner_pubkey.map(|pk| pk.to_hex());
+    let dm_question = match owner
+        .as_deref()
+        .and_then(|o| owner_question(batch, &agent_hex, o).map(|q| (q, o)))
+    {
+        Some((q, o))
+            if crate::owner_dm::channel_is_owner_dm(
+                &ctx.channel_info,
+                channel_id,
+                &agent_hex,
+                o,
+            )
+            .await =>
+        {
+            Some(q)
+        }
+        _ => None,
+    };
+    let Some(asked) = dm_question.or_else(|| bench_ask(batch, &agent_hex, &ctx.bench_ask_signers))
+    else {
         return;
     };
-    if !crate::owner_dm::channel_is_owner_dm(&ctx.channel_info, channel_id, &agent_hex, &owner)
-        .await
-    {
-        return;
-    }
-    let filter = nostr::Filter::new()
+    let thread_tags =
+        crate::queue::notice_thread_tags(asked, crate::queue::parse_thread_tags(asked));
+    let mut filter = nostr::Filter::new()
         .kinds(REPLY_KINDS.map(|k| nostr::Kind::Custom(k as u16)))
         .author(agent)
         .custom_tags(
@@ -5971,6 +6023,12 @@ async fn post_reply_if_silent(
         )
         .since(nostr::Timestamp::from(since))
         .limit(1);
+    // A Bench ask is answered in its card's thread, so a post elsewhere in
+    // #bench must not hide that answer missing. The DM stays channel-wide:
+    // replies there are often top-level.
+    if let (None, Some(root)) = (dm_question, thread_tags.root_event_id.as_deref()) {
+        filter = filter.custom_tags(SingleLetterTag::lowercase(Alphabet::E), [root]);
+    }
     match timeout(
         CONTEXT_FETCH_TIMEOUT,
         rest.query(std::slice::from_ref(&filter)),
@@ -5991,10 +6049,8 @@ async fn post_reply_if_silent(
     tracing::warn!(
         target: "pool::prompt",
         channel = %channel_id,
-        "owner's question ended without a reply — posting the agent's last words"
+        "a question ended without a reply — posting the agent's last words"
     );
-    let thread_tags =
-        crate::queue::notice_thread_tags(asked, crate::queue::parse_thread_tags(asked));
     post_notice(rest, channel_id, &thread_tags, &reply_text, &[]).await;
 }
 
@@ -6197,6 +6253,81 @@ pub(crate) mod tests {
             said(vec![vec!["p".into(), agent.clone()]], &Keys::generate()),
         );
         assert!(super::owner_question(&guest, &agent, &owner_hex).is_none());
+    }
+
+    #[test]
+    fn only_an_opted_in_bench_notice_asks_for_a_reply() {
+        let writer = Keys::generate();
+        let agent = Keys::generate().public_key().to_hex();
+        let card = "c".repeat(64);
+        let notice = |kind: u16, to: &str, ask: Option<&str>| {
+            let mut tags = vec![
+                vec!["e".into(), card.clone(), String::new(), "reply".into()],
+                vec!["p".into(), to.to_string()],
+                vec!["client".into(), "bench:route:x@r0123456789abcdef".into()],
+            ];
+            tags.extend(ask.map(|a| vec!["df-ask".to_string(), a.to_string()]));
+            let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
+            EventBuilder::new(Kind::Custom(kind), "Bench reply · x")
+                .tags(tags)
+                .sign_with_keys(&writer)
+                .unwrap()
+        };
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let signers = HashSet::from([writer.public_key().to_hex()]);
+        let asks = |event: nostr::Event| {
+            super::bench_ask(&batch_with_scope(scope.clone(), event), &agent, &signers)
+                .map(|e| e.id)
+        };
+
+        let asked = notice(9, &agent, Some("r1"));
+        assert_eq!(asks(asked.clone()), Some(asked.id));
+        assert!(asks(notice(9, &agent.to_uppercase(), Some("r1"))).is_some());
+        // What the Factory Steward gets: the same notice, no opt-in.
+        assert!(asks(notice(9, &agent, None)).is_none());
+        let other = Keys::generate().public_key().to_hex();
+        assert!(asks(notice(9, &other, Some("r1"))).is_none());
+        let edit = buzz_core::kind::KIND_STREAM_MESSAGE_EDIT as u16;
+        assert!(asks(notice(edit, &agent, Some("r1"))).is_none());
+
+        // Only a signer on the explicit allowlist opts in. The owner and a
+        // sibling pass the inbound gate, yet the same notice from them is no ask.
+        let same_from = |keys: &Keys| {
+            EventBuilder::new(asked.kind, asked.content.clone())
+                .tags(asked.tags.iter().cloned())
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let (owner, sibling) = (Keys::generate(), Keys::generate());
+        assert!(asks(same_from(&owner)).is_none());
+        assert!(asks(same_from(&sibling)).is_none());
+        // Owner-only or anyone mode: no allowlist, so no Bench fallback.
+        let lone = batch_with_scope(scope.clone(), asked.clone());
+        assert!(super::bench_ask(&lone, &agent, &HashSet::new()).is_none());
+
+        let mut batch = batch_with_scope(scope.clone(), asked.clone());
+        let newer = notice(9, &agent, Some("r2"));
+        batch.events.push(batch_event(newer.clone()));
+        assert_eq!(
+            super::bench_ask(&batch, &agent, &signers).map(|e| e.id),
+            Some(newer.id)
+        );
+
+        // The posted answer is a layer-1 reply in the card's thread.
+        let tags =
+            crate::queue::notice_thread_tags(&asked, crate::queue::parse_thread_tags(&asked));
+        let posted = super::build_failure_notice_event(&writer, Uuid::new_v4(), &tags, "a", &[])
+            .expect("notice builds");
+        assert!(
+            posted
+                .tags
+                .iter()
+                .any(|t| t.as_slice() == ["e", card.as_str(), "", "reply"]),
+            "{:?}",
+            posted.tags
+        );
     }
 
     #[test]
@@ -11223,6 +11354,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
+            bench_ask_signers: HashSet::new(),
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
