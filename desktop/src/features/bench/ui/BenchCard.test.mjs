@@ -24,6 +24,13 @@ import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
+import {
+  ANSWER,
+  REPLY,
+  hold,
+  shipAllCheck,
+} from "../lib/benchShipAll.test-support.mjs";
+
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
 });
@@ -42,7 +49,13 @@ let createElement;
 let QueryClient;
 let QueryClientProvider;
 let TooltipProvider;
+let RouterContextProvider;
+let createMemoryHistory;
+let createRootRoute;
+let createRouter;
+let router;
 let BenchCard;
+let BenchShipAllDetails;
 let clearBenchWhys;
 let formatBenchCreated;
 let useBenchCardForMessage;
@@ -94,10 +107,19 @@ function wrap(element) {
     },
   });
   clients.push(client);
+  // Only the router context useAppNavigation reads (Give me details).
+  router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
   return createElement(
-    QueryClientProvider,
-    { client },
-    createElement(TooltipProvider, null, element),
+    RouterContextProvider,
+    { router },
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(TooltipProvider, null, element),
+    ),
   );
 }
 
@@ -128,6 +150,7 @@ before(async () => {
   Object.assign(globalThis, {
     document: dom.window.document,
     window: dom.window,
+    self: dom.window,
     IS_REACT_ACT_ENVIRONMENT: true,
   });
   for (const key of Object.getOwnPropertyNames(dom.window)) {
@@ -177,7 +200,14 @@ before(async () => {
     "@tanstack/react-query"
   ));
   ({ TooltipProvider } = await import("@/shared/ui/tooltip"));
+  ({
+    RouterContextProvider,
+    createMemoryHistory,
+    createRootRoute,
+    createRouter,
+  } = await import("@tanstack/react-router"));
   ({ BenchCard } = await import("./BenchCard.tsx"));
+  ({ BenchShipAllDetails } = await import("./BenchShipAllDetails.tsx"));
   ({ clearBenchWhys } = await import("./BenchWhyBox.tsx"));
   ({ formatBenchCreated } = await import("../lib/benchCards.ts"));
   ({ useBenchCardForMessage } = await import("../useBenchCards.ts"));
@@ -1331,4 +1361,234 @@ test("Why? on a steward card says the reason goes on the PR, and public unless t
     await hint({ id: "dreamforge/hold-buzz-104", writer: "dreamforge" }),
     "Posted as a reply on this card; no agent is told for dreamforge. Send opens once the card records your tap.",
   );
+});
+
+// Ship all on the steward's digest (benchShipAll.ts): the bar, the confirm,
+// the taps in the steward's order, and Give me details' thread block.
+const DIGEST = card({
+  id: "steward/digest-2026-11-15",
+  writer: "steward",
+  title: "Steward digest 2026-11-15: 2 taps would free 2 pull requests",
+  options: ["Got it"],
+});
+
+/** Serves the snapshot; a bench_answer records on it, as the Bench would. */
+function serveBench(items, { fail = null, onAnswer = () => {} } = {}) {
+  const snapshot = {
+    enabled: true,
+    channelId: CHANNEL,
+    writerPubkey: WRITER,
+    ownerPubkey: OWNER,
+    lastError: null,
+    lastTick: new Date().toISOString(),
+    items,
+  };
+  ipcHandlers.set("bench_cards", async () => structuredClone(snapshot));
+  ipcHandlers.set("bench_answer", async ({ itemId, option }) => {
+    if (itemId === fail) throw new Error("boom");
+    const item = snapshot.items.find((i) => i.id === itemId);
+    Object.assign(item, { recorded: option, answer: ANSWER });
+    onAnswer(snapshot.items);
+    return null;
+  });
+}
+
+const shipAll = () => screen.getByRole("button", { name: /^Ship all \d/ });
+const click = (name) =>
+  act(async () => fireEvent.click(screen.getByRole("button", { name })));
+
+async function renderDigest() {
+  await act(async () => {
+    render(wrap(benchCard({ card: DIGEST, onOther: () => {} })));
+  });
+}
+
+test("the digest shows Ship all and Give me details; a stale check says why", async () => {
+  const a = hold(901);
+  const at = Date.now() - 26 * 60_000;
+  serveBench([DIGEST, a, shipAllCheck([[a, true]], { at })]);
+  await renderDigest();
+  await waitFor(() => assert.equal(shipAll().textContent, "Ship all 1"));
+  assert.equal(shipAll().disabled, true);
+  assert.match(
+    screen.getByTestId("bench-ship-all-reason").textContent,
+    /^The steward's last check \(.*\) is too old to trust\. It checks every 15 minutes; if this stays, the tick may be failing \(see #steward\)\. Each card's own Ship it still works\.$/,
+  );
+  // Give me details opens the digest's thread, from the Inbox too.
+  await click("Give me details");
+  await waitFor(() =>
+    assert.equal(router.history.location.pathname, `/channels/${CHANNEL}`),
+  );
+  assert.match(
+    decodeURIComponent(router.history.location.search),
+    new RegExp(`^\\?messageId="?${DIGEST.cardEventId}"?$`),
+  );
+  assert.ok(optionButton("1. Got it"), "Got it stays the only option");
+});
+
+test("Ship all asks once naming each card; Yes taps in the steward's order", async () => {
+  const a = hold(901, { updatedAt: "2026-11-15T10:00:00Z" });
+  const b = hold(902, { updatedAt: "2026-11-15T11:00:00Z", sha: "c" });
+  const held = hold(903, { readFirst: true, sha: "d" });
+  const listed = [
+    [b, true],
+    [held, false],
+    [a, true],
+  ];
+  serveBench([DIGEST, a, b, held, shipAllCheck(listed)]);
+  await renderDigest();
+  await waitFor(() => assert.equal(shipAll().disabled, false));
+  assert.equal(shipAll().textContent, "Ship all 2", "not the read-first card");
+  assert.ok(
+    screen.getByText(
+      /^1 more is read first \(lane:hold, money, sign-in or database\), so it ships from Give me details\.$/,
+    ),
+  );
+
+  await act(async () => fireEvent.click(shipAll()));
+  const confirm = screen.getByTestId("bench-ship-all-confirm");
+  assert.match(confirm.textContent, /^Ship these 2\?/);
+  assert.deepEqual(
+    [...confirm.querySelectorAll("li")].map((li) => li.textContent),
+    [b, a].map((c) => `${c.title} · risk medium, undo easy`),
+  );
+  await click("Cancel");
+  assert.equal(screen.queryByTestId("bench-ship-all-confirm"), null);
+  assert.deepEqual(answerCalls(), []);
+
+  await act(async () => fireEvent.click(shipAll()));
+  await click("Yes, ship 2");
+  await waitFor(() => screen.getByText(/^Recorded Ship it on 2 cards at /));
+  assert.deepEqual(
+    answerCalls(),
+    [b, a].map((c) => ({
+      itemId: c.id,
+      cardEventId: c.cardEventId,
+      option: 0,
+    })),
+  );
+  assert.ok(screen.getByText(/To take one back, click its Ship it again\./));
+});
+
+test("Ship all stops at the first failure and names the card", async () => {
+  const a = hold(901);
+  const b = hold(902, { sha: "c" });
+  const listed = [
+    [a, true],
+    [b, true],
+  ];
+  serveBench([DIGEST, a, b, shipAllCheck(listed)], { fail: a.id });
+  await renderDigest();
+  await waitFor(() => assert.equal(shipAll().disabled, false));
+  await act(async () => fireEvent.click(shipAll()));
+  await click("Yes, ship 2");
+  await waitFor(() => screen.getByRole("alert"));
+  assert.equal(
+    screen.getByRole("alert").textContent,
+    `Stopped at 1 of 2: ${a.title}: couldn't save: boom The rest were not tapped.`,
+  );
+  assert.equal(answerCalls().length, 1);
+});
+
+test("Ship all reads the Bench again before each tap: a card he answered meanwhile is not overwritten", async () => {
+  const a = hold(901);
+  const b = hold(902, { sha: "c" });
+  const listed = [
+    [a, true],
+    [b, true],
+  ];
+  // While 901 records, he clicks Keep holding on 902 (or taps it on the phone).
+  const keep = (items) =>
+    Object.assign(
+      items.find((i) => i.id === b.id),
+      { recorded: 2, answer: { ...ANSWER, option: 2 } },
+    );
+  serveBench([DIGEST, a, b, shipAllCheck(listed)], { onAnswer: keep });
+  await renderDigest();
+  await waitFor(() => assert.equal(shipAll().disabled, false));
+  await act(async () => fireEvent.click(shipAll()));
+  await click("Yes, ship 2");
+  await waitFor(() => screen.getByRole("alert"));
+  assert.equal(
+    screen.getByRole("alert").textContent,
+    `Stopped at 2 of 2: ${b.title}: not tapped. You answered or wrote on it meanwhile, or the steward's check no longer clears it.`,
+  );
+  assert.deepEqual(
+    answerCalls().map((c) => c.itemId),
+    [a.id],
+  );
+});
+
+test("a conflict the check names keeps Ship all off; other cards have none", async () => {
+  const a = hold(901);
+  const why = "reset PR 901 conflicts with main at cccccccccccc (2 files).";
+  serveBench([
+    DIGEST,
+    a,
+    shipAllCheck([], { digest: "not clear", held: [[a, why]] }),
+  ]);
+  await act(async () => {
+    render(wrap(benchCard({ card: DIGEST, onOther: () => {} })));
+    render(wrap(benchCard({ card: a })));
+  });
+  await waitFor(() => screen.getByTestId("bench-ship-all-reason"));
+  const reason = screen.getByTestId("bench-ship-all-reason").textContent;
+  assert.ok(reason.startsWith(`${why} It checks again by `), reason);
+  assert.equal(screen.getAllByRole("button", { name: /^Ship all/ }).length, 1);
+});
+
+test("Give me details shows every waiting card, read first included, the bar below them, and what is left out", async () => {
+  const a = hold(901);
+  const held = hold(903, { readFirst: true, sha: "c" });
+  const replied = hold(904, { reply: REPLY, sha: "d" });
+  const red = hold(905, { sha: "f" });
+  const listed = [
+    [held, false],
+    [a, true],
+  ];
+  const why = "reset PR 905 has red CI on the commit its card names.";
+  serveBench([
+    DIGEST,
+    a,
+    held,
+    replied,
+    red,
+    shipAllCheck(listed, { held: [[red, why]] }),
+  ]);
+  const message = {
+    id: DIGEST.cardEventId,
+    kind: 9,
+    signerPubkey: WRITER,
+    tags: [],
+  };
+  const props = { channelId: CHANNEL, message, viewerPubkey: OWNER };
+  // The thread head (no Open thread) and the block under it: one Ship all.
+  await act(async () => {
+    render(wrap(benchCard({ card: DIGEST })));
+    render(wrap(createElement(BenchShipAllDetails, props)));
+  });
+  await waitFor(() => screen.getByText("Waiting on your tap (4)"));
+  await waitFor(() => assert.equal(shipAll().disabled, false));
+  assert.equal(shipAll().textContent, "Ship all 2");
+  const block = screen.getByTestId("bench-ship-all-thread");
+  const cards = [...block.querySelectorAll("[data-testid='bench-card']")];
+  const titles = cards.map(
+    (c) => c.querySelector("p.font-semibold").textContent,
+  );
+  assert.deepEqual(titles, [held.title, a.title, red.title, replied.title]);
+  // Below the last card it ships, above what it leaves out.
+  const bar = screen.getByTestId("bench-ship-all-details");
+  const after = (x, y) =>
+    Boolean(
+      x.compareDocumentPosition(y) &
+        dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  assert.ok(after(cards[1], bar) && after(bar, cards[2]));
+  assert.deepEqual(
+    screen
+      .getAllByTestId("bench-ship-all-left-reason")
+      .map((p) => p.textContent),
+    [why, "You wrote on its card: answer it there."],
+  );
+  assert.ok(screen.getByText(/^Typing in this thread ships nothing/));
 });

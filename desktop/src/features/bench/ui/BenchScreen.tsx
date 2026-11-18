@@ -4,6 +4,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useViewerAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import {
   type BenchCard as BenchCardData,
+  benchCardMode,
   benchQueuedLine,
   benchSearch,
 } from "@/features/bench/lib/benchCards";
@@ -12,6 +13,10 @@ import {
   benchLastTickSeconds,
   benchSections,
 } from "@/features/bench/lib/benchScreen";
+import {
+  isStewardDigest,
+  shipAllPick,
+} from "@/features/bench/lib/benchShipAll";
 import {
   type BenchTab,
   benchTabs,
@@ -25,6 +30,7 @@ import {
   workbenches,
 } from "@/features/bench/lib/workbenches";
 import { BenchCard } from "@/features/bench/ui/BenchCard";
+import { BenchShipAllBar } from "@/features/bench/ui/BenchShipAll";
 import { ColorKeyButton } from "@/features/color-key/ui/ColorKey";
 import { useBenchCards } from "@/features/bench/useBenchCards";
 import { useProjectsQuery } from "@/features/projects/hooks";
@@ -345,6 +351,15 @@ export function BenchScreen({ focusCardId }: { focusCardId?: string } = {}) {
           type="search"
           value={query}
         />
+        {/* The digest's Ship all, while no digest is open (the day's 3 are out, or it closed). */}
+        {!snapshot.items.some(isStewardDigest) &&
+        shipAllPick(snapshot).candidates.some(
+          (c) =>
+            benchCardMode(c.card, snapshot.ownerPubkey, viewerPubkey)
+              .interactive,
+        ) ? (
+          <BenchShipAllBar button="digest" />
+        ) : null}
         {SECTIONS.map((section) => (
           <BenchSection
             cards={sections[section.key].filter(matches)}

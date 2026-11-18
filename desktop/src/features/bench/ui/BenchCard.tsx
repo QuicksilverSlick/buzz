@@ -35,10 +35,12 @@ import {
   benchCardMeta,
   benchPostCard,
 } from "@/features/bench/lib/benchCardLayout";
+import { isStewardDigest } from "@/features/bench/lib/benchShipAll";
 import {
   BenchCardBlocks,
   BenchCardDetails,
 } from "@/features/bench/ui/BenchCardFields";
+import { BenchShipAllBar } from "@/features/bench/ui/BenchShipAll";
 import {
   BenchWhyBox,
   benchWhyAfterClick,
@@ -303,6 +305,10 @@ function BenchQuestionCard({
         </fieldset>
       ) : null}
       <BenchWhyBox card={card} live={interactive && card.kind === "pending"} />
+      {/* The thread head has Give me details' own bar below it instead. */}
+      {interactive && isStewardDigest(card) && onOther ? (
+        <BenchShipAllBar button="digest" digest={card} />
+      ) : null}
       <div aria-live="polite" className="text-xs">
         {saving ? (
           <p className="mt-1.5 text-muted-foreground">Saving...</p>
