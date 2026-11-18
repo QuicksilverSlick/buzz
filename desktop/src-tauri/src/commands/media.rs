@@ -301,6 +301,93 @@ pub(crate) fn detect_and_validate_mime(body: &[u8]) -> Result<String, String> {
 /// a 401 or 403 from the server (expired/rejected token), using a single fresh mint+retry.
 pub(crate) const MEDIA_GET_AUTH_EXPIRY_SECS: u64 = 60;
 
+/// How far back a Blossom token's `created_at` is set. The relay accepts a
+/// token stamped at most 5 s in the future and (Strict) at most 60 s old, a
+/// fixed 65 s band. A laptop clock 8 s fast failed every upload (16 Nov 2026).
+/// A 10 s shift accepts clocks from about 15 s fast to 49 s slow without any
+/// round trip; `learn_relay_clock` covers larger drift either way. The price:
+/// a clock 50-59 s slow (accepted before) now needs one learn-and-retry, and
+/// the paths that never retry (agent avatar copy, persona cards) fail there.
+const BLOSSOM_CLOCK_SLACK_SECS: u64 = 10;
+
+/// Largest clock correction learned from a relay's `Date` header. Bounds what
+/// a lying relay can make us stamp on tokens for that relay.
+const MAX_RELAY_CLOCK_OFFSET_SECS: i64 = 3600;
+
+/// Seconds to add to this computer's clock to match each relay's, keyed by
+/// the token's server authority. Learned only after the relay refuses a token.
+static RELAY_CLOCK_OFFSETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, i64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The clock offset the next token for `base_url`'s relay is signed with.
+/// Read it just before minting and hand it to `learn_relay_clock` on a refusal.
+pub(crate) fn relay_clock_offset(base_url: &str) -> i64 {
+    extract_server_authority(base_url).map_or(0, |server| offset_for(&server))
+}
+
+fn offset_for(server: &str) -> i64 {
+    RELAY_CLOCK_OFFSETS
+        .lock()
+        .map(|offsets| offsets.get(server).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// `(created_at, expiration)` for a Blossom token bound to `server`, on that
+/// relay's clock when one was learned. `expiration - created_at` stays
+/// `expiry_secs` (callers pass 60, the NIP-FI maximum).
+fn blossom_token_window(server: &str, expiry_secs: u64) -> (Timestamp, u64) {
+    let now = Timestamp::now()
+        .as_secs()
+        .saturating_add_signed(offset_for(server));
+    let created = now.saturating_sub(BLOSSOM_CLOCK_SLACK_SECS);
+    (Timestamp::from(created), created + expiry_secs)
+}
+
+/// After the relay refuses a Blossom token (401/403), read its `Date` header
+/// and decide whether the token's clock was the reason. `signed_with` is the
+/// offset the refused token was minted with (`relay_clock_offset` just before
+/// minting). If the token's clock was outside what the relay accepts, remember
+/// the relay's clock so the next token matches it, and return true: one retry
+/// with a fresh token is worth it. Requests refused together each carry their
+/// own `signed_with`, so a screen of images all retry. A refusal for any other
+/// reason (not a member, a bad signature) returns false and learns nothing.
+pub(crate) fn learn_relay_clock(
+    base_url: &str,
+    headers: &reqwest::header::HeaderMap,
+    signed_with: i64,
+) -> bool {
+    // Inside this band (token clock minus relay clock) the relay accepts the
+    // token, so a refusal there is not about the clock: at most 5 s ahead after
+    // the slack, at most 60 s back. 2 s off each edge covers the header's
+    // whole-second truncation and transit time.
+    const MAX_AHEAD: i64 = 5 + BLOSSOM_CLOCK_SLACK_SECS as i64 - 2;
+    const MAX_BEHIND: i64 = 60 - BLOSSOM_CLOCK_SLACK_SECS as i64 - 2;
+    let Some(server) = extract_server_authority(base_url) else {
+        return false;
+    };
+    let Some(relay_now) = headers
+        .get(reqwest::header::DATE)
+        .and_then(|date| date.to_str().ok())
+        .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok())
+    else {
+        return false;
+    };
+    let offset = (relay_now.timestamp() - chrono::Utc::now().timestamp())
+        .clamp(-MAX_RELAY_CLOCK_OFFSET_SECS, MAX_RELAY_CLOCK_OFFSET_SECS);
+    let gap = signed_with - offset;
+    if (-MAX_BEHIND..=MAX_AHEAD).contains(&gap) {
+        return false;
+    }
+    let Ok(mut offsets) = RELAY_CLOCK_OFFSETS.lock() else {
+        return false;
+    };
+    if offsets.insert(server.clone(), offset) != Some(offset) {
+        eprintln!("buzz-desktop: clock differs from relay {server} by {offset}s; signing media tokens on the relay's clock");
+    }
+    true
+}
+
 /// Sign a Blossom (BUD-01) `t=get` authorization event, server-scoped to the
 /// relay's authority, and return the full `Authorization` header value.
 ///
@@ -316,15 +403,15 @@ pub(crate) fn sign_blossom_get_auth_header(
 ) -> Result<String, String> {
     let server = extract_server_authority(base_url)
         .ok_or_else(|| "cannot derive server authority from relay URL".to_string())?;
-    let now = Timestamp::now().as_secs();
+    let (created_at, expiration) = blossom_token_window(&server, expiry_secs);
     let tags = vec![
         Tag::parse(vec!["t", "get"]).map_err(|e| e.to_string())?,
-        Tag::parse(vec!["expiration", &(now + expiry_secs).to_string()])
-            .map_err(|e| e.to_string())?,
+        Tag::parse(vec!["expiration", &expiration.to_string()]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["server".to_string(), server]).map_err(|e| e.to_string())?,
     ];
     let event = EventBuilder::new(Kind::from(24242), "Get buzz-media")
         .tags(tags)
+        .custom_created_at(created_at)
         .sign_with_keys(keys)
         .map_err(|e| e.to_string())?;
     Ok(format!(
@@ -368,16 +455,16 @@ pub(crate) fn sign_blossom_upload_auth(
 ) -> Result<nostr::Event, String> {
     let server = extract_server_authority(base_url)
         .ok_or_else(|| "cannot derive server authority from relay URL".to_string())?;
-    let now = Timestamp::now().as_secs();
+    let (created_at, expiration) = blossom_token_window(&server, expiry_secs);
     let tags = vec![
         Tag::parse(vec!["t", "upload"]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["x", sha256]).map_err(|e| e.to_string())?,
-        Tag::parse(vec!["expiration", &(now + expiry_secs).to_string()])
-            .map_err(|e| e.to_string())?,
+        Tag::parse(vec!["expiration", &expiration.to_string()]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["server".to_string(), server]).map_err(|e| e.to_string())?,
     ];
     EventBuilder::new(Kind::from(24242), "Upload buzz-media")
         .tags(tags)
+        .custom_created_at(created_at)
         .sign_with_keys(keys)
         .map_err(|e| e.to_string())
 }
@@ -416,29 +503,31 @@ async fn do_upload(
     let sha256 = hex::encode(Sha256::digest(&body));
 
     // All upload tokens use a 60-second expiry window per NIP-FI §Freshness:
-    // `expiration <= created_at + 60s`. Upload tokens are minted immediately
-    // before the PUT request, so 60 seconds is ample for any upload over a
-    // reasonable connection (the body is already hashed and ready to send).
-    // The server-side window is also 60s in Strict mode, matching this value.
+    // `expiration <= created_at + 60s`. The window starts 10 s back (clock
+    // slack, see `blossom_token_window`), leaving 50 s to reach the relay,
+    // which checks the token before the body streams (the body is already
+    // hashed and ready to send). Strict mode's server window is also 60 s.
     let expiry_secs = 60u64;
     let base_url = relay_api_base_url_with_override(state);
-    let auth_event = {
+    let mint = || -> Result<String, String> {
         let keys = state.signing_keys()?;
-        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?
+        let auth_event = sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?;
+        Ok(format!(
+            "Nostr {}",
+            URL_SAFE_NO_PAD.encode(auth_event.as_json().as_bytes())
+        ))
     };
-
-    let auth_header = format!(
-        "Nostr {}",
-        URL_SAFE_NO_PAD.encode(auth_event.as_json().as_bytes())
-    );
+    let signed_with = relay_clock_offset(&base_url);
+    let auth_header = mint()?;
     let body = bytes::Bytes::from(body);
     if let Some((app, progress_id)) = progress.as_ref() {
         emit_media_upload_phase(app, Some(progress_id.as_str()), "uploading");
     }
+    let mut url = format!("{base_url}/upload");
     let mut resp = send_upload_attempt(
         state,
         UploadAttempt {
-            url: format!("{base_url}/upload"),
+            url: url.clone(),
             auth_header: &auth_header,
             mime,
             sha256: &sha256,
@@ -449,10 +538,33 @@ async fn do_upload(
     )
     .await?;
     if should_retry_legacy_upload(resp.status()) {
+        url = format!("{base_url}/media/upload");
         resp = send_upload_attempt(
             state,
             UploadAttempt {
-                url: format!("{base_url}/media/upload"),
+                url: url.clone(),
+                auth_header: &auth_header,
+                mime,
+                sha256: &sha256,
+                body: body.clone(),
+                progress: progress.as_ref(),
+                cancellation,
+            },
+        )
+        .await?;
+    }
+    // A token refused because this computer's clock is off: re-sign once on
+    // the relay's clock (learned from its Date header) and resend.
+    if matches!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) && learn_relay_clock(&base_url, resp.headers(), signed_with)
+    {
+        let auth_header = mint()?;
+        resp = send_upload_attempt(
+            state,
+            UploadAttempt {
+                url,
                 auth_header: &auth_header,
                 mime,
                 sha256: &sha256,
@@ -861,9 +973,114 @@ mod tests {
         // Server-scoped token: no x tag (BUD-01 allows x OR server).
         assert!(tag("x").is_none());
         let expiration: u64 = tag("expiration").unwrap().parse().unwrap();
-        let now = Timestamp::now().as_secs();
-        // Token expiry must be within the 60s NIP-FI window.
-        assert!(expiration > now && expiration <= now + 60);
+        assert_clock_slack_window(event.created_at.as_secs(), expiration);
+    }
+
+    /// The token window starts BLOSSOM_CLOCK_SLACK_SECS before `now` (this
+    /// clock plus any learned relay offset) and spans exactly the 60 s NIP-FI
+    /// allows. 2 s of tolerance absorbs a second boundary between the reads.
+    fn assert_token_window(created_at: u64, expiration: u64, offset: i64) {
+        let now = Timestamp::now().as_secs().saturating_add_signed(offset);
+        let want = now - BLOSSOM_CLOCK_SLACK_SECS;
+        assert!(
+            created_at.abs_diff(want) <= 2,
+            "created_at {created_at}, want ~{want}"
+        );
+        assert_eq!(
+            expiration - created_at,
+            60,
+            "NIP-FI: expiration <= created_at + 60"
+        );
+        assert!(expiration > now, "still live on the relay's clock");
+    }
+
+    fn assert_clock_slack_window(created_at: u64, expiration: u64) {
+        assert_token_window(created_at, expiration, 0);
+    }
+
+    fn date_header(offset_secs: i64) -> reqwest::header::HeaderMap {
+        // IMF-fixdate, the form relays send ("Mon, 16 Nov 2026 23:10:00 GMT").
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(offset_secs))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::DATE, date.parse().unwrap());
+        headers
+    }
+
+    fn upload_window(base_url: &str) -> (u64, u64) {
+        let event =
+            sign_blossom_upload_auth(&Keys::generate(), &"a".repeat(64), 60, base_url).unwrap();
+        let expiration = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let v = t.as_slice();
+                (v[0] == "expiration").then(|| v[1].parse().unwrap())
+            })
+            .unwrap();
+        (event.created_at.as_secs(), expiration)
+    }
+
+    #[test]
+    fn test_learn_relay_clock_signs_on_the_relays_clock() {
+        // Each case uses its own host: the learned offsets are process-wide.
+        let fast = "https://clock-fast.example";
+        // This computer 40 s fast: the relay's Date is 40 s behind.
+        assert_eq!(relay_clock_offset(fast), 0);
+        assert!(learn_relay_clock(fast, &date_header(-40), 0));
+        let learned = relay_clock_offset(fast);
+        // Whole-second Date header: -40, or -41 across a second boundary.
+        assert!((-41..=-40).contains(&learned), "{learned}");
+        let (created, expiration) = upload_window(fast);
+        assert_token_window(created, expiration, -40);
+        // A request refused alongside it was signed with the old offset (0):
+        // it gets its one retry too.
+        assert!(learn_relay_clock(fast, &date_header(-40), 0));
+        // A request signed on the learned clock and still refused: not the clock.
+        assert!(!learn_relay_clock(fast, &date_header(-40), learned));
+
+        let slow = "https://clock-slow.example:8443";
+        assert!(learn_relay_clock(slow, &date_header(75), 0));
+        let (created, expiration) = upload_window(slow);
+        assert_token_window(created, expiration, 75);
+        // Another relay is unaffected.
+        let (created, expiration) = upload_window("https://clock-other.example");
+        assert_token_window(created, expiration, 0);
+    }
+
+    #[test]
+    fn test_learn_relay_clock_ignores_refusals_the_clock_did_not_cause() {
+        let base = "https://clock-steady.example";
+        // Inside the band the relay accepts (about 13 s ahead to 48 s behind
+        // after the 10 s slack), a refusal is about something else (not a
+        // member, say): no retry, nothing learned, even on a clock 4 s off.
+        for relay_gap in [1, -4, -12, 30, 47] {
+            assert!(
+                !learn_relay_clock(base, &date_header(relay_gap), 0),
+                "{relay_gap}"
+            );
+        }
+        assert!(!learn_relay_clock(
+            base,
+            &reqwest::header::HeaderMap::new(),
+            0
+        ));
+        let mut garbled = reqwest::header::HeaderMap::new();
+        garbled.insert(reqwest::header::DATE, "not a date".parse().unwrap());
+        assert!(!learn_relay_clock(base, &garbled, 0));
+        assert!(!learn_relay_clock("not-a-url", &date_header(-40), 0));
+        assert_eq!(relay_clock_offset(base), 0);
+        let (created, expiration) = upload_window(base);
+        assert_token_window(created, expiration, 0);
+    }
+
+    #[test]
+    fn test_learn_relay_clock_caps_a_wild_date() {
+        let base = "https://clock-wild.example";
+        assert!(learn_relay_clock(base, &date_header(10 * 86_400), 0));
+        let (created, expiration) = upload_window(base);
+        assert_token_window(created, expiration, MAX_RELAY_CLOCK_OFFSET_SECS);
     }
 
     #[test]
@@ -892,10 +1109,8 @@ mod tests {
         assert_eq!(tag("x").as_deref(), Some(sha256.as_str()));
         // server tag MUST be present (NIP-FI §Upload proofs)
         assert_eq!(tag("server").as_deref(), Some("relay.example:3000"));
-        // expiry must be within the 60s NIP-FI window
         let expiration: u64 = tag("expiration").unwrap().parse().unwrap();
-        let now = nostr::Timestamp::now().as_secs();
-        assert!(expiration > now && expiration <= now + 60);
+        assert_clock_slack_window(event.created_at.as_secs(), expiration);
     }
 
     #[test]
