@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
-use super::channels::{bound_bench, thread_reply, ASK};
+use super::channels::{bound_bench, hex, tags, thread_reply, ASK, X};
 use super::*;
 
 /// The owner's answer, as the owner's own message.
@@ -759,6 +759,7 @@ fn replies_are_read_while_the_route_target_can_be_told() {
         role: None,
         at: 1,
         hhmm: String::new(),
+        why: false,
     });
     assert!(reads_replies(&s, &item, &BTreeMap::new()));
 }
@@ -1060,4 +1061,202 @@ async fn the_reply_file_goes_when_the_card_closes_or_is_replaced() {
     b.tick().await.unwrap();
     assert_eq!(b.card(ITEM).event_id, newer.id.to_hex());
     assert_eq!(reply_file(&b, ITEM), None);
+}
+
+/// The hold card with the owner's questions route for its writer: A hears
+/// taps, Q hears questions, both joined and the join's hold over.
+async fn ask_bench() -> (Bench, String, String, String) {
+    let (mut b, card) = hold_bench().await;
+    let a = Keys::generate().public_key().to_hex();
+    let q = Keys::generate().public_key().to_hex();
+    b.ctx.agents = vec![a.clone(), q.clone()];
+    let routes = json!({ "orchestrator": a, "orchestrator-questions": q });
+    std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    (b, a, q, card)
+}
+
+#[test]
+fn render_route_question_text() {
+    let url = "https://github.com/QuicksilverSlick/Metabolic-reset/pull/870";
+    let drop = drop_json(&[
+        (
+            "title",
+            json!("reset PR 870 waits for you: Ask members to sign in"),
+        ),
+        ("decision", json!("steward-hold")),
+        ("recommend", json!(1)),
+        (
+            "options",
+            json!(["Ship it", "Send it back", "Keep holding"]),
+        ),
+        ("links", json!([{"label": "Pull request 870", "url": url}])),
+    ]);
+    let mut item = validate("steward", "hold-reset-870", &drop, NOW).unwrap();
+    let (by, ev) = ("cd".repeat(32), "ab".repeat(32));
+    item.reply = Some(Reply {
+        event_id: ev.clone(),
+        by: by.clone(),
+        by_name: None,
+        role: None,
+        at: 1,
+        hhmm: String::new(),
+        why: false,
+    });
+    let text = render_route_question(&item, "09:12");
+    assert_eq!(
+        text,
+        format!(
+            "Bench question \u{b7} steward/hold-reset-870\n\
+             Card: reset PR 870 waits for you: Ask members to sign in\n\
+             the owner asked a question in this thread at 09:12. Their message is event {ev}.\n\
+             Why you: the owner's routes.json sends questions on steward cards to you \
+             (steward-questions). The steward agent acts only on taps, so nobody else will \
+             answer.\n\
+             Sources to start from: Pull request 870 {url} (the repo is in the link), and this \
+             card, steward/hold-reset-870, in the Bench state.\n\
+             Answer in this thread: say what this card is, where it came from and why, and link \
+             every source you used (the PR, its Factory-Task, Built-by and Claude-Account lines, \
+             what triggered it). Mention {by} so they see it.\n\
+             Answer only. Never tap, label, rerun, merge, or re-drop or clear this card, even \
+             when the question asks for an action: point to the card's buttons instead. If the \
+             card says a reply does something (for example, stops a line), tell them it did."
+        )
+    );
+    assert!(!text.contains(['<', '>']));
+    // Beside their own tap it names the choice; with no links, the card only.
+    item.answer = Some(Answer {
+        by,
+        option: 2,
+        ..Default::default()
+    });
+    item.links.clear();
+    let text = render_route_question(&item, "09:12");
+    assert!(text.contains(" at 09:12, after choosing 3. Keep holding. Their message is event "));
+    assert!(text.contains(
+        "\nSources to start from: this card, steward/hold-reset-870, in the Bench state.\n"
+    ));
+}
+
+/// Owner decision, 18 Nov 2026: a question on a card goes to the writer's
+/// questions route (`<writer>-questions` in routes.json), which says where
+/// the card came from and why; taps stay with the writer's route target.
+#[tokio::test]
+async fn a_question_goes_to_the_questions_route_and_a_tap_to_the_writers() {
+    let (mut b, a, q, card) = ask_bench().await;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Where is this from?", b.now, &[]);
+    reply(&b, &[&r1]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let (ev, id) = (&n[0], r1.id.to_hex());
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert_eq!(
+        content(ev),
+        render_route_question(&b.s.items[ITEM], &local_hhmm(r.at))
+            + &thread_line(&b.channel(), &card)
+    );
+    assert!(content(ev).starts_with(&format!("Bench question \u{b7} {ITEM}\n")));
+    assert_eq!(tags(ev, "p"), [json!(["p", q])]);
+    assert_eq!(tags(ev, "df-ask"), [json!(["df-ask", id])]);
+    assert_eq!(
+        tags(ev, "df-answer"),
+        [json!(["df-answer", "other", b.owner_hex(), id])]
+    );
+    assert_eq!(
+        tag_value(ev, "client").unwrap(),
+        format!("bench:route:{ITEM}@r{}", &id[..16])
+    );
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(id));
+    // The owner's tap goes to A, as the owner's own message.
+    let stay = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&r1, &stay]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(notices(&b, before).is_empty());
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose(&card, "Stay"));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+}
+
+/// A Why? line is a reason, not a question: it stays with the writer's
+/// route target, as today.
+#[tokio::test]
+async fn a_why_line_stays_with_the_writers_route() {
+    let (mut b, a, _q, card) = ask_bench().await;
+    let before = b.posts().len();
+    let text = "Waiting on the relay quote";
+    crate::bench::commands::reply_card(&b.ctx, &b.s, ITEM, &card, text, b.now)
+        .await
+        .unwrap();
+    let why: nostr::Event = serde_json::from_value(b.posts()[before].0.clone()).unwrap();
+    reply(&b, &[&why]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert!(r.why);
+    assert_eq!(
+        content(&n[0]),
+        render_route_reply(&b.s.items[ITEM], &local_hhmm(r.at)) + &thread_line(&b.channel(), &card)
+    );
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+    assert!(tags(&n[0], "df-ask").is_empty());
+}
+
+/// A question beside the owner's own tap still goes to Q, naming the
+/// choice; the tap goes to A once it settles.
+#[tokio::test]
+async fn a_question_beside_the_owners_tap_names_the_choice() {
+    let (mut b, a, q, card) = ask_bench().await;
+    let mv = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    let r1 = thread_reply(&b.ctx.owner, &card, "Who opened this?", b.now, &[]);
+    reply(&b, &[&mv, &r1]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1, "the answer waits for the settle");
+    assert_eq!(tags(&n[0], "p"), [json!(["p", q])]);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert!(content(&n[0]).contains(&format!(
+        "the owner asked a question in this thread at {}, after choosing 2. Move. Their \
+         message is event {}.",
+        local_hhmm(r.at),
+        r1.id.to_hex()
+    )));
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose(&card, "Move"));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+}
+
+/// A questions route not in the card's channel, or one that may answer the
+/// card, is not told: the writer's route target hears the reply, as today.
+#[tokio::test]
+async fn a_questions_route_that_cannot_hear_or_answers_falls_back() {
+    let (mut b, p, list) = bound_bench().await;
+    let card = b.card(ASK).event_id;
+    let (agent, craig) = (hex(&p.agent), hex(&p.craig));
+    let mut said = vec![list];
+    // A key in #bench only, the card being in X; then Craig, in X (as if
+    // joined there) and an answerer on the card.
+    let stranger = Keys::generate().public_key().to_hex();
+    for (q, text) in [(stranger, "Where is this from?"), (craig.clone(), "Who?")] {
+        b.ctx.agents = vec![agent.clone(), q.clone()];
+        let routes = json!({ "reset-worker": agent, "reset-worker-questions": q });
+        std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
+        b.tick().await.unwrap();
+        assert!(b.s.unroutable.is_empty() && b.s.members_added.contains(&q));
+        assert!(!crate::bench::channels::joined(&b.s, X).contains(&q));
+        if q == craig {
+            b.s.joined.get_mut(X).unwrap().push(q.clone());
+        }
+        said.push(thread_reply(&b.ctx.owner, &card, text, b.now, &[]));
+        reply(&b, &said.iter().collect::<Vec<_>>());
+        let n = settle_past(&mut b, 2).await;
+        assert_eq!(n.len(), 1, "{text}");
+        assert!(content(&n[0]).starts_with(&format!("Bench reply \u{b7} {ASK}\n")));
+        assert_eq!(tags(&n[0], "p"), [json!(["p", agent])]);
+        assert!(tags(&n[0], "df-ask").is_empty());
+    }
 }

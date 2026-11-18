@@ -142,6 +142,51 @@ pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
     }
 }
 
+/// The notice for a free-text reply told to the writer's questions route
+/// (`<writer>-questions` in routes.json), so the person learns where the
+/// card came from and why. Never headed "Bench reply": a target told that
+/// closes the card by re-dropping it, and a re-dropped steward hold card
+/// closes for good. No angle brackets: buzz-acp escapes them.
+pub(crate) fn render_route_question(item: &Item, hhmm: &str) -> String {
+    let Some(r) = &item.reply else {
+        return String::new();
+    };
+    let (id, w) = (&item.id, &item.writer);
+    let theirs = item.answer.as_ref().filter(|a| a.by == r.by);
+    let chose = theirs
+        .and_then(|a| Some((a.option, item.options.get(a.option)?)))
+        .map_or(String::new(), |(n, o)| {
+            format!(", after choosing {}. {}", n + 1, plain_text(o, usize::MAX))
+        });
+    let links: Vec<String> = item
+        .links
+        .iter()
+        .map(|l| format!("{} {}", plain_text(&l.label, usize::MAX), l.url))
+        .collect();
+    let sources = if links.is_empty() {
+        String::new()
+    } else {
+        format!("{} (the repo is in the link), and ", links.join("; "))
+    };
+    format!(
+        "Bench question \u{b7} {id}\nCard: {}\n{} asked a question in this thread at \
+         {hhmm}{chose}. Their message is event {}.\n\
+         Why you: the owner's routes.json sends questions on {w} cards to you ({w}-questions). \
+         The {w} agent acts only on taps, so nobody else will answer.\n\
+         Sources to start from: {sources}this card, {id}, in the Bench state.\n\
+         Answer in this thread: say what this card is, where it came from and why, and link \
+         every source you used (the PR, its Factory-Task, Built-by and Claude-Account lines, \
+         what triggered it). Mention {} so they see it.\n\
+         Answer only. Never tap, label, rerun, merge, or re-drop or clear this card, even when \
+         the question asks for an action: point to the card's buttons instead. If the card \
+         says a reply does something (for example, stops a line), tell them it did.",
+        plain_text(&item.title, usize::MAX),
+        answerer_text(item, r.by_name.as_deref(), r.role),
+        r.event_id,
+        r.by
+    )
+}
+
 /// Text the owner's own message may carry: exactly what both apps showed
 /// (the desktop prints drop text as it is, the phone through plain_text),
 /// so nothing the owner signs reads differently from what the owner saw.

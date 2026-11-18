@@ -224,6 +224,10 @@ pub(crate) struct Reply {
     /// The reply's own created_at, never past the Bench clock.
     pub at: u64,
     pub hhmm: String,
+    /// It carries the desktop's Why? marker (`reply_card`): a reason, so it
+    /// stays with the writer's route, never a questions route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub why: bool,
 }
 
 /// Who may answer a scoped card, resolved by the service (`roles::stamp`)
@@ -1265,8 +1269,8 @@ pub(crate) use super::pick::{
     refused_taps, root_until, tell_reply,
 };
 pub(crate) use super::route::{
-    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
-    route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
+    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_question,
+    render_route_reply, route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).

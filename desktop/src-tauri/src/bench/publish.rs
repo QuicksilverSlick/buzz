@@ -646,9 +646,32 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        let text = item::render_route_reply(&item, &local_when(r.at, now)) + &link;
+        // A question goes to the writer's questions route, if the owner set
+        // one that is in this channel and may not answer the card. A Why?
+        // line is a reason, like a tap, so it stays the writer's.
+        let ask = routes
+            .get(&format!("{}-questions", item.writer))
+            .filter(|q| !r.why && joined(s, &ch).contains(q))
+            .filter(|q| {
+                !item
+                    .stamp
+                    .iter()
+                    .flat_map(|st| &st.answerers)
+                    .any(|a| a.pk == **q)
+            });
+        let when = local_when(r.at, now);
+        let (text, ping) = match ask {
+            Some(q) => (item::render_route_question(&item, &when), [q.as_str()]),
+            None => (item::render_route_reply(&item, &when), ping),
+        };
+        let text = text + &link;
         let marker = format!("bench:route:{id}@r{}", &r.event_id[..16]);
-        let extra = vec![df_answer(["other", &r.by, &r.event_id])?];
+        let mut extra = vec![df_answer(["other", &r.by, &r.event_id])?];
+        if ask.is_some() {
+            extra.push(
+                nostr::Tag::parse(["df-ask", r.event_id.as_str()]).map_err(|e| e.to_string())?,
+            );
+        }
         let posted = post_message(
             ctx,
             s,
