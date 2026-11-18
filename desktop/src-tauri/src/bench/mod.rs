@@ -1141,14 +1141,7 @@ async fn poll_answers(
                 if seed || !item::tell_reply(item, e, at, owner_set, &writer_hex) {
                     item.routed_reply = Some(e.id.to_hex());
                 }
-                Some(item::Reply {
-                    event_id: e.id.to_hex(),
-                    by,
-                    by_name,
-                    role,
-                    at,
-                    hhmm: local_hhmm(at),
-                })
+                Some(item::Reply::of(e, by, by_name, role, at))
             }
             None if unread => item
                 .reply

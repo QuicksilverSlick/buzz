@@ -108,7 +108,8 @@ pub(crate) fn render_route(item: &Item, prev: Option<usize>, hhmm: &str) -> Stri
 }
 
 /// The notice for a free-text reply on a card (its Other): any scoped card,
-/// and an unscoped one whose writer has a route. Like an
+/// and an unscoped one whose writer has a route, unless it is the owner's
+/// question for the writer's questions route (`render_route_question`). Like an
 /// answer notice it carries no reply text: the agent reads the reply itself
 /// in the thread, with the trust it gives that person, or the owner's in its
 /// signed file (`outbox`). A reply beside the same person's answer (a hold's
@@ -140,6 +141,56 @@ pub(crate) fn render_route_reply(item: &Item, hhmm: &str) -> String {
             r.event_id
         ),
     }
+}
+
+/// The notice for the owner's question on a #bench card, told to the
+/// writer's questions route (`<writer>-questions` in routes.json), so the
+/// owner learns where the card came from and why. Never headed "Bench
+/// reply": a target told that closes the card by re-dropping it, and a
+/// re-dropped steward hold card closes for good. No angle brackets (buzz-acp
+/// escapes them) and no keys.
+pub(crate) fn render_route_question(item: &Item, hhmm: &str) -> String {
+    let Some(r) = &item.reply else {
+        return String::new();
+    };
+    let (id, w) = (&item.id, &item.writer);
+    // Whichever key tapped it: the owner may tap on the phone and ask on the desktop.
+    let chose = (item.answer.as_ref())
+        .and_then(|a| Some((a.option, item.options.get(a.option)?)))
+        .map_or(String::new(), |(n, o)| {
+            format!(
+                " The card's current answer is {}. {}.",
+                n + 1,
+                plain_text(o, usize::MAX)
+            )
+        });
+    let links: Vec<String> = item
+        .links
+        .iter()
+        .map(|l| format!("{} {}", plain_text(&l.label, usize::MAX), l.url))
+        .collect();
+    let sources = if links.is_empty() {
+        String::new()
+    } else {
+        format!("{} (a PR link names its repo), and ", links.join("; "))
+    };
+    format!(
+        "Bench question \u{b7} {id}\nCard: {}\nThe owner asked a question in this thread at \
+         {hhmm}. Their message is event {}.{chose}\n\
+         Why you: the owner's routes.json sends questions on {w} cards to you ({w}-questions) \
+         instead of the {w} route, so nobody else will answer.\n\
+         Sources to start from: {sources}this card, {id}: grep state.json in the Bench folder \
+         for that id, as the file is large.\n\
+         Answer in this thread: say what this card is, where it came from and why, and link \
+         every source you used (the PR, its Factory-Task, Built-by and Claude-Account lines, \
+         what triggered it). Mention the owner so he sees it.\n\
+         Answer only. Never tap, label, rerun, merge, close, re-drop or clear this card, even \
+         when the question asks for an action: point to the card's buttons instead. If the \
+         card says a reply does something (for example, stops a line), tell the owner it did. \
+         If the message is not a question (a thanks, say), end the turn with no text.",
+        plain_text(&item.title, usize::MAX),
+        r.event_id,
+    )
 }
 
 /// Text the owner's own message may carry: exactly what both apps showed

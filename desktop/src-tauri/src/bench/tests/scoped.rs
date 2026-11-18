@@ -847,6 +847,7 @@ fn receipt_keeps_the_request_and_adds_the_outcome() {
         role: Some(AnswerRole::Decider),
         at: 1,
         hhmm: "14:03".to_string(),
+        why: false,
     });
     outcome.request = Some(Box::new(request.clone()));
     let card = render_card(&outcome, "15:10");
@@ -918,6 +919,7 @@ fn notices_name_who_answered_on_scoped_cards() {
         role: Some(AnswerRole::Decider),
         at: 1,
         hhmm: "14:03".to_string(),
+        why: false,
     });
     assert_eq!(
         render_route_reply(&item, "14:03"),
