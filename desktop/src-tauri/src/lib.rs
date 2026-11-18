@@ -78,7 +78,7 @@ use huddle::{
     reconnect::reconnect_huddle_audio,
     remove_agent_from_huddle, set_huddle_manual_mic_unmuted, set_huddle_transcription_enabled,
     set_tts_enabled, set_voice_input_mode, speak_agent_message, start_huddle, start_stt_pipeline,
-    HuddlePhase,
+    transcribe_voice_note, HuddlePhase,
 };
 use initial_window::*;
 use managed_agents::{
@@ -814,6 +814,7 @@ pub fn run() {
             push_audio_pcm,
             reconnect_huddle_audio,
             start_stt_pipeline,
+            transcribe_voice_note,
             set_huddle_transcription_enabled,
             download_voice_models,
             get_model_status,
