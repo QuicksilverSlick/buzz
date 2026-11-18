@@ -4,9 +4,12 @@ import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import {
   allowlistChipMatches,
   allowlistChips,
+  allowlistReachabilityText,
+  allowlistWithoutSharedChannel,
   mergeAllowlist,
   parsePubkeyInput,
 } from "@/features/agents/lib/respondToAllowlist";
+import { useChannelsQuery } from "@/features/channels/hooks";
 import { parsePubkeyInput as parseCanonicalPubkey } from "@/shared/lib/nostrUtils";
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { PubKey } from "@/shared/ui/PubKey";
@@ -94,6 +97,7 @@ export function CreateAgentRespondToField({
   onModeChange,
   onAllowlistChange,
   ownerPubkey,
+  agentPubkey,
   disabled,
   disabledReason,
   variant,
@@ -109,6 +113,8 @@ export function CreateAgentRespondToField({
    * informational note so it doesn't look like a missing entry.
    */
   ownerPubkey?: string | null;
+  /** The agent's own key on edit surfaces; enables the no-shared-channel line. */
+  agentPubkey?: string | null;
   disabled?: boolean;
   /** Explanation shown when this access control is unavailable. */
   disabledReason?: string;
@@ -254,6 +260,7 @@ export function CreateAgentRespondToField({
       ) : null}
       {mode === "allowlist" ? (
         <AllowlistPicker
+          agentPubkey={agentPubkey ?? null}
           allowlist={allowlist}
           deferredQuery={deferredQuery}
           disabled={disabled}
@@ -286,6 +293,7 @@ export function CreateAgentRespondToField({
 }
 
 function AllowlistPicker({
+  agentPubkey,
   allowlist,
   deferredQuery,
   disabled,
@@ -307,6 +315,7 @@ function AllowlistPicker({
   searchResults,
   variant = "default",
 }: {
+  agentPubkey: string | null;
   allowlist: string[];
   deferredQuery: string;
   disabled?: boolean;
@@ -351,6 +360,25 @@ function AllowlistPicker({
   const visibleChips = chips.filter((chip) =>
     allowlistChipMatches(chip, deferredQuery),
   );
+
+  // Name allowed people (never agent entries) with nowhere to reach the agent;
+  // nothing while channels or profiles load (cached labels carry no isAgent).
+  const channelsQuery = useChannelsQuery({ enabled: agentPubkey != null });
+  const profilesPending =
+    profilesQuery.isLoading || profilesQuery.isPlaceholderData;
+  const unreachableText = React.useMemo(() => {
+    if (agentPubkey == null || !channelsQuery.data || profilesPending) {
+      return null;
+    }
+    const missing = new Set(
+      allowlistWithoutSharedChannel(allowlist, agentPubkey, channelsQuery.data),
+    );
+    return allowlistReachabilityText(
+      chips
+        .filter((chip) => !chip.isAgent && missing.has(chip.pubkey))
+        .map((chip) => (chip.ambiguous ? chip.accessibleName : chip.label)),
+    );
+  }, [agentPubkey, allowlist, channelsQuery.data, chips, profilesPending]);
 
   // Detect if the query is a pubkey (npub or hex) not already in the list;
   // direct entry offers the canonical hex for storage.
@@ -509,6 +537,15 @@ function AllowlistPicker({
           </div>
         ) : null}
       </div>
+      {unreachableText ? (
+        <p
+          aria-live="polite"
+          className="text-xs text-muted-foreground"
+          data-testid="agent-respond-to-unreachable"
+        >
+          {unreachableText}
+        </p>
+      ) : null}
       {searchError ? (
         <p className="text-sm text-destructive">{searchError}</p>
       ) : null}

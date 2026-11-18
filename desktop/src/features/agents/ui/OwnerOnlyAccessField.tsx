@@ -6,6 +6,7 @@ import {
 
 export function OwnerOnlyAccessField({
   accessLocked,
+  agentPubkey,
   allowlist,
   disabled,
   mode,
@@ -13,6 +14,7 @@ export function OwnerOnlyAccessField({
   onModeChange,
 }: {
   accessLocked: boolean;
+  agentPubkey?: string | null;
   allowlist: string[];
   disabled: boolean;
   mode: RespondToMode;
@@ -21,6 +23,7 @@ export function OwnerOnlyAccessField({
 }) {
   return (
     <CreateAgentRespondToField
+      agentPubkey={agentPubkey}
       allowlist={accessLocked ? [] : allowlist}
       disabled={disabled || accessLocked}
       disabledReason={

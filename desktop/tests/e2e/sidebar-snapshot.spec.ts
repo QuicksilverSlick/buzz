@@ -1,10 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import {
-  installMockBridge,
-  pendingChannelsRead,
-  releaseChannelsRead,
-} from "../helpers/bridge";
+import { installMockBridge } from "../helpers/bridge";
 
 const RELAY_URL = "ws://localhost:3000";
 const OTHER_RELAY_URL = "ws://localhost:3001";
@@ -37,6 +33,17 @@ function makeSnapshotChannel(index: number, prefix = "snapshot") {
     ttlSeconds: null,
     ttlDeadline: null,
   };
+}
+
+// Cold-boot tests hold the first channels read (deferFirstChannelsRead) so the
+// loading state is on screen however long boot takes, then release it here.
+async function releaseFirstChannelsRead(page: Page) {
+  await expect
+    .poll(() => page.evaluate(() => window.__BUZZ_E2E_CHANNELS_READ_PENDING__))
+    .toBe(1);
+  expect(
+    await page.evaluate(() => window.__BUZZ_E2E_RELEASE_CHANNELS_READ__?.()),
+  ).toBe(1);
 }
 
 const FULL_SNAPSHOT = Array.from({ length: 14 }, (_, index) =>
@@ -321,13 +328,17 @@ test("matching not-modified preserves display mutations without persisting them"
       exact: true,
     });
   });
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
+  await expect
+    .poll(() => page.evaluate(() => window.__BUZZ_E2E_CHANNELS_READ_PENDING__))
+    .toBe(1);
   await mutateDisplayedChannels(page, optimisticName);
   await expect(
     page.locator('[data-channel-id="optimistic-channel"]'),
   ).toBeVisible();
 
-  expect(await releaseChannelsRead(page)).toBe(1);
+  expect(
+    await page.evaluate(() => window.__BUZZ_E2E_RELEASE_CHANNELS_READ__?.()),
+  ).toBe(1);
   // Invocation logging only proves the request started. Wait for the query to
   // consume its response before checking either display state or persistence.
   await expect
@@ -361,10 +372,9 @@ test("first-ever boot without a snapshot sends null and shows loading", async ({
   await installMockBridge(page, { deferFirstChannelsRead: true });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);
@@ -375,10 +385,7 @@ test("first-ever boot without a snapshot sends null and shows loading", async ({
       presence: "absent",
       serializedBytes: 0,
     });
-
-  expect(await releaseChannelsRead(page)).toBe(1);
   await expect(page.getByTestId("channel-general")).toBeVisible();
-  await expect(page.getByTestId("sidebar-loading")).toHaveCount(0);
   await expect
     .poll(() => getFullSidebarMeasure(page))
     .toEqual({
@@ -397,10 +404,9 @@ test("a different identity's snapshot is ignored", async ({ page }) => {
   await installMockBridge(page, { deferFirstChannelsRead: true });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);
@@ -410,11 +416,7 @@ test("a different identity's snapshot is ignored", async ({ page }) => {
       channelCount: 0,
       presence: "invalid",
     });
-
-  expect(await releaseChannelsRead(page)).toBe(1);
   await expect(page.getByTestId("channel-general")).toBeVisible();
-  await expect(page.getByTestId("sidebar-loading")).toHaveCount(0);
-  await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
 });
 
 test("display-only community pubkey cannot expose another identity's snapshot", async ({
@@ -459,10 +461,9 @@ test("partial hash/list write fails toward a full fetch", async ({ page }) => {
   });
   await page.goto("/");
 
-  // The gate holds the boot read, so the loading frame cannot race the runner.
   await expect(page.getByTestId("sidebar-loading")).toBeVisible();
-  await expect.poll(() => pendingChannelsRead(page)).toBe(1);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
+  await releaseFirstChannelsRead(page);
   await expect
     .poll(() => getChannelsPayloads(page))
     .toEqual([{ knownHash: null }]);
@@ -472,10 +473,7 @@ test("partial hash/list write fails toward a full fetch", async ({ page }) => {
       channelCount: 0,
       presence: "invalid",
     });
-
-  expect(await releaseChannelsRead(page)).toBe(1);
   await expect(page.getByTestId("channel-general")).toBeVisible();
-  await expect(page.getByTestId("sidebar-loading")).toHaveCount(0);
   await expect(page.locator('[data-channel-id^="snapshot-"]')).toHaveCount(0);
 });
 

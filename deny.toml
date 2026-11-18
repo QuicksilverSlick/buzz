@@ -182,5 +182,14 @@ ignore = true
 multiple-versions = "warn"
 wildcards = "allow"
 deny = [
+    { name = "rmcp", version = "<3.9.0", wrappers = ["buzz-agent"], reason = "only buzz-agent's subprocess-only rmcp 1 client may use an older version; HTTP consumers must use patched rmcp" },
+    { name = "rusqlite", version = "<0.41", wrappers = ["mesh-llm-log-store", "buzz-desktop"], reason = "older SQLite is limited to mesh smoke's private local log store and the desktop's own databases (accepted risk, see RUSTSEC-2026-0459)" },
+    { name = "libsqlite3-sys", version = "<0.39", wrappers = ["rusqlite"], reason = "older SQLite is limited to the guarded rusqlite dependency" },
     { name = "ringbuf", version = "<0.5.2", wrappers = ["neteq"], reason = "only audited NetEQ may declare this unused vulnerable dependency; all other consumers must use a patched release" },
 ]
+
+# The rmcp 1 advisory exception is valid only without HTTP transports.
+[[bans.features]]
+name = "rmcp"
+version = "<3.9.0"
+allow = ["client", "transport-child-process", "transport-async-rw"]

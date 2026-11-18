@@ -97,6 +97,7 @@ function renderApp() {
                     <UpdaterProvider>
                       <App />
                       <NostrBindConsentDialog />
+                      {/* Dreamforge: Block's new-app installer download stays unmounted. */}
                     </UpdaterProvider>
                     <Toaster />
                   </PoofBurstProvider>

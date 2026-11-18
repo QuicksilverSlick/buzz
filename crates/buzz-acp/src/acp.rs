@@ -873,12 +873,16 @@ impl AcpClient {
 
     /// Emit a semantic event to the local observer feed, if enabled.
     pub fn observe(&self, kind: impl Into<String>, payload: serde_json::Value) {
+        self.observe_with(kind, || payload);
+    }
+
+    fn observe_with(&self, kind: impl Into<String>, payload: impl FnOnce() -> serde_json::Value) {
         if let Some(observer) = &self.observer {
             observer.emit(
                 kind,
                 self.observer_agent_index,
                 &self.observer_context,
-                payload,
+                payload(),
             );
         }
     }
@@ -1443,7 +1447,7 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        self.observe_with("acp_write", || value.clone());
         Ok(())
     }
 
@@ -1616,7 +1620,7 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            self.observe_with("acp_read", || msg.clone());
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -2089,7 +2093,7 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
+                    self.observe_with("acp_read", || msg.clone());
 
                     clock.on_activity(Instant::now());
 
@@ -6173,6 +6177,8 @@ mod tests {
         let mut client =
             spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
         let mut stdin = client.stdin.take().expect("test stdin");
+        // Raw wire payload copies must be lazy when observation is disabled.
+        client.observe_with("acp_read", || panic!("disabled observer copied payload"));
         let observer = ObserverHandle::in_process();
         let mut events = observer.subscribe();
         client.set_observer(Some(observer), 0);
@@ -6215,6 +6221,10 @@ mod tests {
                     );
                     if let Ok(event) = events.try_recv() {
                         assert_eq!(event.kind, "acp_read");
+                        assert_eq!(
+                            event.payload,
+                            serde_json::from_str::<serde_json::Value>(&frame).unwrap()
+                        );
                         break;
                     }
                     assert!(

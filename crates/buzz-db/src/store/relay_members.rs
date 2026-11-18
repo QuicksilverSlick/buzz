@@ -151,6 +151,19 @@ pub async fn add_relay_member(
     added_by: Option<&str>,
     relay_keypair: &nostr::Keys,
 ) -> Result<MembershipWrite<bool>> {
+    add_relay_member_with_pending(pool, community, pubkey, role, added_by, None, relay_keypair)
+        .await
+}
+
+async fn add_relay_member_with_pending(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &str,
+    role: &str,
+    added_by: Option<&str>,
+    pending: Option<Uuid>,
+    relay_keypair: &nostr::Keys,
+) -> Result<MembershipWrite<bool>> {
     let mut tx = crate::begin_community_write_transaction(
         pool,
         community,
@@ -158,13 +171,14 @@ pub async fn add_relay_member(
     )
     .await?;
     let result = sqlx::query(
-        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, pubkey) DO NOTHING",
+        "INSERT INTO relay_members (community_id, pubkey, role, added_by, auto_join_pending) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (community_id, pubkey) DO NOTHING",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(role)
     .bind(added_by)
+    .bind(pending)
     .execute(tx.conn())
     .await?;
     let added = result.rows_affected() > 0;
@@ -201,38 +215,20 @@ pub async fn claim_relay_membership(
     policy_version: Option<&str>,
     relay_keypair: &nostr::Keys,
 ) -> Result<MembershipWrite<bool>> {
-    let mut tx = crate::begin_community_write_transaction(
+    let write = super::relay_invite::claim_relay_membership_with_owner(
         pool,
         community,
-        observability::WriterOperation::Authorization,
+        pubkey,
+        role,
+        policy_version,
+        None,
+        relay_keypair,
     )
     .await?;
-    let inserted = sqlx::query(
-        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
-         VALUES ($1, $2, $3, 'invite') \
-         ON CONFLICT (community_id, pubkey) DO NOTHING",
-    )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .bind(role)
-    .execute(tx.conn())
-    .await?
-    .rows_affected()
-        > 0;
-
-    if let Some(version) = policy_version {
-        sqlx::query(
-            "INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) \
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(community.as_uuid())
-        .bind(pubkey)
-        .bind(version)
-        .execute(tx.conn())
-        .await?;
-    }
-
-    commit_membership_write(tx, inserted, inserted, relay_keypair).await
+    Ok(MembershipWrite {
+        outcome: write.outcome.inserted,
+        snapshot: write.snapshot,
+    })
 }
 
 /// Returns whether a member has persisted acceptance evidence for a policy version.
@@ -1086,8 +1082,9 @@ pub(crate) async fn write_nip43_membership_snapshot(
         pubkey_bytes.as_slice(),
         None,
     );
-    observability::observe_advisory_lock(
+    observability::observe_event_lock(
         observability::LockType::Membership,
+        kind_i32,
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
             .execute(tx.conn()),
@@ -1155,7 +1152,7 @@ pub(crate) async fn write_nip43_membership_snapshot(
     .await?;
     sqlx::query(
         "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)",
     )
     .bind(community_id.as_uuid())
     .bind(event.id.as_bytes().as_slice())
@@ -1166,13 +1163,13 @@ pub(crate) async fn write_nip43_membership_snapshot(
     .bind(&event.content)
     .bind(event.sig.serialize().as_slice())
     .bind(received_at)
-    .bind::<Option<Uuid>>(None)
     .bind(d_tag.as_deref())
     .execute(tx.conn())
     .await?;
     crate::store::event_follow_up::after_admitted_insert(
         tx,
         event.id.as_bytes().as_slice(),
+        created_at,
         kind_i32,
         None,
     )
@@ -1206,15 +1203,129 @@ pub async fn rewrite_nip43_membership_list(
     commit_membership_write(tx, (), true, relay_keypair).await
 }
 
+/// Durable default-channel work for one roster admission.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PendingDefaultChannelJoin {
+    /// Generation checked before writing or completing this work.
+    pub token: Uuid,
+    /// Original actor; `invite` denotes a self-claim.
+    pub added_by: Option<String>,
+}
+
+async fn pending_default_channel_join(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<Option<PendingDefaultChannelJoin>> {
+    let mut conn =
+        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    pending_default_channel_join_on(&mut conn, community, pubkey).await
+}
+
+async fn pending_default_channel_join_on(
+    conn: &mut sqlx::PgConnection,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<Option<PendingDefaultChannelJoin>> {
+    Ok(sqlx::query_as(
+        "SELECT auto_join_pending AS token, added_by FROM relay_members \
+         WHERE community_id = $1 AND pubkey = $2 AND auto_join_pending IS NOT NULL",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(conn)
+    .await?)
+}
+
 impl Db {
+    /// Read unfinished default-channel work and its original adding actor.
+    #[datastore_span(name = "pending_default_channel_join", system = "postgresql")]
+    pub async fn pending_default_channel_join(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+    ) -> Result<Option<PendingDefaultChannelJoin>> {
+        pending_default_channel_join(&self.pool, community, pubkey).await
+    }
+
+    /// [`Db::pending_default_channel_join`] on the bounded replica arm, for
+    /// the retry that runs on every AUTH. A stale answer is safe: it can only
+    /// defer the work to a later admission or carry an old token, and every
+    /// write re-checks the token on the writer. Falls back to the writer as
+    /// [`Db::is_relay_member`] does.
+    #[datastore_span(name = "pending_default_channel_join_routed", system = "postgresql")]
+    pub async fn pending_default_channel_join_routed(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+    ) -> Result<Option<PendingDefaultChannelJoin>> {
+        let path = "pending_default_channel_join";
+        match self
+            .route_read(
+                path,
+                RoutePredicate::Bounded,
+                crate::observability::ReaderOperation::Authorization,
+            )
+            .await?
+        {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match pending_default_channel_join_on(&mut tx, community, pubkey).await {
+                    Ok(pending) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(pending)
+                    }
+                    Err(e) if e.is_statement_cancelled() => {
+                        Self::record_route(path, "replica", "statement_cancelled");
+                        Err(e)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path, "replica read failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        pending_default_channel_join(&self.pool, community, pubkey).await
+                    }
+                }
+            }
+            RouteDecision::Writer => {
+                pending_default_channel_join(&self.pool, community, pubkey).await
+            }
+        }
+    }
+
+    /// Finish only the admission generation that was actually processed.
+    #[datastore_span(name = "finish_default_channel_join", system = "postgresql")]
+    pub async fn finish_default_channel_join(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        pending: Uuid,
+    ) -> Result<()> {
+        let mut tx = crate::begin_community_write_transaction(
+            &self.pool,
+            community,
+            observability::WriterOperation::Authorization,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE relay_members SET auto_join_pending = NULL \
+             WHERE community_id = $1 AND pubkey = $2 AND auto_join_pending = $3",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .bind(pending)
+        .execute(tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Returns `true` if `pubkey` (64-char hex) is a member of `community`.
     ///
     /// Replica-routed on the bounded arm — the one PERMISSION read routed by
     /// explicit product decision (bounded-stale membership beats the 10s
     /// cache it replaced). Admits and revokes may lag by at most the budget
-    /// `B`; everything else fails closed to the writer, exactly like
-    /// [`Db::query_events_routed_bounded`]. Not precedent for routing other
-    /// permission reads.
+    /// `B`; everything else fails closed to the writer, including a busy
+    /// reader that history reads would be rejected for (see
+    /// [`Db::route_read`]). Not precedent for routing other permission reads.
     #[datastore_span(name = "is_relay_member", system = "postgresql")]
     pub async fn is_relay_member(&self, community: CommunityId, pubkey: &str) -> Result<bool> {
         let path = "relay_membership";
@@ -1224,7 +1335,7 @@ impl Db {
                 RoutePredicate::Bounded,
                 crate::observability::ReaderOperation::Authorization,
             )
-            .await
+            .await?
         {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match is_relay_member_on(&mut tx, community, pubkey).await {
@@ -1293,6 +1404,29 @@ impl Db {
         add_relay_member(&self.pool, community, pubkey, role, added_by, relay_keypair).await
     }
 
+    /// Adds a roster member and records default-channel work atomically.
+    /// Unlike the roster-only `add_relay_member`, this opts into auto-join.
+    #[datastore_span(name = "add_relay_member_with_default_channels", system = "postgresql")]
+    pub async fn add_relay_member_with_default_channels(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        role: &str,
+        added_by: &str,
+        relay_keypair: &nostr::Keys,
+    ) -> Result<MembershipWrite<bool>> {
+        add_relay_member_with_pending(
+            &self.pool,
+            community,
+            pubkey,
+            role,
+            Some(added_by),
+            Some(Uuid::new_v4()),
+            relay_keypair,
+        )
+        .await
+    }
+
     /// Claims relay membership via an invite and atomically persists the
     /// accepted policy version when a policy is configured.
     #[datastore_span(name = "claim_relay_membership", system = "postgresql")]
@@ -1310,6 +1444,29 @@ impl Db {
             pubkey,
             role,
             policy_version,
+            relay_keypair,
+        )
+        .await
+    }
+
+    /// Claim legacy membership and verified ownership in one admission transaction.
+    #[datastore_span(name = "claim_relay_membership_with_owner", system = "postgresql")]
+    pub async fn claim_relay_membership_with_owner(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        role: &str,
+        policy_version: Option<&str>,
+        verified_owner: Option<&str>,
+        relay_keypair: &nostr::Keys,
+    ) -> Result<MembershipWrite<super::relay_invite::MembershipClaimResult>> {
+        super::relay_invite::claim_relay_membership_with_owner(
+            &self.pool,
+            community,
+            pubkey,
+            role,
+            policy_version,
+            verified_owner,
             relay_keypair,
         )
         .await
@@ -1565,6 +1722,57 @@ mod postgres_tests {
 
     fn test_pubkey() -> String {
         format!("{:064x}", Uuid::new_v4().as_u128())
+    }
+
+    /// The roster write records its list lock under `membership` with the
+    /// roster's kind. Mutation: observe the list lock without its kind → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn membership_list_lock_records_the_roster_kind() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let pool = setup_pool().await;
+        let keys = nostr::Keys::generate();
+        let community = make_test_community(&pool).await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut tx = crate::begin_community_write_transaction(
+            &pool,
+            community,
+            observability::WriterOperation::Authorization,
+        )
+        .await
+        .expect("begin roster write");
+        write_nip43_membership_snapshot(&mut tx, &keys)
+            .await
+            .expect("write roster");
+        tx.commit().await.expect("commit roster");
+
+        let roster_kind = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST.to_string();
+        let acquisitions = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                let label = |name: &str| {
+                    key.key()
+                        .labels()
+                        .find(|label| label.key() == name)
+                        .map(|label| label.value().to_owned())
+                };
+                key.key().name() == "buzz_db_advisory_lock_acquisitions_total"
+                    && label("lock_type").as_deref()
+                        == Some(observability::LockType::Membership.as_str())
+                    && label("kind") == Some(roster_kind.clone())
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(count) => count,
+                other => panic!("acquisitions are a counter, got {other:?}"),
+            })
+            .sum::<u64>();
+        assert_eq!(acquisitions, 1, "one roster list lock per write");
     }
 
     async fn assert_role(pool: &PgPool, community: CommunityId, pubkey: &str, role: &str) {

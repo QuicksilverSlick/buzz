@@ -102,3 +102,47 @@ test("selected chips render the resolved name with the key kept nearby", () => {
     /visibleChips = chips\.filter\(\(chip\) => allowlistChipMatches\(chip, deferredQuery\),? \)/,
   );
 });
+
+test("the no-shared-channel line comes from the shared helper and skips agents", () => {
+  assert.match(collapsedSource, /return allowlistReachabilityText\( chips/);
+  assert.match(
+    collapsedSource,
+    /\.filter\(\(chip\) => !chip\.isAgent && missing\.has\(chip\.pubkey\)\)/,
+  );
+  // Two chips sharing a name: the line names the impostor by its short npub.
+  assert.match(
+    collapsedSource,
+    /\.map\(\(chip\) => \(chip\.ambiguous \? chip\.accessibleName : chip\.label\)\)/,
+  );
+  // Until profiles resolve, a partner's agent would be named as a person.
+  assert.match(
+    collapsedSource,
+    /profilesQuery\.isLoading \|\| profilesQuery\.isPlaceholderData/,
+  );
+  assert.match(
+    collapsedSource,
+    /data-testid="agent-respond-to-unreachable" > \{unreachableText\}/,
+  );
+  assert.doesNotMatch(collapsedSource, /nowhere for them to reach it/);
+});
+
+test("both edit surfaces pass the agent's key; the create surface has none", async () => {
+  // A persona definition has no key yet, so it must not show the line.
+  const read = (path) =>
+    readFile(new URL(path, import.meta.url), "utf8").then((source) =>
+      source.replace(/\s+/g, " "),
+    );
+  assert.match(
+    await read("../../channels/ui/EditRespondToDialog.tsx"),
+    /<CreateAgentRespondToField [^>]*agentPubkey=\{agent\?\.pubkey\}/,
+  );
+  assert.match(
+    await read("./AgentInstanceEditDialog.tsx"),
+    /<OwnerOnlyAccessField [^>]*agentPubkey=\{agent\.pubkey\}/,
+  );
+  assert.match(
+    await read("./OwnerOnlyAccessField.tsx"),
+    /<CreateAgentRespondToField agentPubkey=\{agentPubkey\}/,
+  );
+  assert.doesNotMatch(await read("./PersonaAdvancedFields.tsx"), /agentPubkey/);
+});

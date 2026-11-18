@@ -793,6 +793,7 @@ export function AppShell() {
                       onGoForward={goForward}
                     />
                   ) : null}
+                  {/* Dreamforge: Block's "new Buzz app" DeprecationBanner stays unmounted. */}
                   {settingsOpen ? (
                     <div className="relative flex min-h-0 flex-1 overflow-hidden">
                       <div

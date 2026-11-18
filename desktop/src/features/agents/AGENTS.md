@@ -182,6 +182,12 @@ with a TypeScript lookup table or an id comparison in a component.
    self-asserted, so the full npub stays in the chip tooltip, the short npub in
    the remove button's accessible name, and the short npub inline whenever two
    chips share a name. Search matches chips by name or key prefix only.
+   Edit surfaces pass `agentPubkey`, and the picker then names allowed people
+   (never agent entries) who share no unarchived stream or forum with the
+   agent (`allowlistWithoutSharedChannel` + `allowlistReachabilityText`, from
+   the owner's `useChannelsQuery` rosters), with the short npub when two chips
+   share a name, and nothing until channels and profiles have loaded. DMs don't count: a partner can only
+   mention their own agents in a DM. Create surfaces have no key and no line.
    **The owner-only-access build capability is backend-independent.** When
    `getAgentAccessOwnerOnly()` is true, every managed agent's access control is
    locked to owner-only, including provider-backed agents. A provider backend
@@ -394,8 +400,9 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
 - `ui/respondToFieldContract.test.mjs` — plain-language mode labels, the
   persistent warning contract for shared agent access, its two render
   positions (after the people picker for `allowlist`), and named chips that
-  keep the key in the tooltip and accessible name
-  (`lib/respondToAllowlist.test.mjs` pins the label fallbacks).
+  keep the key in the tooltip and accessible name, and the no-shared-channel
+  line's wiring (`lib/respondToAllowlist.test.mjs` pins the label fallbacks
+  and which channels count as shared).
 - `lib/agentAccessWarning.test.mjs` — every mode × run-location copy variant
   plus both resolvers, including unknown-reads-as-local and
   blank-`runOn`-is-not-a-provider.
@@ -442,6 +449,20 @@ keeps the source URL, not the target projection. Transfer or kind:0 rejection
 leaves the previous profile intact so normal reconciliation can retry. The
 Agent-managed profiles opt-out still disables automatic reconciliation.
 
+Creation explicitly transfers a chosen target-local avatar: the captured creating
+owner downloads only that image, then the new agent signs an upload of the
+verified bytes before its profile is published. The relay never lends an
+owner's upload proof to the agent. Automatic reconciliation has no owner signer.
+The captured community stays pinned through download, upload and profile publication, even if the active
+workspace changes while the request is awaiting I/O.
+
+Changed persona avatars transfer before local saves; a failed transfer returns
+an error and leaves the old local avatar intact. A concurrent settings/workspace
+change fences the save and requires retry. Team and individual snapshot imports
+transfer target-local poster and animation bytes before profile publication and
+report errors in the import result. All explicit flows capture owner/community
+before awaits. Unchanged-avatar reconciliation never borrows owner authority.
+
 The configured community origin set is refreshed through narrow workspace IPC
 before startup restore and when inactive communities change, without resetting
 active community state. After source removal, the shared writer may reuse an
@@ -459,3 +480,9 @@ matches the code is worse than no rule; a new pattern that isn't written down
 here will be broken by the next agent that never learns it existed. Reviewers:
 treat a config-behavior diff without a matching AGENTS.md diff (or an explicit
 "no rules changed" note) as incomplete.
+
+Changed-avatar edits refuse the entire save before any transfer when a linked
+instance has no usable signing key. The error names affected instances; restore
+their keys, or remove/unlink those instances, then retry. The previous persona
+and instance avatars remain unchanged, so the same requested avatar is retryable.
+Keys may be permanently lost; waiting alone does not repair a lost key.
