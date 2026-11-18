@@ -65,6 +65,7 @@ test("sections: each item lands in exactly one section, like the board", () => {
       card("w/status", { kind: "status", options: [], state: "done" }),
       card("w/stale", { validity: "suspected-stale" }),
       card("w/gone", { kind: "status", validity: "superseded" }),
+      card("steward/ship-all-check", { kind: "status", options: [] }),
     ]),
   );
   assert.deepEqual(ids(sections.needsYou), ["w/open"]);
