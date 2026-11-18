@@ -223,6 +223,10 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+/// Most of an agent's final text kept for posting: under the 64 KiB a
+/// message may carry, and a bound on a runaway stream.
+pub const TURN_REPLY_TEXT_CAP: usize = 60 * 1024;
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -282,6 +286,11 @@ pub struct AcpClient {
     /// with no extra task, no ordering question, and no way for a refusal to
     /// arrive after the notice that was supposed to mention it.
     permission_refusals: Vec<PermissionRefusal>,
+    /// The agent's text since its last tool call in the turn in flight: what
+    /// it said last. An agent that answers here instead of posting has told
+    /// nobody, so the pool posts it when the turn sent nothing (see
+    /// `pool::post_reply_if_silent`).
+    turn_reply_text: String,
 
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
@@ -824,6 +833,7 @@ impl AcpClient {
             pending_permissions: Default::default(),
             current_turn_authority: TurnAuthority::Guest,
             permission_refusals: Vec::new(),
+            turn_reply_text: String::new(),
             last_prompt_id: None,
             prompt_error_before_drain: None,
             current_hard_deadline: None,
@@ -1087,6 +1097,7 @@ impl AcpClient {
         // Cleared per turn: a refusal from a previous turn reported against
         // this one would name the wrong request to the wrong person.
         self.permission_refusals.clear();
+        self.turn_reply_text.clear();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -2281,10 +2292,16 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    if self.turn_reply_text.len() < TURN_REPLY_TEXT_CAP {
+                        self.turn_reply_text.push_str(text);
+                    }
                 }
                 false
             }
             "tool_call" => {
+                // Text before a tool call is narration ("let me look"), not
+                // the answer; only what follows the last call is.
+                self.turn_reply_text.clear();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -2454,6 +2471,25 @@ impl AcpClient {
     /// be reported against a later turn.
     pub fn take_permission_refusals(&mut self) -> Vec<PermissionRefusal> {
         std::mem::take(&mut self.permission_refusals)
+    }
+
+    /// Take the text the agent ended the turn on, trimmed, and cut to
+    /// [`TURN_REPLY_TEXT_CAP`] with a note saying so.
+    pub fn take_turn_reply_text(&mut self) -> String {
+        let mut text = std::mem::take(&mut self.turn_reply_text).trim().to_string();
+        if text.len() >= TURN_REPLY_TEXT_CAP {
+            let mut cut = TURN_REPLY_TEXT_CAP;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push_str(
+                "
+
+[…cut here: the rest was too long to post]",
+            );
+        }
+        text
     }
 
     /// Answer, refuse, or park a `session/request_permission` from the agent.
@@ -6783,6 +6819,40 @@ sleep 1"#,
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
 
     include!("acp/system_prompt_tests.rs");
+
+    #[tokio::test]
+    async fn turn_reply_text_is_what_follows_the_last_tool_call() {
+        let mut client = spawn_inert_client().await;
+        let update = |update: serde_json::Value| serde_json::json!({"method": "session/update", "params": {"update": update}});
+        let chunk = |text: &str| {
+            update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            }))
+        };
+        let _ = client.handle_session_update(&chunk("Let me look that up."));
+        let _ = client.handle_session_update(&update(serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "gh pr view", "kind": "execute",
+        })));
+        let _ = client.handle_session_update(&chunk("PR #923 fixed "));
+        let _ = client.handle_session_update(&chunk(
+            "the upline name.
+",
+        ));
+        assert_eq!(
+            client.take_turn_reply_text(),
+            "PR #923 fixed the upline name."
+        );
+        assert_eq!(client.take_turn_reply_text(), "", "taking it drains it");
+
+        // A runaway answer is cut below a message's 64 KiB, and says so.
+        for _ in 0..100 {
+            let _ = client.handle_session_update(&chunk(&"é".repeat(1_000)));
+        }
+        let long = client.take_turn_reply_text();
+        assert!(long.len() < 64 * 1024, "{}", long.len());
+        assert!(long.ends_with("[…cut here: the rest was too long to post]"));
+    }
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {

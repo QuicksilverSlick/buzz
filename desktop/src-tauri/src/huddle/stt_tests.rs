@@ -253,3 +253,59 @@ fn held_push_to_talk_never_silence_flushes() {
     // Manually open mic with the shortcut up: normal VAD behavior.
     assert!(vad_flush_allowed(true, true, false));
 }
+
+fn voice_note_wav(rate: u32, samples: &[i16]) -> Vec<u8> {
+    let mut wav = Vec::new();
+    let data_len = (samples.len() * 2) as u32;
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+#[test]
+fn a_voice_note_wav_parses_to_its_rate_and_samples() {
+    let (rate, samples) =
+        super::parse_voice_note_wav(&voice_note_wav(24_000, &[0, 16_384, -32_768])).unwrap();
+    assert_eq!(rate, 24_000);
+    assert_eq!(samples, vec![0.0, 0.5, -1.0]);
+}
+
+#[test]
+fn anything_but_a_mono_16_bit_voice_note_is_refused() {
+    assert!(super::parse_voice_note_wav(b"not audio").is_err());
+    let mut stereo = voice_note_wav(24_000, &[0, 0]);
+    stereo[22] = 2;
+    assert!(super::parse_voice_note_wav(&stereo).is_err());
+    let mut truncated = voice_note_wav(24_000, &[1, 2, 3]);
+    truncated.truncate(40);
+    assert!(super::parse_voice_note_wav(&truncated).is_err());
+}
+
+/// Needs the Parakeet model on disk: `BUZZ_STT_MODEL_DIR=<dir> cargo test --
+/// --ignored transcribes_real_speech`.
+#[test]
+#[ignore = "needs the downloaded Parakeet model"]
+fn transcribes_real_speech() {
+    let dir = std::env::var("BUZZ_STT_MODEL_DIR").expect("BUZZ_STT_MODEL_DIR");
+    let wav = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/pocket-voices/paul.wav"
+    ))
+    .unwrap();
+    let text = super::transcribe_voice_note_wav(std::path::Path::new(&dir), &wav).unwrap();
+    println!("transcript: {text}");
+    assert!(text.split_whitespace().count() > 5, "{text}");
+}

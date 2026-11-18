@@ -338,6 +338,10 @@ type E2eConfig = {
     talkToTalosError?: string;
     /** Delay an invocation-time huddle snapshot to exercise hydration ordering. */
     huddleStateReadDelayMs?: number;
+    /** What `transcribe_voice_note` returns; default "" (no words heard). */
+    voiceNoteTranscript?: string;
+    /** Delay (ms) before `transcribe_voice_note` answers. */
+    voiceNoteTranscriptDelayMs?: number;
     /** Delay (ms) for `sync_agents_to_active_huddle` so e2e tests can hold the
      *  send path open across a leg that writes nothing to the relay (no active
      *  huddle) and revoke a mention mid-hold.
@@ -12188,6 +12192,13 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_voice_input_mode":
         return mockHuddle?.state.voice_input_mode ?? "push_to_talk";
+      case "transcribe_voice_note": {
+        const delayMs = activeConfig?.mock?.voiceNoteTranscriptDelayMs ?? 0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        return activeConfig?.mock?.voiceNoteTranscript ?? "";
+      }
       case "set_voice_input_mode": {
         if (!mockHuddle) throw new Error("No active mock huddle.");
         const mode = (payload as { mode?: unknown }).mode;

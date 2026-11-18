@@ -81,7 +81,9 @@ pub use commands::{
     set_huddle_manual_mic_unmuted,
 };
 pub use state::{HuddleJoinInfo, HuddlePhase, HuddleState, VoiceInputMode};
-pub use transcription::{set_huddle_transcription_enabled, start_stt_pipeline};
+pub use transcription::{
+    set_huddle_transcription_enabled, start_stt_pipeline, transcribe_voice_note,
+};
 pub use tts_settings::set_tts_enabled;
 pub use window::{close_huddle_companion, open_huddle_window};
 
