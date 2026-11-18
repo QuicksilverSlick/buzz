@@ -5916,9 +5916,10 @@ fn owner_question<'a>(batch: &'a FlushBatch, agent: &str, owner: &str) -> Option
 
 /// The last Bench notice in `batch` that asks this agent for an answer in its
 /// card thread: a chat message (kind 9) tagging the agent and carrying a
-/// `["df-ask", …]` tag. The desktop adds that tag only on notices it routes to
-/// a question answerer (Bench Assistant), never on what the Factory Steward
-/// gets, so the steward stays silent.
+/// `["df-ask", …]` tag. The desktop must add that tag only to a #bench notice
+/// (`ch == s.channel_id`) for a question from one of the owner's keys, routed
+/// to a question answerer (Bench Assistant), never to what the Factory Steward
+/// gets. This cannot tell #bench from any other channel and does not check.
 fn bench_ask<'a>(batch: &'a FlushBatch, agent: &str) -> Option<&'a nostr::Event> {
     batch.events.iter().rev().map(|be| &be.event).find(|event| {
         u32::from(event.kind.as_u16()) == buzz_core::kind::KIND_STREAM_MESSAGE
@@ -5943,10 +5944,10 @@ fn bench_ask<'a>(batch: &'a FlushBatch, agent: &str) -> Option<&'a nostr::Event>
 /// tick wake or a Bench notice with nothing to say), and a guest could read
 /// final text that was never written for them. In the owner's DM nobody else
 /// reads it, and a question with no answer is never what the owner wants.
-/// #bench is the owner's private channel, and there the Bench asked in so
-/// many words for an answer in that card's thread. The ask is trusted as any
-/// notice is: only an author the agent's inbound gate (`respond_to`) admits
-/// can start the turn at all.
+/// The desktop tags only #bench notices, #bench is the owner's private
+/// channel, and there the Bench asked for an answer in that card's thread.
+/// The ask is trusted as any notice is: only an author the agent's inbound
+/// gate (`respond_to`) admits can start the turn at all.
 ///
 /// A turn that ends with no text and no post stays silent: that is an agent
 /// choosing not to answer ("thanks"), which the base prompt allows, and the
