@@ -230,7 +230,13 @@ test("surface entrypoints expose the exact ordered production policies", () => {
         ["src/shared/styles", [".css"], 1200],
       ],
     ],
-    [mobilePolicy, [["lib", [".dart"], 1200]]],
+    [
+      mobilePolicy,
+      [
+        ["lib/features/channels/compose_bar", [".dart"], 1202],
+        ["lib", [".dart"], 1200],
+      ],
+    ],
     [
       webPolicy,
       [
