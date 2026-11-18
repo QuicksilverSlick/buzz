@@ -980,6 +980,11 @@ pub struct PromptContext {
     /// Owner pubkey (hex), if resolved at startup. When unset, NIP-AE core
     /// injection is skipped entirely (no owner = no `(agent, owner)` pair).
     pub agent_owner_pubkey: Option<nostr::PublicKey>,
+    /// The explicit `respond_to` allowlist (lowercase hex), without the owner
+    /// and siblings the gate also admits: the only signers whose `df-ask`
+    /// notice may publish the agent's unsent final text ([`bench_ask`]).
+    /// Empty outside allowlist mode, which turns that fallback off.
+    pub bench_ask_signers: HashSet<String>,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the per-session core engram fetch is skipped and `core_sections`
     /// remains empty for every channel, so `format_prompt` renders no
@@ -5916,13 +5921,24 @@ fn owner_question<'a>(batch: &'a FlushBatch, agent: &str, owner: &str) -> Option
 
 /// The last Bench notice in `batch` that asks this agent for an answer in its
 /// card thread: a chat message (kind 9) tagging the agent and carrying a
-/// `["df-ask", …]` tag. The desktop must add that tag only to a #bench notice
-/// (`ch == s.channel_id`) for a question from one of the owner's keys, routed
-/// to a question answerer (Bench Assistant), never to what the Factory Steward
-/// gets. This cannot tell #bench from any other channel and does not check.
-fn bench_ask<'a>(batch: &'a FlushBatch, agent: &str) -> Option<&'a nostr::Event> {
+/// `["df-ask", …]` tag, signed by a key in `signers`, the agent's explicit
+/// `respond_to` allowlist (for Bench Assistant, only the Bench writer key).
+/// The owner and same-owner sibling agents pass the inbound gate but are not
+/// in that list, so they cannot opt a message into the fallback; an empty list
+/// (owner-only or anyone mode) means no Bench fallback at all. The desktop
+/// must add that tag only to a #bench notice (`ch == s.channel_id`) for a
+/// question from one of the owner's keys, routed to a question answerer
+/// (Bench Assistant), never to what the Factory Steward gets. This cannot tell
+/// #bench from any other channel and does not check.
+fn bench_ask<'a>(
+    batch: &'a FlushBatch,
+    agent: &str,
+    signers: &HashSet<String>,
+) -> Option<&'a nostr::Event> {
     batch.events.iter().rev().map(|be| &be.event).find(|event| {
         u32::from(event.kind.as_u16()) == buzz_core::kind::KIND_STREAM_MESSAGE
+            // Config stores the allowlist lowercased; `to_hex` is lowercase.
+            && signers.contains(&event.pubkey.to_hex())
             && event.tags.iter().any(|t| matches!(t.as_slice(), [k, ..] if k == "df-ask"))
             && event.tags.iter().any(|t| {
                 matches!(t.as_slice(), [k, pk, ..] if k == "p" && pk.eq_ignore_ascii_case(agent))
@@ -5946,8 +5962,10 @@ fn bench_ask<'a>(batch: &'a FlushBatch, agent: &str) -> Option<&'a nostr::Event>
 /// reads it, and a question with no answer is never what the owner wants.
 /// The desktop tags only #bench notices, #bench is the owner's private
 /// channel, and there the Bench asked for an answer in that card's thread.
-/// The ask is trusted as any notice is: only an author the agent's inbound
-/// gate (`respond_to`) admits can start the turn at all.
+/// The ask counts only from a signer on the agent's explicit `respond_to`
+/// allowlist ([`PromptContext::bench_ask_signers`]), not from everyone the
+/// inbound gate admits: a sibling agent or the owner tagging `df-ask` could
+/// otherwise make the agent publish final text it never meant to send.
 ///
 /// A turn that ends with no text and no post stays silent: that is an agent
 /// choosing not to answer ("thanks"), which the base prompt allows, and the
@@ -5990,7 +6008,8 @@ async fn post_reply_if_silent(
         }
         _ => None,
     };
-    let Some(asked) = dm_question.or_else(|| bench_ask(batch, &agent_hex)) else {
+    let Some(asked) = dm_question.or_else(|| bench_ask(batch, &agent_hex, &ctx.bench_ask_signers))
+    else {
         return;
     };
     let thread_tags =
@@ -6257,8 +6276,10 @@ pub(crate) mod tests {
         let scope = SessionScope::Conversation {
             channel_id: Uuid::new_v4(),
         };
+        let signers = HashSet::from([writer.public_key().to_hex()]);
         let asks = |event: nostr::Event| {
-            super::bench_ask(&batch_with_scope(scope.clone(), event), &agent).map(|e| e.id)
+            super::bench_ask(&batch_with_scope(scope.clone(), event), &agent, &signers)
+                .map(|e| e.id)
         };
 
         let asked = notice(9, &agent, Some("r1"));
@@ -6271,11 +6292,26 @@ pub(crate) mod tests {
         let edit = buzz_core::kind::KIND_STREAM_MESSAGE_EDIT as u16;
         assert!(asks(notice(edit, &agent, Some("r1"))).is_none());
 
+        // Only a signer on the explicit allowlist opts in. The owner and a
+        // sibling pass the inbound gate, yet the same notice from them is no ask.
+        let same_from = |keys: &Keys| {
+            EventBuilder::new(asked.kind, asked.content.clone())
+                .tags(asked.tags.iter().cloned())
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let (owner, sibling) = (Keys::generate(), Keys::generate());
+        assert!(asks(same_from(&owner)).is_none());
+        assert!(asks(same_from(&sibling)).is_none());
+        // Owner-only or anyone mode: no allowlist, so no Bench fallback.
+        let lone = batch_with_scope(scope.clone(), asked.clone());
+        assert!(super::bench_ask(&lone, &agent, &HashSet::new()).is_none());
+
         let mut batch = batch_with_scope(scope.clone(), asked.clone());
         let newer = notice(9, &agent, Some("r2"));
         batch.events.push(batch_event(newer.clone()));
         assert_eq!(
-            super::bench_ask(&batch, &agent).map(|e| e.id),
+            super::bench_ask(&batch, &agent, &signers).map(|e| e.id),
             Some(newer.id)
         );
 
@@ -11318,6 +11354,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
+            bench_ask_signers: HashSet::new(),
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
