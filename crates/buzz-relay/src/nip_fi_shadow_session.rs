@@ -19,7 +19,7 @@ use nostr::PublicKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::nip_fi_core::NipFiSession;
-use crate::nip_fi_shadow::{Stage, WouldDeny};
+use crate::nip_fi_shadow::{Stage, WouldDeny, DENY_SET};
 use crate::state::AppState;
 
 #[derive(Clone, Copy)]
@@ -132,7 +132,13 @@ impl ShadowSession {
     /// NIP-42 key is not the asserted one, or the assertion has no key.
     pub(crate) fn observe_pairing(&self, pubkey: PublicKey) {
         if self.assertion.asserted_key() != Some(pubkey) {
-            self.decide(Err((Stage::Pairing, DenialClass::AuthorizationDenied)));
+            let reason = if self.assertion.asserted_key().is_some() {
+                "key_mismatch"
+            } else {
+                "no_asserted_key"
+            };
+            let deny = WouldDeny::new(Stage::Pairing, DenialClass::AuthorizationDenied, reason);
+            self.decide(Err(deny.by(Some(pubkey))));
         }
     }
 
@@ -147,10 +153,11 @@ impl ShadowSession {
         let Some(owner) = self.assertion.owner() else {
             return;
         };
-        if let Some(class) =
+        if let Some((class, reason)) =
             crate::handlers::auth::token_owner_denial(state, community, pubkey, owner).await
         {
-            self.decide(Err((Stage::Owner, class)));
+            let deny = WouldDeny::new(Stage::Owner, class, reason);
+            self.decide(Err(deny.by(Some(pubkey))));
         }
     }
 
@@ -161,7 +168,7 @@ impl ShadowSession {
             .registered()
             .insert(self.id, Arc::downgrade(self));
         if deny_listed(state, &self.assertion) {
-            self.decide(Err((Stage::DenySet, DenialClass::AuthorizationDenied)));
+            self.decide(Err(DENY_SET.by(self.assertion.asserted_key())));
         }
     }
 
@@ -178,7 +185,12 @@ impl ShadowSession {
         self.transition(|phase| match *phase {
             Phase::Pending { revoked: false } => {
                 *phase = Phase::Ended;
-                let verdict = Err((Stage::Deadline, DenialClass::EvidenceRejected));
+                let deny = WouldDeny::new(
+                    Stage::Deadline,
+                    DenialClass::EvidenceRejected,
+                    "session_deadline",
+                );
+                let verdict = Err(deny.by(self.assertion.asserted_key()));
                 crate::nip_fi_shadow::record_for(self.route, self.community.clone(), verdict);
             }
             Phase::Admitted => self.end(phase, "expired"),
@@ -252,15 +264,34 @@ impl ShadowSession {
 /// One AUTH attempt, audio's through its join commit: refused, or dropped,
 /// while the session is still pending, it ended unadmitted for a non-NIP-FI
 /// reason (NIP-42 failure, ordinary policy refusal), so the session retires
-/// without a record.
-pub(crate) struct AuthAttempt<'a>(pub(crate) Option<&'a Arc<ShadowSession>>);
+/// without a record. Both the shadow and the enforce session retire.
+pub(crate) struct AuthAttempt<'a>(&'a crate::state::CommunityConnectionControl);
 
-impl AuthAttempt<'_> {
+impl<'a> AuthAttempt<'a> {
+    pub(crate) fn new(control: &'a crate::state::CommunityConnectionControl) -> Self {
+        Self(control)
+    }
+
     /// Retires a pending session where the refusal is decided, before the
     /// refusal's frames and cleanup are awaited.
     pub(crate) fn refused(&self) {
-        if let Some(session) = self.0 {
+        if let Some(session) = self.0.nip_fi_shadow() {
             session.retire_pending();
+        }
+        if let Some(session) = self.0.nip_fi_enforce() {
+            session.retire();
+        }
+    }
+}
+
+impl AuthAttempt<'_> {
+    /// An effect permit refused at `gate`: when its deadline has passed, the
+    /// gate saw the expiry before the expiry worker could, so the enforce
+    /// session claims that deadline outcome now, before this attempt's
+    /// retirement could end it unrecorded. Cancellation alone stays quiet.
+    pub(crate) fn effect_refused(&self, gate: &crate::nip_fi_gate::SessionAdmissionGate) {
+        if let Some(session) = self.0.nip_fi_enforce().filter(|_| gate.deadline_passed()) {
+            session.expire();
         }
     }
 }
@@ -289,7 +320,7 @@ pub(crate) fn upgrade_denied(
 ) -> bool {
     let denied = deny_listed(state, assertion);
     if denied {
-        let verdict = Err((Stage::DenySet, DenialClass::AuthorizationDenied));
+        let verdict = Err(DENY_SET.by(assertion.asserted_key()));
         crate::nip_fi_shadow::record_for("ws", community.clone(), verdict);
     }
     denied
@@ -318,6 +349,11 @@ pub(crate) mod tests {
     /// `end/reason`, sorted.
     pub(crate) fn shadow_records(body: impl Future<Output = ()>) -> Vec<String> {
         collect(body, false, false)
+    }
+
+    /// [`shadow_records`] plus the would-deny lines `body` logged.
+    pub(crate) fn shadow_logged(body: impl Future<Output = ()>) -> (Vec<String>, Vec<String>) {
+        crate::nip_fi_shadow::tests::would_deny_lines(|| shadow_records(body))
     }
 
     /// [`shadow_records`], each prefixed with its `route` label.
@@ -350,6 +386,7 @@ pub(crate) mod tests {
             };
             let record = match key.name() {
                 "buzz_nip_fi_shadow_total" => {
+                    crate::nip_fi_shadow::tests::assert_shadow_schema(key);
                     format!("{}/{}", label("stage").unwrap(), label("outcome").unwrap())
                 }
                 "buzz_nip_fi_shadow_session_end_total" => {
@@ -375,10 +412,11 @@ pub(crate) mod tests {
     /// timeout, so a path that reaches Postgres fails fast whether or not
     /// one runs locally.
     pub(crate) async fn shadow_state(denied: Option<PublicKey>) -> AppState {
-        let mut state =
-            (*crate::state::tests::test_state_with_database_url("postgres://127.0.0.1:1/none")
-                .await)
-                .clone();
+        let mut state = (*crate::state::tests::test_state_with_unreachable_database_url(
+            "postgres://127.0.0.1:1/none",
+        )
+        .await)
+            .clone();
         let capacity = vec![IssuerCapacity {
             issuer: "test-issuer".to_owned(),
             capacity: 8,
@@ -494,6 +532,65 @@ pub(crate) mod tests {
         match crate::api::nip_fi::apply_nip_fi_disconnect(state, &msg, Utc::now()) {
             crate::api::nip_fi::NipFiDisconnectApplyResult::Applied(merged) => merged,
             other => panic!("disconnect not applied: {other:?}"),
+        }
+    }
+
+    /// Audio's owner-link refusal is recorded through the same admission
+    /// seam root uses (`owner_link_denial` → `record_enforce_refusal`), on
+    /// route `audio`, with root's reasons: a conflicting stored owner is
+    /// `not_stored_owner`, an unwritable link `owner_link_unavailable`; a
+    /// NIP-OA (non-token) link failure is no owner verdict and retires.
+    /// Mutation: dropping `owner_reason` from `owner_link_denial` records
+    /// nothing for the token cases.
+    #[test]
+    fn audio_owner_link_refusal_shares_roots_seam_and_reasons() {
+        use crate::api::relay_members::OwnerLink;
+        for (link, token, expected, reason) in [
+            (
+                OwnerLink::Conflict,
+                true,
+                &["audio owner/denied"][..],
+                Some("not_stored_owner"),
+            ),
+            (
+                OwnerLink::Unavailable,
+                true,
+                &["audio owner/unavailable"][..],
+                Some("owner_link_unavailable"),
+            ),
+            (OwnerLink::Unavailable, false, &[][..], None),
+        ] {
+            let (records, lines, _, ()) =
+                crate::nip_fi_shadow::tests::enforce_observed(async {}, |()| async move {
+                    let (agent, owner) = (
+                        nostr::Keys::generate().public_key(),
+                        nostr::Keys::generate().public_key(),
+                    );
+                    let control = crate::state::CommunityConnectionControl::new(
+                        tokio_util::sync::CancellationToken::new(),
+                    );
+                    control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+                        "audio",
+                        crate::nip_fi_shadow::BOUND.into(),
+                        Some(agent),
+                    ));
+                    let denial = crate::handlers::auth::owner_link_denial(link, token);
+                    assert!(denial.is_some(), "{link:?} refuses");
+                    crate::handlers::auth::record_enforce_refusal(
+                        &control,
+                        denial.as_ref(),
+                        Some(&owned_assertion(agent, owner)),
+                    );
+                });
+            assert_eq!(records, expected, "{link:?} token={token}: {lines:?}");
+            if let Some(reason) = reason {
+                assert!(
+                    lines.len() == 1
+                        && lines[0].contains(&format!("reason=\"{reason}\""))
+                        && lines[0].contains("route=\"audio\""),
+                    "{lines:?}"
+                );
+            }
         }
     }
 

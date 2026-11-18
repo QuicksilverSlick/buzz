@@ -187,8 +187,11 @@ test("encryption and native save continue after closing the dialog and settings"
 });
 
 test("the temporary download expires after five minutes", async ({ page }) => {
-  await page.clock.install({ time: new Date("2026-07-29T12:00:00Z") });
   await openBackupSettings(page);
+  // Install the fake clock after Settings is open: under Playwright 1.65 the fake
+  // clock fires the composer's deferred autofocus while the profile menu opens,
+  // and the focus move closes the menu before the Settings click lands.
+  await page.clock.install({ time: new Date("2026-07-29T12:00:00Z") });
   const dialog = await openCreateBackup(page);
   await dialog.getByTestId("backup-passphrase-input").fill("expiring password");
   await dialog.getByTestId("encrypted-backup-create").click();

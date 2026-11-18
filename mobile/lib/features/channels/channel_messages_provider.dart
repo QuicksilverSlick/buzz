@@ -14,6 +14,7 @@ import 'timeline_message.dart';
 
 part 'channel_messages_provider/thread_summaries.dart';
 part 'channel_messages_provider/pagination.dart';
+part 'channel_messages_provider/notices.dart';
 
 // Channel history keeps partial reply evidence; full threads stay route-scoped.
 const _maxCachedRepliesPerRoot = 256;
@@ -38,17 +39,39 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   void Function()? _unsubscribe;
   bool _reachedOldest = false;
   bool _initInFlight = false;
+  Future<bool>? _olderInFlight;
   bool _usingChannelWindow = false;
   NostrEvent? _legacyHistoryCursor;
   bool _initialWindowQueryInFlight = false;
   int _initVersion = 0;
   ChannelWindowStore _windowStore = const ChannelWindowStore.empty();
+
+  /// System notices read apart from the window pages (see `_fillNotices`).
+  final Map<String, NostrEvent> _notices = {};
+
+  /// Reactions to [_notices] and deletions of those reactions.
+  final Map<String, NostrEvent> _noticeAux = {};
+
+  /// Where the next older notice read starts: null before the first read.
+  ChannelPageCursor? _noticeCursor;
+  bool _noticesReachedStart = false;
+
+  /// The init a notice read is running for, so only one runs per window.
+  int? _noticeFillVersion;
+
+  /// Whether a page loaded while a notice read ran, so the read runs again.
+  bool _noticeFillAgain = false;
   final Set<String> _liveSummaryRootsDuringInitialWindowQuery = {};
   final Map<String, NostrEvent> _deepLinkEvents = {};
   final Set<String> _retainedDeepLinkEventIds = {};
   final Map<String, String> _localReplyRoots = {};
   final Map<String, ChannelWindowThreadSummary> _queryThreadSummaries = {};
   final Map<String, ChannelWindowThreadSummary> _overflowFloors = {};
+
+  /// Thread summaries from the window a reconnect discarded. They stand,
+  /// below every fresher source, until the replacement history lands, so
+  /// reply counts don't blink off during the catch-up.
+  Map<String, ChannelWindowThreadSummary> _reconnectSummaries = const {};
   final Map<String, int> _threadQueryVersions = {};
   final Map<String, int> _threadEvidenceVersions = {};
   int _threadQuerySerial = 0;
@@ -95,6 +118,10 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   /// empty value returned while the relay is not yet connected.
   bool get hasLoadedMessages => _lastKnownMessages != null;
 
+  /// Whether a loaded timeline is resubscribing and fetching its newest
+  /// history, as after a reconnect, to become current again.
+  bool get isCatchingUp => _initInFlight && hasLoadedMessages;
+
   Map<String, ChannelWindowThreadSummary> get threadSummaries => {
     for (final entry in _baseThreadSummaries.entries)
       entry.key: _deletionSummaryUncertainty.containsKey(entry.key)
@@ -115,6 +142,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   }
 
   Map<String, ChannelWindowThreadSummary> get _baseThreadSummaries => {
+    ..._reconnectSummaries,
     ...channelWindowThreadSummaries(_windowStore),
     ..._queryThreadSummaries,
     ..._overflowFloors,
@@ -169,7 +197,15 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     }
 
     _reachedOldest = false;
+    if (_windowStore.pages.isNotEmpty) {
+      _reconnectSummaries = channelWindowThreadSummaries(_windowStore);
+    }
     _windowStore = const ChannelWindowStore.empty();
+    _notices.clear();
+    _noticeAux.clear();
+    _noticeCursor = null;
+    _noticesReachedStart = false;
+    _noticeFillAgain = false;
     // A reconnect window can lag a confirmed thread query and contains only
     // top-level rows. Keep known replies as summary evidence, including their
     // deletion markers so a reset cannot resurrect a deleted reply.
@@ -234,10 +270,15 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
         ...history.where((event) => existingIds.add(event.id)),
       ]);
       _lastKnownMessages = merged;
+      _reconnectSummaries = const {};
       _reconcileRetainedSummaryPayloads(merged);
       _reconcileRetainedAggregates(historyVersion);
+      // Clear before publishing so the rebuild it triggers is no longer
+      // catching up.
+      _initInFlight = false;
       state = AsyncData(merged);
       _summaryRefreshes.resume();
+      unawaited(_fillNotices());
     } catch (e, st) {
       if (!_isCurrentInit(initVersion)) return;
       final fallbackMessages = state.value ?? _lastKnownMessages;
@@ -245,9 +286,14 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
         debugPrint(
           '[ChannelMessagesNotifier] history sync failed for $channelId: $e',
         );
+        _initInFlight = false;
         state = AsyncData(fallbackMessages);
+        // The fallback is usually the list already on screen, which Riverpod
+        // treats as unchanged. Notify anyway so the page sees catch-up end.
+        ref.notifyListeners();
         return;
       }
+      _initInFlight = false;
       state = AsyncError(e, st);
     } finally {
       if (_isCurrentInit(initVersion)) {
@@ -278,12 +324,13 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
         page,
         retainLiveSummaryRootIds: _liveSummaryRootsDuringInitialWindowQuery,
       );
+      _reconnectSummaries = const {};
       _liveSummaryRootsDuringInitialWindowQuery.clear();
       _pruneOffWindowReplies();
       _usingChannelWindow = true;
       _reconcilePageSummaries(page, pageVersion);
       _reachedOldest = !channelWindowHasMore(_windowStore);
-      return flattenChannelWindowEvents(_windowStore);
+      return _windowEvents();
     } catch (error) {
       _initialWindowQueryInFlight = false;
       _liveSummaryRootsDuringInitialWindowQuery.clear();
@@ -310,7 +357,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   }
 
   NostrFilter _channelWindowFilter(ChannelPageCursor? cursor) => NostrFilter(
-    kinds: EventKind.channelTimelineContentKinds,
+    kinds: EventKind.channelWindowPageKinds,
     tags: {
       '#h': [channelId],
     },
@@ -404,7 +451,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     if (!_mergeWindowEventIntoStore(event, summaryVersion: summaryVersion)) {
       return;
     }
-    final windowEvents = flattenChannelWindowEvents(_windowStore);
+    final windowEvents = _windowEvents();
     // Flattening already orders the window. Only merge and sort again when
     // there are retained deep-link events to include.
     final flattened = _deepLinkEvents.isEmpty
@@ -577,7 +624,11 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       _rotateDeletionProofTargets(missingIds);
 
   /// Snapshots cached overlay replies covered by a query for this outer root.
-  Set<String> cachedThreadReplyIds(String rootId) {
+  Set<String> cachedThreadReplyIds(String rootId) =>
+      _cachedThreadReplyIdsByRoot(only: rootId)[rootId] ?? <String>{};
+
+  /// Snapshots cached overlay replies for every outer root, or only [only].
+  Map<String, Set<String>> _cachedThreadReplyIdsByRoot({String? only}) {
     final deletedIds = {
       for (final event in [
         ..._windowStore.liveAux,
@@ -589,15 +640,21 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
           for (final tag in event.tags)
             if (tag.length > 1 && tag[0] == 'e') tag[1],
     };
-    return {
-      for (final entry in _localReplyRoots.entries)
-        if (entry.value == rootId && !deletedIds.contains(entry.key)) entry.key,
-      for (final event in _cachedThreadEvents)
-        if (event.threadReference.parentId != null &&
-            event.threadReference.rootId == rootId &&
-            !deletedIds.contains(event.id))
-          event.id,
-    };
+    final byRoot = <String, Set<String>>{};
+    void add(String root, String id) {
+      if ((only == null || root == only) && !deletedIds.contains(id)) {
+        (byRoot[root] ??= <String>{}).add(id);
+      }
+    }
+
+    for (final entry in _localReplyRoots.entries) {
+      add(entry.value, entry.key);
+    }
+    for (final event in _cachedThreadEvents) {
+      final thread = event.threadReference;
+      if (thread.parentId != null) add(thread.rootId!, event.id);
+    }
+    return byRoot;
   }
 
   /// Applies explicit deletion evidence fetched for cached replies.
@@ -783,7 +840,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       }
     }
     if (_usingChannelWindow) {
-      events = _withDeepLinkEvents(flattenChannelWindowEvents(_windowStore));
+      events = _withDeepLinkEvents(_windowEvents());
     }
     events = _boundEventReplies(events);
     _lastKnownMessages = events;
@@ -896,6 +953,12 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
 
   bool _isCurrentInit(int initVersion) => initVersion == _initVersion;
 
+  List<NostrEvent> _windowEvents() => flattenChannelWindowEvents(
+    _windowStore,
+    notices: _notices.values,
+    noticeAux: _noticeAux.values,
+  );
+
   /// Stops live work for a chat that stayed hidden; resume catches it up.
   void _detachLive() {
     _liveDetachTimer = null;
@@ -975,7 +1038,10 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   AsyncValue<List<NostrEvent>> get _historyState => state;
   set _historyState(AsyncValue<List<NostrEvent>> value) => state = value;
 
-  Future<bool> fetchOlder() => _fetchOlder();
+  /// Concurrent callers share one in-flight page; pages continue one cursor.
+  Future<bool> fetchOlder() => _olderInFlight ??= _fetchOlder().whenComplete(
+    () => _olderInFlight = null,
+  );
 }
 
 int _currentUnixSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;

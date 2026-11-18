@@ -97,7 +97,9 @@ void main() {
         (call) async => switch (call.method) {
           'enrollPush' => grant,
           'endpointGrants' => [grant],
-          'startRegistration' || 'syncPushSnapshot' => null,
+          'startRegistration' ||
+          'syncPushSnapshot' ||
+          'takePendingNotificationResponse' => null,
           _ => throw StateError('Unexpected native call ${call.method}'),
         },
       );
@@ -171,9 +173,6 @@ void main() {
               return _descriptor;
             }),
             appLifecycleProvider.overrideWith(_Lifecycle.new),
-            buzzPushAuthorizationStatusReaderProvider.overrideWithValue(
-              () async => BuzzPushAuthorizationStatus.denied,
-            ),
           ],
           child: BuzzPushBootstrap(
             child: MaterialApp(

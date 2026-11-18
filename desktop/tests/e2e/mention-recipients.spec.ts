@@ -8,6 +8,7 @@ import {
   releaseChannelMembersReads,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
+import { replaceComposerText } from "../helpers/composer";
 
 const FIRST = TEST_IDENTITIES.alice.pubkey;
 const SECOND = TEST_IDENTITIES.bob.pubkey;
@@ -117,7 +118,7 @@ test("ambiguous added mention blocks editing before clearing the draft", async (
   await page.getByRole("menuitem", { name: "Edit message" }).click();
   await expect(page.getByTestId("edit-target")).toBeVisible();
   await expect(input).toHaveText("original message for ambiguity edit");
-  await input.fill("edited @Scout hello");
+  await replaceComposerText(input, "edited @Scout hello");
   await page.getByTestId("send-message").click();
   await expect(page.getByText(AMBIGUOUS, { exact: false })).toBeVisible();
   await expect(input).toHaveText("edited @Scout hello");
@@ -405,7 +406,7 @@ test("editing to a longer typed member drops the original shorter reference", as
   await row.getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menuitem", { name: "Edit message" }).click();
   await expect(input).toHaveText("@Scout hello");
-  await input.fill("@Scout Jones hello");
+  await replaceComposerText(input, "@Scout Jones hello");
   await page.getByTestId("send-message").click();
   await expect
     .poll(() =>
@@ -650,7 +651,7 @@ for (const replacement of [
     // by filling the still-idle composer before the historical body is loaded.
     await expect(panel.getByTestId("edit-target")).toBeVisible();
     await expect(input).toHaveText("@Scout historical ambiguity");
-    await input.fill(replacement);
+    await replaceComposerText(input, replacement);
     await panel.getByTestId("send-message").click();
     await expect(row).toContainText("repaired history");
     const expected = replacement.startsWith("@")
@@ -753,7 +754,7 @@ for (const mixed of [false, true]) {
     await expect(input).toHaveText(
       "@Scout and @Scout Jones historical ambiguity",
     );
-    await input.fill(replacement);
+    await replaceComposerText(input, replacement);
     await panel.getByTestId("send-message").click();
     await expect(row).toContainText("repaired history");
     const expected = long;
