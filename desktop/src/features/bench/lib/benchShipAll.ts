@@ -8,7 +8,11 @@
  * tick) lists as clear, card by card; every other waiting card says why.
  */
 
-import type { BenchCard, BenchSnapshot } from "@/features/bench/lib/benchCards";
+import {
+  type BenchCard,
+  type BenchSnapshot,
+  benchCreatedSeconds,
+} from "@/features/bench/lib/benchCards";
 
 export type ShipAllButton = "digest" | "details";
 
@@ -43,6 +47,10 @@ const CARD_LINE =
   /^card: (steward\/(?:hold|stack)-[a-z0-9-]{1,64}) (digest details|details)$/;
 const HELD_LINE =
   /^held: (steward\/(?:hold|stack)-[a-z0-9-]{1,64}) (.{1,200})$/;
+const OVER = / cards wait, more than one check can list: /;
+/** Under two ticks: one slow tick (232 s, 15 Nov) must not turn it off. */
+const STALE_MS = 25 * 60_000;
+const FUTURE_MS = 2 * 60_000;
 
 export function isStewardDigest(card: BenchCard): boolean {
   return (
@@ -221,4 +229,222 @@ const HHMM = new Intl.DateTimeFormat("en-US", {
 });
 export function formatShipAllTime(ms: number): string {
   return HHMM.format(new Date(ms));
+}
+
+export type ShipAllGate = {
+  /** What this button taps, in the steward's order; while the check can't be used, what it would. */
+  cards: ShipAllCard[];
+  enabled: boolean;
+  /** Why it is off, and when that clears; empty when enabled. */
+  reasons: string[];
+  /** This button's other waiting cards, each with why it is not tapped. */
+  left: ShipAllLeftOut[];
+  /** When the steward checks again, once its check is in use. */
+  recheck: string;
+};
+
+/**
+ * What one button taps now: the cards both picked here and listed clear for
+ * it by a readable steward check at most 25 minutes old (their ids hold
+ * their commits), in the check's order. A card answered since the check just
+ * drops out; one the check holds, or has not seen yet, is left out with why.
+ */
+export function shipAllGate(
+  snapshot: Pick<BenchSnapshot, "items">,
+  button: ShipAllButton,
+  now: number,
+): ShipAllGate {
+  const { candidates } = shipAllPick(snapshot);
+  const mine = candidates
+    .filter((c) => button === "details" || !c.readFirst)
+    .sort(
+      (a, b) =>
+        (benchCreatedSeconds(a.card) ?? 0) - (benchCreatedSeconds(b.card) ?? 0),
+    );
+  const off = (reason: string) => ({
+    cards: mine,
+    enabled: false,
+    reasons: [reason],
+    left: [],
+    recheck: "",
+  });
+  if (mine.length === 0) {
+    return off(
+      candidates.length > 0
+        ? "Every waiting card is read first (lane:hold, money, sign-in or database): open Give me details to read and ship them there."
+        : "Nothing for this button waits on your tap.",
+    );
+  }
+  const check = readShipAllCheck(snapshot);
+  const still = "Each card's own Ship it still works.";
+  if (check === "missing") {
+    return off(
+      `The steward's check is not on the Bench yet: it checks every 15 minutes. ${still}`,
+    );
+  }
+  if (check === "unreadable") {
+    return off(
+      `The steward's check could not be read. ${still} It checks every 15 minutes; if this stays, see #steward.`,
+    );
+  }
+  const at = formatShipAllTime(check.checked);
+  if (now - check.checked > STALE_MS || check.checked - now > FUTURE_MS) {
+    return off(
+      `The steward's last check (${at}) is too old to trust. It checks every 15 minutes; if this stays, the tick may be failing (see #steward). ${still}`,
+    );
+  }
+  const recheck =
+    check.next > now
+      ? `It checks again by ${formatShipAllTime(check.next)}.`
+      : "It checks again at its next tick.";
+  const cards = check.cards
+    .filter((l) => button === "details" || l.digest)
+    .flatMap((l) => mine.filter((c) => c.card.id === l.id));
+  const left = mine
+    .filter((c) => !cards.includes(c))
+    .map(({ card }): ShipAllLeftOut => {
+      const held = check.held.get(card.id);
+      if (held) return { card, reason: held };
+      if (check.cards.some((l) => l.id === card.id)) {
+        return {
+          card,
+          reason:
+            "It is read first now (lane:hold was added after its card): ship it from Give me details.",
+          readFirst: true,
+        };
+      }
+      // The kit's one way to name no card while some wait: too many to list.
+      const over = check.whys[button].find((w) => OVER.test(w));
+      return {
+        card,
+        reason: over ?? `New since the steward's check at ${at}.`,
+      };
+    });
+  if (cards.length === 0) {
+    const shown = left.slice(0, 3).map((l) => l.reason);
+    const more = left.length - shown.length;
+    return {
+      cards,
+      enabled: false,
+      reasons: [...shown, ...(more > 0 ? [`And ${more} more.`] : []), recheck],
+      left,
+      recheck,
+    };
+  }
+  return { cards, enabled: true, reasons: [], left, recheck };
+}
+
+export type ShipAllTap = {
+  itemId: string;
+  cardEventId: string;
+  /** 0-based: the card's recommended Ship it. */
+  option: number;
+  title: string;
+};
+
+export function shipAllTaps(cards: readonly ShipAllCard[]): ShipAllTap[] {
+  return cards.map(({ card }) => ({
+    itemId: card.id,
+    cardEventId: card.cardEventId ?? "",
+    option: (card.recommend ?? 1) - 1,
+    title: card.title,
+  }));
+}
+
+/**
+ * Taps each card in order with `answer` (bench_answer), then waits for its
+ * Recorded line before the next; the first failure stops the run, so no
+ * card goes before one under it. `stillOk` reads the Bench again before each
+ * tap, so an answer or reply he gave meanwhile, or a new check that holds
+ * the card, is never overwritten with Ship it.
+ */
+export async function runShipAll(
+  taps: readonly ShipAllTap[],
+  {
+    answer,
+    stillOk,
+    isRecorded,
+    onStep,
+    sleep,
+    pollMs = 1_000,
+    timeoutMs = 15_000,
+  }: {
+    answer: (tap: ShipAllTap) => Promise<unknown>;
+    stillOk: (tap: ShipAllTap) => Promise<boolean>;
+    isRecorded: (tap: ShipAllTap) => Promise<boolean>;
+    onStep: (index: number) => void;
+    sleep: (ms: number) => Promise<void>;
+    pollMs?: number;
+    timeoutMs?: number;
+  },
+): Promise<{ recorded: number; error: string | null }> {
+  for (const [i, tap] of taps.entries()) {
+    onStep(i);
+    if (!(await stillOk(tap).catch(() => false))) {
+      return {
+        recorded: i,
+        error: `${tap.title}: not tapped. You answered or wrote on it meanwhile, or the steward's check no longer clears it.`,
+      };
+    }
+    try {
+      await answer(tap);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { recorded: i, error: `${tap.title}: couldn't save: ${message}` };
+    }
+    for (let polls = 0; !(await isRecorded(tap).catch(() => false)); polls++) {
+      if (polls * pollMs >= timeoutMs) {
+        return {
+          recorded: i,
+          error: `${tap.title}: its Ship it was sent, but the Bench has not recorded it after ${timeoutMs / 1_000} s. It may still record: check its card, and click its Ship it to take it back.`,
+        };
+      }
+      await sleep(pollMs);
+    }
+  }
+  return { recorded: taps.length, error: null };
+}
+
+/** Whether a fresh snapshot still has this card waiting and clear on this button. */
+export function shipAllStillOk(
+  snapshot: Pick<BenchSnapshot, "items"> | null,
+  tap: ShipAllTap,
+  button: ShipAllButton,
+  now: number,
+): boolean {
+  const gate = snapshot && shipAllGate(snapshot, button, now);
+  return (
+    !!gate?.enabled &&
+    gate.cards.some(
+      (c) => c.card.id === tap.itemId && c.card.cardEventId === tap.cardEventId,
+    )
+  );
+}
+
+/** Whether a fresh snapshot shows the owner's Ship it recorded on the card. */
+export function shipAllRecorded(
+  snapshot: Pick<BenchSnapshot, "items"> | null,
+  tap: ShipAllTap,
+): boolean {
+  const card = snapshot?.items.find((i) => i.id === tap.itemId);
+  return (
+    card?.cardEventId === tap.cardEventId &&
+    card.recorded === tap.option &&
+    (card.answer?.byOwner ?? true)
+  );
+}
+
+/** The titles of the steward's trains still on their way to live. */
+export function shipAllTrains(
+  snapshot: Pick<BenchSnapshot, "items">,
+): string[] {
+  return snapshot.items
+    .filter(
+      (i) =>
+        i.writer === "steward" &&
+        /^steward\/(?:reset|talos|buzz)-train$/.test(i.id) &&
+        i.validity === "current" &&
+        !i.title.endsWith(": live"),
+    )
+    .map((i) => i.title);
 }
