@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::app_state::AppState;
 use crate::commands::clipboard::with_clipboard;
 use crate::commands::export_util::save_bytes_with_dialog;
-use crate::commands::media::{detect_and_validate_mime, mint_media_get_auth};
+use crate::commands::media::{
+    detect_and_validate_mime, learn_relay_clock, mint_media_get_auth, relay_clock_offset,
+};
 use crate::commands::media_filename::sanitize_filename;
 use crate::commands::{
     personas::{
@@ -263,26 +265,41 @@ pub(super) async fn fetch_blob_bytes_with_cap(
     // A no-redirect client keeps the minted media auth token from being
     // forwarded across origins by a relay-issued 3xx (redirect-hop SSRF); a
     // 3xx is returned verbatim and rejected by the `is_success` check below.
-    let mut req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
-
     // Every caller pre-validates `url` against the relay origin via
     // `validate_download_url`, satisfying the mint_media_get_auth safety
     // contract (the token never leaves the relay origin).
     let relay_base = relay_api_base_url_with_override(state);
-    if let Some(auth) = mint_media_get_auth(state, &relay_base) {
-        req = req.header("authorization", auth);
-    }
-
-    let request = req.send();
-    let resp = if let Some(cancellation) = cancellation {
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err("media fetch cancelled".to_string()),
-            result = request => result,
+    // Two tries at most: the second only when the first token was refused
+    // because this computer's clock is off from the relay's.
+    let mut first_try = true;
+    let resp = loop {
+        let mut req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
+        let signed_with = relay_clock_offset(&relay_base);
+        if let Some(auth) = mint_media_get_auth(state, &relay_base) {
+            req = req.header("authorization", auth);
         }
-    } else {
-        request.await
-    }
-    .map_err(|e| classify_request_error(&e))?;
+
+        let request = req.send();
+        let resp = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err("media fetch cancelled".to_string()),
+                result = request => result,
+            }
+        } else {
+            request.await
+        }
+        .map_err(|e| classify_request_error(&e))?;
+
+        let refused = matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        );
+        if first_try && refused && learn_relay_clock(&relay_base, resp.headers(), signed_with) {
+            first_try = false;
+            continue;
+        }
+        break resp;
+    };
 
     if let Some(err) = redirect_refusal_error(resp.status()) {
         return Err(err);
