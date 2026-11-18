@@ -19,6 +19,8 @@ import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
+import { hold, shipAllCheck } from "../lib/benchShipAll.test-support.mjs";
+
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
 });
@@ -391,6 +393,36 @@ test("screen: only the owner's identity gets live buttons", async () => {
     fireEvent.click(button);
   });
   assert.equal(answerCalls().length, 0);
+});
+
+test("screen: with no digest open, the owner gets the digest's Ship all above Needs you", async () => {
+  const a = hold(901);
+  const check = shipAllCheck([[a, true]]);
+  const show = async (items, viewer = OWNER) => {
+    cleanup();
+    serveIdentity(viewer);
+    serveSnapshot(snapshot(items));
+    await act(async () => {
+      render(wrap(createElement(BenchScreen)));
+    });
+    await waitFor(() => screen.getByText(a.title));
+    return screen.queryAllByRole("button", { name: /^Ship all/ });
+  };
+  const [bar] = await show([a, check]);
+  await waitFor(() => assert.equal(bar.disabled, false));
+  assert.equal(bar.textContent, "Ship all 1");
+  assert.equal(
+    screen.queryByText("Ship all check"),
+    null,
+    "the check stays off the screen",
+  );
+  // A digest is open: its own card carries Ship all, so the screen adds none.
+  const digest = card("steward/digest-2026-11-15", {
+    writer: "steward",
+    options: ["Got it"],
+  });
+  assert.equal((await show([a, digest, check])).length, 1);
+  assert.equal((await show([a, check], STRANGER)).length, 0);
 });
 
 test("screen: disabled, unreadable and not-yet-ticked Benches say so", async () => {
