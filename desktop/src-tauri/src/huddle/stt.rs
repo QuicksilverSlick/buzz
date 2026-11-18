@@ -26,7 +26,7 @@
 
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
@@ -445,31 +445,10 @@ fn stt_worker(
     // has a `model` path set, so we don't need to set `model_type` explicitly.
     // (See rust-api-examples/parakeet_tdt_ctc_simulate_streaming_microphone.rs
     // in k2-fsa/sherpa-onnx.)
-    use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
-
-    let tokens_path = model_dir.join("tokens.txt");
-    let model_path = model_dir.join("model.int8.onnx");
-    if !tokens_path.exists() || !model_path.exists() {
-        eprintln!(
-            "buzz-desktop: STT model not found at {} — STT disabled",
-            model_dir.display()
-        );
-        drain_until_shutdown(audio_rx, &shutdown);
-        return;
-    }
-
-    let mut cfg = OfflineRecognizerConfig::default();
-    cfg.model_config.nemo_ctc.model = Some(model_path.to_string_lossy().into_owned());
-    cfg.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
-    cfg.model_config.num_threads = stt_num_threads();
-    // Explicit — defaults are not part of the API contract, and noisy debug
-    // logging in release builds would be expensive on every VAD chunk.
-    cfg.model_config.debug = false;
-
-    let recognizer = match OfflineRecognizer::create(&cfg) {
-        Some(r) => r,
-        None => {
-            eprintln!("buzz-desktop: OfflineRecognizer::create returned None — STT disabled");
+    let recognizer = match create_recognizer(&model_dir) {
+        Ok(r) => r,
+        Err(error) => {
+            eprintln!("buzz-desktop: {error} — STT disabled");
             drain_until_shutdown(audio_rx, &shutdown);
             return;
         }
@@ -749,6 +728,98 @@ fn flush_to_stt(
         return;
     }
     send_transcript(decode_speech(recognizer, speech_buf), text_tx);
+}
+
+/// Load the Parakeet recognizer from `model_dir`.
+fn create_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecognizer, String> {
+    use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
+
+    let tokens_path = model_dir.join("tokens.txt");
+    let model_path = model_dir.join("model.int8.onnx");
+    if !tokens_path.exists() || !model_path.exists() {
+        return Err(format!("STT model not found at {}", model_dir.display()));
+    }
+
+    let mut cfg = OfflineRecognizerConfig::default();
+    cfg.model_config.nemo_ctc.model = Some(model_path.to_string_lossy().into_owned());
+    cfg.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
+    cfg.model_config.num_threads = stt_num_threads();
+    // Explicit — defaults are not part of the API contract, and noisy debug
+    // logging in release builds would be expensive on every VAD chunk.
+    cfg.model_config.debug = false;
+
+    OfflineRecognizer::create(&cfg).ok_or_else(|| "OfflineRecognizer::create returned None".into())
+}
+
+/// Mono 16-bit PCM from a WAV the composer's voice-note encoder wrote
+/// (`voiceNoteWav.ts`): returns the sample rate and the samples in [-1, 1].
+fn parse_voice_note_wav(wav: &[u8]) -> Result<(i32, Vec<f32>), String> {
+    let u16_at = |at: usize| {
+        wav.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let u32_at = |at: usize| {
+        wav.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if wav.get(0..4) != Some(b"RIFF") || wav.get(8..12) != Some(b"WAVE") {
+        return Err("not a WAV file".into());
+    }
+    // Only the layout our own encoder writes: fmt at 12, data at 36.
+    if wav.get(12..16) != Some(b"fmt ")
+        || u16_at(20) != Some(1)
+        || u16_at(22) != Some(1)
+        || u16_at(34) != Some(16)
+        || wav.get(36..40) != Some(b"data")
+    {
+        return Err("not a mono 16-bit voice note".into());
+    }
+    let rate = u32_at(24)
+        .and_then(|r| i32::try_from(r).ok())
+        .filter(|r| *r > 0)
+        .ok_or("bad sample rate")?;
+    let len = u32_at(40).ok_or("truncated WAV")? as usize;
+    let data = wav.get(44..).ok_or("truncated WAV")?;
+    let data = &data[..len.min(data.len())];
+    let samples = data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| f32::from(i16::from_le_bytes(b)) / 32_768.0)
+        .collect();
+    Ok((rate, samples))
+}
+
+/// Transcribe a recorded voice note, so the message carries its words.
+///
+/// Decoded in 30-second windows, the same bound the huddle puts on one
+/// utterance, so a five-minute note never reaches Parakeet whole.
+// ponytail: fixed windows can split a word at a boundary; cut on VAD silence
+// if transcripts show it.
+pub fn transcribe_voice_note_wav(model_dir: &Path, wav: &[u8]) -> Result<String, String> {
+    let (rate, samples) = parse_voice_note_wav(wav)?;
+    let recognizer = create_recognizer(model_dir)?;
+    let window = rate as usize * (MAX_SPEECH_SAMPLES / 16_000);
+    // A last window of a few samples (a 30.01 s note) carries no words, and
+    // the huddle never decodes that little audio either (MIN_VOICED_FRAMES).
+    let shortest = rate as usize / 4;
+    let text = samples
+        .chunks(window)
+        .filter(|chunk| chunk.len() >= shortest)
+        .map(|chunk| {
+            let stream = recognizer.create_stream();
+            // sherpa-onnx resamples to the model's 16 kHz itself.
+            stream.accept_waveform(rate, chunk);
+            recognizer.decode(&stream);
+            stream
+                .get_result()
+                .map(|r| r.text.trim().to_string())
+                .unwrap_or_default()
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(text)
 }
 
 /// Run the Parakeet decode on a speech buffer and return the trimmed text.

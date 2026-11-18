@@ -2,7 +2,48 @@ use tauri::State;
 
 use crate::app_state::AppState;
 
-use super::{models, pipeline::maybe_start_stt_pipeline};
+use super::{models, pipeline::maybe_start_stt_pipeline, stt};
+
+/// A five-minute voice note is ~14.4 MB at the encoder's 24 kHz 16-bit mono.
+const MAX_VOICE_NOTE_WAV_BYTES: usize = 20 * 1024 * 1024;
+
+/// Transcribe a voice note the composer just recorded (raw WAV body).
+///
+/// A voice note is audio only, and agents read text: without this the agent
+/// gets a player it cannot hear. The composer puts the words in the message,
+/// where the sender can correct them before sending.
+///
+/// Errors say why in words the composer can show; the detail goes to the log.
+/// A missing model starts its download, so the next note can be transcribed.
+#[tauri::command]
+pub async fn transcribe_voice_note(
+    request: tauri::ipc::Request<'_>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected raw binary body".to_string());
+    };
+    if bytes.len() > MAX_VOICE_NOTE_WAV_BYTES {
+        return Err("the voice note is too long to transcribe".to_string());
+    }
+    let model_dir = models::stt_model_dir().filter(|_| models::is_stt_ready());
+    let Some(model_dir) = model_dir else {
+        let Some(manager) = models::global_model_manager() else {
+            return Err("the speech model isn't available on this computer".to_string());
+        };
+        manager.start_stt_download(state.http_client.clone());
+        return Err("the speech model isn't downloaded yet; it's downloading now".to_string());
+    };
+    let wav = bytes.to_vec();
+    tauri::async_runtime::spawn_blocking(move || stt::transcribe_voice_note_wav(&model_dir, &wav))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result)
+        .map_err(|detail| {
+            eprintln!("buzz-desktop: voice note transcription failed: {detail}");
+            "the speech model couldn't read it".to_string()
+        })
+}
 
 /// Start the STT pipeline for the active huddle.
 ///

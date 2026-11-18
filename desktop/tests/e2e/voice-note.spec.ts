@@ -68,6 +68,12 @@ test.beforeEach(async ({ page }, testInfo) => {
     sendMessageErrors: testInfo.title.includes("shows a send error")
       ? ["relay rejected voice note"]
       : undefined,
+    voiceNoteTranscript: testInfo.title.includes("its words")
+      ? "Tell me about PR nine twenty three"
+      : undefined,
+    voiceNoteTranscriptDelayMs: testInfo.title.includes("while transcribing")
+      ? 1_500
+      : undefined,
     uploadDescriptors: [
       {
         duration: 9.4,
@@ -103,6 +109,49 @@ test("restores the voice note and shows a send error after upload succeeds", asy
   await expect(
     page.getByText("Message failed to send: relay rejected voice note"),
   ).toBeVisible();
+});
+
+test("sends a voice note with its words as text, for agents", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+
+  await page.getByRole("button", { name: "Record voice note" }).click();
+  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await page.waitForTimeout(100);
+  await page.getByRole("button", { name: "Finish voice note" }).click();
+
+  await expect(page.getByTestId("composer-voice-note-card")).toBeVisible();
+  await expect(page.getByTestId("message-composer")).toContainText(
+    "Tell me about PR nine twenty three",
+  );
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "Tell me about PR nine twenty three",
+  );
+});
+
+test("its words: discarding while transcribing drops the audio and the words", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+
+  await page.getByRole("button", { name: "Record voice note" }).click();
+  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await page.waitForTimeout(100);
+  await page.getByRole("button", { name: "Finish voice note" }).click();
+  await expect(page.getByText("Preparing voice note…")).toBeVisible();
+  await page.getByRole("button", { name: "Discard voice note" }).click();
+
+  await expect(page.getByTestId("voice-note-recorder")).toHaveCount(0);
+  // Past the transcript's arrival: neither the card nor the words appear.
+  await page.waitForTimeout(2_000);
+  await expect(page.getByTestId("composer-voice-note-card")).toHaveCount(0);
+  await expect(page.getByTestId("message-composer")).not.toContainText(
+    "Tell me about PR nine twenty three",
+  );
 });
 
 test("keeps pasted snapshots and channel drops out of an active voice note", async ({

@@ -236,6 +236,10 @@ type MockBridgeOptions = {
   };
   /** Delay an invocation-time huddle snapshot to exercise hydration ordering. */
   huddleStateReadDelayMs?: number;
+  /** What `transcribe_voice_note` returns; default "" (no words heard). */
+  voiceNoteTranscript?: string;
+  /** Delay (ms) before `transcribe_voice_note` answers. */
+  voiceNoteTranscriptDelayMs?: number;
   /** Delay (ms) for `sync_agents_to_active_huddle` so e2e tests can hold the
    * send path open across a leg that writes nothing to the relay.
    * Releasable early via `__BUZZ_E2E_RELEASE_HUDDLE_AGENT_SYNCS__()`. */

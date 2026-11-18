@@ -7,6 +7,10 @@ import {
   VOICE_NOTE_MAX_DURATION_SECONDS,
 } from "@/features/messages/lib/audioAttachment";
 import { useVoiceNoteRecorder } from "@/features/messages/lib/useVoiceNoteRecorder";
+import {
+  transcribeVoiceNote,
+  voiceNoteWithoutWordsMessage,
+} from "@/features/messages/lib/voiceNoteTranscript";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import { VoiceNoteRecorder } from "./VoiceNoteRecorder";
 
@@ -14,19 +18,29 @@ export function useComposerVoiceNote({
   draftKey,
   editTargetId,
   media,
+  onTranscript,
   setEmojiPickerOpen,
   setFormattingOpen,
 }: {
   draftKey: string | null | undefined;
   editTargetId: string | null;
   media: MediaUploadController;
+  /** Puts a finished note's words in the composer, so they send as text. */
+  onTranscript: (text: string) => void;
   setEmojiPickerOpen: (open: boolean) => void;
   setFormattingOpen: (open: boolean) => void;
 }) {
   const recorder = useVoiceNoteRecorder();
   const limitReachedRef = React.useRef(false);
-  const statusRef = React.useRef(recorder.status);
-  statusRef.current = recorder.status;
+  // Transcribing keeps the recorder in "processing", so Send waits for the
+  // words instead of posting audio an agent cannot hear.
+  const [transcribing, setTranscribing] = React.useState(false);
+  const transcriptionRef = React.useRef(0);
+  const onTranscriptRef = React.useRef(onTranscript);
+  onTranscriptRef.current = onTranscript;
+  const status = transcribing ? "processing" : recorder.status;
+  const statusRef = React.useRef(status);
+  statusRef.current = status;
   const getAttachments = React.useCallback(
     () => ({
       pending: media.pendingImetaRef.current,
@@ -45,25 +59,61 @@ export function useComposerVoiceNote({
   currentContextRef.current = { draftKey, editTargetId };
   const recordingContextRef = React.useRef({ draftKey, editTargetId });
 
+  const cancel = React.useCallback(() => {
+    transcriptionRef.current += 1;
+    setTranscribing(false);
+    recorder.cancel();
+  }, [recorder.cancel]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: composer identity fields are the cancellation triggers
   React.useEffect(() => {
-    recorder.cancel();
+    cancel();
   }, [draftKey, editTargetId]);
 
   React.useEffect(() => {
     if (recorder.error) toast.error(recorder.error);
   }, [recorder.error]);
 
+  // A late transcript must never reach an unmounted composer.
+  React.useEffect(
+    () => () => {
+      transcriptionRef.current += 1;
+    },
+    [],
+  );
+
   const finish = React.useCallback(async () => {
     const recording = await recorder.stop();
-    const recordingContext = recordingContextRef.current;
-    const currentContext = currentContextRef.current;
-    if (
-      recording &&
-      recordingContext.draftKey === currentContext.draftKey &&
-      recordingContext.editTargetId === currentContext.editTargetId
-    ) {
+    const inRecordingContext = () =>
+      recordingContextRef.current.draftKey ===
+        currentContextRef.current.draftKey &&
+      recordingContextRef.current.editTargetId ===
+        currentContextRef.current.editTargetId;
+    if (!recording || !inRecordingContext()) return recording;
+    // Words first, then the audio: a Discard while transcribing (cancel bumps
+    // the token) drops both, and nothing lands in a draft it was not made in.
+    const transcription = ++transcriptionRef.current;
+    const current = () =>
+      transcription === transcriptionRef.current && inRecordingContext();
+    setTranscribing(true);
+    let text = "";
+    let failure: string | null = null;
+    try {
+      text = await transcribeVoiceNote(recording.file);
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    if (!current()) return null;
+    try {
       await media.uploadFile(recording.file);
+      if (!current()) return null;
+      if (text) onTranscriptRef.current(text);
+      else
+        toast.warning(
+          voiceNoteWithoutWordsMessage(failure ?? "no words were heard"),
+        );
+    } finally {
+      if (transcription === transcriptionRef.current) setTranscribing(false);
     }
     return recording;
   }, [recorder.stop, media.uploadFile]);
@@ -95,7 +145,6 @@ export function useComposerVoiceNote({
     void recorder.start();
   }, [finish, recorder.start]);
 
-  const cancel = recorder.cancel;
   const attachments = getAttachments();
   const hasAttachment =
     attachments.pending.some((attachment) =>
@@ -143,19 +192,21 @@ export function useComposerVoiceNote({
 
   return {
     ...recorder,
-    acceptsAttachment: recorder.status === "idle" && !hasAttachment,
+    cancel,
+    status,
+    acceptsAttachment: status === "idle" && !hasAttachment,
     hasAttachment,
     hasAttachmentRef,
-    isIdle: recorder.status === "idle",
+    isIdle: status === "idle",
     recorderElement:
-      recorder.status === "idle" ? null : (
+      status === "idle" ? null : (
         <VoiceNoteRecorder
           elapsedSeconds={recorder.elapsedSeconds}
           levels={recorder.levels}
           maxDurationSeconds={VOICE_NOTE_MAX_DURATION_SECONDS}
           onCancel={cancel}
-          processing={recorder.status === "processing"}
-          requesting={recorder.status === "requesting"}
+          processing={status === "processing"}
+          requesting={status === "requesting"}
         />
       ),
     statusRef,

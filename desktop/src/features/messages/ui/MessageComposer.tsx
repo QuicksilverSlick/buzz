@@ -161,10 +161,13 @@ function MessageComposerImpl({
   );
   const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
   const media = mediaController ?? internalMedia;
+  // The editor is created below; the ref lets the voice note reach it.
+  const insertTranscriptRef = React.useRef<(text: string) => void>(() => {});
   const voiceNote = useComposerVoiceNote({
     draftKey: effectiveDraftKey,
     editTargetId: editTarget?.id ?? null,
     media,
+    onTranscript: (text) => insertTranscriptRef.current(text),
     setFormattingOpen: setIsFormattingOpen,
     setEmojiPickerOpen: setIsEmojiPickerOpen,
   });
@@ -338,6 +341,12 @@ function MessageComposerImpl({
       }
     },
   });
+  insertTranscriptRef.current = (text) => {
+    const editor = richText.editor;
+    if (!editor || editor.isDestroyed) return;
+    const spacer = editor.getText().trim() ? " " : "";
+    editor.chain().focus("end").insertContent(`${spacer}${text}`).run();
+  };
   const linkEditor = useLinkEditor(richText);
   syncContentRefFromEditorRef.current = () => {
     const markdown = richText.getMarkdown();
