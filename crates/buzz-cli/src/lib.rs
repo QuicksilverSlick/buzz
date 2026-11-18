@@ -518,7 +518,8 @@ impl RespondToArg {
 pub enum AgentsCmd {
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
-        /// Current channel UUID; the new agent is added here after save
+        /// Current channel UUID; the new agent is added here after save (from a
+        /// DM: a new DM of the same people plus the agent)
         #[arg(long)]
         channel: String,
         /// Proposed agent name

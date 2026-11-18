@@ -190,37 +190,43 @@ export async function attachManagedAgentToChannel(
     (pubkey) => normalizePubkey(pubkey) === agentPubkey,
   );
 
-  let agent = input.agent;
-  let started = false;
-
-  if (ensureRunning) {
-    // Running agents (local or provider) auto-discover new channel membership
-    // via the harness's membership notifications — no restart needed. Only
-    // not-yet-running agents need a start/deploy call before the first mention
-    // can reach them. For a local agent the status check and the start are both
-    // pair-scoped to the active community: `agent.status` reflects that
-    // community's (agent, relay) pair, and `startManagedAgent` spawns that same
-    // pair — so this ensures the pair the caller is attaching to, never
-    // another community's.
-    const isRemote = input.agent.backend.type === "provider";
-    const needsStart = isRemote
-      ? input.agent.status !== "deployed"
-      : input.agent.status !== "running" && input.agent.status !== "deployed";
-    if (needsStart) {
-      if (input.detachedStart) {
-        input.detachedStart(input.agent);
-      } else {
-        agent = await startManagedAgent(input.agent.pubkey);
-        started = true;
-      }
-    }
-  }
+  const { agent, started } = ensureRunning
+    ? await ensureManagedAgentRunning(input.agent, input.detachedStart)
+    : { agent: input.agent, started: false };
 
   return {
     agent,
     membershipAdded,
     started,
   } satisfies AttachManagedAgentToChannelResult;
+}
+
+/**
+ * Starts (or deploys) an agent that isn't running yet, once it has joined a
+ * channel or DM. `detachedStart`: see `AttachManagedAgentToChannelInput`.
+ */
+export async function ensureManagedAgentRunning(
+  agent: ManagedAgent,
+  detachedStart?: (agent: ManagedAgent) => void,
+): Promise<{ agent: ManagedAgent; started: boolean }> {
+  // Running agents (local or provider) auto-discover new channel membership
+  // via the harness's membership notifications — no restart needed. Only
+  // not-yet-running agents need a start/deploy call before the first mention
+  // can reach them. For a local agent the status check and the start are both
+  // pair-scoped to the active community: `agent.status` reflects that
+  // community's (agent, relay) pair, and `startManagedAgent` spawns that same
+  // pair — so this ensures the pair the caller is attaching to, never
+  // another community's.
+  const isRemote = agent.backend.type === "provider";
+  const needsStart = isRemote
+    ? agent.status !== "deployed"
+    : agent.status !== "running" && agent.status !== "deployed";
+  if (!needsStart) return { agent, started: false };
+  if (detachedStart) {
+    detachedStart(agent);
+    return { agent, started: false };
+  }
+  return { agent: await startManagedAgent(agent.pubkey), started: true };
 }
 
 function buildChannelAgentName(runtimeId: string, runtimeLabel: string) {
