@@ -154,11 +154,15 @@ pub(crate) fn render_route_question(item: &Item, hhmm: &str) -> String {
         return String::new();
     };
     let (id, w) = (&item.id, &item.writer);
-    let theirs = item.answer.as_ref().filter(|a| a.by == r.by);
-    let chose = theirs
+    // Whichever key tapped it: the owner may tap on the phone and ask on the desktop.
+    let chose = (item.answer.as_ref())
         .and_then(|a| Some((a.option, item.options.get(a.option)?)))
         .map_or(String::new(), |(n, o)| {
-            format!(", after choosing {}. {}", n + 1, plain_text(o, usize::MAX))
+            format!(
+                " The card's current answer is {}. {}.",
+                n + 1,
+                plain_text(o, usize::MAX)
+            )
         });
     let links: Vec<String> = item
         .links
@@ -172,7 +176,7 @@ pub(crate) fn render_route_question(item: &Item, hhmm: &str) -> String {
     };
     format!(
         "Bench question \u{b7} {id}\nCard: {}\nThe owner asked a question in this thread at \
-         {hhmm}{chose}. Their message is event {}.\n\
+         {hhmm}. Their message is event {}.{chose}\n\
          Why you: the owner's routes.json sends questions on {w} cards to you ({w}-questions) \
          instead of the {w} route, so nobody else will answer.\n\
          Sources to start from: {sources}this card, {id}: grep state.json in the Bench folder \

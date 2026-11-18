@@ -1116,8 +1116,8 @@ fn render_route_question_text() {
         format!(
             "Bench question \u{b7} steward/hold-reset-870\n\
              Card: reset PR 870 waits for you: Ask members to sign in\n\
-             The owner asked a question in this thread at 09:12, after choosing 1. Ship it. \
-             Their message is event {ev}.\n\
+             The owner asked a question in this thread at 09:12. Their message is event \
+             {ev}. The card's current answer is 1. Ship it.\n\
              Why you: the owner's routes.json sends questions on steward cards to you \
              (steward-questions) instead of the steward route, so nobody else will answer.\n\
              Sources to start from: Pull request 870 {url} (a PR link names its repo), and this \
@@ -1225,8 +1225,8 @@ async fn a_question_beside_the_owners_tap_names_the_choice() {
     assert_eq!(tags(&n[0], "p"), [json!(["p", q])]);
     let r = b.s.items[ITEM].reply.clone().unwrap();
     assert!(content(&n[0]).contains(&format!(
-        "The owner asked a question in this thread at {}, after choosing 2. Move. Their \
-         message is event {}.",
+        "The owner asked a question in this thread at {}. Their message is event {}. The \
+         card's current answer is 2. Move.",
         local_hhmm(r.at),
         r1.id.to_hex()
     )));
