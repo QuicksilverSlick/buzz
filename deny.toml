@@ -16,8 +16,9 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     # chrono and humantime are unmaintained, not vulnerable (chrono maintainers
-    # announced the end of maintenance; humantime wraps chrono). chrono is a
-    # direct dependency of most buzz crates and of the desktop; humantime arrives
+    # announced the end of maintenance; humantime is listed in the same notice, and
+    # our humantime 2.3.0/2.4.0 has no dependencies). chrono is a direct dependency
+    # of many buzz crates and of the desktop; humantime arrives
     # only via mesh-llm → hf-xet → xet-runtime (root via buzz-mesh-smoke, desktop
     # via the mesh-llm feature). No maintained release exists; removal needs a
     # migration to `time` or `jiff`. Same entries as upstream block/buzz#9609.
@@ -82,21 +83,23 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
     { id = "RUSTSEC-2026-0368", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
     { id = "RUSTSEC-2026-0369", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 via tauri-plugin-updater extracts only after a signature check, and we ship .exe updates" },
-    # zip < 9.0.5, published 17 Nov 2026 (same ids as upstream block/buzz#9609): AES entries returned
+    # zip < 9.0.0 (0545-0547) and < 9.0.5 (0548), published 17 Nov 2026 (same ids as upstream
+    # block/buzz#9609): AES entries returned
     # without their auth code checked (0545, needs `aes-crypto`), extract() writing through symlinks
     # (0546, zip >= 7.2), legacy Shrink/Reduce/Implode preallocation (0547, needs `legacy-zip`, zip >= 5.1),
-    # and ZipStreamReader using local-header names (0548). zip 8.6.0 via mesh-llm v0.76.2 (root via
-    # buzz-mesh-smoke, desktop via the mesh-llm feature) is built with `deflate` only, and mesh-llm
-    # reads through ZipArchive, copies entries by hand, and never calls extract() or ZipStreamReader.
+    # and ZipStreamReader / read_zipfile_from_stream using local-header names (0548). zip 8.6.0 via
+    # mesh-llm v0.76.2 (root via buzz-mesh-smoke, desktop via the mesh-llm feature) is built with
+    # `deflate` only, and mesh-llm reads through ZipArchive, copies entries by hand via enclosed_name(),
+    # and never calls extract(), ZipStreamReader or read_zipfile_from_stream.
     # zip 4.6.1 via tauri-plugin-updater (desktop) has no AES code built in (its only deps are crc32fast,
     # indexmap, memchr and arbitrary), is outside 0546/0547's ranges, and the updater only calls
     # ZipArchive::extract after verify_signature() on .zip updates, while we ship signed .exe updates.
     # Remove on the mesh-llm v0.79 bump (it ships zip 9.0.5 but needs a mesh-llm-sdk `client`
     # migration) together with tauri-plugin-updater moving to zip >= 9.0.5.
     { id = "RUSTSEC-2026-0545", reason = "zip 8.6.0 via mesh-llm v0.76.2 and zip 4.6.1 via tauri-plugin-updater are built without aes-crypto, so AES entries are never decrypted" },
-    { id = "RUSTSEC-2026-0546", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries via enclosed_name(), never extracts; zip 4.6.1 is below the affected range" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 8.6.0 via mesh-llm v0.76.2 copies entries by hand via enclosed_name() and never calls extract(); zip 4.6.1 is below the affected range (>= 7.2.0)" },
     { id = "RUSTSEC-2026-0547", reason = "zip 8.6.0 via mesh-llm v0.76.2 is built without legacy-zip; zip 4.6.1 is below the affected range" },
-    { id = "RUSTSEC-2026-0548", reason = "neither zip 8.6.0 via mesh-llm v0.76.2 nor zip 4.6.1 via tauri-plugin-updater is read through ZipStreamReader" },
+    { id = "RUSTSEC-2026-0548", reason = "neither zip 8.6.0 via mesh-llm v0.76.2 nor zip 4.6.1 via tauri-plugin-updater is read through ZipStreamReader or read_zipfile_from_stream" },
     # zvariant / zvariant_derive / zbus_names: unmaintained, "no safe upgrade" (zbus issue 2043).
     # Linux-only D-Bus stack via notify-rust, tauri notification/opener/single-instance plugins
     # and the secret-service keyring store (desktop), and mesh-llm → keyring 4 (root).
