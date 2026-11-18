@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   allowlistChipMatches,
   allowlistChips,
+  allowlistReachabilityText,
+  allowlistWithoutSharedChannel,
   mergeAllowlist,
   parsePubkeyInput,
 } from "./respondToAllowlist.ts";
@@ -149,4 +151,100 @@ test("allowlistChipMatches finds a selected entry by name or key prefix", () => 
   // Short text lands inside a random key; only a key prefix may match.
   assert.equal(allowlistChipMatches(chip, HEX.slice(20, 24)), false);
   assert.equal(allowlistChipMatches(chip, HEX_NPUB.slice(20, 24)), false);
+});
+
+const AGENT = "c".repeat(64);
+const HEX_D = "d".repeat(64);
+
+function channel(channelType, memberPubkeys, archivedAt = null) {
+  return { channelType, archivedAt, memberPubkeys };
+}
+
+test("allowlistWithoutSharedChannel counts a shared stream and a shared forum", () => {
+  const channels = [
+    channel("stream", [AGENT, HEX_A]),
+    channel("forum", [HEX_B, AGENT]),
+  ];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel([HEX_A, HEX_B], AGENT, channels),
+    [],
+  );
+});
+
+test("allowlistWithoutSharedChannel ignores shared DMs, group or 1:1", () => {
+  // A partner can only mention their own agents in a DM on Desktop.
+  const channels = [
+    channel("dm", [AGENT, HEX_A, HEX_B]),
+    channel("dm", [AGENT, HEX_D]),
+  ];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel([HEX_A, HEX_B, HEX_D], AGENT, channels),
+    [HEX_A, HEX_B, HEX_D],
+  );
+});
+
+test("allowlistWithoutSharedChannel ignores a shared archived channel", () => {
+  const channels = [channel("stream", [AGENT, HEX_A], "2026-11-01T00:00:00Z")];
+  assert.deepEqual(allowlistWithoutSharedChannel([HEX_A], AGENT, channels), [
+    HEX_A,
+  ]);
+});
+
+test("allowlistWithoutSharedChannel flags people only in channels without the agent", () => {
+  const channels = [
+    channel("stream", [HEX_A, HEX_B]),
+    channel("stream", [AGENT, HEX_B]),
+  ];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel([HEX_A, HEX_B], AGENT, channels),
+    [HEX_A],
+  );
+});
+
+test("allowlistWithoutSharedChannel flags everyone when the agent is in no channel", () => {
+  const channels = [channel("stream", [HEX_A, HEX_B])];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel([HEX_A, HEX_B], AGENT, channels),
+    [HEX_A, HEX_B],
+  );
+  assert.deepEqual(allowlistWithoutSharedChannel([HEX_A], AGENT, []), [HEX_A]);
+});
+
+test("allowlistWithoutSharedChannel matches keys across case", () => {
+  const channels = [channel("stream", [AGENT.toUpperCase(), HEX_A])];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel([HEX_A_UPPER], AGENT, channels),
+    [],
+  );
+});
+
+test("allowlistWithoutSharedChannel keeps input spelling and order", () => {
+  const channels = [channel("stream", [AGENT, HEX_B])];
+  assert.deepEqual(
+    allowlistWithoutSharedChannel(
+      [HEX_D, HEX_A_UPPER, HEX_B],
+      AGENT.toUpperCase(),
+      channels,
+    ),
+    [HEX_D, HEX_A_UPPER],
+  );
+});
+
+test("allowlistReachabilityText names nobody, one, two, or a few and a count", () => {
+  const tail =
+    "in a channel with this agent yet, so there's nowhere for them to reach it. Add them to one of its channels.";
+  assert.equal(allowlistReachabilityText([]), null);
+  assert.equal(allowlistReachabilityText(["Chris"]), `Chris isn't ${tail}`);
+  assert.equal(
+    allowlistReachabilityText(["Chris", "Craig"]),
+    `Chris and Craig aren't ${tail}`,
+  );
+  assert.equal(
+    allowlistReachabilityText(["A", "B", "C"]),
+    `A, B and C aren't ${tail}`,
+  );
+  assert.equal(
+    allowlistReachabilityText(["A", "B", "C", "D", "E"]),
+    `A, B and 3 others aren't ${tail}`,
+  );
 });
