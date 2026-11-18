@@ -3410,6 +3410,7 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+    let turn_started_at = unix_now_secs();
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -3616,6 +3617,15 @@ pub async fn run_prompt_task(
             }
         }
     };
+
+    // The owner's unanswered question first: checked before the refusal
+    // notice below, which is the agent's kind 9 too and would read as a reply.
+    let reply_text = agent.acp.take_turn_reply_text();
+    if let (Some(channel_id), Some(b), Ok(StopReason::EndTurn)) =
+        (source.channel_id(), batch.as_ref(), &prompt_result)
+    {
+        post_reply_if_silent(&ctx, channel_id, b, turn_started_at, reply_text).await;
+    }
 
     // Tell the channel what was refused, before anything else reports on the
     // turn.
@@ -5875,6 +5885,119 @@ pub(crate) async fn post_notice(
     }
 }
 
+/// Kinds that count as the agent answering in a channel. Reactions do not:
+/// the harness adds its own 👀 to every event it picks up.
+const REPLY_KINDS: [u32; 6] = [
+    buzz_core::kind::KIND_STREAM_MESSAGE,
+    buzz_core::kind::KIND_STREAM_MESSAGE_V2,
+    buzz_core::kind::KIND_STREAM_MESSAGE_EDIT,
+    buzz_core::kind::KIND_STREAM_MESSAGE_DIFF,
+    buzz_core::kind::KIND_FORUM_POST,
+    buzz_core::kind::KIND_FORUM_COMMENT,
+];
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The owner's last chat message in `batch`: the owner waiting on a reply.
+/// Bench notices and other owner-signed automation do not count
+/// ([`crate::owner_dm::is_owner_message`]).
+fn owner_question<'a>(batch: &'a FlushBatch, agent: &str, owner: &str) -> Option<&'a nostr::Event> {
+    batch
+        .events
+        .iter()
+        .rev()
+        .map(|be| &be.event)
+        .find(|event| crate::owner_dm::is_owner_message(event, agent, owner))
+}
+
+/// Post the agent's answer when it ended a turn without sending one.
+///
+/// An agent replies by running `buzz messages send`. One that writes its
+/// answer as the turn's final text instead ends the turn normally, the typing
+/// indicator stops, and the person who asked gets nothing (Bench Assistant,
+/// 18 Nov 2026 03:12 UTC). So after an `end_turn` on the owner's question in
+/// their one-on-one DM, ask the relay whether the agent posted there since
+/// the turn began; if not, post its last words for it.
+///
+/// Only there. Elsewhere silence can be the job (the Factory Steward ends a
+/// tick wake or a Bench notice with nothing to say), and a guest could read
+/// final text that was never written for them. In the owner's DM nobody else
+/// reads it, and a question with no answer is never what the owner wants.
+///
+/// A turn that ends with no text and no post stays silent: that is an agent
+/// choosing not to answer ("thanks"), which the base prompt allows, and the
+/// base prompt tells it to end with no text when it means to.
+///
+/// If the relay cannot be asked, nothing is posted: a duplicate answer is
+/// worse than the rare miss, which the log records.
+// ponytail: `since` is whole seconds, so a reply from the previous turn in
+// the turn's first second counts as this turn's. Narrow with event ids if seen.
+async fn post_reply_if_silent(
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    batch: &FlushBatch,
+    since: u64,
+    reply_text: String,
+) {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    if reply_text.is_empty() {
+        return;
+    }
+    let Some(owner) = ctx.agent_owner_pubkey.map(|pk| pk.to_hex()) else {
+        return;
+    };
+    let rest = &ctx.rest_client;
+    let agent = rest.keys.public_key();
+    let agent_hex = agent.to_hex();
+    let Some(asked) = owner_question(batch, &agent_hex, &owner) else {
+        return;
+    };
+    if !crate::owner_dm::channel_is_owner_dm(&ctx.channel_info, channel_id, &agent_hex, &owner)
+        .await
+    {
+        return;
+    }
+    let filter = nostr::Filter::new()
+        .kinds(REPLY_KINDS.map(|k| nostr::Kind::Custom(k as u16)))
+        .author(agent)
+        .custom_tags(
+            SingleLetterTag::lowercase(Alphabet::H),
+            [channel_id.to_string()],
+        )
+        .since(nostr::Timestamp::from(since))
+        .limit(1);
+    match timeout(
+        CONTEXT_FETCH_TIMEOUT,
+        rest.query(std::slice::from_ref(&filter)),
+    )
+    .await
+    {
+        Ok(Ok(json)) if json.as_array().is_some_and(Vec::is_empty) => {}
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "could not check the turn's reply: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "checking the turn's reply timed out");
+            return;
+        }
+    }
+    tracing::warn!(
+        target: "pool::prompt",
+        channel = %channel_id,
+        "owner's question ended without a reply — posting the agent's last words"
+    );
+    let thread_tags =
+        crate::queue::notice_thread_tags(asked, crate::queue::parse_thread_tags(asked));
+    post_notice(rest, channel_id, &thread_tags, &reply_text, &[]).await;
+}
+
 /// Build the signed notice event published by [`post_notice`].
 pub(crate) fn build_failure_notice_event(
     keys: &nostr::Keys,
@@ -6037,6 +6160,45 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn only_the_owner_talking_is_a_question_waiting_on_a_reply() {
+        let owner = Keys::generate();
+        let agent = Keys::generate().public_key().to_hex();
+        let owner_hex = owner.public_key().to_hex();
+        let said = |tags: Vec<Vec<String>>, keys: &Keys| {
+            let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
+            EventBuilder::new(Kind::Custom(9), "PR nine twenty three?")
+                .tags(tags)
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let mut batch = batch_with_scope(scope.clone(), said(vec![], &owner));
+        let question = batch.events[0].event.id;
+        // A Bench notice is owner-signed but marked: it is for the tick.
+        batch.events.push(batch_event(said(
+            vec![
+                vec!["p".into(), agent.clone()],
+                vec!["client".into(), "bench:reply".into()],
+            ],
+            &owner,
+        )));
+        assert_eq!(
+            super::owner_question(&batch, &agent, &owner_hex).map(|e| e.id),
+            Some(question),
+            "the owner's own words, not the notice after them"
+        );
+
+        let guest = batch_with_scope(
+            scope,
+            said(vec![vec!["p".into(), agent.clone()]], &Keys::generate()),
+        );
+        assert!(super::owner_question(&guest, &agent, &owner_hex).is_none());
+    }
+
     #[test]
     fn a_refusal_notice_names_what_stopped_and_what_to_do() {
         let text = super::permission_refusal_notice_text(&["Bash".to_string()]);
