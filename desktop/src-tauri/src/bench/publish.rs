@@ -492,8 +492,10 @@ pub(super) async fn publish(
 
     // (a3) Tell the writer's route target of a settled answer change, and of
     // each new free-text reply on the card, in the card's thread so the
-    // board stays newest. `routed` lands only once the relay took the notice,
-    // so a failed post is retried next tick.
+    // board stays newest; the owner's own question on a #bench card goes to
+    // the writer's questions route (`<writer>-questions`) instead. `routed`
+    // lands only once the relay took the notice, so a failed post is retried
+    // next tick.
     for id in s.items.keys().cloned().collect::<Vec<_>>() {
         let item = s.items[&id].clone();
         let ch = card_channel(s, &item);
@@ -504,16 +506,40 @@ pub(super) async fn publish(
         else {
             continue;
         };
-        if item
-            .stamp
-            .iter()
-            .flat_map(|st| &st.answerers)
-            .any(|a| a.pk == to)
-        {
+        let answers = |k: &str| {
+            item.stamp
+                .iter()
+                .flat_map(|st| &st.answerers)
+                .any(|a| a.pk == k)
+        };
+        if answers(&to) {
             s.unroutable
                 .push(format!("{id}: route target is an answerer on this card"));
             continue;
         }
+        // buzz-acp posts the answer to a df-ask notice itself, so only the
+        // owner's question on a #bench card goes to the questions route,
+        // never a Why? line (a reason, like a tap) or the writer's agent. A
+        // route that cannot take it is an alarm while it stands, and the
+        // writer's route target hears the question, as before.
+        let qs = format!("{}-questions", item.writer);
+        let asked = item
+            .reply
+            .as_ref()
+            .is_some_and(|r| ch == s.channel_id && owner_set.contains(&r.by) && !r.why);
+        let ask = match routes.get(&qs).filter(|_| asked) {
+            Some(q) if !joined(s, &ch).contains(q) => Err("not joined to #bench".to_string()),
+            Some(q) if answers(q) => Err("an answerer on a card the owner asked on".to_string()),
+            Some(q) if *q == to => Err(format!("the same agent as the {} route", item.writer)),
+            q => Ok(q.cloned()),
+        };
+        let ask = ask.unwrap_or_else(|why| {
+            let alarm = format!("{qs}: {why}");
+            if !s.unroutable.contains(&alarm) {
+                s.unroutable.push(alarm);
+            }
+            None
+        });
         // A channel no longer ready is not read either (an untap there is
         // unseen), so its answers wait, like a held card's.
         if now < s.routes_held_until || s.held.contains(&id) || !channel_ready(s, &item) {
@@ -646,21 +672,8 @@ pub(super) async fn publish(
         if !spend(budget, 1) {
             return Ok(());
         }
-        // A question goes to the writer's questions route, if the owner set
-        // one that is in this channel and may not answer the card. A Why?
-        // line is a reason, like a tap, so it stays the writer's.
-        let ask = routes
-            .get(&format!("{}-questions", item.writer))
-            .filter(|q| !r.why && joined(s, &ch).contains(q))
-            .filter(|q| {
-                !item
-                    .stamp
-                    .iter()
-                    .flat_map(|st| &st.answerers)
-                    .any(|a| a.pk == **q)
-            });
         let when = local_when(r.at, now);
-        let (text, ping) = match ask {
+        let (text, ping) = match &ask {
             Some(q) => (item::render_route_question(&item, &when), [q.as_str()]),
             None => (item::render_route_reply(&item, &when), ping),
         };
