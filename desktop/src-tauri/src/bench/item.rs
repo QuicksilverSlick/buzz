@@ -212,7 +212,8 @@ pub(crate) enum AnswerSource {
 }
 
 /// The newest free-text reply on a scoped or routed card from someone who
-/// may answer it: their "Other", routed to the writer like an answer.
+/// may answer it: their "Other", routed to the writer like an answer, or
+/// the owner's question on a #bench card to the writer's questions route.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Reply {
@@ -224,6 +225,10 @@ pub(crate) struct Reply {
     /// The reply's own created_at, never past the Bench clock.
     pub at: u64,
     pub hhmm: String,
+    /// It carries the desktop's Why? marker (`reply_card`): a reason, so it
+    /// stays with the writer's route, never a questions route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub why: bool,
 }
 
 /// Who may answer a scoped card, resolved by the service (`roles::stamp`)
@@ -1265,8 +1270,8 @@ pub(crate) use super::pick::{
     refused_taps, root_until, tell_reply,
 };
 pub(crate) use super::route::{
-    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_reply,
-    route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
+    owner_route, render_owner_ended, render_owner_withdrawal, render_route, render_route_question,
+    render_route_reply, route_due, OwnerSent, Routed, ROUTE_SETTLE_SECS,
 };
 
 /// Board text. Stale and superseded items are folded (not rendered).

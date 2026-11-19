@@ -229,6 +229,31 @@ pub(crate) fn pick_reply<'e>(
         .max_by_key(|e| (e.created_at.as_secs(), e.id.to_hex()))
 }
 
+impl Reply {
+    /// The picked reply `e` as the card's Other, by `by` at `at`.
+    pub(crate) fn of(
+        e: &nostr::Event,
+        by: String,
+        by_name: Option<String>,
+        role: Option<AnswerRole>,
+        at: u64,
+    ) -> Reply {
+        let why = e
+            .tags
+            .iter()
+            .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "client" && v == "bench:why"));
+        Reply {
+            event_id: e.id.to_hex(),
+            by,
+            by_name,
+            role,
+            at,
+            hhmm: super::local_hhmm(at),
+            why,
+        }
+    }
+}
+
 /// Whether a newly picked reply `e` (its time `at`) is for the route target
 /// to be told of. Not one that tags anyone but the writer and the owner's
 /// keys: tags pick who answers, and a route target it tags hears it itself.

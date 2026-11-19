@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::answers::{last_query, outbox, posted, reply, tap, ITEM};
-use super::channels::{bound_bench, thread_reply, ASK};
+use super::channels::{bound_bench, hex, tags, thread_reply, ASK, X};
 use super::*;
 
 /// The owner's answer, as the owner's own message.
@@ -759,6 +759,7 @@ fn replies_are_read_while_the_route_target_can_be_told() {
         role: None,
         at: 1,
         hhmm: String::new(),
+        why: false,
     });
     assert!(reads_replies(&s, &item, &BTreeMap::new()));
 }
@@ -1060,4 +1061,332 @@ async fn the_reply_file_goes_when_the_card_closes_or_is_replaced() {
     b.tick().await.unwrap();
     assert_eq!(b.card(ITEM).event_id, newer.id.to_hex());
     assert_eq!(reply_file(&b, ITEM), None);
+}
+
+/// The hold card with the owner's questions route for its writer: A hears
+/// taps, Q hears questions, both joined and the join's hold over.
+async fn ask_bench() -> (Bench, String, String, String) {
+    let (mut b, card) = hold_bench().await;
+    let a = Keys::generate().public_key().to_hex();
+    let q = Keys::generate().public_key().to_hex();
+    b.ctx.agents = vec![a.clone(), q.clone()];
+    let routes = json!({ "orchestrator": a, "orchestrator-questions": q });
+    std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
+    b.tick().await.unwrap();
+    b.now += ROUTE_SETTLE_SECS;
+    (b, a, q, card)
+}
+
+#[test]
+fn render_route_question_text() {
+    let url = "https://github.com/QuicksilverSlick/Metabolic-reset/pull/870";
+    let drop = drop_json(&[
+        (
+            "title",
+            json!("reset PR 870 waits for you: Ask members to sign in"),
+        ),
+        ("decision", json!("steward-hold")),
+        ("recommend", json!(1)),
+        (
+            "options",
+            json!(["Ship it", "Send it back", "Keep holding"]),
+        ),
+        ("links", json!([{"label": "Pull request 870", "url": url}])),
+    ]);
+    let mut item = validate("steward", "hold-reset-870", &drop, NOW).unwrap();
+    let (by, ev) = ("cd".repeat(32), "ab".repeat(32));
+    item.reply = Some(Reply {
+        event_id: ev.clone(),
+        by: by.clone(),
+        by_name: None,
+        role: None,
+        at: 1,
+        hhmm: String::new(),
+        why: false,
+    });
+    // The owner tapped Ship it, then asked: the choice is named.
+    item.answer = Some(Answer {
+        by: by.clone(),
+        option: 0,
+        ..Default::default()
+    });
+    let text = render_route_question(&item, "09:12");
+    assert_eq!(
+        text,
+        format!(
+            "Bench question \u{b7} steward/hold-reset-870\n\
+             Card: reset PR 870 waits for you: Ask members to sign in\n\
+             The owner asked a question in this thread at 09:12. Their message is event \
+             {ev}. The card's current answer is 1. Ship it.\n\
+             Why you: the owner's routes.json sends questions on steward cards to you \
+             (steward-questions) instead of the steward route, so nobody else will answer.\n\
+             Sources to start from: Pull request 870 {url} (a PR link names its repo), and this \
+             card, steward/hold-reset-870: grep state.json in the Bench folder for that id, as \
+             the file is large.\n\
+             Answer in this thread: say what this card is, where it came from and why, and link \
+             every source you used (the PR, its Factory-Task, Built-by and Claude-Account lines, \
+             what triggered it). Mention the owner so he sees it.\n\
+             Answer only. Never tap, label, rerun, merge, close, re-drop or clear this card, even \
+             when the question asks for an action: point to the card's buttons instead. If the \
+             card says a reply does something (for example, stops a line), tell the owner it \
+             did. If the message is not a question (a thanks, say), end the turn with no text."
+        )
+    );
+    assert!(!text.contains(['<', '>']) && !text.contains(&by));
+    // No answer of theirs, no choice; with no links, the card only.
+    item.answer = None;
+    item.links.clear();
+    let text = render_route_question(&item, "09:12");
+    assert!(text.contains(" at 09:12. Their message is event "));
+    assert!(text.contains(
+        "\nSources to start from: this card, steward/hold-reset-870: grep state.json in the \
+         Bench folder for that id, as the file is large.\n"
+    ));
+}
+
+/// Owner decision, 18 Nov 2026: the owner's question on a #bench card goes
+/// to the writer's questions route (`<writer>-questions` in routes.json),
+/// which says where the card came from and why; taps stay with the writer's
+/// route target.
+#[tokio::test]
+async fn a_question_goes_to_the_questions_route_and_a_tap_to_the_writers() {
+    let (mut b, a, q, card) = ask_bench().await;
+    let r1 = thread_reply(&b.ctx.owner, &card, "Where is this from?", b.now, &[]);
+    reply(&b, &[&r1]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let (ev, id) = (&n[0], r1.id.to_hex());
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert_eq!(
+        content(ev),
+        render_route_question(&b.s.items[ITEM], &local_hhmm(r.at))
+            + &thread_line(&b.channel(), &card)
+    );
+    assert!(content(ev).starts_with(&format!("Bench question \u{b7} {ITEM}\n")));
+    assert_eq!(tags(ev, "p"), [json!(["p", q])]);
+    assert_eq!(tags(ev, "df-ask"), [json!(["df-ask", id])]);
+    assert_eq!(
+        tags(ev, "df-answer"),
+        [json!(["df-answer", "other", b.owner_hex(), id])]
+    );
+    assert_eq!(
+        tag_value(ev, "client").unwrap(),
+        format!("bench:route:{ITEM}@r{}", &id[..16])
+    );
+    assert_eq!(b.s.items[ITEM].routed_reply, Some(id));
+    // The owner's tap goes to A, as the owner's own message.
+    let stay = tap(&b.ctx.owner, &card, OPTION_EMOJI[0], b.now);
+    reply(&b, &[&r1, &stay]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    assert!(notices(&b, before).is_empty());
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose(&card, "Stay"));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+}
+
+/// A Why? line is a reason, not a question: it stays with the writer's
+/// route target, as today.
+#[tokio::test]
+async fn a_why_line_stays_with_the_writers_route() {
+    let (mut b, a, _q, card) = ask_bench().await;
+    let before = b.posts().len();
+    let text = "Waiting on the relay quote";
+    crate::bench::commands::reply_card(&b.ctx, &b.s, ITEM, &card, text, b.now)
+        .await
+        .unwrap();
+    let why: nostr::Event = serde_json::from_value(b.posts()[before].0.clone()).unwrap();
+    reply(&b, &[&why]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert!(r.why);
+    assert_eq!(
+        content(&n[0]),
+        render_route_reply(&b.s.items[ITEM], &local_hhmm(r.at)) + &thread_line(&b.channel(), &card)
+    );
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+    assert!(tags(&n[0], "df-ask").is_empty());
+}
+
+/// A question beside the owner's own tap still goes to Q, naming the
+/// choice; the tap goes to A once it settles.
+#[tokio::test]
+async fn a_question_beside_the_owners_tap_names_the_choice() {
+    let (mut b, a, q, card) = ask_bench().await;
+    let mv = tap(&b.ctx.owner, &card, OPTION_EMOJI[1], b.now);
+    let r1 = thread_reply(&b.ctx.owner, &card, "Who opened this?", b.now, &[]);
+    reply(&b, &[&mv, &r1]);
+    let before = b.posts().len();
+    b.settle(2).await;
+    let n = notices(&b, before);
+    assert_eq!(n.len(), 1, "the answer waits for the settle");
+    assert_eq!(tags(&n[0], "p"), [json!(["p", q])]);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert!(content(&n[0]).contains(&format!(
+        "The owner asked a question in this thread at {}. Their message is event {}. The \
+         card's current answer is 2. Move.",
+        local_hhmm(r.at),
+        r1.id.to_hex()
+    )));
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert_eq!(content(&n[0]), chose(&card, "Move"));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+}
+
+/// The owner's question on a card in a bound channel is not a #bench one:
+/// the writer's route target hears it, with no df-ask and no alarm, though
+/// the questions route is in that channel too.
+#[tokio::test]
+async fn a_question_on_a_bound_card_goes_to_the_writers_route() {
+    let (mut b, p, list) = bound_bench().await;
+    let (card, agent) = (b.card(ASK).event_id, hex(&p.agent));
+    let q = Keys::generate().public_key().to_hex();
+    b.ctx.agents = vec![agent.clone(), q.clone()];
+    let routes = json!({ "reset-worker": agent, "reset-worker-questions": q });
+    std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
+    b.tick().await.unwrap();
+    assert!(b.s.members_added.contains(&q));
+    b.s.joined.get_mut(X).unwrap().push(q.clone());
+    let r1 = thread_reply(&b.ctx.owner, &card, "Where is this from?", b.now, &[]);
+    reply(&b, &[&list, &r1]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).starts_with(&format!("Bench reply \u{b7} {ASK}\n")));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", agent])]);
+    assert!(tags(&n[0], "df-ask").is_empty() && b.s.unroutable.is_empty());
+}
+
+/// A questions route on the writer's own agent gets no df-ask, which would
+/// have buzz-acp post that agent's final text: it hears the question as
+/// today, the alarm stands meanwhile, and repliesTold (which matches
+/// `<writer>: `) does not read it as the writer's route refused.
+#[tokio::test]
+async fn a_questions_route_on_the_writers_agent_is_an_alarm() {
+    let (mut b, a, _q, card) = ask_bench().await;
+    let routes = json!({ "orchestrator": a, "orchestrator-questions": a });
+    std::fs::write(b.root.join("routes.json"), routes.to_string()).unwrap();
+    let r1 = thread_reply(&b.ctx.owner, &card, "Where is this from?", b.now, &[]);
+    reply(&b, &[&r1]);
+    let n = settle_past(&mut b, 2).await;
+    assert_eq!(n.len(), 1);
+    let r = b.s.items[ITEM].reply.clone().unwrap();
+    assert_eq!(
+        content(&n[0]),
+        render_route_reply(&b.s.items[ITEM], &local_hhmm(r.at)) + &thread_line(&b.channel(), &card)
+    );
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+    assert!(tags(&n[0], "df-ask").is_empty());
+    let alarm = "orchestrator-questions: the same agent as the orchestrator route";
+    assert_eq!(b.s.unroutable, [alarm]);
+    save_state(&b.root, &b.s, &mut String::new()).unwrap();
+    let snap = serde_json::to_value(crate::bench::commands::cards(&b.root)).unwrap();
+    let items = snap["items"].as_array().unwrap();
+    let card = items.iter().find(|i| i["id"] == ITEM).unwrap();
+    assert_eq!(card["repliesTold"], json!(true));
+}
+
+/// publish alone, as the tick calls it, with `routes` and `by`'s `text` as
+/// the card's newest reply (`named` when it is not the owner's): for what
+/// no tick reaches on a #bench card, where bootstrap joins every route
+/// target first and only the owner may reply. The notices it posted.
+async fn publish_reply(
+    b: &mut Bench,
+    routes: [(&str, &str); 2],
+    by: &Keys,
+    named: Option<&str>,
+    text: &str,
+) -> Vec<Value> {
+    let r = thread_reply(by, &b.card(ITEM).event_id, text, b.now, &[]);
+    let (name, role) = (
+        named.map(str::to_string),
+        named.map(|_| AnswerRole::Decider),
+    );
+    b.s.items.get_mut(ITEM).unwrap().reply = Some(Reply::of(&r, hex(by), name, role, b.now));
+    let routes = BTreeMap::from(routes.map(|(w, k)| (w.to_string(), k.to_string())));
+    let (before, owner) = (b.posts().len(), [b.owner_hex()]);
+    let (budget, now) = (&mut 10, b.now);
+    crate::bench::publish::publish(
+        &b.ctx,
+        &mut b.s,
+        budget,
+        now,
+        "09:00",
+        &routes,
+        &owner,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
+    notices(b, before)
+}
+
+/// A stamped answerer's reply is not the owner's question: the writer's
+/// route target hears it, with no df-ask and no alarm.
+#[tokio::test]
+async fn an_answerers_question_goes_to_the_writers_route() {
+    let (mut b, a, q, _card) = ask_bench().await;
+    let craig = Keys::generate();
+    b.s.items.get_mut(ITEM).unwrap().stamp = Some(Stamp {
+        answerers: vec![Answerer {
+            pk: hex(&craig),
+            name: "Craig".to_string(),
+            role: AnswerRole::Decider,
+            agent: false,
+        }],
+        ..Default::default()
+    });
+    let routes = [
+        ("orchestrator", a.as_str()),
+        ("orchestrator-questions", q.as_str()),
+    ];
+    let n = publish_reply(&mut b, routes, &craig, Some("Craig"), "Where is this from?").await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).starts_with(&format!("Bench reply \u{b7} {ITEM}\n")));
+    assert!(content(&n[0]).contains("\nCraig (decider) replied in this thread at "));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+    assert!(tags(&n[0], "df-ask").is_empty() && b.s.unroutable.is_empty());
+}
+
+/// A questions route not joined to #bench, or one that may answer the card,
+/// is an alarm, and the writer's route target hears the question as today.
+#[tokio::test]
+async fn a_questions_route_that_cannot_take_it_is_an_alarm_and_falls_back() {
+    let (mut b, a, q, _card) = ask_bench().await;
+    let routes = [
+        ("orchestrator", a.as_str()),
+        ("orchestrator-questions", q.as_str()),
+    ];
+    let owner = b.ctx.owner.clone();
+    b.s.members_added.retain(|k| *k != q);
+    let n = publish_reply(&mut b, routes, &owner, None, "Where is this from?").await;
+    assert_eq!(n.len(), 1);
+    assert!(content(&n[0]).starts_with(&format!("Bench reply \u{b7} {ITEM}\n")));
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a.clone()])]);
+    assert!(tags(&n[0], "df-ask").is_empty());
+    assert_eq!(
+        b.s.unroutable,
+        ["orchestrator-questions: not joined to #bench"]
+    );
+    b.s.members_added.push(q.clone());
+    b.s.unroutable.clear();
+    b.s.items.get_mut(ITEM).unwrap().stamp = Some(Stamp {
+        answerers: vec![Answerer {
+            pk: q.clone(),
+            name: "Bench Assistant".to_string(),
+            role: AnswerRole::Decider,
+            agent: true,
+        }],
+        ..Default::default()
+    });
+    let n = publish_reply(&mut b, routes, &owner, None, "Who opened it?").await;
+    assert_eq!(n.len(), 1);
+    assert_eq!(tags(&n[0], "p"), [json!(["p", a])]);
+    assert!(tags(&n[0], "df-ask").is_empty());
+    assert_eq!(
+        b.s.unroutable,
+        ["orchestrator-questions: an answerer on a card the owner asked on"]
+    );
 }
