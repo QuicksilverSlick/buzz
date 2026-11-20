@@ -157,6 +157,10 @@ pub struct SessionState {
     /// pool uses this fence to discard that stale provider session before the
     /// worker becomes claimable again.
     scope_owner_generations: HashMap<SessionScope, u64>,
+    /// Scopes reset because an owner turn followed a guest's words. The new
+    /// session's first prompt fetches recent history once, labelled owner or
+    /// guest, and takes its scope out of here.
+    pub(crate) history_after_guest: HashSet<SessionScope>,
 }
 
 impl SessionState {
@@ -3241,7 +3245,10 @@ pub async fn run_prompt_task(
         let channel_info = resolved_channel_info.clone();
 
         let is_dm = prompt_is_dm;
-        let context_target = resolve_context_target(b, is_dm);
+        // A session reset after a guest's words has no memory of the talk: fetch
+        // the recent history once, as a DM would (the same query fits any channel).
+        let refetch_history = agent.state.history_after_guest.remove(&b.scope);
+        let context_target = resolve_context_target(b, is_dm || refetch_history);
         let hydrated_thread_root = match &context_target {
             ContextTarget::Thread(root) => Some(root),
             ContextTarget::Dm | ContextTarget::None => None,
@@ -3324,11 +3331,13 @@ pub async fn run_prompt_task(
         // allowlisted collaborator. `None` here means the harness never learned
         // an owner, and every author is then reported as `guest`.
         let owner_hex = ctx.agent_owner_pubkey.as_ref().map(|pk| pk.to_hex());
+        let agent_hex = ctx.agent_keys.public_key().to_hex();
 
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
                 owner_pubkey_hex: owner_hex.as_deref(),
+                agent_pubkey_hex: Some(&agent_hex),
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
                 channel_info: channel_info.as_ref(),
