@@ -5880,22 +5880,29 @@ pub(crate) fn permission_refusal_notice_text(tools: &[String]) -> String {
 ///
 /// Best-effort by design: the caller must not be blocked waiting on the relay,
 /// and a notice that cannot be delivered must not take the turn down with it.
+/// Returns whether the relay accepted it.
 pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
     mentions: &[String],
-) {
+) -> bool {
     let Some(event) =
         build_failure_notice_event(&rest.keys, channel_id, thread_tags, content, mentions)
     else {
-        return;
+        return false;
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "notice timed out"),
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "notice failed: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "notice timed out");
+            false
+        }
     }
 }
 
