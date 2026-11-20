@@ -615,6 +615,11 @@ mod inbound_author_gate {
         if is_dm {
             return match respond_to {
                 RespondTo::Nobody => Some(false),
+                // Owner decision 15 Nov 2026: people on the allowlist may DM the agent. The check is
+                // still on the author, so a stranger in the same DM gets nothing. `anyone` stays
+                // owner-only in DMs (upstream #2591: an agent can be asked to open a DM with anyone).
+                // Deliberate divergence from upstream: keep this arm on the next upstream sync.
+                RespondTo::Allowlist if allowlist.contains(author) => Some(true),
                 _ => owner_or_sibling(author, owner_cache, rest_client).await,
             };
         }
@@ -3470,8 +3475,10 @@ async fn run_harness(
     // reply per refused event lets a noisy author turn the agent into a
     // flooder. Bounded because this process is long-lived and the key space is
     // attacker-controlled — on overflow we clear and allow one more notice per
-    // pair rather than growing without limit.
-    let mut gate_notified: HashSet<(Uuid, String)> = HashSet::new();
+    // pair rather than growing without limit. A pair is claimed while its
+    // notice posts and kept once the relay accepted it; a first failure
+    // releases it once (`settle_refusal_notice`).
+    let gate_notified: Arc<std::sync::Mutex<RefusalMemo>> = Arc::default();
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
@@ -4265,6 +4272,7 @@ async fn run_harness(
                             let inbound_channel_id = buzz_event.channel_id;
                             let inbound_kind = buzz_event.event.kind.as_u16();
                             let inbound_author = buzz_event.event.pubkey.to_hex();
+                            let inbound_event_id = buzz_event.event.id.to_hex();
                             let inbound_thread_tags = queue::notice_thread_tags(
                                 &buzz_event.event,
                                 queue::parse_thread_tags(&buzz_event.event),
@@ -4283,6 +4291,7 @@ async fn run_harness(
                             )
                             .await;
                             let refusal = authorized.as_ref().err().copied();
+                            let ledgered = inbound_mention.is_some();
                             // Refused under the policy it was sent under: a
                             // later respond-to change restarts the agent and
                             // must not reopen it. A failed lookup retries.
@@ -4298,10 +4307,14 @@ async fn run_harness(
                                 // into a flooder. A failed lookup is not a
                                 // refusal, so it gets no notice: "not set up to
                                 // take requests from you" would be false.
-                                if gate_notice_due(refusal, inbound_backlog)
+                                let memo_key = (inbound_channel_id, inbound_author);
+                                if gate_notice_due(refusal, inbound_backlog, ledgered)
                                     && remember_gate_notice(
-                                        &mut gate_notified,
-                                        (inbound_channel_id, inbound_author),
+                                        &mut gate_notified
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .told,
+                                        memo_key.clone(),
                                     )
                                 {
                                     let is_dm =
@@ -4315,15 +4328,36 @@ async fn run_harness(
                                     };
                                     let content = author_gate_notice_text(is_dm);
                                     let rest = ctx.rest_client.clone();
+                                    let factory = config.factory.clone();
+                                    let alert_cmd = config.factory_alert_cmd.clone();
+                                    let sms_to = config.factory_alert_sms_to.clone();
+                                    let memo = Arc::clone(&gate_notified);
                                     tokio::spawn(async move {
-                                        pool::post_notice(
+                                        // The relay's membership cache can refuse a post into a DM
+                                        // opened moments ago, for up to 10 s.
+                                        let waits = [Duration::ZERO, Duration::from_secs(11)];
+                                        let posted = post_refusal_notice(
                                             &rest,
                                             inbound_channel_id,
                                             &inbound_thread_tags,
                                             &content,
                                             &mentions,
+                                            &waits,
                                         )
                                         .await;
+                                        let texts = settle_refusal_notice(
+                                            posted,
+                                            &memo,
+                                            &memo_key,
+                                            &factory,
+                                            &inbound_event_id,
+                                        );
+                                        if !texts.is_empty() {
+                                            deliver_factory_state(
+                                                None, None, texts, rest, alert_cmd, sms_to,
+                                            )
+                                            .await;
+                                        }
                                     });
                                 }
                                 continue;
@@ -5725,6 +5759,28 @@ mod try_native_steer_fallback_log_tests {
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+/// An owner turn must not run in a session a guest's words were written into:
+/// their words would sit in the provider's memory under the owner's trust.
+/// The new session's first prompt fetches the recent history instead, each
+/// line labelled owner or guest. Returns whether the scope was reset.
+fn fresh_session_for_owner_turn(
+    agent: &mut OwnedAgent,
+    scope: &scope::SessionScope,
+    authority: acp::TurnAuthority,
+) -> bool {
+    if authority != acp::TurnAuthority::Owner {
+        return false;
+    }
+    let Some(id) = agent.state.sessions.get(scope).cloned() else {
+        return false;
+    };
+    if !(agent.acp.take_guest_mark(&id) && agent.state.invalidate_scope(scope)) {
+        return false;
+    }
+    agent.state.history_after_guest.insert(scope.clone());
+    true
+}
+
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
@@ -5871,6 +5927,20 @@ fn dispatch_pending(
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
 
+        // Before record_scope_owner: invalidating after it would make
+        // return_agent discard the new session as stale.
+        if fresh_session_for_owner_turn(
+            &mut agent,
+            &scope,
+            pool::turn_authority_for(Some(&batch), ctx.agent_owner_pubkey.as_ref()),
+        ) {
+            tracing::info!(
+                target: "buzz_acp::authority",
+                scope = %scope.telemetry_label(),
+                "owner turn after a guest's words — starting a fresh session"
+            );
+        }
+
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
         // prior busy worker's copy when that worker eventually returns.
@@ -5990,11 +6060,81 @@ fn remember_gate_notice(seen: &mut HashSet<(Uuid, String)>, key: (Uuid, String))
     true
 }
 
+/// Post a refusal notice, retrying after each wait; true once the relay accepts it.
+async fn post_refusal_notice(
+    rest: &relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    mentions: &[String],
+    waits: &[Duration],
+) -> bool {
+    for wait in waits {
+        tokio::time::sleep(*wait).await;
+        if pool::post_notice(rest, channel_id, thread_tags, content, mentions).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// The refusal-notice memo, keyed by (channel, author).
+#[derive(Default)]
+struct RefusalMemo {
+    /// Told, or a notice in flight.
+    told: HashSet<(Uuid, String)>,
+    /// A notice already failed once; the owner was told about it.
+    failed: HashSet<(Uuid, String)>,
+}
+
+/// After a refusal notice's last try; returns the owner's texts to send now.
+///
+/// A landed notice keeps its claim. A pair's first failure releases it, so
+/// their next message tries again (the relay's cache may have caught up), and
+/// the owner gets one card and one text (D1, 15 Nov 2026). Any later failure
+/// keeps the claim, so a relay that keeps refusing costs no more posts, cards
+/// or texts. The texts go out from here because the beat that sends queued
+/// texts runs only while the pool is up, and a refusal needs no pool.
+fn settle_refusal_notice(
+    posted: bool,
+    memo: &std::sync::Mutex<RefusalMemo>,
+    key: &(Uuid, String),
+    factory: &factory::FactoryHandle,
+    event_id: &str,
+) -> Vec<String> {
+    if posted {
+        return Vec::new();
+    }
+    let first = {
+        let mut memo = memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = remember_gate_notice(&mut memo.failed, key.clone());
+        if first {
+            memo.told.remove(key);
+        }
+        first
+    };
+    tracing::error!(
+        channel_id = %key.0,
+        event_id,
+        first,
+        "refusal notice could not be posted — the sender was not told"
+    );
+    if !first {
+        return Vec::new();
+    }
+    let mut factory = factory.lock();
+    factory.refusal_unseen(key.0, &key.1, event_id);
+    factory.take_alerts()
+}
+
 /// Whether a gate refusal earns the "not set up to take requests" notice.
-/// Never for backlog: a refused mention is replayed on every restart inside
-/// the catch-up window, and the notice memo does not survive one.
-fn gate_notice_due(refusal: Option<GateRefusal>, backlog: bool) -> bool {
-    !backlog && refusal == Some(GateRefusal::Policy)
+/// A refused mention is marked done in the catch-up ledger (`note_refused`), so one replayed here was
+/// never answered: notify it. A non-mention has no ledger entry and would repeat every restart: skip it.
+/// Worst case: one repeat notice if the agent dies within REFUSED_SAVE_DELAY (10 s).
+fn gate_notice_due(refusal: Option<GateRefusal>, backlog: bool, ledgered: bool) -> bool {
+    refusal == Some(GateRefusal::Policy) && (!backlog || ledgered)
 }
 
 /// What someone outside the author gate is told.
@@ -9147,9 +9287,9 @@ mod author_gate_tests {
     }
 
     /// Both production boundaries must retain DM classification when composing
-    /// trusted workflow attribution with configured author policy. External
-    /// allowlist entries and `Anyone` stay denied in a DM; owner and sibling
-    /// principals remain allowed; `Nobody` remains absolute.
+    /// trusted workflow attribution with configured author policy. `Anyone`
+    /// stays denied in a DM; allowlisted people (owner decision 15 Nov 2026),
+    /// owner and sibling principals are allowed; `Nobody` remains absolute.
     #[tokio::test]
     async fn production_listener_boundaries_enforce_dm_author_policy() {
         for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
@@ -9157,7 +9297,7 @@ mod author_gate_tests {
             let relay_hex = relay_keys.public_key().to_hex();
             let external = nostr::Keys::generate().public_key().to_hex();
             let external_allowlist = HashSet::from([external.clone()]);
-            let denied_external = listener_boundary_scenario(ListenerBoundaryScenario {
+            let allowed_external = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
                 relay_keys: &relay_keys,
                 workflow_owner: &external,
@@ -9173,8 +9313,8 @@ mod author_gate_tests {
             })
             .await;
             assert!(
-                !denied_external.1,
-                "{} listener must deny an external allowlist entry in a DM",
+                allowed_external.1,
+                "{} listener must allow an allowlisted person in a DM",
                 listener.name()
             );
 
@@ -10073,7 +10213,7 @@ mod author_gate_tests {
                 .err();
                 assert_eq!(refusal, Some(expected));
                 assert_eq!(
-                    gate_notice_due(refusal, false),
+                    gate_notice_due(refusal, false, true),
                     expected == GateRefusal::Policy,
                     "{expected:?}"
                 );
@@ -10082,13 +10222,23 @@ mod author_gate_tests {
         server.abort();
     }
 
+    /// A message sent while the agent was down is refused on catch-up. A
+    /// mention is ledgered when refused, so it never replays twice: tell them.
+    /// A non-mention has no ledger entry and would re-notice every restart.
     #[test]
-    fn backlog_refusal_posts_no_notice() {
-        assert!(gate_notice_due(Some(GateRefusal::Policy), false));
-        assert!(
-            !gate_notice_due(Some(GateRefusal::Policy), true),
-            "a refused mention replays on every restart; it must not re-notice each time"
-        );
+    fn backlog_refusal_notices_only_a_ledgered_mention() {
+        let policy = Some(GateRefusal::Policy);
+        let unverified = Some(GateRefusal::Unverified);
+        for (refusal, backlog, ledgered, due, case) in [
+            (policy, false, false, true, "live + Policy"),
+            (policy, true, true, true, "backlog + Policy + ledgered"),
+            (policy, true, false, false, "backlog + Policy, unledgered"),
+            (unverified, false, true, false, "Unverified, live"),
+            (unverified, true, true, false, "Unverified, backlog"),
+            (None, false, true, false, "no refusal"),
+        ] {
+            assert_eq!(gate_notice_due(refusal, backlog, ledgered), due, "{case}");
+        }
     }
 
     #[test]
@@ -10194,16 +10344,18 @@ mod author_gate_tests {
     // ── DM hardening ──────────────────────────────────────────────────────
     //
     // In a DM, clients auto-p-tag every participant, and an agent can be
-    // asked to open a DM with a third party. The gate must therefore ignore
-    // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // asked to open a DM with a third party. The gate therefore checks the
+    // author, never the DM's membership: owner, verified siblings and (in
+    // allowlist mode, owner decision 15 Nov 2026) allowlisted people fire
+    // turns. `anyone` stays owner-only in DMs. Upstream #2591 rejects the
+    // allowlist here too; this fork diverges on purpose.
 
     #[tokio::test]
-    async fn test_dm_rejects_allowlisted_external_pubkey() {
+    async fn test_dm_admits_allowlisted_person_under_allowlist() {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            !inbound_author_gate::test_author_allowed(
+            inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
@@ -10212,8 +10364,77 @@ mod author_gate_tests {
                 &dummy_rest_client()
             )
             .await,
-            "an allowlisted external pubkey must NOT fire a turn inside a DM"
+            "an allowlisted person must be able to DM an allowlist-mode agent"
         );
+    }
+
+    #[tokio::test]
+    async fn test_dm_rejects_stranger_under_allowlist() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                STRANGER,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "the check is on the author: a stranger in the same DM gets nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dm_ignores_the_list_outside_allowlist_mode() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::OwnerOnly,
+                &allowlist,
+                EXTERNAL,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "a leftover list must not open an owner-only agent's DMs"
+        );
+    }
+
+    /// The 13 Nov incident: Chris, on Chris Orchestrator's allowlist, DMed it
+    /// and was dropped by the DM branch. Replayed through the listener gate.
+    #[tokio::test]
+    async fn test_dm_from_allowlisted_person_passes_the_listener_gate() {
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let chris = nostr::Keys::generate();
+        let rest = dummy_rest_client();
+        let gate = InboundAuthorGate::connect(&rest, &agent, "test").await;
+        let cache = OwnerCache::new(Some(nostr::Keys::generate().public_key().to_hex()));
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "can you look at this?",
+        )
+        .tags([nostr::Tag::parse(["p", agent.as_str()]).expect("p tag")])
+        .sign_with_keys(&chris)
+        .unwrap();
+        let allowlist = HashSet::from([chris.public_key().to_hex()]);
+        let decision = gate
+            .evaluate_for_test(
+                &event,
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                &cache,
+                &rest,
+            )
+            .await;
+        assert!(decision.allowed, "an allowlisted DM must start a turn");
+        // The list answers before any relay lookup: an unreachable relay is no excuse.
+        assert!(!decision.unverified);
+        assert_eq!(cache.proven_verdict(&chris.public_key().to_hex()), None);
     }
 
     #[tokio::test]
@@ -10316,6 +10537,159 @@ mod author_gate_tests {
             auth_tag_json: None,
         };
         (rest, server)
+    }
+
+    // ── refusal notice transport ──────────────────────────────────────────
+    //
+    // 13 Nov: the refusal reply to Chris's first DM failed with HTTP 400 and
+    // the harness threw the relay's reason away; his next two DMs got nothing.
+
+    const NOT_A_MEMBER: (&str, &str) = (
+        "400 Bad Request",
+        r#"{"error":"restricted: not a channel member"}"#,
+    );
+    const ACCEPTED: (&str, &str) = ("200 OK", r#"{"accepted":true}"#);
+
+    /// A relay that answers each request with the next of `replies` (the last
+    /// one repeats), counting requests. Reads the whole request first, so the
+    /// close never resets a client still sending its body.
+    async fn scripted_relay(
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> (
+        relay::RestClient,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted relay");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let complete = text.find("\r\n\r\n").is_some_and(|end| {
+                        let body_len = text[..end]
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        request.len() >= end + 4 + body_len
+                    });
+                    if n == 0 || complete {
+                        break;
+                    }
+                }
+                let i = served.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = replies[i.min(replies.len() - 1)];
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, requests, server)
+    }
+
+    #[tokio::test]
+    async fn refused_post_names_the_relay_rule() {
+        let (rest, _, server) = scripted_relay(vec![NOT_A_MEMBER]).await;
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+            .sign_with_keys(&rest.keys)
+            .unwrap();
+        let err = rest
+            .submit_event(&event)
+            .await
+            .expect_err("a 400 is refused")
+            .to_string();
+        server.abort();
+        assert!(err.contains("restricted: not a channel member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refusal_notice_retries_until_the_relay_accepts_it() {
+        use std::sync::atomic::Ordering;
+        let waits = [Duration::ZERO, Duration::ZERO];
+        let post = |rest: relay::RestClient| async move {
+            post_refusal_notice(
+                &rest,
+                Uuid::new_v4(),
+                &ThreadTags::default(),
+                "not set up",
+                &[],
+                &waits,
+            )
+            .await
+        };
+
+        let (rest, posts, server) = scripted_relay(vec![NOT_A_MEMBER, ACCEPTED]).await;
+        assert!(
+            post(rest).await,
+            "the retry lands once the relay accepts it"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        server.abort();
+
+        let (rest, posts, server) = scripted_relay(vec![NOT_A_MEMBER]).await;
+        assert!(!post(rest).await, "a notice that never lands is reported");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            2,
+            "one post per wait, no more"
+        );
+        server.abort();
+    }
+
+    /// 13 Nov: the failed reply used up Chris's one notice, so his next two
+    /// DMs met silence. A first failure releases the claim once and tells the
+    /// owner; a relay that keeps refusing costs no more posts, cards or texts.
+    #[test]
+    fn refusal_memo_releases_a_failed_claim_once() {
+        let bench = tempfile::tempdir().unwrap();
+        let mut factory = factory::Factory::new(None, "claude-agent-acp");
+        factory.reporting.short = "ade9d0e2".to_string();
+        factory.reporting.bench = Some(bench.path().to_path_buf());
+        let factory = factory::FactoryHandle::new(factory);
+        let memo = std::sync::Mutex::new(RefusalMemo::default());
+        let key = (Uuid::from_u128(1), "cd".repeat(32));
+        let event = "ab".repeat(32);
+        let cards = bench.path().join("inbox").join(factory::CARD_WRITER);
+        let card_count = || std::fs::read_dir(&cards).map_or(0, |d| d.count());
+        let claim = || remember_gate_notice(&mut memo.lock().unwrap().told, key.clone());
+
+        assert!(claim());
+        assert!(settle_refusal_notice(true, &memo, &key, &factory, &event).is_empty());
+        assert!(!claim(), "told: stays told");
+        assert_eq!(card_count(), 0, "a landed notice needs no card");
+
+        memo.lock().unwrap().told.clear();
+        assert!(claim());
+        let texts = settle_refusal_notice(false, &memo, &key, &factory, &event);
+        assert_eq!(texts.len(), 1, "the owner is texted, now: {texts:?}");
+        assert_eq!(card_count(), 1, "and carded");
+        assert!(claim(), "never told: their next message must try again");
+
+        // The retry fails too: the claim stays, and nothing more is raised.
+        assert!(settle_refusal_notice(false, &memo, &key, &factory, &event).is_empty());
+        assert!(!claim(), "a relay that keeps refusing gets no more posts");
+        assert_eq!(card_count(), 1);
+        assert!(factory.lock().take_alerts().is_empty());
     }
 
     #[tokio::test]
@@ -10778,21 +11152,21 @@ mod author_gate_tests {
         let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
         let channel_info = resolver(discovered);
         let owner_cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
 
         let is_dm = is_dm_channel(id, &channel_info).await;
         assert!(is_dm, "unknown startup metadata must fail closed as DM");
+        // `anyone` admits a stranger in a channel but not in a DM.
         assert!(
             !inbound_author_gate::test_author_allowed(
-                &RespondTo::Allowlist,
-                &allowlist,
-                EXTERNAL,
+                &RespondTo::Anyone,
+                &HashSet::new(),
+                STRANGER,
                 is_dm,
                 &owner_cache,
                 &dummy_rest_client(),
             )
             .await,
-            "an external author must not pass when startup discovery omitted metadata"
+            "a stranger must not pass when startup discovery omitted metadata"
         );
     }
 
@@ -12732,6 +13106,90 @@ mod error_outcome_emission_tests {
     ) {
         let generation = pool.record_scope_owner(scope.clone(), agent.index);
         agent.state.set_scope_owner_generation(scope, generation);
+    }
+
+    /// Run one prompt as `authority` into `session_id`. `cat` echoes it back as a
+    /// request the harness rejects, which ends the prompt at once; only the guest
+    /// mark it leaves behind matters here.
+    async fn prompt_once(agent: &mut OwnedAgent, session_id: &str, authority: acp::TurnAuthority) {
+        let _ = agent
+            .acp
+            .session_prompt_with_idle_timeout(
+                session_id,
+                "hello",
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                authority,
+                None,
+            )
+            .await;
+    }
+
+    /// Only an owner turn reaching a session a guest wrote into starts fresh.
+    #[tokio::test]
+    async fn an_owner_turn_after_guest_words_resets_the_scope() {
+        use acp::TurnAuthority::{Guest, Owner};
+        let scope = scope::SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        // (who last wrote into the session, the next turn's authority, reset?)
+        for (writer, next, reset) in [
+            (Guest, Owner, true),
+            (Guest, Guest, false),
+            (Owner, Owner, false),
+        ] {
+            let mut agent = dummy_agent(0).await;
+            agent.state.sessions.insert(scope.clone(), "old".into());
+            prompt_once(&mut agent, "old", writer).await;
+            assert_eq!(
+                fresh_session_for_owner_turn(&mut agent, &scope, next),
+                reset,
+                "{writer:?} then {next:?}"
+            );
+            assert_eq!(
+                agent.state.sessions.contains_key(&scope),
+                !reset,
+                "{writer:?} then {next:?}"
+            );
+            // The fresh session's first prompt fetches the history it lost.
+            assert_eq!(
+                agent.state.history_after_guest.contains(&scope),
+                reset,
+                "{writer:?} then {next:?}"
+            );
+        }
+    }
+
+    /// The reset happens before `record_scope_owner`, so the session the owner's
+    /// turn opens is not discarded as stale when the worker comes back.
+    #[tokio::test]
+    async fn the_fresh_session_survives_return_agent() {
+        let scope = scope::SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut agent = dummy_agent(0).await;
+        bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        agent.state.sessions.insert(scope.clone(), "old".into());
+        prompt_once(&mut agent, "old", acp::TurnAuthority::Guest).await;
+
+        // Dispatch order: reset, record the owner, then the turn opens a session.
+        assert!(fresh_session_for_owner_turn(
+            &mut agent,
+            &scope,
+            acp::TurnAuthority::Owner
+        ));
+        bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        agent.state.sessions.insert(scope.clone(), "new".into());
+        pool.return_agent(agent);
+
+        let back = pool
+            .try_claim(Some(&scope))
+            .expect("the worker is idle again");
+        assert_eq!(
+            back.state.sessions.get(&scope).map(String::as_str),
+            Some("new")
+        );
     }
 
     // Exercise result handling and both production idle decisions with a fake clock.

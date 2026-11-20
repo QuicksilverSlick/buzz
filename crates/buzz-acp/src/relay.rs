@@ -475,14 +475,18 @@ impl RestClient {
                     // Surface non-retriable statuses (401/403/500/…): callers
                     // often swallow the Err, and a silent auth failure here has
                     // previously masqueraded as "the agent just went quiet".
-                    tracing::warn!(
-                        "{method} {path} returned non-retriable HTTP {}",
-                        resp.status()
-                    );
+                    // The body names the relay rule, e.g. "restricted: not a channel member".
+                    let status = resp.status();
+                    let why: String = resp
+                        .text()
+                        .await
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect();
+                    tracing::warn!("{method} {path} returned non-retriable HTTP {status}: {why}");
                     return Err(RelayError::Http(format!(
-                        "{method} {} returned HTTP {}",
-                        path,
-                        resp.status()
+                        "{method} {path} returned HTTP {status}: {why}"
                     )));
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => {
